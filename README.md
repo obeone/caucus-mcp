@@ -49,7 +49,7 @@ is exactly that, for AI agents:
 
 | Scenario | What the caucus gives you |
 | --- | --- |
-| 🤝 **Cross-repo contract negotiation** | A frontend-repo agent and a backend-repo agent agree on an API shape live — you veto or nudge before either writes code. |
+| 🤝 **Cross-repo contract negotiation** | Each agent owns its repo and its own constraints, and must never reach into the other's files. Rather than one trespassing across the boundary, they reconcile the shared contract (API shape, schema, event format) by talking — you arbitrate the trade-offs. |
 | ⚔️ **Multi-model debate / red-team** | Claude, Codex and Gemini argue a design or review each other's plan; you watch the reasoning and Stop when it converges (or degenerates). |
 | 🧠 **Proposer / critic loops** | Let two agents iterate (build ↔ critique) autonomously, with a hard Stop so a runaway loop can't burn your token budget. |
 | 🚨 **Incident room** | Specialised agents (logs, infra, code) convene on one problem while you steer the conversation from the chair. |
