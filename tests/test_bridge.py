@@ -17,10 +17,16 @@ from warroom import mcp_bridge as bridge_module
 
 @pytest.fixture
 def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
-    """Point the bridge module at the live hub with a clean token slate."""
+    """Point the bridge module at the live hub with a clean, armed slate.
+
+    ``_setup_done`` is pre-armed so the gated tools run; the gate itself is
+    exercised by tests that flip it back to ``False``.
+    """
     monkeypatch.setattr(bridge_module, "HUB_URL", live_hub)
     monkeypatch.setattr(bridge_module, "_token", None)
     monkeypatch.setattr(bridge_module, "_joined_as", None)
+    monkeypatch.setattr(bridge_module, "_setup_done", True)
+    monkeypatch.setattr(bridge_module, "_known_protocol_version", None)
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "reset"})
     return bridge_module
@@ -30,6 +36,63 @@ def _register_peer(base: str, project: str) -> str:
     """Register a peer straight against the hub and return its token."""
     with httpx.Client(base_url=base, timeout=5.0) as http:
         return str(http.post("/register", json={"project": project}).json()["token"])
+
+
+# --- setup & gate --------------------------------------------------------
+
+
+def test_setup_arms_and_returns_protocol(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    result = bridge.setup()
+    assert result["ready"] is True
+    assert isinstance(result["protocol_version"], int)
+    assert "War Room operating protocol" in result["protocol"]
+    assert bridge.whoami()["setup_done"] is True
+
+
+def test_gated_tools_refuse_before_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    expected = {"error": "setup_required", "hint": "call setup() first"}
+    assert bridge.join() == expected
+    assert bridge.leave() == expected
+    assert bridge.list_peers() == expected
+    assert bridge.say("hi") == expected
+    assert bridge.listen(timeout=0) == expected
+
+
+def test_whoami_is_available_before_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    info = bridge.whoami()
+    assert info["setup_done"] is False
+    assert info["joined"] is False
+
+
+def test_join_flags_stale_protocol_when_behind(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fixture leaves _known_protocol_version=None, i.e. "never read it".
+    monkeypatch.setattr(bridge, "PROJECT", "stale-joiner")
+    result = bridge.join()
+    assert result["joined"] is True
+    assert result["protocol_stale"] is True
+    assert "War Room operating protocol" in result["protocol"]
+
+
+def test_join_is_current_after_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "fresh-joiner")
+    bridge.setup()  # learn the hub's current protocol revision
+    result = bridge.join()
+    assert result["joined"] is True
+    assert result["protocol_stale"] is False
+    assert "protocol" not in result
 
 
 # --- identity ------------------------------------------------------------
@@ -62,7 +125,7 @@ def test_join_with_explicit_name_overrides_default(
     monkeypatch.setattr(bridge, "PROJECT", "from-env")
     bridge.join(project="explicit-name")
     assert bridge.whoami()["joined_as"] == "explicit-name"
-    assert "explicit-name" in bridge.list_peers()
+    assert "explicit-name" in bridge.list_peers()["peers"]
 
 
 def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,7 +141,7 @@ def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_list_peers_includes_self(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "peers-test")
     bridge.join()
-    assert "peers-test" in bridge.list_peers()
+    assert "peers-test" in bridge.list_peers()["peers"]
 
 
 # --- say -----------------------------------------------------------------

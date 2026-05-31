@@ -45,16 +45,74 @@ def _default_project() -> str:
 HUB_URL = os.environ.get("WARROOM_HUB_URL", "http://127.0.0.1:8765").rstrip("/")
 PROJECT = os.environ.get("WARROOM_PROJECT") or _default_project()
 
-mcp = FastMCP("warroom")
+mcp = FastMCP(
+    "warroom",
+    instructions=(
+        "Call setup() before any other tool. It returns the War Room operating "
+        "protocol (fetched from the hub) and arms join/say/listen, which refuse "
+        "until then."
+    ),
+)
 
 # Active membership, populated by :func:`join`. ``None`` means "not in the room".
 _token: str | None = None
 _joined_as: str | None = None
 
+# Flipped by :func:`setup`. The active tools refuse until then, so the agent
+# always reads the protocol before acting.
+_setup_done: bool = False
+
+# Protocol revision learned from the last :func:`setup`. Sent on :func:`join`
+# so the hub can flag drift. ``None`` until setup has run.
+_known_protocol_version: int | None = None
+
 
 def _client() -> httpx.Client:
     """Return an HTTP client with a timeout that outlasts the hub long-poll."""
     return httpx.Client(base_url=HUB_URL, timeout=35.0)
+
+
+def _require_setup() -> dict[str, object] | None:
+    """Return a gate error if :func:`setup` has not run, else ``None``."""
+    if not _setup_done:
+        return {"error": "setup_required", "hint": "call setup() first"}
+    return None
+
+
+@mcp.tool()
+def setup() -> dict[str, object]:
+    """Read the War Room protocol from the hub and arm the other tools.
+
+    Must be called before ``join``/``leave``/``list_peers``/``say``/``listen``;
+    they refuse with ``setup_required`` until then. Fetches the canonical
+    protocol (and its revision) from the hub so no local copy is needed, caches
+    the revision for :func:`join`'s drift check, and returns the protocol text
+    to read now.
+
+    Returns:
+        ``{"ready": true, "protocol_version": <int>, "protocol": "<text>",
+        "default_project": "<name>", "hub": "<url>"}`` on success, or
+        ``{"error": "hub_unreachable", ...}`` if the hub cannot be reached.
+    """
+    global _setup_done, _known_protocol_version
+    try:
+        with _client() as http:
+            resp = http.get("/protocol")
+            resp.raise_for_status()
+            body = resp.json()
+    except httpx.HTTPError as exc:
+        logger.error("setup failed: %s", exc)
+        return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
+    _known_protocol_version = int(body["version"])
+    _setup_done = True
+    logger.info("setup complete (protocol v%s)", _known_protocol_version)
+    return {
+        "ready": True,
+        "protocol_version": _known_protocol_version,
+        "protocol": body["text"],
+        "default_project": PROJECT,
+        "hub": HUB_URL,
+    }
 
 
 @mcp.tool()
@@ -69,23 +127,48 @@ def join(project: str | None = None) -> dict[str, object]:
         project: Name to register under. Defaults to ``WARROOM_PROJECT`` or the
             repo directory name.
 
+    Requires ``setup`` first. Sends the protocol revision learned at setup so
+    the hub can flag drift; if the hub's protocol moved on, the result carries
+    ``protocol_stale=True`` and the new ``protocol`` text to re-read.
+
     Returns:
-        ``{"joined": true, "project": "<name>", "hub": "<url>"}`` on success,
-        or ``{"error": "..."}`` if the hub is unreachable.
+        ``{"joined": true, "project": "<name>", "hub": "<url>",
+        "protocol_version": <int>, "protocol_stale": bool}`` on success (plus
+        ``protocol`` when stale), ``{"error": "setup_required"}`` if setup has
+        not run, or ``{"error": "..."}`` if the hub is unreachable.
     """
-    global _token, _joined_as
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    global _token, _joined_as, _known_protocol_version
     name = project or PROJECT
     try:
         with _client() as http:
-            resp = http.post("/register", json={"project": name})
+            resp = http.post(
+                "/register",
+                json={"project": name, "protocol_version": _known_protocol_version},
+            )
             resp.raise_for_status()
-            _token = resp.json()["token"]
+            body = resp.json()
+            _token = body["token"]
     except httpx.HTTPError as exc:
         logger.error("join failed: %s", exc)
         return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
     _joined_as = name
-    logger.info("joined War Room as project=%s", name)
-    return {"joined": True, "project": name, "hub": HUB_URL}
+    stale = bool(body.get("protocol_stale"))
+    _known_protocol_version = int(body["protocol_version"])
+    logger.info("joined War Room as project=%s (protocol_stale=%s)", name, stale)
+    result: dict[str, object] = {
+        "joined": True,
+        "project": name,
+        "hub": HUB_URL,
+        "protocol_version": _known_protocol_version,
+        "protocol_stale": stale,
+    }
+    if stale:
+        result["protocol"] = body.get("protocol_text")
+        result["note"] = "protocol updated; re-read the protocol below"
+    return result
 
 
 @mcp.tool()
@@ -96,9 +179,14 @@ def leave() -> dict[str, object]:
     in-memory roster until it restarts (there is no server-side deregister),
     but this agent will no longer participate until it ``join``s again.
 
+    Requires ``setup`` first.
+
     Returns:
         ``{"left": true, "project": "<name>"}``.
     """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
     global _token, _joined_as
     name, _joined_as, _token = _joined_as, None, None
     logger.info("left War Room (was project=%s)", name)
@@ -107,33 +195,47 @@ def leave() -> dict[str, object]:
 
 @mcp.tool()
 def whoami() -> dict[str, object]:
-    """Report this agent's identity and whether it has joined the War Room."""
+    """Report this agent's identity and War Room status.
+
+    Always available (not gated), so it can diagnose why the other tools are
+    refusing: it reports whether :func:`setup` has run and the known protocol
+    revision alongside the joined state.
+    """
     return {
         "default_project": PROJECT,
         "joined_as": _joined_as,
         "hub": HUB_URL,
         "joined": _token is not None,
+        "setup_done": _setup_done,
+        "known_protocol_version": _known_protocol_version,
     }
 
 
 @mcp.tool()
-def list_peers() -> list[str]:
+def list_peers() -> dict[str, object]:
     """List the project names currently connected to the War Room.
 
-    Does not require joining first — useful to scout who is around before
-    deciding to ``join``.
+    Requires ``setup`` first, but not ``join`` — useful to scout who is around
+    before deciding to ``join``.
+
+    Returns:
+        ``{"peers": ["<name>", ...]}``, or ``{"error": "setup_required"}`` if
+        setup has not run.
     """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
     with _client() as http:
         resp = http.get("/peers")
         resp.raise_for_status()
-        return list(resp.json().get("peers", []))
+        return {"peers": list(resp.json().get("peers", []))}
 
 
 @mcp.tool()
 def say(content: str, to: str = "all") -> dict[str, object]:
     """Send a message to a peer or broadcast to everyone.
 
-    Requires ``join`` first.
+    Requires ``setup`` then ``join`` first.
 
     Args:
         content: The message text.
@@ -144,6 +246,9 @@ def say(content: str, to: str = "all") -> dict[str, object]:
         with ``retry_after`` when rate-limited, or a ``stopped`` flag when the
         operator has stopped the room.
     """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
     with _client() as http:
@@ -161,10 +266,10 @@ def say(content: str, to: str = "all") -> dict[str, object]:
 def listen(timeout: float = 30.0) -> dict[str, object]:
     """Wait for messages addressed to this agent (or broadcast).
 
-    Requires ``join`` first. Blocks up to ``timeout`` seconds. Returns an empty
-    ``messages`` list on a quiet poll (call again to keep listening). If a
-    control ``stop`` arrives, the result contains ``{"stop": true}`` and the
-    agent should end the exchange.
+    Requires ``setup`` then ``join`` first. Blocks up to ``timeout`` seconds.
+    Returns an empty ``messages`` list on a quiet poll (call again to keep
+    listening). If a control ``stop`` arrives, the result contains
+    ``{"stop": true}`` and the agent should end the exchange.
 
     Args:
         timeout: Maximum seconds to wait for inbound traffic.
@@ -172,6 +277,9 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     Returns:
         ``{"messages": [...], "mode": "<mode>", "stop": bool}``.
     """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
     with _client() as http:
