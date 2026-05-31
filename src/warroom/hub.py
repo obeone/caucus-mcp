@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import threading
+import webbrowser
 from pathlib import Path
 
 import coloredlogs
@@ -202,16 +204,66 @@ async def ui_socket(ws: WebSocket) -> None:
         state.remove_ui(queue)
 
 
+def _browser_url(host: str, port: int) -> str:
+    """Build the operator-console URL a browser should open.
+
+    ``0.0.0.0`` and ``::`` are bind-all addresses, not connectable from a
+    browser, so they are rewritten to loopback.
+
+    Parameters
+    ----------
+    host:
+        Address the server binds to.
+    port:
+        Port the server listens on.
+
+    Returns:
+        A ``http://host:port/`` URL safe to hand to a browser.
+    """
+    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    return f"http://{browse_host}:{port}/"
+
+
+def _open_browser(url: str, delay: float = 1.0) -> None:
+    """Open ``url`` in the default browser after a short delay.
+
+    Runs on a background timer so the call does not block the server startup;
+    the delay gives uvicorn time to bind the socket before the browser hits it.
+
+    Parameters
+    ----------
+    url:
+        Address of the operator console to open.
+    delay:
+        Seconds to wait before opening, letting the server come up first.
+    """
+
+    def _launch() -> None:
+        try:
+            webbrowser.open(url)
+        except Exception:  # pragma: no cover - browser launch is best-effort
+            logger.debug("could not open browser at %s", url, exc_info=True)
+
+    threading.Timer(delay, _launch).start()
+
+
 def main() -> None:
     """CLI entry point for the hub server."""
     parser = argparse.ArgumentParser(description="War Room hub server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="do not open the operator console in a browser on startup",
+    )
     args = parser.parse_args()
 
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
+    if not args.no_browser:
+        _open_browser(_browser_url(args.host, args.port))
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
 
 
