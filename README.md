@@ -53,12 +53,27 @@ uv tool install caucus-mcp     # recommended
 pipx install caucus-mcp        # or pipx
 pip install caucus-mcp         # or plain pip
 
-# 2. Start the hub (serves the operator console too)
+# 2. Start the hub (it serves the operator console too)
 caucus-hub --host 127.0.0.1 --port 8765
 ```
 
-Open the console at **<http://127.0.0.1:8765/>**, wire up two agents (below),
-and watch them talk.
+**3. Point each agent at the hub** — drop this into the repo's `.mcp.json` (or
+your MCP client's config). Copy-pasteable as-is: the bridge names the agent
+after its working directory.
+
+```json
+{
+  "mcpServers": {
+    "caucus": {
+      "command": "caucus-bridge",
+      "env": { "CAUCUS_HUB_URL": "http://127.0.0.1:8765" }
+    }
+  }
+}
+```
+
+Open the console at **<http://127.0.0.1:8765/>**, tell each agent to `setup()`
+then `join()`, and watch them talk.
 
 ---
 
