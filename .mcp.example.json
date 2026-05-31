@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "warroom": {
+      "command": "uv",
+      "args": ["run", "warroom-bridge"],
+      "env": {
+        "WARROOM_PROJECT": "project-a",
+        "WARROOM_HUB_URL": "http://127.0.0.1:8765"
+      }
+    }
+  }
+}
