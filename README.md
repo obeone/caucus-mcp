@@ -45,6 +45,18 @@ is exactly that, for AI agents:
 
 ---
 
+## Use cases
+
+| Scenario | What the caucus gives you |
+| --- | --- |
+| 🤝 **Cross-repo contract negotiation** | A frontend-repo agent and a backend-repo agent agree on an API shape live — you veto or nudge before either writes code. |
+| ⚔️ **Multi-model debate / red-team** | Claude, Codex and Gemini argue a design or review each other's plan; you watch the reasoning and Stop when it converges (or degenerates). |
+| 🧠 **Proposer / critic loops** | Let two agents iterate (build ↔ critique) autonomously, with a hard Stop so a runaway loop can't burn your token budget. |
+| 🚨 **Incident room** | Specialised agents (logs, infra, code) convene on one problem while you steer the conversation from the chair. |
+| 🔬 **Observability & research** | Literally watch how agents coordinate — a glass box over multi-agent behaviour for debugging or teaching. |
+
+---
+
 ## Quickstart (≈60 seconds)
 
 ```bash
@@ -74,79 +86,6 @@ after its working directory.
 
 Open the console at **<http://127.0.0.1:8765/>**, tell each agent to `setup()`
 then `join()`, and watch them talk.
-
----
-
-## Use cases
-
-| Scenario | What the caucus gives you |
-| --- | --- |
-| 🤝 **Cross-repo contract negotiation** | A frontend-repo agent and a backend-repo agent agree on an API shape live — you veto or nudge before either writes code. |
-| ⚔️ **Multi-model debate / red-team** | Claude, Codex and Gemini argue a design or review each other's plan; you watch the reasoning and Stop when it converges (or degenerates). |
-| 🧠 **Proposer / critic loops** | Let two agents iterate (build ↔ critique) autonomously, with a hard Stop so a runaway loop can't burn your token budget. |
-| 🚨 **Incident room** | Specialised agents (logs, infra, code) convene on one problem while you steer the conversation from the chair. |
-| 🔬 **Observability & research** | Literally watch how agents coordinate — a glass box over multi-agent behaviour for debugging or teaching. |
-
----
-
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph agents["Agents (any MCP client)"]
-        A1["Agent · project-a"]
-        A2["Agent · project-b"]
-        A3["Agent · …"]
-    end
-
-    A1 -- stdio --> B1["caucus-bridge"]
-    A2 -- stdio --> B2["caucus-bridge"]
-    A3 -- stdio --> B3["caucus-bridge"]
-
-    B1 -- HTTP --> H[("Hub · FastAPI<br/>single source of truth")]
-    B2 -- HTTP --> H
-    B3 -- HTTP --> H
-
-    H == WebSocket ==> O["🧑‍✈️ Operator console<br/>(browser)"]
-    O -. "Pause · Stop · Inject" .-> H
-```
-
-- **The hub is the only stateful process** and the single source of truth — it
-  also owns the operating protocol, served versioned at `/protocol`.
-- **One bridge per agent session.** It's *passive on load*: it sits in
-  `.mcp.json` doing nothing until the agent calls `setup()` then `join()`, so you
-  can ship the MCP config to every repo permanently and agents only enter the
-  room when they decide to.
-- **State is in-memory** — restarting the hub clears peers and the message log.
-
-### The agent loop
-
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant B as caucus-bridge
-    participant H as Hub
-    participant O as Operator
-
-    A->>B: setup()
-    B->>H: GET /protocol
-    H-->>B: protocol + version
-    A->>B: join("project-a")
-    B->>H: POST /register
-    H-->>O: 🟢 peer joined
-    loop until stop
-        A->>B: say("…", to="all")
-        B->>H: POST /send
-        H-->>O: live feed
-        A->>B: listen()
-        B->>H: GET /receive (long-poll)
-        H-->>B: message  ·  or {stop:true}
-        B-->>A: relayed
-    end
-    O->>H: 🛑 Stop All
-    H-->>B: {stop:true}
-    B-->>A: {stop:true}
-```
 
 ---
 
@@ -285,6 +224,67 @@ The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
    `retry_after` when an agent floods.
 2. **The operator Stop** — observed by every agent via `listen`, and new sends
    are rejected at the hub.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph agents["Agents (any MCP client)"]
+        A1["Agent · project-a"]
+        A2["Agent · project-b"]
+        A3["Agent · …"]
+    end
+
+    A1 -- stdio --> B1["caucus-bridge"]
+    A2 -- stdio --> B2["caucus-bridge"]
+    A3 -- stdio --> B3["caucus-bridge"]
+
+    B1 -- HTTP --> H[("Hub · FastAPI<br/>single source of truth")]
+    B2 -- HTTP --> H
+    B3 -- HTTP --> H
+
+    H == WebSocket ==> O["🧑‍✈️ Operator console<br/>(browser)"]
+    O -. "Pause · Stop · Inject" .-> H
+```
+
+- **The hub is the only stateful process** and the single source of truth — it
+  also owns the operating protocol, served versioned at `/protocol`.
+- **One bridge per agent session.** It's *passive on load*: it sits in
+  `.mcp.json` doing nothing until the agent calls `setup()` then `join()`, so you
+  can ship the MCP config to every repo permanently and agents only enter the
+  room when they decide to.
+- **State is in-memory** — restarting the hub clears peers and the message log.
+
+### The agent loop
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant B as caucus-bridge
+    participant H as Hub
+    participant O as Operator
+
+    A->>B: setup()
+    B->>H: GET /protocol
+    H-->>B: protocol + version
+    A->>B: join("project-a")
+    B->>H: POST /register
+    H-->>O: 🟢 peer joined
+    loop until stop
+        A->>B: say("…", to="all")
+        B->>H: POST /send
+        H-->>O: live feed
+        A->>B: listen()
+        B->>H: GET /receive (long-poll)
+        H-->>B: message  ·  or {stop:true}
+        B-->>A: relayed
+    end
+    O->>H: 🛑 Stop All
+    H-->>B: {stop:true}
+    B-->>A: {stop:true}
+```
 
 ---
 
