@@ -40,6 +40,44 @@ logger = logging.getLogger("warroom.hub")
 # bridge can re-poll cleanly without spurious disconnects.
 LONG_POLL_SECONDS = 25.0
 
+# Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
+# bridges learn (on their next join) that they are behind and re-read it. The
+# hub is the single source of truth: clients only carry a version number.
+PROTOCOL_VERSION = 1
+
+# The protocol agents must follow once in the room. Delivered by ``setup`` and
+# re-shipped on ``join`` whenever the caller is behind. This is the canonical
+# copy — peer repos no longer need a local protocol file.
+PROTOCOL_TEXT = """\
+War Room operating protocol
+===========================
+
+Use the room only when work here genuinely depends on, or affects, another
+project. Solo work needs no room; silence is fine.
+
+The loop:
+  1. call join() once, when you decide to reach out.
+  2. list_peers() to confirm the peer you need is connected.
+  3. say(...) one concrete ask or fact.
+  4. listen(...) for the reply.
+  5. repeat only while the exchange is making progress; leave() when resolved.
+
+Discipline:
+  - One ask per turn; wait for the answer before sending again.
+  - On rate_limited, back off for retry_after seconds.
+  - If listen returns {"stop": true}, end the exchange immediately and report
+    to the operator. Send nothing further.
+  - Cap yourself at ~6 back-and-forths without operator input.
+  - Lead with the ask or fact; reference concrete identifiers; keep it terse.
+
+Listening (important):
+  - Never block your main turn on listen() — it long-polls for up to ~35s and
+    freezes you. Delegate listening to a background watcher subagent (a cheap
+    model such as haiku) that loops listen() and reports inbound messages back;
+    you stay free to talk to the operator. Relaunch the watcher after each
+    message until the exchange ends.
+"""
+
 state = HubState()
 app = FastAPI(title="War Room Hub", version="0.1.0")
 
@@ -60,12 +98,39 @@ async def peers() -> dict[str, list[str]]:
     return {"peers": state.peers()}
 
 
+@app.get("/protocol")
+async def protocol() -> dict[str, object]:
+    """Return the current operating protocol and its revision.
+
+    The hub is the single source of truth for the protocol; the bridge fetches
+    this on ``setup`` so peer repos need no local copy.
+    """
+    return {"version": PROTOCOL_VERSION, "text": PROTOCOL_TEXT}
+
+
 @app.post("/register", response_model=RegisterResponse)
 async def register(req: RegisterRequest) -> RegisterResponse:
-    """Register a project and hand back its access token."""
+    """Register a project and hand back its access token.
+
+    Compares the caller's ``protocol_version`` against :data:`PROTOCOL_VERSION`.
+    A caller that is behind (or has never read the protocol) gets
+    ``protocol_stale=True`` plus the current :data:`PROTOCOL_TEXT` to re-read.
+    """
     client = state.register(req.project)
-    logger.info("registered project=%s", req.project)
-    return RegisterResponse(token=client.token, project=client.project)
+    stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
+    logger.info(
+        "registered project=%s (protocol_version=%s, stale=%s)",
+        req.project,
+        req.protocol_version,
+        stale,
+    )
+    return RegisterResponse(
+        token=client.token,
+        project=client.project,
+        protocol_version=PROTOCOL_VERSION,
+        protocol_stale=stale,
+        protocol_text=PROTOCOL_TEXT if stale else None,
+    )
 
 
 @app.post("/send", response_model=SendResponse)

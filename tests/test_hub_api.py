@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from warroom.hub import PROTOCOL_VERSION
 from warroom.state import HubState
 
 
@@ -38,6 +39,40 @@ def test_register_returns_token_and_lists_peer(client: TestClient) -> None:
 
 def test_register_rejects_empty_project(client: TestClient) -> None:
     assert client.post("/register", json={"project": ""}).status_code == 422
+
+
+# --- protocol ------------------------------------------------------------
+
+
+def test_protocol_endpoint_returns_version_and_text(client: TestClient) -> None:
+    body = client.get("/protocol").json()
+    assert body["version"] == PROTOCOL_VERSION
+    assert "War Room operating protocol" in body["text"]
+
+
+def test_register_without_version_is_stale(client: TestClient) -> None:
+    body = client.post("/register", json={"project": "newcomer"}).json()
+    assert body["protocol_version"] == PROTOCOL_VERSION
+    assert body["protocol_stale"] is True
+    assert "War Room operating protocol" in body["protocol_text"]
+
+
+def test_register_with_current_version_is_not_stale(client: TestClient) -> None:
+    body = client.post(
+        "/register",
+        json={"project": "uptodate", "protocol_version": PROTOCOL_VERSION},
+    ).json()
+    assert body["protocol_stale"] is False
+    assert body["protocol_text"] is None
+
+
+def test_register_with_older_version_is_stale(client: TestClient) -> None:
+    body = client.post(
+        "/register",
+        json={"project": "behind", "protocol_version": PROTOCOL_VERSION - 1},
+    ).json()
+    assert body["protocol_stale"] is True
+    assert body["protocol_text"] is not None
 
 
 # --- send ----------------------------------------------------------------

@@ -74,16 +74,30 @@ class Message:
 
 
 class RegisterRequest(BaseModel):
-    """Body for ``POST /register``."""
+    """Body for ``POST /register``.
+
+    ``protocol_version`` is the protocol revision the caller has already read
+    (via ``setup``). ``None`` means "never read it"; the hub then flags the
+    response as stale and ships the current protocol text.
+    """
 
     project: str = Field(min_length=1, max_length=64)
+    protocol_version: int | None = None
 
 
 class RegisterResponse(BaseModel):
-    """Reply for ``POST /register``."""
+    """Reply for ``POST /register``.
+
+    Carries the hub's current protocol revision so the caller can detect drift.
+    When the caller is behind (or has never read the protocol), ``protocol_stale``
+    is ``True`` and ``protocol_text`` holds the up-to-date protocol to re-read.
+    """
 
     token: str
     project: str
+    protocol_version: int
+    protocol_stale: bool = False
+    protocol_text: str | None = None
 
 
 class SendRequest(BaseModel):
