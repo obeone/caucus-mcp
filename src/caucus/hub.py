@@ -1,11 +1,11 @@
-"""FastAPI hub for the War Room.
+"""FastAPI hub for the Caucus.
 
 Exposes a small HTTP surface for agents (register / send / receive) plus a
 WebSocket feed and control channel for the human operator's UI. Run with::
 
-    warroom-hub --host 127.0.0.1 --port 8765
+    caucus-hub --host 127.0.0.1 --port 8765
 
-or ``python -m warroom.hub``.
+or ``python -m caucus.hub``.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from .models import (
 )
 from .state import HubState
 
-logger = logging.getLogger("warroom.hub")
+logger = logging.getLogger("caucus.hub")
 
 # Server-side long-poll ceiling. Kept under typical client timeouts so the
 # bridge can re-poll cleanly without spurious disconnects.
@@ -49,7 +49,7 @@ PROTOCOL_VERSION = 1
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
 # copy — peer repos no longer need a local protocol file.
 PROTOCOL_TEXT = """\
-War Room operating protocol
+Caucus operating protocol
 ===========================
 
 Use the room only when work here genuinely depends on, or affects, another
@@ -79,7 +79,7 @@ Listening (important):
 """
 
 state = HubState()
-app = FastAPI(title="War Room Hub", version="0.1.0")
+app = FastAPI(title="Caucus Hub", version="0.1.0")
 
 _UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
 
@@ -314,7 +314,7 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
 
 def main() -> None:
     """CLI entry point for the hub server."""
-    parser = argparse.ArgumentParser(description="War Room hub server")
+    parser = argparse.ArgumentParser(description="Caucus hub server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--log-level", default="INFO")

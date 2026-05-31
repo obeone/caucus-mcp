@@ -8,11 +8,11 @@ listen for replies. The natural loop is ``join()`` once, then ``say(...)`` and
 
 Configuration via environment variables:
 
-* ``WARROOM_PROJECT``  -- this agent's default identity. Optional: when unset,
+* ``CAUCUS_PROJECT``  -- this agent's default identity. Optional: when unset,
   the bridge names itself after the current working directory (the MCP client
   launches it at the repo root), so the same ``.mcp.json`` is copy-pasteable
   into any repo without editing. ``join`` can still override it per call.
-* ``WARROOM_HUB_URL``  -- hub base URL (default ``http://127.0.0.1:8765``).
+* ``CAUCUS_HUB_URL``  -- hub base URL (default ``http://127.0.0.1:8765``).
 """
 
 from __future__ import annotations
@@ -26,14 +26,14 @@ import coloredlogs
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-logger = logging.getLogger("warroom.bridge")
+logger = logging.getLogger("caucus.bridge")
 
 
 def _default_project() -> str:
     """Derive a self-assigned project name from the working directory.
 
     MCP clients start the bridge with its cwd set to the repo root, so the
-    directory's basename is a sensible identity when ``WARROOM_PROJECT`` is
+    directory's basename is a sensible identity when ``CAUCUS_PROJECT`` is
     not provided. Falls back to ``"unknown"`` for a nameless root (e.g. ``/``).
 
     Returns:
@@ -42,13 +42,13 @@ def _default_project() -> str:
     return Path.cwd().name or "unknown"
 
 
-HUB_URL = os.environ.get("WARROOM_HUB_URL", "http://127.0.0.1:8765").rstrip("/")
-PROJECT = os.environ.get("WARROOM_PROJECT") or _default_project()
+HUB_URL = os.environ.get("CAUCUS_HUB_URL", "http://127.0.0.1:8765").rstrip("/")
+PROJECT = os.environ.get("CAUCUS_PROJECT") or _default_project()
 
 mcp = FastMCP(
-    "warroom",
+    "caucus",
     instructions=(
-        "Call setup() before any other tool. It returns the War Room operating "
+        "Call setup() before any other tool. It returns the Caucus operating "
         "protocol (fetched from the hub) and arms join/say/listen, which refuse "
         "until then."
     ),
@@ -81,7 +81,7 @@ def _require_setup() -> dict[str, object] | None:
 
 @mcp.tool()
 def setup() -> dict[str, object]:
-    """Read the War Room protocol from the hub and arm the other tools.
+    """Read the Caucus protocol from the hub and arm the other tools.
 
     Must be called before ``join``/``leave``/``list_peers``/``say``/``listen``;
     they refuse with ``setup_required`` until then. Fetches the canonical
@@ -117,14 +117,14 @@ def setup() -> dict[str, object]:
 
 @mcp.tool()
 def join(project: str | None = None) -> dict[str, object]:
-    """Join the War Room, registering this agent with the hub.
+    """Join the Caucus, registering this agent with the hub.
 
     Nothing is sent to the hub until this is called, so the bridge can live in
     a repo's ``.mcp.json`` permanently and stay dormant. Calling ``join`` again
     is idempotent on the hub side (it re-registers the same name).
 
     Args:
-        project: Name to register under. Defaults to ``WARROOM_PROJECT`` or the
+        project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or the
             repo directory name.
 
     Requires ``setup`` first. Sends the protocol revision learned at setup so
@@ -157,7 +157,7 @@ def join(project: str | None = None) -> dict[str, object]:
     _joined_as = name
     stale = bool(body.get("protocol_stale"))
     _known_protocol_version = int(body["protocol_version"])
-    logger.info("joined War Room as project=%s (protocol_stale=%s)", name, stale)
+    logger.info("joined Caucus as project=%s (protocol_stale=%s)", name, stale)
     result: dict[str, object] = {
         "joined": True,
         "project": name,
@@ -173,7 +173,7 @@ def join(project: str | None = None) -> dict[str, object]:
 
 @mcp.tool()
 def leave() -> dict[str, object]:
-    """Leave the War Room locally, dropping the cached token.
+    """Leave the Caucus locally, dropping the cached token.
 
     The agent stops sending and listening. The hub keeps the peer in its
     in-memory roster until it restarts (there is no server-side deregister),
@@ -189,13 +189,13 @@ def leave() -> dict[str, object]:
         return gate
     global _token, _joined_as
     name, _joined_as, _token = _joined_as, None, None
-    logger.info("left War Room (was project=%s)", name)
+    logger.info("left Caucus (was project=%s)", name)
     return {"left": True, "project": name}
 
 
 @mcp.tool()
 def whoami() -> dict[str, object]:
-    """Report this agent's identity and War Room status.
+    """Report this agent's identity and Caucus status.
 
     Always available (not gated), so it can diagnose why the other tools are
     refusing: it reports whether :func:`setup` has run and the known protocol
@@ -213,7 +213,7 @@ def whoami() -> dict[str, object]:
 
 @mcp.tool()
 def list_peers() -> dict[str, object]:
-    """List the project names currently connected to the War Room.
+    """List the project names currently connected to the Caucus.
 
     Requires ``setup`` first, but not ``join`` — useful to scout who is around
     before deciding to ``join``.
@@ -295,11 +295,11 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
 def main() -> None:
     """CLI entry point: serve the MCP stdio loop (no auto-join)."""
     coloredlogs.install(
-        level=os.environ.get("WARROOM_LOG_LEVEL", "INFO"),
+        level=os.environ.get("CAUCUS_LOG_LEVEL", "INFO"),
         fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,  # keep stdout clean for the MCP stdio transport
     )
-    logger.info("warroom bridge ready (default project=%s); call join() to enter", PROJECT)
+    logger.info("caucus bridge ready (default project=%s); call join() to enter", PROJECT)
     mcp.run()
 
 

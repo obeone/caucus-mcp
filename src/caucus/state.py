@@ -1,4 +1,4 @@
-"""In-memory state for the War Room hub.
+"""In-memory state for the Caucus hub.
 
 Holds connected clients, their per-recipient message queues, the global
 control mode, a bounded message log, and the set of UI WebSocket listeners.

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from warroom.hub import PROTOCOL_VERSION
-from warroom.state import HubState
+from caucus.hub import PROTOCOL_VERSION
+from caucus.state import HubState
 
 
 def _register(client: TestClient, project: str) -> str:
@@ -47,14 +47,14 @@ def test_register_rejects_empty_project(client: TestClient) -> None:
 def test_protocol_endpoint_returns_version_and_text(client: TestClient) -> None:
     body = client.get("/protocol").json()
     assert body["version"] == PROTOCOL_VERSION
-    assert "War Room operating protocol" in body["text"]
+    assert "Caucus operating protocol" in body["text"]
 
 
 def test_register_without_version_is_stale(client: TestClient) -> None:
     body = client.post("/register", json={"project": "newcomer"}).json()
     assert body["protocol_version"] == PROTOCOL_VERSION
     assert body["protocol_stale"] is True
-    assert "War Room operating protocol" in body["protocol_text"]
+    assert "Caucus operating protocol" in body["protocol_text"]
 
 
 def test_register_with_current_version_is_not_stale(client: TestClient) -> None:

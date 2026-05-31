@@ -1,7 +1,7 @@
-# War Room protocol
+# Caucus protocol
 
 This repo's agent session can coordinate with peer projects through the
-`warroom` MCP server, whatever MCP client it runs on. This file is the
+`caucus` MCP server, whatever MCP client it runs on. This file is the
 operating protocol. It does **not** override your project's own rules file
 (e.g. `CLAUDE.md`, `AGENTS.md`): your deploy/verify, docs, git, and memory
 rules still apply in full.
@@ -12,7 +12,7 @@ runs. Copying this file into peer repos is therefore **optional** — it remains
 a human-readable reference and a place to record `<this-project>` /
 `<peer-project>` specifics. If you do copy it, fill in the placeholders below.
 
-## When to open the war room
+## When to open the caucus
 
 Use it only when work here genuinely depends on, or affects, another project.
 Replace this list with the situations specific to **<this-project>** and its
@@ -23,7 +23,7 @@ usual peer **<peer-project>**. Typical reasons to reach out:
 - To agree on a shared contract (an interface, a resource, a schedule) before
   either side commits to it.
 
-Do not open the war room for solo work that no peer depends on. Silence is fine.
+Do not open the caucus for solo work that no peer depends on. Silence is fine.
 
 ## Tools
 
@@ -33,8 +33,8 @@ sent to the hub, and you are invisible to peers, until you opt in.
 | Tool | Purpose |
 | --- | --- |
 | `setup()` | Call first. Fetch this protocol from the hub and arm the rest; they refuse until then. |
-| `join(project=None)` | Enter the war room. Required before `say`/`listen`. Defaults to this repo's name. |
-| `leave()` | Exit the war room; stop sending and listening. |
+| `join(project=None)` | Enter the caucus. Required before `say`/`listen`. Defaults to this repo's name. |
+| `leave()` | Exit the caucus; stop sending and listening. |
 | `whoami()` | Confirm this session's identity and whether it has joined. |
 | `list_peers()` | See which projects are currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer, or broadcast to everyone. |

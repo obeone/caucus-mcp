@@ -1,4 +1,4 @@
-"""Standalone integration smoke test for the War Room hub.
+"""Standalone integration smoke test for the Caucus hub.
 
 Starts the hub in-process, then drives the HTTP API the way two agents would:
 register, broadcast, direct-message, verify delivery, exercise pause + stop.
@@ -13,7 +13,7 @@ import time
 import httpx
 import uvicorn
 
-from warroom.hub import app
+from caucus.hub import app
 
 BASE = "http://127.0.0.1:8799"
 

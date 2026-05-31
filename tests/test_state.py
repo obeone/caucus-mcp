@@ -1,4 +1,4 @@
-"""Unit tests for :class:`~warroom.state.HubState`.
+"""Unit tests for :class:`~caucus.state.HubState`.
 
 These exercise the state object directly (no HTTP), so they run inside the
 event loop provided by ``pytest-asyncio`` (``asyncio_mode = auto``). The focus
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
-from warroom.models import BROADCAST, ControlMode, Message, MessageKind
-from warroom.state import HubState
+from caucus.models import BROADCAST, ControlMode, Message, MessageKind
+from caucus.state import HubState
 
 
 def _msg(sender: str, recipient: str, content: str = "x") -> Message:

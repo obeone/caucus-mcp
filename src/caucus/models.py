@@ -1,4 +1,4 @@
-"""Shared data models for the War Room hub and bridge.
+"""Shared data models for the Caucus hub and bridge.
 
 Internal state uses ``dataclass`` objects; the HTTP/WebSocket boundary uses
 Pydantic models so payloads are validated and serialised consistently.

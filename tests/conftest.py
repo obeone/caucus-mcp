@@ -1,7 +1,7 @@
-"""Shared pytest fixtures for the War Room test suite.
+"""Shared pytest fixtures for the Caucus test suite.
 
-The hub keeps its :class:`~warroom.state.HubState` in a module-level global
-(``warroom.hub.state``); every endpoint resolves that name at call time. Tests
+The hub keeps its :class:`~caucus.state.HubState` in a module-level global
+(``caucus.hub.state``); every endpoint resolves that name at call time. Tests
 therefore swap in a fresh ``HubState`` per test to stay isolated, and drive the
 FastAPI app through Starlette's :class:`TestClient`.
 """
@@ -17,8 +17,8 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from warroom import hub as hub_module
-from warroom.state import HubState
+from caucus import hub as hub_module
+from caucus.state import HubState
 
 
 @pytest.fixture

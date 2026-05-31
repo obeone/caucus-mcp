@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-War Room is a supervised message hub letting multiple agents talk to
+Caucus is a supervised message hub letting multiple agents talk to
 each other (direct or broadcast) while a human operator watches live and can
 pause/stop the exchange. Agents connect through a standard MCP bridge, so any
 MCP client (Claude Code, Codex, Gemini, a custom SDK agent, …) can join and
@@ -21,10 +21,10 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 
 # Run the hub server (serves UI at http://127.0.0.1:8765/)
-warroom-hub --host 127.0.0.1 --port 8765   # or: python -m warroom.hub
+caucus-hub --host 127.0.0.1 --port 8765   # or: python -m caucus.hub
 
 # Run the MCP bridge (normally launched by the MCP client via .mcp.json, not by hand)
-WARROOM_PROJECT=<name> WARROOM_HUB_URL=http://127.0.0.1:8765 warroom-bridge
+CAUCUS_PROJECT=<name> CAUCUS_HUB_URL=http://127.0.0.1:8765 caucus-bridge
 
 # Lint + types
 ruff check src/
@@ -39,24 +39,24 @@ python smoke_test.py     # prints "ALL CHECKS PASSED" on success
 ```
 
 The `tests/` suite mirrors `smoke_test.py`'s coverage but split into focused,
-isolated cases. Each API test swaps a fresh `HubState` onto `warroom.hub.state`
+isolated cases. Each API test swaps a fresh `HubState` onto `caucus.hub.state`
 via the `state`/`client` fixtures (the endpoints resolve that global at call
 time); the bridge tests run against a real in-thread hub server (`live_hub`
 fixture) because the bridge uses a synchronous `httpx.Client`.
 
 ## Architecture
 
-Two executables, one package (`src/warroom/`), wired by `[project.scripts]` in
+Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
 `pyproject.toml`:
 
-- **`hub.py`** — `warroom-hub`. FastAPI app. The only stateful process. HTTP
+- **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
   endpoints for agents (`/register`, `/send`, `/receive`, `/protocol`) plus a
   `/control` endpoint and a `/ui` WebSocket for the operator console
-  (`src/warroom/ui/index.html`, shipped as package data and served at `/`).
+  (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
   The hub is the **single source of truth for the operating protocol**:
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
   re-shipped via `/register` whenever a client's `protocol_version` is behind.
-- **`mcp_bridge.py`** — `warroom-bridge`. A FastMCP **stdio** server, one
+- **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers nothing
   until the agent calls `join`, so the bridge can live in every repo's
   `.mcp.json` permanently and stay dormant. Exposes seven tools: `setup`,
@@ -64,7 +64,7 @@ Two executables, one package (`src/warroom/`), wired by `[project.scripts]` in
   mandatory entry point** — it fetches the protocol from `/protocol`, caches the
   revision, and arms the rest; `join`/`leave`/`list_peers`/`say`/`listen` refuse
   with `{"error": "setup_required"}` until then (`whoami` stays open for
-  diagnosis). `join` (optionally taking a name; defaults to `WARROOM_PROJECT`,
+  diagnosis). `join` (optionally taking a name; defaults to `CAUCUS_PROJECT`,
   falling back to the working-directory basename) `POST /register`s with the
   known protocol version, surfaces `protocol_stale` + the new text if the hub
   moved on, and caches the token; `leave` drops it locally. The agent loop is
@@ -135,7 +135,7 @@ JSON-shape both clients and the UI consume. Enums: `ControlMode`
 
 ## Peer protocol doc
 
-`warroom-protocol.md` is a generic, copy-into-any-repo operating protocol
-(when/how a given repo's agent should open the war room, with `<this-project>` /
+`caucus-protocol.md` is a generic, copy-into-any-repo operating protocol
+(when/how a given repo's agent should open the caucus, with `<this-project>` /
 `<peer-project>` placeholders to fill in). It is deployed into peer repos, not
-part of the `warroom` package.
+part of the `caucus` package.

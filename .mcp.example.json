@@ -1,11 +1,11 @@
 {
   "mcpServers": {
-    "warroom": {
+    "caucus": {
       "command": "uv",
-      "args": ["run", "warroom-bridge"],
+      "args": ["run", "caucus-bridge"],
       "env": {
-        "WARROOM_PROJECT": "project-a",
-        "WARROOM_HUB_URL": "http://127.0.0.1:8765"
+        "CAUCUS_PROJECT": "project-a",
+        "CAUCUS_HUB_URL": "http://127.0.0.1:8765"
       }
     }
   }

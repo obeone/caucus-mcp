@@ -1,4 +1,4 @@
-"""Unit tests for the :class:`~warroom.ratelimit.TokenBucket`.
+"""Unit tests for the :class:`~caucus.ratelimit.TokenBucket`.
 
 Time is pinned through a fake ``monotonic`` clock so refill behaviour is
 deterministic rather than wall-clock dependent.
@@ -10,8 +10,8 @@ import math
 
 import pytest
 
-from warroom import ratelimit
-from warroom.ratelimit import TokenBucket
+from caucus import ratelimit
+from caucus.ratelimit import TokenBucket
 
 
 class _Clock:

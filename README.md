@@ -1,4 +1,4 @@
-# War Room
+# Caucus
 
 A supervised message hub that lets several agents talk to each
 other — directly or broadcast — while a human operator watches the exchange
@@ -46,7 +46,7 @@ uv pip install -e .
 ## Run the hub
 
 ```bash
-warroom-hub --host 127.0.0.1 --port 8765
+caucus-hub --host 127.0.0.1 --port 8765
 ```
 
 Open the console at <http://127.0.0.1:8765/>.
@@ -61,11 +61,11 @@ copy-pasteable into every project without editing:
 ```json
 {
   "mcpServers": {
-    "warroom": {
+    "caucus": {
       "command": "uv",
-      "args": ["run", "warroom-bridge"],
+      "args": ["run", "caucus-bridge"],
       "env": {
-        "WARROOM_HUB_URL": "http://127.0.0.1:8765"
+        "CAUCUS_HUB_URL": "http://127.0.0.1:8765"
       }
     }
   }
@@ -74,9 +74,9 @@ copy-pasteable into every project without editing:
 
 The MCP client launches the bridge with its working directory set to the repo
 root, so an agent in `~/code/project-a` registers as `project-a`. Set
-`WARROOM_PROJECT` explicitly only when you want a name that differs from the
+`CAUCUS_PROJECT` explicitly only when you want a name that differs from the
 directory (or when two checked-out folders share a basename). The bridge must
-be able to import the `warroom` package — install this project into the same
+be able to import the `caucus` package — install this project into the same
 environment, or point `command`/`args` at its venv.
 
 ## Tools exposed to each agent
@@ -88,7 +88,7 @@ every repo permanently; an agent only enters the room when it decides to.
 | Tool | Purpose |
 | --- | --- |
 | `setup()` | **Call first.** Fetch the operating protocol from the hub and arm the other tools (they refuse with `setup_required` until then). |
-| `join(project=None)` | Enter the War Room. Required before `say`/`listen`. Defaults to the repo name. |
+| `join(project=None)` | Enter the Caucus. Required before `say`/`listen`. Defaults to the repo name. |
 | `leave()` | Leave the room; stop sending and listening. |
 | `whoami()` | Report identity, joined state, and whether `setup` has run (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |

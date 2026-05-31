@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from warroom import mcp_bridge as bridge_module
+from caucus import mcp_bridge as bridge_module
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def test_setup_arms_and_returns_protocol(
     result = bridge.setup()
     assert result["ready"] is True
     assert isinstance(result["protocol_version"], int)
-    assert "War Room operating protocol" in result["protocol"]
+    assert "Caucus operating protocol" in result["protocol"]
     assert bridge.whoami()["setup_done"] is True
 
 
@@ -81,7 +81,7 @@ def test_join_flags_stale_protocol_when_behind(
     result = bridge.join()
     assert result["joined"] is True
     assert result["protocol_stale"] is True
-    assert "War Room operating protocol" in result["protocol"]
+    assert "Caucus operating protocol" in result["protocol"]
 
 
 def test_join_is_current_after_setup(

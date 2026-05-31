@@ -1,7 +1,7 @@
 """Unit tests for the hub's startup browser-open behavior.
 
-Covers :func:`warroom.hub._browser_url` (the loopback rewrite for bind-all
-addresses) and :func:`warroom.hub._open_browser` (best-effort, non-blocking
+Covers :func:`caucus.hub._browser_url` (the loopback rewrite for bind-all
+addresses) and :func:`caucus.hub._open_browser` (best-effort, non-blocking
 launch on a background timer).
 """
 
@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from warroom import hub
+from caucus import hub
 
 
 @pytest.mark.parametrize(

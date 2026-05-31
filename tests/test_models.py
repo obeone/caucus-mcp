@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`warroom.models`.
+"""Unit tests for :mod:`caucus.models`.
 
 Covers the internal :class:`Message` dataclass (id/timestamp generation and the
 public JSON shape) and the Pydantic request models that guard the HTTP
@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from warroom.models import (
+from caucus.models import (
     BROADCAST,
     ControlMode,
     Message,
