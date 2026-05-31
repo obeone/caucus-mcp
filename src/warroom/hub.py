@@ -43,7 +43,7 @@ LONG_POLL_SECONDS = 25.0
 state = HubState()
 app = FastAPI(title="War Room Hub", version="0.1.0")
 
-_UI_INDEX = Path(__file__).resolve().parents[2] / "ui" / "index.html"
+_UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
 
 
 @app.get("/")
