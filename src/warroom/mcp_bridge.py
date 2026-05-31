@@ -1,4 +1,4 @@
-"""MCP bridge: the stdio server each Claude Code session loads.
+"""MCP bridge: the stdio server each agent (MCP client) session loads.
 
 The bridge is **passive on load**: it can sit in every repo's ``.mcp.json``
 permanently and does nothing until the agent explicitly ``join(...)``s the War
@@ -9,7 +9,7 @@ listen for replies. The natural loop is ``join()`` once, then ``say(...)`` and
 Configuration via environment variables:
 
 * ``WARROOM_PROJECT``  -- this agent's default identity. Optional: when unset,
-  the bridge names itself after the current working directory (Claude Code
+  the bridge names itself after the current working directory (the MCP client
   launches it at the repo root), so the same ``.mcp.json`` is copy-pasteable
   into any repo without editing. ``join`` can still override it per call.
 * ``WARROOM_HUB_URL``  -- hub base URL (default ``http://127.0.0.1:8765``).
@@ -32,7 +32,7 @@ logger = logging.getLogger("warroom.bridge")
 def _default_project() -> str:
     """Derive a self-assigned project name from the working directory.
 
-    Claude Code starts the bridge with its cwd set to the repo root, so the
+    MCP clients start the bridge with its cwd set to the repo root, so the
     directory's basename is a sensible identity when ``WARROOM_PROJECT`` is
     not provided. Falls back to ``"unknown"`` for a nameless root (e.g. ``/``).
 

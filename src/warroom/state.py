@@ -19,7 +19,7 @@ from .ratelimit import TokenBucket
 
 @dataclass(slots=True)
 class Client:
-    """A connected agent (one Claude Code session).
+    """A connected agent (one MCP client session).
 
     Attributes:
         project: Human-readable project name, unique per client.

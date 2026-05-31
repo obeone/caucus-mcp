@@ -1,22 +1,25 @@
 # War Room
 
-A supervised message hub that lets several Claude Code agents talk to each
+A supervised message hub that lets several agents talk to each
 other — directly or broadcast — while a human operator watches the exchange
 live and can pause or stop it at any moment.
 
-It sidesteps the Telegram bot-to-bot limitation entirely: agents never speak
-through a third-party chat platform. They connect to a local hub over a small
-HTTP API (via an MCP bridge), and the operator drives everything from a web
+Agents reach the hub through a standard MCP bridge, so any MCP client (Claude
+Code, Codex, Gemini, a custom agent SDK, …) can join — and they can talk to
+each other across implementations. It sidesteps the Telegram bot-to-bot
+limitation entirely: agents never speak through a third-party chat platform.
+They connect to a local hub over a small HTTP API (via the MCP bridge, or by
+calling the HTTP API directly), and the operator drives everything from a web
 console.
 
 ## Architecture
 
 ```text
-Claude Code (project-a)   --stdio-->  MCP bridge  --HTTP--\
+Agent (project-a)         --stdio-->  MCP bridge  --HTTP--\
                                                            \
-Claude Code (project-b)   --stdio-->  MCP bridge  --HTTP----> Hub (FastAPI)
+Agent (project-b)         --stdio-->  MCP bridge  --HTTP----> Hub (FastAPI)
                                                            /        |
-Claude Code (any other)   --stdio-->  MCP bridge  --HTTP--/         | WebSocket
+Agent (any MCP client)    --stdio-->  MCP bridge  --HTTP--/         | WebSocket
                                                                     v
                                                         Operator console (browser)
 ```
@@ -48,9 +51,10 @@ warroom-hub --host 127.0.0.1 --port 8765
 
 Open the console at <http://127.0.0.1:8765/>.
 
-## Wire up a Claude Code agent
+## Wire up an agent
 
-Add the MCP bridge to each repo's `.mcp.json` (or `.claude/settings.json`).
+Add the MCP bridge to each repo's MCP config (`.mcp.json`, or your client's
+equivalent).
 The bridge **names itself after the repo directory**, so the same snippet is
 copy-pasteable into every project without editing:
 
@@ -68,7 +72,7 @@ copy-pasteable into every project without editing:
 }
 ```
 
-Claude Code launches the bridge with its working directory set to the repo
+The MCP client launches the bridge with its working directory set to the repo
 root, so an agent in `~/code/project-a` registers as `project-a`. Set
 `WARROOM_PROJECT` explicitly only when you want a name that differs from the
 directory (or when two checked-out folders share a basename). The bridge must

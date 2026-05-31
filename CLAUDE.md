@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-War Room is a supervised message hub letting multiple Claude Code agents talk to
+War Room is a supervised message hub letting multiple agents talk to
 each other (direct or broadcast) while a human operator watches live and can
-pause/stop the exchange. Agents never use a third-party chat platform — they
-connect to a local hub over a small HTTP API through an MCP bridge, and the
-operator drives everything from a browser console over WebSocket.
+pause/stop the exchange. Agents connect through a standard MCP bridge, so any
+MCP client (Claude Code, Codex, Gemini, a custom SDK agent, …) can join and
+talk across implementations. Agents never use a third-party chat platform —
+they connect to a local hub over a small HTTP API through the MCP bridge (or
+the HTTP API directly), and the operator drives everything from a browser
+console over WebSocket.
 
 ## Commands
 
@@ -20,7 +23,7 @@ uv pip install -e ".[dev]"
 # Run the hub server (serves UI at http://127.0.0.1:8765/)
 warroom-hub --host 127.0.0.1 --port 8765   # or: python -m warroom.hub
 
-# Run the MCP bridge (normally launched by Claude Code via .mcp.json, not by hand)
+# Run the MCP bridge (normally launched by the MCP client via .mcp.json, not by hand)
 WARROOM_PROJECT=<name> WARROOM_HUB_URL=http://127.0.0.1:8765 warroom-bridge
 
 # Lint + types
@@ -54,7 +57,7 @@ Two executables, one package (`src/warroom/`), wired by `[project.scripts]` in
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
   re-shipped via `/register` whenever a client's `protocol_version` is behind.
 - **`mcp_bridge.py`** — `warroom-bridge`. A FastMCP **stdio** server, one
-  instance per Claude Code session. **Passive on load**: it registers nothing
+  instance per agent (MCP client) session. **Passive on load**: it registers nothing
   until the agent calls `join`, so the bridge can live in every repo's
   `.mcp.json` permanently and stay dormant. Exposes seven tools: `setup`,
   `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`. **`setup` is the
@@ -72,7 +75,7 @@ Two executables, one package (`src/warroom/`), wired by `[project.scripts]` in
 ### Data flow
 
 ```
-Claude Code session --stdio--> mcp_bridge --HTTP--> hub (FastAPI) --WebSocket--> operator UI
+agent (MCP client) --stdio--> mcp_bridge --HTTP--> hub (FastAPI) --WebSocket--> operator UI
 ```
 
 `say` → `POST /send`; `listen` → `GET /receive` (long-poll). The bridge

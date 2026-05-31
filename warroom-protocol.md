@@ -1,9 +1,10 @@
 # War Room protocol
 
-This repo's Claude Code session can coordinate with peer projects through the
-`warroom` MCP server. This file is the operating protocol. It does **not**
-override `CLAUDE.md`: your project's own rules (deploy/verify, docs, git, memory
-updates) still apply in full.
+This repo's agent session can coordinate with peer projects through the
+`warroom` MCP server, whatever MCP client it runs on. This file is the
+operating protocol. It does **not** override your project's own rules file
+(e.g. `CLAUDE.md`, `AGENTS.md`): your deploy/verify, docs, git, and memory
+rules still apply in full.
 
 The hub now serves this protocol at runtime: the bridge's `setup()` tool
 downloads the canonical, versioned text from the hub before any other tool
