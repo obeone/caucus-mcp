@@ -27,13 +27,19 @@ WARROOM_PROJECT=<name> WARROOM_HUB_URL=http://127.0.0.1:8765 warroom-bridge
 ruff check src/
 mypy src/        # configured strict
 
-# Test: there is NO pytest suite. The single integration test is a standalone script
-# that boots the hub in-process and drives the full HTTP flow:
+# Test: pytest suite under tests/ (unit + integration; asyncio auto mode)
+pytest                   # 59 tests across models, ratelimit, state, hub API, bridge
+
+# Legacy standalone smoke test (still works; boots the hub in-process and
+# drives the full HTTP flow end to end):
 python smoke_test.py     # prints "ALL CHECKS PASSED" on success
 ```
 
-Note: project memory may say `test=pytest`, but the actual test is `python
-smoke_test.py`. There is no `tests/` directory.
+The `tests/` suite mirrors `smoke_test.py`'s coverage but split into focused,
+isolated cases. Each API test swaps a fresh `HubState` onto `warroom.hub.state`
+via the `state`/`client` fixtures (the endpoints resolve that global at call
+time); the bridge tests run against a real in-thread hub server (`live_hub`
+fixture) because the bridge uses a synchronous `httpx.Client`.
 
 ## Architecture
 
