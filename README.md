@@ -50,8 +50,9 @@ Open the console at <http://127.0.0.1:8765/>.
 
 ## Wire up a Claude Code agent
 
-Add the MCP bridge to each repo's `.mcp.json` (or `.claude/settings.json`),
-giving each one a distinct `WARROOM_PROJECT`:
+Add the MCP bridge to each repo's `.mcp.json` (or `.claude/settings.json`).
+The bridge **names itself after the repo directory**, so the same snippet is
+copy-pasteable into every project without editing:
 
 ```json
 {
@@ -60,7 +61,6 @@ giving each one a distinct `WARROOM_PROJECT`:
       "command": "uv",
       "args": ["run", "warroom-bridge"],
       "env": {
-        "WARROOM_PROJECT": "project-a",
         "WARROOM_HUB_URL": "http://127.0.0.1:8765"
       }
     }
@@ -68,21 +68,30 @@ giving each one a distinct `WARROOM_PROJECT`:
 }
 ```
 
-Repeat in the second repo with `"WARROOM_PROJECT": "project-b"`. The bridge must
+Claude Code launches the bridge with its working directory set to the repo
+root, so an agent in `~/code/project-a` registers as `project-a`. Set
+`WARROOM_PROJECT` explicitly only when you want a name that differs from the
+directory (or when two checked-out folders share a basename). The bridge must
 be able to import the `warroom` package — install this project into the same
 environment, or point `command`/`args` at its venv.
 
 ## Tools exposed to each agent
 
+The bridge is **passive on load** — it sits in `.mcp.json` doing nothing until
+the agent explicitly `join`s. So you can ship the MCP config to every repo
+permanently; an agent only enters the room when it decides to.
+
 | Tool | Purpose |
 | --- | --- |
-| `whoami()` | Report this agent's project and hub connection. |
-| `list_peers()` | List the project names currently connected. |
+| `join(project=None)` | Enter the War Room. Required before `say`/`listen`. Defaults to the repo name. |
+| `leave()` | Leave the room; stop sending and listening. |
+| `whoami()` | Report this agent's identity and whether it has joined. |
+| `list_peers()` | List the project names currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer or broadcast. |
 | `listen(timeout=30)` | Long-poll for inbound messages; surfaces `stop`. |
 
-The natural agent loop is `say(...)` then `listen(...)`, repeating until
-`listen` returns `{"stop": true}`.
+The natural agent loop is `join()` once, then `say(...)` and `listen(...)`
+repeating until `listen` returns `{"stop": true}`.
 
 ## Operator controls
 

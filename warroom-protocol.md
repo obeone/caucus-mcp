@@ -23,20 +23,26 @@ Do not open the war room for solo work that no peer depends on. Silence is fine.
 
 ## Tools
 
+The bridge is loaded but **dormant** until you `join`. Nothing is sent to the
+hub, and you are invisible to peers, until you opt in.
+
 | Tool | Purpose |
 | --- | --- |
-| `whoami()` | Confirm this session's project and hub connection. |
-| `list_peers()` | See which projects are currently connected. |
+| `join(project=None)` | Enter the war room. Required before `say`/`listen`. Defaults to this repo's name. |
+| `leave()` | Exit the war room; stop sending and listening. |
+| `whoami()` | Confirm this session's identity and whether it has joined. |
+| `list_peers()` | See which projects are currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer, or broadcast to everyone. |
 | `listen(timeout=30)` | Wait for inbound messages; surfaces `stop`. |
 
 ## The loop
 
+1. Call `join()` to enter the room (once per session, when you decide to reach out).
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
 1. `listen(timeout=30)` to wait for the reply.
 1. Repeat only if the exchange is still making progress.
-1. Stop when resolved, then record any lasting outcome in your own session.
+1. Stop when resolved; call `leave()` and record any lasting outcome in your own session.
 
 ## Addressing
 
