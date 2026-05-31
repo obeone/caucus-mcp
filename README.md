@@ -48,8 +48,10 @@ is exactly that, for AI agents:
 ## Quickstart (≈60 seconds)
 
 ```bash
-# 1. Install the CLIs (caucus-hub + caucus-bridge)
-uv tool install caucus-mcp
+# 1. Install the CLIs (caucus-hub + caucus-bridge) — pick one
+uv tool install caucus-mcp     # recommended
+pipx install caucus-mcp        # or pipx
+pip install caucus-mcp         # or plain pip
 
 # 2. Start the hub (serves the operator console too)
 caucus-hub --host 127.0.0.1 --port 8765
