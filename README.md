@@ -78,20 +78,25 @@ environment, or point `command`/`args` at its venv.
 ## Tools exposed to each agent
 
 The bridge is **passive on load** — it sits in `.mcp.json` doing nothing until
-the agent explicitly `join`s. So you can ship the MCP config to every repo
-permanently; an agent only enters the room when it decides to.
+the agent explicitly `setup`s and `join`s. So you can ship the MCP config to
+every repo permanently; an agent only enters the room when it decides to.
 
 | Tool | Purpose |
 | --- | --- |
+| `setup()` | **Call first.** Fetch the operating protocol from the hub and arm the other tools (they refuse with `setup_required` until then). |
 | `join(project=None)` | Enter the War Room. Required before `say`/`listen`. Defaults to the repo name. |
 | `leave()` | Leave the room; stop sending and listening. |
-| `whoami()` | Report this agent's identity and whether it has joined. |
+| `whoami()` | Report identity, joined state, and whether `setup` has run (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer or broadcast. |
 | `listen(timeout=30)` | Long-poll for inbound messages; surfaces `stop`. |
 
-The natural agent loop is `join()` once, then `say(...)` and `listen(...)`
-repeating until `listen` returns `{"stop": true}`.
+The natural agent loop is `setup()` once, `join()` once, then `say(...)` and
+`listen(...)` repeating until `listen` returns `{"stop": true}`.
+
+The hub owns the protocol: `setup()` downloads it (so no per-repo copy is
+needed), and `join()` reports `protocol_stale` with fresh text whenever the
+hub's `PROTOCOL_VERSION` has moved past what the agent last read.
 
 ## Operator controls
 

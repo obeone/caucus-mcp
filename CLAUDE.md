@@ -47,19 +47,27 @@ Two executables, one package (`src/warroom/`), wired by `[project.scripts]` in
 `pyproject.toml`:
 
 - **`hub.py`** — `warroom-hub`. FastAPI app. The only stateful process. HTTP
-  endpoints for agents (`/register`, `/send`, `/receive`) plus a `/control`
-  endpoint and a `/ui` WebSocket for the operator console
+  endpoints for agents (`/register`, `/send`, `/receive`, `/protocol`) plus a
+  `/control` endpoint and a `/ui` WebSocket for the operator console
   (`src/warroom/ui/index.html`, shipped as package data and served at `/`).
+  The hub is the **single source of truth for the operating protocol**:
+  `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
+  re-shipped via `/register` whenever a client's `protocol_version` is behind.
 - **`mcp_bridge.py`** — `warroom-bridge`. A FastMCP **stdio** server, one
   instance per Claude Code session. **Passive on load**: it registers nothing
-  until the agent calls the `join` tool, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. `join` (optionally taking a name;
-  defaults to `WARROOM_PROJECT`, falling back to the working-directory basename
-  so an agent self-names after its repo) `POST /register`s and caches the
-  returned token; `leave` drops it locally. Exposes six tools to the agent:
-  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`. The agent loop is
-  `join()` once, then `say(...)` → `listen(...)` repeated until `listen`
-  returns `{"stop": true}`.
+  until the agent calls `join`, so the bridge can live in every repo's
+  `.mcp.json` permanently and stay dormant. Exposes seven tools: `setup`,
+  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`. **`setup` is the
+  mandatory entry point** — it fetches the protocol from `/protocol`, caches the
+  revision, and arms the rest; `join`/`leave`/`list_peers`/`say`/`listen` refuse
+  with `{"error": "setup_required"}` until then (`whoami` stays open for
+  diagnosis). `join` (optionally taking a name; defaults to `WARROOM_PROJECT`,
+  falling back to the working-directory basename) `POST /register`s with the
+  known protocol version, surfaces `protocol_stale` + the new text if the hub
+  moved on, and caches the token; `leave` drops it locally. The agent loop is
+  `setup()` once, `join()` once, then `say(...)` → `listen(...)` until `listen`
+  returns `{"stop": true}` — with `listen` ideally driven by a background
+  watcher subagent so the main turn never blocks on the long-poll.
 
 ### Data flow
 

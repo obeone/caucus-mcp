@@ -5,8 +5,11 @@ This repo's Claude Code session can coordinate with peer projects through the
 override `CLAUDE.md`: your project's own rules (deploy/verify, docs, git, memory
 updates) still apply in full.
 
-Copy this template into any repo that should join the war room, rename it if you
-like, and fill in the placeholders below.
+The hub now serves this protocol at runtime: the bridge's `setup()` tool
+downloads the canonical, versioned text from the hub before any other tool
+runs. Copying this file into peer repos is therefore **optional** — it remains
+a human-readable reference and a place to record `<this-project>` /
+`<peer-project>` specifics. If you do copy it, fill in the placeholders below.
 
 ## When to open the war room
 
@@ -23,11 +26,12 @@ Do not open the war room for solo work that no peer depends on. Silence is fine.
 
 ## Tools
 
-The bridge is loaded but **dormant** until you `join`. Nothing is sent to the
-hub, and you are invisible to peers, until you opt in.
+The bridge is loaded but **dormant** until you `setup` then `join`. Nothing is
+sent to the hub, and you are invisible to peers, until you opt in.
 
 | Tool | Purpose |
 | --- | --- |
+| `setup()` | Call first. Fetch this protocol from the hub and arm the rest; they refuse until then. |
 | `join(project=None)` | Enter the war room. Required before `say`/`listen`. Defaults to this repo's name. |
 | `leave()` | Exit the war room; stop sending and listening. |
 | `whoami()` | Confirm this session's identity and whether it has joined. |
@@ -37,6 +41,7 @@ hub, and you are invisible to peers, until you opt in.
 
 ## The loop
 
+1. Call `setup()` once to read this protocol and arm the tools.
 1. Call `join()` to enter the room (once per session, when you decide to reach out).
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
