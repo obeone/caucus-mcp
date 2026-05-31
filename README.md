@@ -7,6 +7,7 @@
 Several agents talk to each other, directly or broadcast, while you watch the
 exchange live in a browser and can **pause** or **stop** it at any moment.
 
+![PyPI](https://img.shields.io/pypi/v/caucus-mcp?logo=pypi&logoColor=white&color=3775A9)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![uv](https://img.shields.io/badge/packaged%20with-uv-DE5FE9?logo=astral&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
@@ -47,9 +48,8 @@ is exactly that, for AI agents:
 ## Quickstart (≈60 seconds)
 
 ```bash
-# 1. Install the CLIs into an isolated tool environment
-git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
-uv tool install .
+# 1. Install the CLIs (caucus-hub + caucus-bridge)
+uv tool install caucus-mcp
 
 # 2. Start the hub (serves the operator console too)
 caucus-hub --host 127.0.0.1 --port 8765
@@ -137,56 +137,43 @@ sequenceDiagram
 
 > **Requirements:** Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
-### As a tool — `uv` (recommended)
+Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**;
+both CLIs (`caucus-hub`, `caucus-bridge`) come with it.
 
-Puts `caucus-hub` and `caucus-bridge` on your `PATH` in an isolated environment:
+### As a tool (recommended)
 
-```bash
-git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
-uv tool install .
-
-uv tool upgrade caucus-mcp     # later, to update
-uv tool uninstall caucus-mcp   # to remove
-```
-
-Once the repo is public (or you have access), install straight from git:
+Installs the CLIs on your `PATH` in an isolated environment:
 
 ```bash
-uv tool install git+https://github.com/obeone/caucus-mcp.git
+uv tool install caucus-mcp     # with uv
+pipx install caucus-mcp        # or with pipx
 ```
 
-### As a tool — `pipx`
-
-Same isolated-CLI idea without uv:
-
-```bash
-pipx install git+https://github.com/obeone/caucus-mcp.git
-pipx install .                  # or from a local clone
-```
+Update with `uv tool upgrade caucus-mcp` (or `pipx upgrade caucus-mcp`).
 
 ### With plain `pip`
 
 ```bash
-pip install git+https://github.com/obeone/caucus-mcp.git
-pip install -e ".[dev]"         # or, from a clone, an editable dev install
+pip install caucus-mcp
 ```
 
 ### Run once, install nothing
 
 ```bash
-uvx --from git+https://github.com/obeone/caucus-mcp.git caucus-hub
+uvx --from caucus-mcp caucus-hub
 ```
 
-### For development (editable)
+### Bleeding edge / development
 
 ```bash
+# latest from git
+uv tool install git+https://github.com/obeone/caucus-mcp.git
+
+# editable checkout, with dev tooling
+git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
-
-> **Private repo?** Every git-URL install needs read access while the repo is
-> private — authenticate over SSH with
-> `git+ssh://git@github.com/obeone/caucus-mcp.git`, or use a token over HTTPS.
 
 ---
 
