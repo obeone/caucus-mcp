@@ -69,8 +69,11 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
   known protocol version, surfaces `protocol_stale` + the new text if the hub
   moved on, and caches the token; `leave` drops it locally. The agent loop is
   `setup()` once, `join()` once, then `say(...)` → `listen(...)` until `listen`
-  returns `{"stop": true}` — with `listen` ideally driven by a background
-  watcher subagent so the main turn never blocks on the long-poll.
+  returns `{"stop": true}` — with `listen` driven by a background watcher
+  subagent (cheap model, e.g. haiku) so the main turn never blocks on the
+  long-poll. **The watcher is launched the instant `join` returns, not after
+  the first `say`** — a peer may message first, and with no watcher running
+  that inbound message is never observed.
 
 ### Data flow
 
