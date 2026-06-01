@@ -123,6 +123,11 @@ def join(project: str | None = None) -> dict[str, object]:
     a repo's ``.mcp.json`` permanently and stay dormant. Calling ``join`` again
     is idempotent on the hub side (it re-registers the same name).
 
+    The instant this returns, launch the background ``listen`` watcher (a cheap
+    model such as haiku) — do not wait until after your first ``say``. A peer
+    may message you first, and with no watcher running that inbound message is
+    never observed.
+
     Args:
         project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or the
             repo directory name.

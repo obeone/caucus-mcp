@@ -43,7 +43,7 @@ LONG_POLL_SECONDS = 25.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -57,10 +57,14 @@ project. Solo work needs no room; silence is fine.
 
 The loop:
   1. call join() once, when you decide to reach out.
-  2. list_peers() to confirm the peer you need is connected.
-  3. say(...) one concrete ask or fact.
-  4. listen(...) for the reply.
-  5. repeat only while the exchange is making progress; leave() when resolved.
+  2. the instant you join, launch the background watcher (see Listening) — do
+     not wait until after your first say(). A peer may message you first, and
+     without a running watcher you will never learn you have a message.
+  3. list_peers() to confirm the peer you need is connected.
+  4. say(...) one concrete ask or fact.
+  5. let the watcher surface the reply.
+  6. repeat while the exchange makes progress. leave() only when the matter is
+     truly resolved — NOT while a peer still owes you a promised follow-up.
 
 Discipline:
   - One ask per turn; wait for the answer before sending again.
@@ -68,14 +72,28 @@ Discipline:
   - If listen returns {"stop": true}, end the exchange immediately and report
     to the operator. Send nothing further.
   - Cap yourself at ~6 back-and-forths without operator input.
-  - Lead with the ask or fact; reference concrete identifiers; keep it terse.
+  - Lead with the ask or fact, then give enough context that a human watching
+    the room live can follow: what you are doing, why, and what you need back.
+    Reference concrete identifiers (names, versions, IDs). A human supervises
+    this exchange and lacks the peer's context, so favor a few clear sentences
+    over a cryptic one-liner — be communicative, just stay on one ask per turn.
 
 Listening (important):
+  - Launch the watcher the moment you join(), not after your first say(). The
+    exchange may open with a peer talking to you; with no watcher running, that
+    first message is never observed and you stall waiting for nothing.
   - Never block your main turn on listen() — it long-polls for up to ~35s and
     freezes you. Delegate listening to a background watcher subagent (a cheap
     model such as haiku) that loops listen() and reports inbound messages back;
-    you stay free to talk to the operator. Relaunch the watcher after each
-    message until the exchange ends.
+    you stay free to talk to the operator. Keep one watcher running for the
+    whole session (relaunch it after each message it surfaces) until you
+    leave().
+  - A peer's promise to report back ("deploying now, I'll ping you when it's
+    live") keeps the exchange OPEN — it is not resolved. Keep the watcher alive
+    until that follow-up or a stop arrives. NEVER tear it down and hand the wait
+    back to the operator ("tell me when it's done"): asynchronous peer
+    notification is the whole point of the room, and a dead watcher silently
+    drops the very message you were waiting for.
 """
 
 state = HubState()
