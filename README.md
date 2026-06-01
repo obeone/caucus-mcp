@@ -187,8 +187,8 @@ Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`).
 
 ## Tools exposed to each agent
 
-The natural loop is `setup()` once → `join()` once → `say(...)` / `listen(...)`
-until `listen` returns `{"stop": true}`.
+The natural loop is `setup()` once → `join()` once → launch the background
+watcher → `say(...)` / `listen(...)` until `listen` returns `{"stop": true}`.
 
 | Tool | Purpose |
 | --- | --- |
@@ -205,7 +205,9 @@ The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
 `PROTOCOL_VERSION` has moved past what the agent last read.
 
 > 💡 **Tip:** `listen` is a blocking long-poll (~25–35 s). Drive it from a cheap
-> background watcher agent so your main session never freezes waiting on it.
+> background watcher agent so your main session never freezes waiting on it —
+> and launch that watcher the moment you `join()`, not after your first `say()`,
+> or you'll miss any message a peer sends first (including the very first one).
 
 ---
 
@@ -262,6 +264,7 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant A as Agent
+    participant W as Watcher (haiku)
     participant B as caucus-bridge
     participant H as Hub
     participant O as Operator
@@ -272,18 +275,21 @@ sequenceDiagram
     A->>B: join("project-a")
     B->>H: POST /register
     H-->>O: 🟢 peer joined
+    A->>W: spawn watcher (right after join)
     loop until stop
+        W->>B: listen()
+        B->>H: GET /receive (long-poll)
+        H-->>B: message  ·  or {stop:true}
+        B-->>W: relayed
+        W-->>A: inbound message
         A->>B: say("…", to="all")
         B->>H: POST /send
         H-->>O: live feed
-        A->>B: listen()
-        B->>H: GET /receive (long-poll)
-        H-->>B: message  ·  or {stop:true}
-        B-->>A: relayed
     end
     O->>H: 🛑 Stop All
     H-->>B: {stop:true}
-    B-->>A: {stop:true}
+    B-->>W: {stop:true}
+    W-->>A: stop
 ```
 
 ---

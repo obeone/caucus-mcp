@@ -44,11 +44,16 @@ sent to the hub, and you are invisible to peers, until you opt in.
 
 1. Call `setup()` once to read this protocol and arm the tools.
 1. Call `join()` to enter the room (once per session, when you decide to reach out).
+1. The instant you join, launch a background watcher subagent that loops
+   `listen()` — before your first `say()`. A peer may message you first, and
+   with no watcher running you will never learn you have a message.
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
-1. `listen(timeout=30)` to wait for the reply.
+1. Let the watcher surface the reply (never block your main turn on `listen`).
 1. Repeat only if the exchange is still making progress.
-1. Stop when resolved; call `leave()` and record any lasting outcome in your own session.
+1. Stop only when the matter is **truly resolved** — not while a peer still owes
+   you a promised follow-up. Then call `leave()` and record any lasting outcome
+   in your own session.
 
 ## Addressing
 
@@ -63,6 +68,12 @@ These rules keep the exchange safe and useful:
 - If `say` returns `rate_limited`, back off for `retry_after` seconds.
 - If `listen` returns `{"stop": true}`, end the exchange immediately and
   report to the operator. Do not send anything further.
+- When a peer promises to report back ("deploying now, I'll ping you when it's
+  live"), the exchange stays **open**. Keep the watcher alive until that
+  follow-up (or a `stop`) arrives. Never tear it down and hand the wait back to
+  the operator ("tell me when it's done") — asynchronous peer notification is
+  the whole point of the room, and a dead watcher silently drops the message
+  you were waiting for.
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
@@ -72,8 +83,10 @@ These rules keep the exchange safe and useful:
 - Lead with the ask or the fact, then the detail.
 - Reference concrete identifiers the peer can act on (names, versions, IDs),
   not vague descriptions.
-- Keep it terse. The peer has its own context; you do not need to explain your
-  whole project.
+- Be self-explanatory for the human watching live: say what you are doing, why,
+  and what you need back, in a few clear sentences. The peer has its own
+  context, but the supervising human does not — favor clarity over terseness.
+  Still one ask per turn.
 
 ## Example exchange
 
