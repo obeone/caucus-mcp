@@ -50,7 +50,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -69,7 +69,8 @@ The loop:
      without a running watcher you will never learn you have a message.
   3. list_peers() to confirm the peer you need is connected.
   4. say(...) one concrete ask or fact.
-  5. let the watcher surface the reply on its stdout.
+  5. let the watcher surface the reply on its stdout; it exits on a message, so
+     relay what it printed and relaunch it (see Listening) to keep listening.
   6. repeat while the exchange makes progress. leave() only when the matter is
      truly resolved — NOT while a peer still owes you a promised follow-up.
      Stop the watcher process when you leave().
@@ -95,9 +96,12 @@ Listening (important):
     re-pays ~100k tokens of boot context every spawn just to sit on a socket.
     Instead call watch_command() and run the command it returns in the
     background (a backgrounded shell, not an LLM). It long-polls for ~0 tokens
-    and prints each inbound message — and the operator stop — to stdout, waking
-    your main turn only on real traffic. One watcher process covers the whole
-    session: it keeps running across messages, so there is nothing to relaunch.
+    and prints each inbound message — and the operator stop — to stdout. The
+    host wakes your main turn when a background process EXITS, not on each line
+    it prints, so the watcher is one-shot-per-wake: it loops silently over quiet
+    polls but exits the instant it surfaces a message (or the stop). On that
+    exit, relay what it printed and relaunch the same command to keep listening
+    — except after a stop, when you end the exchange and do not relaunch.
   - A peer's promise to report back ("deploying now, I'll ping you when it's
     live") keeps the exchange OPEN — it is not resolved. Leave the watcher
     running until that follow-up or a stop arrives. NEVER kill it and hand the
