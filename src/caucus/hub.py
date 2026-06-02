@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import threading
 import webbrowser
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import coloredlogs
@@ -25,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from .models import (
     ControlMode,
     ControlRequest,
+    LeaveRequest,
     Message,
     MessageKind,
     RegisterRequest,
@@ -39,6 +42,10 @@ logger = logging.getLogger("caucus.hub")
 # Server-side long-poll ceiling. Kept under typical client timeouts so the
 # bridge can re-poll cleanly without spurious disconnects.
 LONG_POLL_SECONDS = 25.0
+
+# How often the background reaper sweeps the roster for idle peers. Kept well
+# under the client TTL so a gone peer is detected within a couple of sweeps.
+REAP_INTERVAL_SECONDS = 15.0
 
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
@@ -100,7 +107,42 @@ Listening (important):
 """
 
 state = HubState()
-app = FastAPI(title="Caucus Hub", version="0.1.0")
+
+
+async def _reaper_loop() -> None:
+    """Periodically drop peers that have gone silent past the client TTL.
+
+    Agents never reliably announce their own death — a killed process or a
+    dead watcher leaves the hub's in-memory roster stale forever. This loop
+    sweeps every :data:`REAP_INTERVAL_SECONDS` and reaps any client idle longer
+    than ``state.client_ttl``; a live watcher keeps its peer fresh by polling
+    ``/receive``. The module global ``state`` is resolved each iteration so a
+    swapped-in instance (e.g. in tests) is honored.
+    """
+    while True:
+        await asyncio.sleep(REAP_INTERVAL_SECONDS)
+        try:
+            reaped = state.reap_stale(state.client_ttl)
+        except Exception:  # pragma: no cover - never let the sweep die
+            logger.exception("reaper sweep failed")
+            continue
+        for name in reaped:
+            logger.info("reaped idle peer project=%s", name)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Run the background idle-peer reaper for the lifetime of the app."""
+    task = asyncio.create_task(_reaper_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="Caucus Hub", version="0.1.0", lifespan=lifespan)
 
 _UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
 
@@ -152,6 +194,22 @@ async def register(req: RegisterRequest) -> RegisterResponse:
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
     )
+
+
+@app.post("/leave")
+async def leave(req: LeaveRequest) -> dict[str, object]:
+    """Gracefully deregister the caller, removing it from the roster at once.
+
+    Without this, a peer lingers until the idle reaper times it out; an explicit
+    leave drops it immediately so the operator roster stays accurate.
+
+    Rejected with 401 when the token is unknown (already gone or never valid).
+    """
+    name = state.unregister(req.token)
+    if name is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    logger.info("deregistered project=%s", name)
+    return {"left": True, "project": name}
 
 
 @app.post("/send", response_model=SendResponse)
@@ -340,12 +398,22 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
+        "--client-ttl",
+        type=float,
+        default=state.client_ttl,
+        help=(
+            "seconds a peer may stay idle before the reaper drops it "
+            "(default: %(default)s); must exceed the watcher poll interval"
+        ),
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="do not open the operator console in a browser on startup",
     )
     args = parser.parse_args()
 
+    state.client_ttl = args.client_ttl
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
     if not args.no_browser:
