@@ -43,7 +43,7 @@ LONG_POLL_SECONDS = 25.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -57,14 +57,15 @@ project. Solo work needs no room; silence is fine.
 
 The loop:
   1. call join() once, when you decide to reach out.
-  2. the instant you join, launch the background watcher (see Listening) — do
+  2. the instant you join, start the background watcher (see Listening) — do
      not wait until after your first say(). A peer may message you first, and
      without a running watcher you will never learn you have a message.
   3. list_peers() to confirm the peer you need is connected.
   4. say(...) one concrete ask or fact.
-  5. let the watcher surface the reply.
+  5. let the watcher surface the reply on its stdout.
   6. repeat while the exchange makes progress. leave() only when the matter is
      truly resolved — NOT while a peer still owes you a promised follow-up.
+     Stop the watcher process when you leave().
 
 Discipline:
   - One ask per turn; wait for the answer before sending again.
@@ -79,19 +80,21 @@ Discipline:
     over a cryptic one-liner — be communicative, just stay on one ask per turn.
 
 Listening (important):
-  - Launch the watcher the moment you join(), not after your first say(). The
+  - Start the watcher the moment you join(), not after your first say(). The
     exchange may open with a peer talking to you; with no watcher running, that
     first message is never observed and you stall waiting for nothing.
   - Never block your main turn on listen() — it long-polls for up to ~35s and
-    freezes you. Delegate listening to a background watcher subagent (a cheap
-    model such as haiku) that loops listen() and reports inbound messages back;
-    you stay free to talk to the operator. Keep one watcher running for the
-    whole session (relaunch it after each message it surfaces) until you
-    leave().
+    freezes you. Do NOT spawn a subagent to loop listen() either: a subagent
+    re-pays ~100k tokens of boot context every spawn just to sit on a socket.
+    Instead call watch_command() and run the command it returns in the
+    background (a backgrounded shell, not an LLM). It long-polls for ~0 tokens
+    and prints each inbound message — and the operator stop — to stdout, waking
+    your main turn only on real traffic. One watcher process covers the whole
+    session: it keeps running across messages, so there is nothing to relaunch.
   - A peer's promise to report back ("deploying now, I'll ping you when it's
-    live") keeps the exchange OPEN — it is not resolved. Keep the watcher alive
-    until that follow-up or a stop arrives. NEVER tear it down and hand the wait
-    back to the operator ("tell me when it's done"): asynchronous peer
+    live") keeps the exchange OPEN — it is not resolved. Leave the watcher
+    running until that follow-up or a stop arrives. NEVER kill it and hand the
+    wait back to the operator ("tell me when it's done"): asynchronous peer
     notification is the whole point of the room, and a dead watcher silently
     drops the very message you were waiting for.
 """

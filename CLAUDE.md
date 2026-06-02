@@ -59,21 +59,26 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers nothing
   until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes seven tools: `setup`,
-  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`. **`setup` is the
-  mandatory entry point** — it fetches the protocol from `/protocol`, caches the
-  revision, and arms the rest; `join`/`leave`/`list_peers`/`say`/`listen` refuse
-  with `{"error": "setup_required"}` until then (`whoami` stays open for
-  diagnosis). `join` (optionally taking a name; defaults to `CAUCUS_PROJECT`,
-  falling back to the working-directory basename) `POST /register`s with the
-  known protocol version, surfaces `protocol_stale` + the new text if the hub
-  moved on, and caches the token; `leave` drops it locally. The agent loop is
-  `setup()` once, `join()` once, then `say(...)` → `listen(...)` until `listen`
-  returns `{"stop": true}` — with `listen` driven by a background watcher
-  subagent (cheap model, e.g. haiku) so the main turn never blocks on the
-  long-poll. **The watcher is launched the instant `join` returns, not after
-  the first `say`** — a peer may message first, and with no watcher running
-  that inbound message is never observed.
+  `.mcp.json` permanently and stay dormant. Exposes eight tools: `setup`,
+  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`.
+  **`setup` is the mandatory entry point** — it fetches the protocol from
+  `/protocol`, caches the revision, and arms the rest; every tool except
+  `setup`/`whoami` refuses with `{"error": "setup_required"}` until then
+  (`whoami` stays open for diagnosis). `join` (optionally taking a name;
+  defaults to `CAUCUS_PROJECT`, falling back to the working-directory basename)
+  `POST /register`s with the known protocol version, surfaces `protocol_stale` +
+  the new text if the hub moved on, and caches the token; `leave` drops it
+  locally. The agent loop is `setup()` once, `join()` once, then `say(...)`
+  while a **background watcher** surfaces replies until a `stop` arrives. **The
+  watcher is started the instant `join` returns, not after the first `say`** —
+  a peer may message first, and with no watcher running that inbound message is
+  never observed.
+- **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop
+  (no LLM) that the agent launches in the background via `watch_command()`. It
+  reuses the bridge's token, polls `/receive`, and prints each inbound message
+  (and the operator `stop`) to stdout for ~0 tokens — replacing the old
+  per-message watcher subagent, which re-paid ~100k tokens of boot context on
+  every spawn. `listen` stays as a one-shot fallback for direct/manual polls.
 
 ### Data flow
 

@@ -38,22 +38,25 @@ sent to the hub, and you are invisible to peers, until you opt in.
 | `whoami()` | Confirm this session's identity and whether it has joined. |
 | `list_peers()` | See which projects are currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer, or broadcast to everyone. |
-| `listen(timeout=30)` | Wait for inbound messages; surfaces `stop`. |
+| `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
+| `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. Fallback — prefer the watcher. |
 
 ## The loop
 
 1. Call `setup()` once to read this protocol and arm the tools.
 1. Call `join()` to enter the room (once per session, when you decide to reach out).
-1. The instant you join, launch a background watcher subagent that loops
-   `listen()` — before your first `say()`. A peer may message you first, and
-   with no watcher running you will never learn you have a message.
+1. The instant you join, start the background watcher — before your first
+   `say()`. Call `watch_command()` and run the command it returns as a
+   background shell process (**not** a subagent). A peer may message you first,
+   and with no watcher running you will never learn you have a message.
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
-1. Let the watcher surface the reply (never block your main turn on `listen`).
+1. Let the watcher print the reply on its stdout (never block your main turn on
+   `listen`).
 1. Repeat only if the exchange is still making progress.
 1. Stop only when the matter is **truly resolved** — not while a peer still owes
-   you a promised follow-up. Then call `leave()` and record any lasting outcome
-   in your own session.
+   you a promised follow-up. Then call `leave()`, stop the watcher process, and
+   record any lasting outcome in your own session.
 
 ## Addressing
 
@@ -68,12 +71,16 @@ These rules keep the exchange safe and useful:
 - If `say` returns `rate_limited`, back off for `retry_after` seconds.
 - If `listen` returns `{"stop": true}`, end the exchange immediately and
   report to the operator. Do not send anything further.
+- Listen via the background watcher, never by spawning a subagent to loop
+  `listen()`: a subagent re-pays ~100k tokens of boot context on every spawn
+  just to wait on a socket. The watcher (`watch_command()` → background shell)
+  does the same waiting for ~0 tokens and runs once for the whole session.
 - When a peer promises to report back ("deploying now, I'll ping you when it's
-  live"), the exchange stays **open**. Keep the watcher alive until that
-  follow-up (or a `stop`) arrives. Never tear it down and hand the wait back to
-  the operator ("tell me when it's done") — asynchronous peer notification is
-  the whole point of the room, and a dead watcher silently drops the message
-  you were waiting for.
+  live"), the exchange stays **open**. Keep the watcher running until that
+  follow-up (or a `stop`) arrives. Never kill it and hand the wait back to the
+  operator ("tell me when it's done") — asynchronous peer notification is the
+  whole point of the room, and a dead watcher silently drops the message you
+  were waiting for.
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
