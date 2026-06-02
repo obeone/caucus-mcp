@@ -237,3 +237,65 @@ def test_listen_surfaces_stop(
     assert result["stop"] is True
     # The control signal is folded into the stop flag, not the chatter list.
     assert all(m.get("kind") != "control" for m in result["messages"])
+
+
+# --- watch_command -------------------------------------------------------
+
+
+def test_watch_command_requires_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    assert bridge.watch_command() == {
+        "error": "setup_required",
+        "hint": "call setup() first",
+    }
+
+
+def test_watch_command_requires_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "unjoined")
+    assert bridge.watch_command() == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
+
+
+def test_watch_command_returns_runnable_command(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watcher-host")
+    bridge.join()
+    result = bridge.watch_command()
+    assert result["background"] is True
+    command = result["command"]
+    assert isinstance(command, str)
+    assert command.startswith("caucus-watch ")
+    assert f"--hub {bridge.HUB_URL}" in command
+    # The token travels by file path, never inline in the command/transcript.
+    assert "--token " not in command
+    assert "--token-file " in command
+    token_path = bridge._token_file
+    assert token_path is not None and os.path.exists(token_path)
+    with open(token_path, encoding="utf-8") as fh:
+        assert fh.read().strip() == bridge._token
+    # And the file is owner-only (0600).
+    assert (os.stat(token_path).st_mode & 0o777) == 0o600
+
+
+def test_leave_deletes_watcher_token_file(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watcher-leaver")
+    bridge.join()
+    bridge.watch_command()
+    path = bridge._token_file
+    assert path is not None and os.path.exists(path)
+    bridge.leave()
+    assert bridge._token_file is None
+    assert not os.path.exists(path)
