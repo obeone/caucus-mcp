@@ -50,12 +50,18 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
 `pyproject.toml`:
 
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
-  endpoints for agents (`/register`, `/send`, `/receive`, `/protocol`) plus a
-  `/control` endpoint and a `/ui` WebSocket for the operator console
+  endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`)
+  plus a `/control` endpoint and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
   The hub is the **single source of truth for the operating protocol**:
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
   re-shipped via `/register` whenever a client's `protocol_version` is behind.
+  A background **reaper** (started by the app lifespan, sweeping every
+  `REAP_INTERVAL_SECONDS`) drops peers idle past `state.client_ttl` — agents
+  rarely announce their own death, so a killed process or dead watcher would
+  otherwise linger in the roster forever. A live watcher refreshes its
+  `last_seen` on every `/receive` poll, so only genuinely gone peers are reaped;
+  the TTL is set well above the poll interval (`--client-ttl`, default 90s).
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers nothing
   until the agent calls `join`, so the bridge can live in every repo's
@@ -67,8 +73,10 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
   (`whoami` stays open for diagnosis). `join` (optionally taking a name;
   defaults to `CAUCUS_PROJECT`, falling back to the working-directory basename)
   `POST /register`s with the known protocol version, surfaces `protocol_stale` +
-  the new text if the hub moved on, and caches the token; `leave` drops it
-  locally. The agent loop is `setup()` once, `join()` once, then `say(...)`
+  the new text if the hub moved on, and caches the token; `leave` `POST /leave`s
+  to deregister server-side (best-effort) and drops the token locally — falling
+  back to the reaper if the hub is unreachable. The agent loop is `setup()`
+  once, `join()` once, then `say(...)`
   while a **background watcher** surfaces replies until a `stop` arrives. **The
   watcher is started the instant `join` returns, not after the first `say`** —
   a peer may message first, and with no watcher running that inbound message is
