@@ -126,6 +126,12 @@ class ReceivedMessage(BaseModel):
     ts: float
 
 
+class LeaveRequest(BaseModel):
+    """Body for ``POST /leave`` (graceful, server-side deregister)."""
+
+    token: str
+
+
 class ControlRequest(BaseModel):
     """Body for ``POST /control``."""
 
