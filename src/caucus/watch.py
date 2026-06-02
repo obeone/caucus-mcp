@@ -6,9 +6,10 @@ messages the instant it joins, without freezing its main turn on the blocking
 looped ``listen()`` — but a subagent re-pays its full boot context (system
 prompt, tool schemas, project rules) on every spawn, ~100k tokens just to sit
 on an HTTP socket and decide nothing. This module replaces it with a dumb shell
-process: the agent launches ``caucus-watch`` with ``run_in_background`` and it
-long-polls the hub for ~0 tokens, printing each arrival to **stdout** so the
-host re-wakes the main turn with only the message text.
+process: the agent launches ``caucus-watch`` with ``run_in_background``; it
+long-polls the hub for ~0 tokens and, on an inbound message, prints it to
+stdout and **exits** — the process exit (not the stdout itself) is what
+re-wakes the agent's main turn with the message text.
 
 Output contract:
 
@@ -17,6 +18,16 @@ Output contract:
   Quiet polls print nothing, so a background reader is woken only on real
   traffic.
 * **stderr** carries diagnostics (``coloredlogs``), never mistaken for signal.
+
+Wake contract (why the loop exits on a message):
+
+The host re-invokes the launching agent when a background process *exits*, not
+on each new stdout line. A perpetual loop would therefore print arrivals into a
+buffer the agent is never woken to read. So the watcher is **one-shot per
+wake**: it loops silently over quiet polls (~0 tokens, no wake), but returns the
+instant it has emitted at least one inbound message -- the exit wakes the agent,
+which relays what landed on stdout and re-launches the watcher to keep
+listening. An operator ``stop`` also exits (and the agent must *not* relaunch).
 
 The watcher reuses the bridge's existing token (handed over by the bridge's
 ``watch_command()`` tool); it does not register, so it shares the bridge's hub
@@ -61,8 +72,9 @@ _BACKOFF_MAX = 15.0
 def _emit(line: str) -> None:
     """Write one signal line to stdout and flush so the host sees it at once.
 
-    Background hosts wake the main turn on new stdout; flushing immediately
-    keeps inbound messages from buffering behind an idle long-poll.
+    Flush immediately so the line is durably on stdout before the watcher
+    exits to wake the agent — an unflushed line could be lost or delayed
+    past the exit.
 
     Args:
         line: The already-formatted event text (no trailing newline needed).
@@ -87,8 +99,8 @@ def _render_message(msg: dict[str, object]) -> str:
     return f"[caucus] msg {sender} -> {recipient}: {content}"
 
 
-def _drain(payload: dict[str, object]) -> bool:
-    """Emit every event in one ``/receive`` payload; report whether to stop.
+def _drain(payload: dict[str, object]) -> tuple[bool, bool]:
+    """Emit every event in one ``/receive`` payload; report emitted and stop.
 
     Splits the control ``stop`` signal from ordinary chatter (the bridge's
     ``listen`` does the same), emits each chatter message to stdout, and emits a
@@ -98,12 +110,14 @@ def _drain(payload: dict[str, object]) -> bool:
         payload: The decoded ``/receive`` body (``{"messages": [...], ...}``).
 
     Returns:
-        ``True`` if a stop control was seen (the caller should exit), else
-        ``False``.
+        A ``(emitted, stop)`` tuple where ``emitted`` is ``True`` if at least
+        one non-control chatter message was written to stdout, and ``stop`` is
+        ``True`` if a stop control was seen (the caller should exit).
     """
     messages = payload.get("messages", [])
     if not isinstance(messages, list):
-        return False
+        return False, False
+    emitted = False
     stop = False
     for msg in messages:
         if not isinstance(msg, dict):
@@ -112,13 +126,21 @@ def _drain(payload: dict[str, object]) -> bool:
             stop = True
             continue
         _emit(_render_message(msg))
+        emitted = True
     if stop:
         _emit("[caucus] STOP -- operator stopped the room; watcher exiting.")
-    return stop
+    return emitted, stop
 
 
 def watch(hub: str, token: str, timeout: float) -> int:
     """Long-poll the hub for inbound messages until stop, rejection, or signal.
+
+    Implements one-shot-per-wake: the loop polls silently over quiet polls
+    (~0 tokens), but returns as soon as it has emitted at least one inbound
+    chatter message OR an operator stop arrives. The exit wakes the launching
+    agent, which relays the stdout and re-launches the watcher to keep
+    listening. This ensures messages are not buffered in a perpetual-loop
+    process that never exits to re-wake the agent.
 
     Args:
         hub: Hub base URL (no trailing slash required).
@@ -126,8 +148,10 @@ def watch(hub: str, token: str, timeout: float) -> int:
         timeout: Per-poll long-poll ceiling in seconds.
 
     Returns:
-        Process exit code: ``0`` on a clean stop, ``1`` if the token is
-        rejected (fatal -- a re-``join`` is required).
+        Process exit code: ``0`` after a non-empty message batch or a stop
+        (one-shot-per-wake -- the agent must re-launch to keep listening,
+        unless a stop was received), ``1`` if the token is rejected (fatal
+        -- a re-``join`` is required).
     """
     base = hub.rstrip("/")
     backoff = _BACKOFF_MIN
@@ -158,7 +182,8 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 continue
 
             backoff = _BACKOFF_MIN
-            if _drain(resp.json()):
+            emitted, stop = _drain(resp.json())
+            if stop or emitted:
                 return 0
 
 
