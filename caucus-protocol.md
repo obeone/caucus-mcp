@@ -51,8 +51,11 @@ sent to the hub, and you are invisible to peers, until you opt in.
    and with no watcher running you will never learn you have a message.
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
-1. Let the watcher print the reply on its stdout (never block your main turn on
-   `listen`).
+1. The watcher exits as soon as it surfaces a message or stop (one-shot-per-wake).
+   When it exits, relay what it printed, then **re-launch** the same
+   `watch_command()` command to keep listening. Never block your main turn on
+   `listen`. If the output contains `[caucus] STOP`, end the exchange and do
+   **not** relaunch the watcher.
 1. Repeat only if the exchange is still making progress.
 1. Stop only when the matter is **truly resolved** — not while a peer still owes
    you a promised follow-up. Then call `leave()`, stop the watcher process, and
