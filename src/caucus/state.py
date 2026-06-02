@@ -45,6 +45,7 @@ class HubState:
         bucket_capacity: float = 5.0,
         bucket_refill: float = 0.5,
         log_size: int = 500,
+        client_ttl: float = 90.0,
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
@@ -55,6 +56,10 @@ class HubState:
         self._transmit.set()
         self._bucket_capacity = bucket_capacity
         self._bucket_refill = bucket_refill
+        # Idle clients are reaped once their ``last_seen`` is older than this.
+        # A live watcher refreshes ``last_seen`` on every ``/receive`` poll
+        # (~25s), so the default sits well above that to avoid false reaps.
+        self.client_ttl = client_ttl
 
     # --- properties ------------------------------------------------------
 
@@ -101,6 +106,55 @@ class HubState:
         if client is not None:
             client.last_seen = time.time()
         return client
+
+    def _drop(self, client: Client, reason: str) -> None:
+        """Remove ``client`` from the roster and notify the operator UI.
+
+        Shared by graceful deregister (:meth:`unregister`) and idle reaping
+        (:meth:`reap_stale`). Pops both lookup maps, announces a system notice
+        carrying ``reason`` (e.g. ``"left"`` / ``"timed out"``), and pushes the
+        refreshed peer list so the UI roster reflects reality at once.
+        """
+        self._clients.pop(client.project, None)
+        self._by_token.pop(client.token, None)
+        self._announce_system(f"{client.project} {reason}")
+        self._push_ui({"type": "peers", "peers": self.peers()})
+
+    def unregister(self, token: str) -> str | None:
+        """Drop the client holding ``token`` (an explicit, graceful leave).
+
+        Args:
+            token: The access token of the leaving client.
+
+        Returns:
+            The deregistered project name, or ``None`` if the token is unknown.
+        """
+        client = self._by_token.get(token)
+        if client is None:
+            return None
+        self._drop(client, "left")
+        return client.project
+
+    def reap_stale(self, ttl: float, *, now: float | None = None) -> list[str]:
+        """Drop clients idle longer than ``ttl`` seconds; return their names.
+
+        A live agent's background watcher refreshes ``last_seen`` on every
+        ``/receive`` poll, so only genuinely gone peers (killed process, dead
+        watcher) cross the threshold. Each reaped peer is announced to the UI.
+
+        Args:
+            ttl: Maximum idle time, in seconds, before a client is reaped.
+            now: Reference timestamp (defaults to :func:`time.time`); injectable
+                for deterministic tests.
+
+        Returns:
+            The names of the clients that were reaped (possibly empty).
+        """
+        cutoff = (time.time() if now is None else now) - ttl
+        stale = [c for c in self._clients.values() if c.last_seen < cutoff]
+        for client in stale:
+            self._drop(client, "timed out")
+        return [c.project for c in stale]
 
     # --- messaging -------------------------------------------------------
 
