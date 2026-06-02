@@ -219,11 +219,12 @@ def join(project: str | None = None) -> dict[str, object]:
 
 @mcp.tool()
 def leave() -> dict[str, object]:
-    """Leave the Caucus locally, dropping the cached token.
+    """Leave the Caucus, deregistering this agent from the hub roster.
 
-    The agent stops sending and listening. The hub keeps the peer in its
-    in-memory roster until it restarts (there is no server-side deregister),
-    but this agent will no longer participate until it ``join``s again.
+    Best-effort tells the hub to drop this peer immediately (``POST /leave``) so
+    the operator roster stays accurate, then clears the cached token locally. If
+    the hub is unreachable the local drop still happens; the idle reaper removes
+    the stale peer shortly after. Stop the background watcher when you leave.
 
     Requires ``setup`` first.
 
@@ -234,7 +235,13 @@ def leave() -> dict[str, object]:
     if gate is not None:
         return gate
     global _token, _joined_as
-    name, _joined_as, _token = _joined_as, None, None
+    token, name, _joined_as, _token = _token, _joined_as, None, None
+    if token is not None:
+        try:
+            with _client() as http:
+                http.post("/leave", json={"token": token})
+        except httpx.HTTPError as exc:  # hub down: reaper will clean up later
+            logger.warning("leave: hub deregister failed (%s); dropped locally", exc)
     _cleanup_token_file()
     logger.info("left Caucus (was project=%s)", name)
     return {"left": True, "project": name}
