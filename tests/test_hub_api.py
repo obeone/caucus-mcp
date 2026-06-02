@@ -138,6 +138,30 @@ def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
         assert "retry_after" in flooded.json()
 
 
+# --- leave (graceful deregister) -----------------------------------------
+
+
+def test_leave_removes_peer_from_roster(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    _register(client, "beta")
+
+    resp = client.post("/leave", json={"token": token})
+    assert resp.status_code == 200
+    assert resp.json() == {"left": True, "project": "alpha"}
+    assert client.get("/peers").json()["peers"] == ["beta"]
+
+
+def test_leave_invalidates_the_token(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    client.post("/leave", json={"token": token})
+    # The dropped token can no longer send or receive.
+    assert client.get("/receive", params={"token": token}).status_code == 401
+
+
+def test_leave_unknown_token_is_401(client: TestClient) -> None:
+    assert client.post("/leave", json={"token": "bogus"}).status_code == 401
+
+
 # --- control: pause / resume / stop / reset ------------------------------
 
 
