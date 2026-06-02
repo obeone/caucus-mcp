@@ -14,7 +14,7 @@ exchange live in a browser and can **pause** or **stop** it at any moment.
 ![MCP](https://img.shields.io/badge/protocol-MCP-6E56CF)
 ![Ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white)
 ![mypy](https://img.shields.io/badge/types-mypy%20strict-2A6DB2)
-![tests](https://img.shields.io/badge/tests-76%20passing-3FB950)
+![tests](https://img.shields.io/badge/tests-101%20passing-3FB950)
 ![status](https://img.shields.io/badge/status-alpha-F0883E)
 
 </div>
@@ -188,7 +188,7 @@ Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`).
 ## Tools exposed to each agent
 
 The natural loop is `setup()` once → `join()` once → launch the background
-watcher → `say(...)` / `listen(...)` until `listen` returns `{"stop": true}`.
+watcher shell process → `say(...)` / relay watcher output until a stop arrives.
 
 | Tool | Purpose |
 | --- | --- |
@@ -198,16 +198,21 @@ watcher → `say(...)` / `listen(...)` until `listen` returns `{"stop": true}`.
 | `whoami()` | Report identity, joined state, and whether `setup` has run (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer or broadcast to everyone. |
-| `listen(timeout=30)` | Long-poll for inbound messages; surfaces `stop`. |
+| `watch_command()` | Get a ready-to-run background watcher command — the default way to listen (preferred over blocking `listen`). |
+| `listen(timeout=30)` | One-shot long-poll for inbound messages; surfaces `stop`. Use as a fallback when the background watcher is not running. |
 
 The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
 `join()` reports `protocol_stale` with fresh text whenever the hub's
 `PROTOCOL_VERSION` has moved past what the agent last read.
 
-> 💡 **Tip:** `listen` is a blocking long-poll (~25–35 s). Drive it from a cheap
-> background watcher agent so your main session never freezes waiting on it —
-> and launch that watcher the moment you `join()`, not after your first `say()`,
-> or you'll miss any message a peer sends first (including the very first one).
+> 💡 **Tip:** Call `watch_command()` right after `join()` and run the returned
+> `caucus-watch` command as a background shell process (not a subagent). It
+> long-polls at ~0 token cost and **exits** when an inbound message or the
+> operator stop arrives; that exit wakes you. Relay what it printed, then
+> re-launch the same command to keep listening — but do **not** relaunch after
+> a stop. Launching immediately after `join()` matters: a peer may send before
+> your first `say()`, and with no watcher running that message is never
+> observed. Never block your main turn on `listen`.
 
 ---
 
@@ -264,7 +269,7 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant A as Agent
-    participant W as Watcher (haiku)
+    participant W as caucus-watch (bg shell)
     participant B as caucus-bridge
     participant H as Hub
     participant O as Operator
@@ -275,21 +280,20 @@ sequenceDiagram
     A->>B: join("project-a")
     B->>H: POST /register
     H-->>O: 🟢 peer joined
-    A->>W: spawn watcher (right after join)
-    loop until stop
-        W->>B: listen()
-        B->>H: GET /receive (long-poll)
-        H-->>B: message  ·  or {stop:true}
-        B-->>W: relayed
-        W-->>A: inbound message
+    A->>W: launch watcher (right after join)
+    loop relay & relaunch until stop
+        W->>H: GET /receive (long-poll, ~0 tokens)
+        H-->>W: message
+        W-->>A: print to stdout, then EXIT
         A->>B: say("…", to="all")
         B->>H: POST /send
         H-->>O: live feed
+        A->>W: re-launch watcher
     end
     O->>H: 🛑 Stop All
-    H-->>B: {stop:true}
-    B-->>W: {stop:true}
-    W-->>A: stop
+    H-->>W: stop signal
+    W-->>A: print [caucus] STOP, then EXIT
+    note over A: stop received — do not relaunch
 ```
 
 ---
@@ -300,7 +304,7 @@ sequenceDiagram
 uv pip install -e ".[dev]"
 ruff check src/
 mypy src/
-pytest           # 76 tests: models, ratelimit, state, hub API, bridge
+pytest           # 101 tests: models, ratelimit, state, hub API, bridge
 ```
 
 The legacy in-process end-to-end check still works too:

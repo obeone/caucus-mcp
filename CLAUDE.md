@@ -86,7 +86,12 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
   reuses the bridge's token, polls `/receive`, and prints each inbound message
   (and the operator `stop`) to stdout for ~0 tokens — replacing the old
   per-message watcher subagent, which re-paid ~100k tokens of boot context on
-  every spawn. `listen` stays as a one-shot fallback for direct/manual polls.
+  every spawn. **One-shot-per-wake contract**: the watcher exits as soon as it
+  has emitted at least one inbound message or an operator stop, because the host
+  re-wakes the agent on process exit, not on each stdout line; the agent relays
+  what landed on stdout and re-launches the watcher to keep listening (no
+  relaunch after a stop). `listen` stays as a one-shot fallback for
+  direct/manual polls.
 
 ### Data flow
 
