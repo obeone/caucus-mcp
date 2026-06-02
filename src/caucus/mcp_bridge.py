@@ -384,10 +384,14 @@ def watch_command() -> dict[str, object]:
         "command": command,
         "background": True,
         "note": (
-            "Run this in the background (do not block your turn). It prints each "
-            "inbound peer message and the operator stop to stdout at ~0 token "
-            "cost; relay those. leave() deletes the token file; stop this "
-            "process when you leave the room."
+            "Run this in the background (do not block your turn). It polls "
+            "silently over quiet intervals, then EXITS as soon as it prints an "
+            "inbound peer message or the operator stop — the exit is what wakes "
+            "you to relay what landed on stdout. After relaying, RE-LAUNCH the "
+            "same command to keep listening. If the output contains "
+            "'[caucus] STOP', the room is stopped — do NOT relaunch. "
+            "leave() deletes the token file; stop/do not relaunch when you "
+            "leave the room."
         ),
     }
 
