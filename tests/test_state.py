@@ -177,6 +177,72 @@ async def test_register_notifies_ui_with_system_and_peers() -> None:
     assert "message" in types  # the "alpha joined" system notice
 
 
+async def test_unregister_drops_peer_and_invalidates_token() -> None:
+    state = HubState()
+    client = state.register("alpha")
+    state.register("beta")
+
+    name = state.unregister(client.token)
+
+    assert name == "alpha"
+    assert state.peers() == ["beta"]
+    assert state.client_for(client.token) is None
+
+
+async def test_unregister_unknown_token_is_none() -> None:
+    state = HubState()
+    state.register("alpha")
+    assert state.unregister("bogus") is None
+    assert state.peers() == ["alpha"]
+
+
+async def test_unregister_notifies_ui_with_peers_and_system() -> None:
+    state = HubState()
+    client = state.register("alpha")
+    queue = state.add_ui()
+    queue.get_nowait()  # priming snapshot
+
+    state.unregister(client.token)
+
+    events: list[dict[str, object]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    types = {e["type"] for e in events}
+    assert "peers" in types
+    assert "message" in types  # the "alpha left" system notice
+
+
+async def test_reap_stale_drops_only_idle_clients() -> None:
+    state = HubState()
+    stale = state.register("stale")
+    fresh = state.register("fresh")
+    # Backdate the stale peer well past a 30s TTL; leave the fresh one current.
+    stale.last_seen -= 120.0
+
+    reaped = state.reap_stale(ttl=30.0)
+
+    assert reaped == ["stale"]
+    assert state.peers() == ["fresh"]
+    assert state.client_for(stale.token) is None
+    assert state.client_for(fresh.token) is fresh
+
+
+async def test_reap_stale_keeps_recently_seen_clients() -> None:
+    state = HubState()
+    state.register("alpha")
+    # Nothing is older than the TTL, so nothing is reaped (no false positives).
+    assert state.reap_stale(ttl=30.0) == []
+    assert state.peers() == ["alpha"]
+
+
+async def test_reap_stale_uses_injected_now() -> None:
+    state = HubState()
+    client = state.register("alpha")
+    # last_seen ~= time.time(); a far-future ``now`` makes it stale deterministically.
+    reaped = state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+    assert reaped == ["alpha"]
+
+
 async def test_receive_style_drain_after_route() -> None:
     """Mirror the hub's queue-draining: first await, then drain the rest."""
     state = HubState()

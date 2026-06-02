@@ -138,6 +138,17 @@ def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> Non
     assert bridge.say("nope") == {"error": "not_joined", "hint": "call join() first"}
 
 
+def test_leave_deregisters_from_hub_roster(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "hub-leaver")
+    bridge.join()
+    assert "hub-leaver" in bridge.list_peers()["peers"]
+    bridge.leave()
+    # The hub dropped the peer at once, not just the local token cache.
+    assert "hub-leaver" not in bridge.list_peers()["peers"]
+
+
 def test_list_peers_includes_self(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "peers-test")
     bridge.join()
