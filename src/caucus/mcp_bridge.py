@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import coloredlogs
@@ -58,6 +59,10 @@ mcp = FastMCP(
 _token: str | None = None
 _joined_as: str | None = None
 
+# Path of the 0600 token file written by :func:`watch_command` for the
+# background watcher, cleaned up by :func:`leave`. ``None`` when none is live.
+_token_file: str | None = None
+
 # Flipped by :func:`setup`. The active tools refuse until then, so the agent
 # always reads the protocol before acting.
 _setup_done: bool = False
@@ -77,6 +82,42 @@ def _require_setup() -> dict[str, object] | None:
     if not _setup_done:
         return {"error": "setup_required", "hint": "call setup() first"}
     return None
+
+
+def _write_token_file(token: str) -> str:
+    """Write ``token`` to a private (0600) temp file and return its path.
+
+    Used by :func:`watch_command` so the access token reaches the background
+    watcher by path rather than on the command line, keeping it out of the
+    process argv and the launching transcript. One file per bridge process
+    (keyed by PID); re-writing overwrites it in place.
+
+    Args:
+        token: The access token to persist.
+
+    Returns:
+        The absolute path to the token file.
+    """
+    path = Path(tempfile.gettempdir()) / f"caucus-watch-{os.getpid()}.token"
+    # Open with restrictive perms from the start, never widening a pre-existing
+    # file's mode (O_TRUNC keeps it owner-only).
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return str(path)
+
+
+def _cleanup_token_file() -> None:
+    """Remove the watcher token file if one is live; ignore if already gone."""
+    global _token_file
+    if _token_file is not None:
+        try:
+            os.unlink(_token_file)
+        except OSError:
+            pass
+        _token_file = None
 
 
 @mcp.tool()
@@ -194,6 +235,7 @@ def leave() -> dict[str, object]:
         return gate
     global _token, _joined_as
     name, _joined_as, _token = _joined_as, None, None
+    _cleanup_token_file()
     logger.info("left Caucus (was project=%s)", name)
     return {"left": True, "project": name}
 
@@ -295,6 +337,52 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     stop = any(m.get("kind") == "control" and m.get("content") == "stop" for m in messages)
     chatter = [m for m in messages if m.get("kind") != "control"]
     return {"messages": chatter, "mode": payload.get("mode"), "stop": stop}
+
+
+@mcp.tool()
+def watch_command() -> dict[str, object]:
+    """Return a ready-to-run shell command for the zero-token inbound watcher.
+
+    This is the **default** way to listen — preferred over spawning a subagent
+    to loop :func:`listen`. A subagent re-pays its full boot context (~100k
+    tokens) every spawn just to sit on a long-poll and decide nothing; the
+    ``caucus-watch`` process does the same watching for ~0 tokens. Launch the
+    returned command in the background (e.g. a backgrounded shell) the instant
+    :func:`join` returns: it long-polls the hub and prints each inbound message
+    (and the operator ``stop``) to stdout, waking your main turn only on real
+    traffic. Relay what it surfaces; never block your main turn on
+    :func:`listen`.
+
+    The hub access token is written to a private (0600) temp file and the
+    command references it by path, so the secret stays out of the process argv
+    and your transcript. ``leave()`` deletes that file. The watcher reuses this
+    bridge's identity — it does not register a second peer.
+
+    Requires ``setup`` then ``join`` first.
+
+    Returns:
+        ``{"command": "caucus-watch --hub <url> --token-file <path>",
+        "background": true, "note": "..."}`` on success, ``{"error":
+        "setup_required"}`` / ``{"error": "not_joined"}`` otherwise.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    global _token_file
+    _token_file = _write_token_file(_token)
+    command = f"caucus-watch --hub {HUB_URL} --token-file {_token_file}"
+    return {
+        "command": command,
+        "background": True,
+        "note": (
+            "Run this in the background (do not block your turn). It prints each "
+            "inbound peer message and the operator stop to stdout at ~0 token "
+            "cost; relay those. leave() deletes the token file; stop this "
+            "process when you leave the room."
+        ),
+    }
 
 
 def main() -> None:
