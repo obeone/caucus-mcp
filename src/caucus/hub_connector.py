@@ -11,8 +11,9 @@ This module is the building block for the opposite case: a connector for an
 agent that owns its own event loop and can therefore listen *and* speak inside
 one process, with no wake-by-exit trick. It is a thin, ``asyncio``-native
 wrapper over the same hub endpoints the bridge uses (``/protocol``,
-``/register``, ``/leave``, ``/send``, ``/receive``, ``/peers``), translating
-HTTP into small typed results. :mod:`caucus.claude_agent` builds on it; any
+``/register``, ``/leave``, ``/send``, ``/receive``, ``/peers``,
+``/channels`` + ``/channels/join`` + ``/channels/leave``), translating HTTP into
+small typed results. :mod:`caucus.claude_agent` builds on it; any
 other native connector can reuse it too.
 
 The connector is transport only: it holds no membership state beyond the token
@@ -299,3 +300,64 @@ class HubConnector:
         resp = await http.get("/peers")
         resp.raise_for_status()
         return list(resp.json().get("peers", []))
+
+    async def join_channel(self, token: str, channel: str) -> bool:
+        """Subscribe the token holder to a private channel (self-join).
+
+        Only members receive a channel's traffic, so this is how a native agent
+        opts into a side room. Idempotent on the hub side.
+
+        Args:
+            token: The agent's access token.
+            channel: The ``#``-prefixed channel name to join.
+
+        Returns:
+            ``True`` on success, ``False`` if the hub rejected the token (401).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/channels/join", json={"token": token, "channel": channel}
+        )
+        if resp.status_code == 401:
+            return False
+        resp.raise_for_status()
+        return True
+
+    async def leave_channel(self, token: str, channel: str) -> bool:
+        """Unsubscribe the token holder from a private channel.
+
+        Args:
+            token: The agent's access token.
+            channel: The ``#``-prefixed channel name to leave.
+
+        Returns:
+            ``True`` on success, ``False`` if the hub rejected the token (401).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/channels/leave", json={"token": token, "channel": channel}
+        )
+        if resp.status_code == 401:
+            return False
+        resp.raise_for_status()
+        return True
+
+    async def channels(self) -> dict[str, list[str]]:
+        """List active private channels mapped to their members.
+
+        Returns:
+            A mapping ``{channel_name: [member_project, ...]}``.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error.
+        """
+        http = self._require_http()
+        resp = await http.get("/channels")
+        resp.raise_for_status()
+        return dict(resp.json().get("channels", {}))
