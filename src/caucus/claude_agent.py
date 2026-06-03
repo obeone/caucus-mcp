@@ -142,6 +142,11 @@ def compose_system_prompt(project: str, protocol_text: str) -> str:
         'with "[caucus inbound]", each naming the sender and recipient.\n'
         "- To speak, use the `say` tool (set `to` to a peer name, or to=\"all\" "
         "to broadcast). Use `list_peers` to see who is connected.\n"
+        "- For a focused side-conversation with a subset of peers, use a private "
+        'channel: a "#"-prefixed name (e.g. "#api-shape"). say(to="#api-shape", '
+        "...) talks in it and subscribes you; `join_channel`/`leave_channel` "
+        "subscribe/unsubscribe explicitly. Only members receive a channel's "
+        "messages, so announce it in broadcast first if you want peers to join.\n"
         "- If a turn does not warrant a reply, simply stay silent — do not call "
         "say.\n"
         "- When the operator stops the room, your session ends; do not try to "
@@ -293,7 +298,35 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         text = "peers: " + ", ".join(peers) if peers else "no peers connected"
         return {"content": [{"type": "text", "text": text}]}
 
-    return create_sdk_mcp_server(name="caucus", version="1.0.0", tools=[say, list_peers])
+    @tool(
+        "join_channel",
+        'Subscribe to a private channel (e.g. "#api-shape") to receive its '
+        "messages. Only members get a channel's traffic.",
+        {"channel": str},
+    )
+    async def join_channel(args: dict[str, Any]) -> dict[str, Any]:
+        channel = args["channel"]
+        ok = await connector.join_channel(token, channel)
+        text = f"joined {channel}" if ok else f"could not join {channel}"
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "leave_channel",
+        'Unsubscribe from a private channel (e.g. "#api-shape") once the '
+        "sub-topic is resolved.",
+        {"channel": str},
+    )
+    async def leave_channel(args: dict[str, Any]) -> dict[str, Any]:
+        channel = args["channel"]
+        ok = await connector.leave_channel(token, channel)
+        text = f"left {channel}" if ok else f"could not leave {channel}"
+        return {"content": [{"type": "text", "text": text}]}
+
+    return create_sdk_mcp_server(
+        name="caucus",
+        version="1.0.0",
+        tools=[say, list_peers, join_channel, leave_channel],
+    )
 
 
 async def run_session(
@@ -327,7 +360,12 @@ async def run_session(
         options = ClaudeAgentOptions(
             system_prompt=compose_system_prompt(me.project, proto.text),
             mcp_servers={"caucus": server},
-            allowed_tools=["mcp__caucus__say", "mcp__caucus__list_peers"],
+            allowed_tools=[
+                "mcp__caucus__say",
+                "mcp__caucus__list_peers",
+                "mcp__caucus__join_channel",
+                "mcp__caucus__leave_channel",
+            ],
             disallowed_tools=_BLOCKED_TOOLS,
             permission_mode="bypassPermissions",
             model=model,
