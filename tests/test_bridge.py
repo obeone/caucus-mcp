@@ -250,6 +250,74 @@ def test_listen_surfaces_stop(
     assert all(m.get("kind") != "control" for m in result["messages"])
 
 
+# --- channels ------------------------------------------------------------
+
+
+def test_join_channel_subscribes(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "ch-joiner")
+    bridge.join()
+    result = bridge.join_channel("#br-room")
+    assert result == {"joined": True, "channel": "#br-room"}
+    assert "#br-room" in bridge.list_channels()["channels"]
+
+
+def test_join_channel_rejects_bad_name(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "ch-bad")
+    bridge.join()
+    assert bridge.join_channel("noprefix") == {
+        "error": "invalid_channel",
+        "hint": "channel must start with '#'",
+    }
+
+
+def test_say_to_channel_reaches_member(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    peer = _register_peer(live_hub, "br-ch-rx")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": peer, "channel": "#br-deliver"})
+
+    monkeypatch.setattr(bridge, "PROJECT", "br-ch-tx")
+    bridge.join()
+    result = bridge.say("hi channel", to="#br-deliver")
+    assert "br-ch-rx" in result["delivered_to"]
+
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        got = http.get("/receive", params={"token": peer, "timeout": 3}).json()
+    assert any("hi channel" in m["content"] for m in got["messages"])
+
+
+def test_leave_channel_unsubscribes(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "ch-leaver")
+    bridge.join()
+    bridge.join_channel("#br-leave")
+    result = bridge.leave_channel("#br-leave")
+    assert result == {"left": True, "channel": "#br-leave"}
+
+
+def test_channel_tools_refuse_before_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    expected = {"error": "setup_required", "hint": "call setup() first"}
+    assert bridge.join_channel("#x") == expected
+    assert bridge.leave_channel("#x") == expected
+    assert bridge.list_channels() == expected
+
+
+def test_channel_membership_tools_require_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "unjoined-ch")
+    not_joined = {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.join_channel("#x") == not_joined
+    assert bridge.leave_channel("#x") == not_joined
+
+
 # --- watch_command -------------------------------------------------------
 
 
