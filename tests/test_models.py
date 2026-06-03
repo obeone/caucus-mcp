@@ -12,11 +12,13 @@ from pydantic import ValidationError
 
 from caucus.models import (
     BROADCAST,
+    ChannelRequest,
     ControlMode,
     Message,
     MessageKind,
     RegisterRequest,
     SendRequest,
+    is_channel,
 )
 
 
@@ -71,3 +73,35 @@ def test_register_request_rejects_empty_and_oversized_project() -> None:
         RegisterRequest(project="")
     with pytest.raises(ValidationError):
         RegisterRequest(project="p" * 65)
+
+
+# --- channels ------------------------------------------------------------
+
+
+def test_is_channel_recognises_hash_prefixed_names() -> None:
+    assert is_channel("#design") is True
+    assert is_channel("#a") is True
+
+
+def test_is_channel_rejects_non_channels() -> None:
+    assert is_channel("all") is False
+    assert is_channel("project-x") is False
+    assert is_channel("#") is False  # bare prefix is not a channel
+    assert is_channel("") is False
+
+
+def test_channel_request_accepts_hash_prefixed_name() -> None:
+    req = ChannelRequest(token="t", channel="#api-shape")
+    assert req.channel == "#api-shape"
+
+
+def test_channel_request_rejects_name_without_prefix() -> None:
+    with pytest.raises(ValidationError):
+        ChannelRequest(token="t", channel="api-shape")
+
+
+def test_channel_request_rejects_bare_or_oversized_name() -> None:
+    with pytest.raises(ValidationError):
+        ChannelRequest(token="t", channel="#")  # below min_length
+    with pytest.raises(ValidationError):
+        ChannelRequest(token="t", channel="#" + "x" * 64)  # above max_length

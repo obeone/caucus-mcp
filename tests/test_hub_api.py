@@ -138,6 +138,71 @@ def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
         assert "retry_after" in flooded.json()
 
 
+# --- channels ------------------------------------------------------------
+
+
+def test_channel_message_reaches_only_members(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    gamma = _register(client, "gamma")
+    assert (
+        client.post("/channels/join", json={"token": beta, "channel": "#design"}).status_code
+        == 200
+    )
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "#design", "content": "members only"}
+    )
+    assert sent.status_code == 200
+    assert sent.json()["delivered_to"] == ["beta"]
+
+    got_beta = client.get("/receive", params={"token": beta, "timeout": 3}).json()
+    assert any("members only" in m["content"] for m in got_beta["messages"])
+    # gamma never joined the channel, so it sees nothing.
+    got_gamma = client.get("/receive", params={"token": gamma, "timeout": 0}).json()
+    assert got_gamma["messages"] == []
+
+
+def test_send_to_channel_auto_subscribes_sender(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    client.post("/send", json={"token": alpha, "to": "#api", "content": "opening"})
+    assert client.get("/channels").json()["channels"] == {"#api": ["alpha"]}
+
+
+def test_channels_endpoint_lists_members(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/channels/join", json={"token": alpha, "channel": "#x"})
+    client.post("/channels/join", json={"token": beta, "channel": "#x"})
+    assert client.get("/channels").json()["channels"] == {"#x": ["alpha", "beta"]}
+
+
+def test_channel_join_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post("/channels/join", json={"token": "bogus", "channel": "#x"})
+    assert resp.status_code == 401
+
+
+def test_channel_join_rejects_non_hash_name(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post("/channels/join", json={"token": token, "channel": "design"})
+    assert resp.status_code == 422
+
+
+def test_channel_leave_stops_delivery(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/channels/join", json={"token": beta, "channel": "#x"})
+    client.post("/channels/leave", json={"token": beta, "channel": "#x"})
+
+    sent = client.post("/send", json={"token": alpha, "to": "#x", "content": "nope"})
+    assert sent.json()["delivered_to"] == []
+
+
+def test_channel_leave_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post("/channels/leave", json={"token": "bogus", "channel": "#x"})
+    assert resp.status_code == 401
+
+
 # --- leave (graceful deregister) -----------------------------------------
 
 
@@ -246,6 +311,23 @@ def test_ui_socket_sees_peer_join(client: TestClient) -> None:
         events = [ws.receive_json(), ws.receive_json()]
     types = {e["type"] for e in events}
     assert "peers" in types
+
+
+def test_ui_socket_snapshot_includes_channels(client: TestClient) -> None:
+    with client.websocket_connect("/ui") as ws:
+        snap = ws.receive_json()
+    assert snap["channels"] == {}
+
+
+def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "snapshot"
+        client.post("/channels/join", json={"token": token, "channel": "#x"})
+        # subscribe announces a system message and pushes the channel map.
+        events = [ws.receive_json(), ws.receive_json()]
+    channels_events = [e for e in events if e["type"] == "channels"]
+    assert channels_events and channels_events[0]["channels"] == {"#x": ["alpha"]}
 
 
 def _token(client: TestClient, project: str) -> str:
