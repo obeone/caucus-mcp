@@ -119,6 +119,45 @@ async def test_peers_lists_registered_and_leave_drops(live_hub: str) -> None:
         assert "conn-peer" not in await hub.peers()
 
 
+async def test_channel_join_send_and_receive(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        rx = await hub.register("conn-ch-rx", None)
+        tx = await hub.register("conn-ch-tx", None)
+        assert await hub.join_channel(rx.token, "#conn-room") is True
+
+        result = await hub.send(tx.token, "#conn-room", "channel hello")
+        assert result.ok is True
+        assert "conn-ch-rx" in result.delivered_to
+
+        inbound = await hub.receive(rx.token, 3.0)
+    assert any("channel hello" in m["content"] for m in inbound.messages)
+
+
+async def test_channels_lists_membership(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-ch-list", None)
+        await hub.join_channel(me.token, "#conn-list-room")
+        chans = await hub.channels()
+    assert "conn-ch-list" in chans.get("#conn-list-room", [])
+
+
+async def test_leave_channel_stops_delivery(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        rx = await hub.register("conn-ch-leaver", None)
+        tx = await hub.register("conn-ch-sender", None)
+        await hub.join_channel(rx.token, "#conn-leave-room")
+        assert await hub.leave_channel(rx.token, "#conn-leave-room") is True
+
+        result = await hub.send(tx.token, "#conn-leave-room", "should miss")
+    assert "conn-ch-leaver" not in result.delivered_to
+
+
+async def test_join_channel_unknown_token_is_false(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        assert await hub.join_channel("bogus-token", "#x") is False
+        assert await hub.leave_channel("bogus-token", "#x") is False
+
+
 async def test_use_outside_context_raises() -> None:
     hub = HubConnector("http://127.0.0.1:8765")
     with pytest.raises(RuntimeError):
