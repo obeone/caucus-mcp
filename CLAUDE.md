@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Caucus is a supervised message hub letting multiple agents talk to
-each other (direct or broadcast) while a human operator watches live and can
-pause/stop the exchange. Agents never use a third-party chat platform — they
+each other (direct, broadcast, or in private channels) while a human operator
+watches live and can pause/stop the exchange. Agents never use a third-party
+chat platform — they
 connect to a local hub over a small HTTP API, and the operator drives
 everything from a browser console over WebSocket.
 
@@ -70,7 +71,8 @@ wired by `[project.scripts]` in `pyproject.toml`. The hub is the common
 denominator; everything else is a connector to it (see *What this is*):
 
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
-  endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`)
+  endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`,
+  `/peers`, `/channels` + `/channels/join` + `/channels/leave`)
   plus a `/control` endpoint and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
   The hub is the **single source of truth for the operating protocol**:
@@ -85,8 +87,10 @@ denominator; everything else is a connector to it (see *What this is*):
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers nothing
   until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes eight tools: `setup`,
-  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`.
+  `.mcp.json` permanently and stay dormant. Exposes eleven tools: `setup`,
+  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
+  and the private-channel trio `join_channel`, `leave_channel`,
+  `list_channels`.
   **`setup` is the mandatory entry point** — it fetches the protocol from
   `/protocol`, caches the revision, and arms the rest; every tool except
   `setup`/`whoami` refuses with `{"error": "setup_required"}` until then
@@ -116,7 +120,8 @@ denominator; everything else is a connector to it (see *What this is*):
 - **`hub_connector.py`** — no script; the shared **async** client library for
   native connectors. A thin `httpx.AsyncClient` wrapper over the same hub
   endpoints the bridge uses (`/protocol`, `/register`, `/leave`, `/send`,
-  `/receive`, `/peers`), returning small typed results (`Protocol`,
+  `/receive`, `/peers`, `/channels` + `/channels/join` + `/channels/leave`),
+  returning small typed results (`Protocol`,
   `Membership`, `SendResult`, `Inbound`). It is transport only: it holds no
   membership state beyond the token the caller keeps, and never decides *when*
   to talk. Network failures raise `httpx.HTTPError`; the `/send` brakes (429/409)
@@ -162,7 +167,11 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 — restarting the hub clears peers and log.
 
 - **Routing** (`route`): appends to log, fans out to the UI feed, then queues to
-  the recipient (or to every client except the sender for `BROADCAST = "all"`).
+  the target(s): the named recipient for a direct message, every client except
+  the sender for `BROADCAST = "all"`, or only the subscribed members (sender
+  excluded) for a `#`-prefixed private channel. Channel membership lives in
+  `Client.channels` and is ephemeral — `channels()` derives the live map and a
+  channel vanishes once its last member leaves or is reaped.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds messages without draining queues; `STOPPED` floods a `stop` control
   into every queue and *sets* `_transmit` so blocked waiters wake and observe
