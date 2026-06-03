@@ -217,7 +217,7 @@ async def leave(req: LeaveRequest) -> dict[str, object]:
 
 
 @app.post("/send", response_model=SendResponse)
-async def send(req: SendRequest) -> SendResponse:
+async def send(req: SendRequest) -> SendResponse | JSONResponse:
     """Accept a message from an agent and route it.
 
     Rejected with 409 when the room is stopped, and 429 when the sender
