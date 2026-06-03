@@ -4,7 +4,10 @@ The bridge is **passive on load**: it can sit in every repo's ``.mcp.json``
 permanently and does nothing until the agent explicitly ``join(...)``s the War
 Room. After joining it exposes tools so the agent can talk to its peers and
 listen for replies. The natural loop is ``join()`` once, then ``say(...)`` and
-``listen(...)`` until a stop control arrives.
+``listen(...)`` until a stop control arrives. For focused side-conversations it
+also exposes private channels (``join_channel`` / ``leave_channel`` /
+``list_channels``): a ``#``-prefixed room whose traffic reaches only its
+members, so a subset of peers can work a sub-topic without spamming the rest.
 
 Configuration via environment variables:
 
@@ -287,13 +290,17 @@ def list_peers() -> dict[str, object]:
 
 @mcp.tool()
 def say(content: str, to: str = "all") -> dict[str, object]:
-    """Send a message to a peer or broadcast to everyone.
+    """Send a message to a peer, a private channel, or broadcast to everyone.
 
     Requires ``setup`` then ``join`` first.
 
     Args:
         content: The message text.
-        to: Target project name, or ``"all"`` to broadcast to every peer.
+        to: Target project name, ``"all"`` to broadcast to every peer, or a
+            ``"#channel"`` name to talk in a private channel. Sending to a
+            channel subscribes you to it automatically (you then receive its
+            replies); announce the channel in broadcast first so the peers you
+            want can ``join_channel`` it.
 
     Returns:
         A dict with the delivered message id and the recipients, or an error
@@ -314,6 +321,91 @@ def say(content: str, to: str = "all") -> dict[str, object]:
             return {"stopped": True, "note": "room is stopped; halt the exchange"}
         resp.raise_for_status()
         return dict(resp.json())
+
+
+@mcp.tool()
+def join_channel(channel: str) -> dict[str, object]:
+    """Subscribe to a private channel to start receiving its messages.
+
+    Channels are named side rooms prefixed with ``#`` (e.g. ``#api-shape``).
+    Only members receive a channel's traffic, so two or more peers can work a
+    sub-topic without spamming the rest of the room. Typically a peer announces
+    the channel in broadcast first ("let's move this to #api-shape"); interested
+    peers then ``join_channel`` it. Sending to a channel via ``say`` already
+    joins you, so this is for *listening* to a channel you have not spoken in.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        channel: The ``#``-prefixed channel name to join.
+
+    Returns:
+        ``{"joined": true, "channel": "<name>"}`` on success,
+        ``{"error": "invalid_channel"}`` if the name lacks the ``#`` prefix, or
+        the usual ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/channels/join", json={"token": _token, "channel": channel}
+        )
+        if resp.status_code == 422:
+            return {"error": "invalid_channel", "hint": "channel must start with '#'"}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def leave_channel(channel: str) -> dict[str, object]:
+    """Unsubscribe from a private channel once the sub-topic is resolved.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        channel: The ``#``-prefixed channel name to leave.
+
+    Returns:
+        ``{"left": true, "channel": "<name>"}`` on success,
+        ``{"error": "invalid_channel"}`` if the name lacks the ``#`` prefix, or
+        the usual ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/channels/leave", json={"token": _token, "channel": channel}
+        )
+        if resp.status_code == 422:
+            return {"error": "invalid_channel", "hint": "channel must start with '#'"}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def list_channels() -> dict[str, object]:
+    """List the active private channels and their members.
+
+    Requires ``setup`` first, but not ``join`` — useful to scout which side
+    rooms exist before deciding to join one.
+
+    Returns:
+        ``{"channels": {"#name": ["member", ...], ...}}``, or
+        ``{"error": "setup_required"}`` if setup has not run.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/channels")
+        resp.raise_for_status()
+        return {"channels": dict(resp.json().get("channels", {}))}
 
 
 @mcp.tool()
