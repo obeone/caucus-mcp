@@ -605,9 +605,9 @@
     const isChannel = String(m.recipient).startsWith("#");
     if (m.recipient === "all") {
       to.className = "to-all"; to.textContent = "all";
-    } else if (isChannel) {
-      to.textContent = m.recipient; to.style.color = colorFor(m.recipient);
     } else {
+      // channel and direct recipients render the same here; the routing badge
+      // below is what distinguishes them.
       to.textContent = m.recipient; to.style.color = colorFor(m.recipient);
     }
     const t = document.createElement("span"); t.style.marginLeft = "auto"; t.textContent = fmtTime(m.ts);
