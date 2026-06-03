@@ -146,7 +146,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await task
 
 
-app = FastAPI(title="Caucus Hub", version="0.1.1", lifespan=lifespan)
+app = FastAPI(title="Caucus Hub", version="0.2.0", lifespan=lifespan)
 
 _UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
 
