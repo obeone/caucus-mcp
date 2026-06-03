@@ -11,10 +11,29 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 BROADCAST = "all"
 """Recipient value meaning "send to every connected peer except the sender"."""
+
+CHANNEL_PREFIX = "#"
+"""Recipient prefix marking a private channel — a named side room whose traffic
+reaches only its members (plus the always-watching operator)."""
+
+
+def is_channel(recipient: str) -> bool:
+    """Return whether ``recipient`` names a private channel.
+
+    A channel is any recipient prefixed with :data:`CHANNEL_PREFIX` and carrying
+    at least one character after it (so a bare ``"#"`` is not a channel).
+
+    Args:
+        recipient: A ``Message`` recipient (peer name, ``BROADCAST`` or channel).
+
+    Returns:
+        ``True`` if ``recipient`` is a channel address, else ``False``.
+    """
+    return len(recipient) > 1 and recipient.startswith(CHANNEL_PREFIX)
 
 
 class ControlMode(str, Enum):
@@ -130,6 +149,26 @@ class LeaveRequest(BaseModel):
     """Body for ``POST /leave`` (graceful, server-side deregister)."""
 
     token: str
+
+
+class ChannelRequest(BaseModel):
+    """Body for ``POST /channels/join`` and ``POST /channels/leave``.
+
+    ``channel`` must be a :data:`CHANNEL_PREFIX`-prefixed name; the validator
+    rejects anything else with a 422 so the membership maps never hold a name
+    that routing would not treat as a channel.
+    """
+
+    token: str
+    channel: str = Field(min_length=2, max_length=64)
+
+    @field_validator("channel")
+    @classmethod
+    def _must_be_channel(cls, value: str) -> str:
+        """Ensure the channel name carries the ``#`` prefix."""
+        if not value.startswith(CHANNEL_PREFIX):
+            raise ValueError(f"channel must start with {CHANNEL_PREFIX!r}")
+        return value
 
 
 class ControlRequest(BaseModel):

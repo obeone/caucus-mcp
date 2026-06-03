@@ -78,6 +78,108 @@ async def test_broadcast_reaches_everyone_but_the_sender() -> None:
     assert alpha.queue.empty()
 
 
+# --- channels ------------------------------------------------------------
+
+
+async def test_route_to_channel_reaches_only_members() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    beta = state.register("beta")
+    gamma = state.register("gamma")
+    state.subscribe(alpha.token, "#design")  # sender is a member too
+    state.subscribe(beta.token, "#design")
+
+    delivered = state.route(_msg("alpha", "#design", "members only"))
+
+    assert delivered == ["beta"]  # sender excluded, non-member gamma excluded
+    assert beta.queue.get_nowait().content == "members only"
+    assert alpha.queue.empty()
+    assert gamma.queue.empty()
+
+
+async def test_route_to_channel_with_no_members_delivers_to_nobody() -> None:
+    state = HubState()
+    state.register("alpha")
+    assert state.route(_msg("alpha", "#empty")) == []
+
+
+async def test_subscribe_unknown_token_is_false() -> None:
+    state = HubState()
+    assert state.subscribe("nope", "#x") is False
+
+
+async def test_subscribe_is_idempotent() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    assert state.subscribe(alpha.token, "#x") is True
+    assert state.subscribe(alpha.token, "#x") is True
+    assert state.channels() == {"#x": ["alpha"]}
+
+
+async def test_unsubscribe_removes_membership_and_empties_channel() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#x")
+    assert state.unsubscribe(alpha.token, "#x") is True
+    assert state.channels() == {}  # ephemeral: last member gone -> channel gone
+
+
+async def test_unsubscribe_stops_delivery() -> None:
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta")
+    state.subscribe(beta.token, "#x")
+    state.unsubscribe(beta.token, "#x")
+    assert state.route(_msg("alpha", "#x", "nope")) == []
+
+
+async def test_unsubscribe_unknown_token_is_false() -> None:
+    state = HubState()
+    assert state.unsubscribe("nope", "#x") is False
+
+
+async def test_channels_lists_members_sorted() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    beta = state.register("beta")
+    state.subscribe(beta.token, "#design")
+    state.subscribe(alpha.token, "#design")
+    state.subscribe(alpha.token, "#api")
+    assert state.channels() == {"#api": ["alpha"], "#design": ["alpha", "beta"]}
+
+
+async def test_dropping_a_member_updates_channels() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#x")
+    state.unregister(alpha.token)
+    assert state.channels() == {}
+
+
+async def test_subscribe_pushes_channels_event_to_ui() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    queue = state.add_ui()
+    queue.get_nowait()  # priming snapshot
+
+    state.subscribe(alpha.token, "#x")
+
+    events: list[dict[str, object]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    types = {e["type"] for e in events}
+    assert "channels" in types  # the refreshed channel map
+    assert "message" in types  # the "alpha joined #x" system notice
+
+
+async def test_snapshot_includes_channels() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#x")
+    snapshot = state.add_ui().get_nowait()
+    assert snapshot["channels"] == {"#x": ["alpha"]}
+
+
 async def test_log_is_bounded() -> None:
     state = HubState(log_size=3)
     for i in range(5):

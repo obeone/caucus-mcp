@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from .models import (
+    ChannelRequest,
     ControlMode,
     ControlRequest,
     LeaveRequest,
@@ -34,6 +35,7 @@ from .models import (
     RegisterResponse,
     SendRequest,
     SendResponse,
+    is_channel,
 )
 from .state import HubState
 
@@ -50,7 +52,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -86,6 +88,23 @@ Discipline:
     Reference concrete identifiers (names, versions, IDs). A human supervises
     this exchange and lacks the peer's context, so favor a few clear sentences
     over a cryptic one-liner — be communicative, just stay on one ask per turn.
+
+Private channels (side rooms):
+  - Default talk is broadcast (to="all", everyone hears it) or direct
+    (to="<peer>"). When two or more peers need to dig into a sub-topic WITHOUT
+    spamming the rest of the room, take it to a private channel: a name
+    prefixed with "#", e.g. "#api-shape".
+  - Open one by first announcing it in broadcast ("let's move the schema
+    details to #api-shape"), then say(to="#api-shape", ...). Sending to a
+    channel makes you a member automatically. Peers who care join it; the rest
+    ignore the announcement and never receive the channel's traffic.
+  - Membership is explicit and self-served: join_channel("#api-shape") to start
+    receiving it, leave_channel("#api-shape") when the sub-topic is resolved.
+    Only members receive a channel's messages — non-members are not spammed.
+  - Channels are ephemeral and have NO history: a channel exists only while it
+    has members, and a peer joining late sees nothing said before it joined.
+  - This is a focus tool, not secrecy: the human operator always sees every
+    channel and all its traffic, and can speak into any of them.
 
 Listening (important):
   - Start the watcher the moment you join(), not after your first say(). The
@@ -165,6 +184,43 @@ async def peers() -> dict[str, list[str]]:
     return {"peers": state.peers()}
 
 
+@app.get("/channels")
+async def channels() -> dict[str, dict[str, list[str]]]:
+    """List active private channels mapped to their members.
+
+    Channels are ephemeral (derived from live membership), so this only ever
+    lists channels with at least one connected member. Serves both agent
+    discovery and the operator console's channel roster.
+    """
+    return {"channels": state.channels()}
+
+
+@app.post("/channels/join")
+async def channel_join(req: ChannelRequest) -> dict[str, object]:
+    """Subscribe the caller to a private channel (self-join).
+
+    Idempotent: re-joining a channel already subscribed to is a no-op success.
+    Rejected with 401 when the token is unknown.
+    """
+    if not state.subscribe(req.token, req.channel):
+        raise HTTPException(status_code=401, detail="unknown token")
+    logger.info("channel join channel=%s", req.channel)
+    return {"joined": True, "channel": req.channel}
+
+
+@app.post("/channels/leave")
+async def channel_leave(req: ChannelRequest) -> dict[str, object]:
+    """Unsubscribe the caller from a private channel.
+
+    Idempotent: leaving a channel not subscribed to is a no-op success.
+    Rejected with 401 when the token is unknown.
+    """
+    if not state.unsubscribe(req.token, req.channel):
+        raise HTTPException(status_code=401, detail="unknown token")
+    logger.info("channel leave channel=%s", req.channel)
+    return {"left": True, "channel": req.channel}
+
+
 @app.get("/protocol")
 async def protocol() -> dict[str, object]:
     """Return the current operating protocol and its revision.
@@ -235,6 +291,11 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
             status_code=429,
             content={"detail": "rate limited", "retry_after": retry},
         )
+
+    # Sending to a channel makes the sender a member, so it receives replies
+    # without a separate join_channel call (no "I spoke but hear nothing").
+    if is_channel(req.to):
+        state.subscribe(client.token, req.to)
 
     msg = Message(
         sender=client.project,
