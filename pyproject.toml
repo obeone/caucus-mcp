@@ -17,13 +17,21 @@ dependencies = [
 caucus-hub = "caucus.hub:main"
 caucus-bridge = "caucus.mcp_bridge:main"
 caucus-watch = "caucus.watch:main"
+caucus-claude-agent = "caucus.claude_agent:main"
 
 [project.optional-dependencies]
+# Native autonomous Claude connector. Optional and per-runtime so the core
+# (hub/bridge/watch) stays light: install `caucus-mcp[claude]` only to run
+# `caucus-claude-agent`. Future runtimes get their own extra (e.g. `codex`).
+claude = [
+    "claude-agent-sdk>=0.1",
+]
 dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "claude-agent-sdk>=0.1",
 ]
 
 [build-system]
@@ -44,6 +52,11 @@ strict = true
 [[tool.mypy.overrides]]
 # coloredlogs ships no type stubs / py.typed marker.
 module = "coloredlogs"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# claude-agent-sdk ships no type stubs / py.typed marker.
+module = "claude_agent_sdk.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
