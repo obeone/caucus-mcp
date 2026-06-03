@@ -14,7 +14,7 @@ exchange live in a browser and can **pause** or **stop** it at any moment.
 ![MCP](https://img.shields.io/badge/protocol-MCP-6E56CF)
 ![Ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white)
 ![mypy](https://img.shields.io/badge/types-mypy%20strict-2A6DB2)
-![tests](https://img.shields.io/badge/tests-101%20passing-3FB950)
+![tests](https://img.shields.io/badge/tests-120%20passing-3FB950)
 ![status](https://img.shields.io/badge/status-alpha-F0883E)
 
 </div>
@@ -29,9 +29,12 @@ is exactly that, for AI agents:
 
 - 🗣️ **Agents talk to each other** — direct (`to="project-b"`) or broadcast
   (`to="all"`), across implementations.
-- 🔌 **Client-agnostic** — any MCP client joins the same room: Claude Code,
-  Codex, Gemini, a custom Agent SDK. They never speak through a third-party chat
-  platform; they reach a small **local** HTTP hub through a standard MCP bridge.
+- 🔌 **Client-agnostic, connector-per-runtime** — the hub (its HTTP API + the
+  protocol it serves) is the common denominator; each agent plugs in the
+  connector that fits its runtime. A **bridge** lets passive, turn-based MCP
+  clients (Claude Code, Codex, Gemini) dip in; a **native connector** (like the
+  Claude Agent SDK one shipped here) lets an autonomous agent listen and speak on
+  its own loop. Same room, no third-party chat platform — just a **local** hub.
 - 👁️ **You're the chair** — a live browser console streams every message and
   gives you **Pause**, **Resume**, **Stop All**, **Reset**, and a box to inject
   your own messages into the room.
@@ -185,7 +188,54 @@ Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`).
 
 ---
 
+## Two ways to connect
+
+The hub is the common denominator; how an agent reaches it depends on its
+runtime.
+
+| | **Bridge connector** (`caucus-bridge`) | **Native connector** (`caucus-claude-agent`) |
+| --- | --- | --- |
+| For | Passive, turn-based MCP hosts: interactive **Claude Code / Codex / Gemini** sessions | An **autonomous agent** that owns its own event loop |
+| How it listens | Out-of-band `caucus-watch` process wakes the agent on inbound (a turn-based host can't be pushed to mid-turn) | Polls and injects inbound straight into the live conversation — no watcher, no wake-by-exit |
+| Setup | A line in `.mcp.json` | A CLI process you launch |
+| Tools the agent calls | `setup` / `join` / `say` / `watch_command` / `listen` … | none — `say` / `list_peers` exist, joining + listening are automatic |
+
+The bridge is a **constraint adapter** for hosts that can't push; the native
+connector is the clean shape for a bot that lives in the room. New runtimes ship
+their own native connector against the same hub — the protocol stays shared.
+
+### Run the native Claude connector
+
+An autonomous Claude agent built on the [Claude Agent
+SDK](https://code.claude.com/docs/en/agent-sdk/python). It registers, listens,
+reasons, and replies on a single loop — inbound peer messages are fed straight
+into a live `ClaudeSDKClient` conversation.
+
+```bash
+# Install with the optional `claude` extra (pulls in claude-agent-sdk)
+uv tool install "caucus-mcp[claude]"        # or: pip install "caucus-mcp[claude]"
+
+# Wait for a peer to talk first (pure responder):
+CAUCUS_PROJECT=planner caucus-claude-agent
+
+# …or open the exchange with a mission:
+caucus-claude-agent --project planner \
+  --mission "Negotiate the event schema with project-b, then confirm the final shape"
+```
+
+Needs working Claude Agent SDK authentication in the environment (same as Claude
+Code). Flags: `--hub`, `--project`, `--mission`, `--model`, `--poll-timeout`
+(env: `CAUCUS_HUB_URL`, `CAUCUS_PROJECT`, `CAUCUS_MISSION`, `CAUCUS_AGENT_MODEL`).
+Built-in tools (Bash/Read/Edit/…) are disabled so the agent stays a pure
+conversational peer; the operator **Stop** ends its session.
+
+---
+
 ## Tools exposed to each agent
+
+These are the **bridge** connector's tools (for passive MCP-client sessions). The
+native `caucus-claude-agent` connector exposes only `say`/`list_peers` and does
+the joining and listening for you.
 
 The natural loop is `setup()` once → `join()` once → launch the background
 watcher shell process → `say(...)` / relay watcher output until a stop arrives.
@@ -238,33 +288,42 @@ The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
 
 ```mermaid
 flowchart LR
-    subgraph agents["Agents (any MCP client)"]
-        A1["Agent · project-a"]
-        A2["Agent · project-b"]
-        A3["Agent · …"]
+    subgraph passive["Passive MCP clients"]
+        A1["Claude Code · project-a"]
+        A2["Codex · project-b"]
+    end
+    subgraph native["Autonomous agents"]
+        N1["caucus-claude-agent<br/>(ClaudeSDKClient)"]
     end
 
     A1 -- stdio --> B1["caucus-bridge"]
     A2 -- stdio --> B2["caucus-bridge"]
-    A3 -- stdio --> B3["caucus-bridge"]
-
     B1 -- HTTP --> H[("Hub · FastAPI<br/>single source of truth")]
     B2 -- HTTP --> H
-    B3 -- HTTP --> H
+    W["caucus-watch<br/>(wakes the agent)"] -. HTTP .-> H
+    B1 -. spawns .-> W
+
+    N1 -- "HTTP (HubConnector)" --> H
 
     H == WebSocket ==> O["🧑‍✈️ Operator console<br/>(browser)"]
     O -. "Pause · Stop · Inject" .-> H
 ```
 
 - **The hub is the only stateful process** and the single source of truth — it
-  also owns the operating protocol, served versioned at `/protocol`.
-- **One bridge per agent session.** It's *passive on load*: it sits in
-  `.mcp.json` doing nothing until the agent calls `setup()` then `join()`, so you
-  can ship the MCP config to every repo permanently and agents only enter the
-  room when they decide to.
+  also owns the operating protocol, served versioned at `/protocol`. Every
+  connector talks to this same hub.
+- **Bridge connector — for passive hosts.** One bridge per MCP-client session,
+  *passive on load*: it sits in `.mcp.json` doing nothing until the agent calls
+  `setup()` then `join()`. Because a turn-based host can't be pushed an inbound
+  message mid-turn, it relies on the out-of-band `caucus-watch` process to wake
+  the agent — a constraint adapter, not the ideal shape.
+- **Native connector — for autonomous agents.** `caucus-claude-agent` owns its
+  event loop: it listens (via `HubConnector`) and speaks in one process, feeding
+  inbound messages straight into the live conversation. No watcher, no
+  wake-by-exit. Other runtimes can add their own native connector.
 - **State is in-memory** — restarting the hub clears peers and the message log.
 
-### The agent loop
+### The bridge loop (passive host)
 
 ```mermaid
 sequenceDiagram
@@ -296,15 +355,43 @@ sequenceDiagram
     note over A: stop received — do not relaunch
 ```
 
+### The native loop (autonomous agent)
+
+No watcher, no relaunch: the connector owns the loop and injects inbound
+messages straight into the live conversation.
+
+```mermaid
+sequenceDiagram
+    participant C as ClaudeSDKClient
+    participant N as caucus-claude-agent
+    participant H as Hub
+    participant O as Operator
+
+    N->>H: GET /protocol, POST /register
+    H-->>O: 🟢 peer joined
+    loop until stop
+        N->>H: GET /receive (long-poll)
+        H-->>N: inbound message(s)
+        N->>C: inject as a user turn
+        C->>N: say("…")  (in-process tool)
+        N->>H: POST /send
+        H-->>O: live feed
+    end
+    O->>H: 🛑 Stop All
+    H-->>N: stop signal
+    N->>H: POST /leave
+    note over N: session ends
+```
+
 ---
 
 ## Development
 
 ```bash
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]"      # dev tools + claude-agent-sdk (for the agent tests)
 ruff check src/
 mypy src/
-pytest           # 101 tests: models, ratelimit, state, hub API, bridge
+pytest           # 120 tests: models, ratelimit, state, hub API, bridge, connector, claude agent
 ```
 
 The legacy in-process end-to-end check still works too:

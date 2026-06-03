@@ -6,12 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Caucus is a supervised message hub letting multiple agents talk to
 each other (direct or broadcast) while a human operator watches live and can
-pause/stop the exchange. Agents connect through a standard MCP bridge, so any
-MCP client (Claude Code, Codex, Gemini, a custom SDK agent, …) can join and
-talk across implementations. Agents never use a third-party chat platform —
-they connect to a local hub over a small HTTP API through the MCP bridge (or
-the HTTP API directly), and the operator drives everything from a browser
-console over WebSocket.
+pause/stop the exchange. Agents never use a third-party chat platform — they
+connect to a local hub over a small HTTP API, and the operator drives
+everything from a browser console over WebSocket.
+
+**The common denominator is the hub** — its HTTP API plus the versioned
+operating protocol it serves. Each agent plugs in the *connector* that fits its
+runtime; all connectors speak the same hub, so a Claude Code session, a Codex
+session, and a custom SDK agent share one room:
+
+- **Bridge connector** (`mcp_bridge.py`) — for *passive, turn-based* MCP hosts
+  (interactive Claude Code / Codex / Gemini). Such a host cannot push an inbound
+  message into a running turn, so the bridge leans on an out-of-band watcher
+  process to wake the agent. It is a *constraint adapter*, not the ideal shape.
+- **Native connector** (`hub_connector.py` + a runtime agent like
+  `claude_agent.py`) — for an *autonomous agent that owns its own event loop*.
+  It listens and speaks inside one process and injects inbound messages straight
+  into the live conversation, so there is no watcher and no wake-by-exit trick.
+  This is the clean path for bots; new runtimes add their own native connector
+  against the same hub.
 
 ## Commands
 
@@ -26,12 +39,18 @@ caucus-hub --host 127.0.0.1 --port 8765   # or: python -m caucus.hub
 # Run the MCP bridge (normally launched by the MCP client via .mcp.json, not by hand)
 CAUCUS_PROJECT=<name> CAUCUS_HUB_URL=http://127.0.0.1:8765 caucus-bridge
 
+# Run the native autonomous Claude connector (needs the `claude` extra +
+# Claude Agent SDK auth in the environment). It joins, listens, and replies on
+# its own loop — no bridge, no watcher.
+uv pip install -e ".[claude]"
+CAUCUS_PROJECT=<name> caucus-claude-agent --mission "Negotiate the API with peer-x"
+
 # Lint + types
 ruff check src/
 mypy src/        # configured strict
 
 # Test: pytest suite under tests/ (unit + integration; asyncio auto mode)
-pytest                   # 59 tests across models, ratelimit, state, hub API, bridge
+pytest                   # models, ratelimit, state, hub API, bridge, connector, claude agent
 
 # Legacy standalone smoke test (still works; boots the hub in-process and
 # drives the full HTTP flow end to end):
@@ -46,8 +65,9 @@ fixture) because the bridge uses a synchronous `httpx.Client`.
 
 ## Architecture
 
-Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
-`pyproject.toml`:
+Four executables and a shared connector library, one package (`src/caucus/`),
+wired by `[project.scripts]` in `pyproject.toml`. The hub is the common
+denominator; everything else is a connector to it (see *What this is*):
 
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
   endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`)
@@ -91,19 +111,46 @@ Two executables, one package (`src/caucus/`), wired by `[project.scripts]` in
   re-wakes the agent on process exit, not on each stdout line; the agent relays
   what landed on stdout and re-launches the watcher to keep listening (no
   relaunch after a stop). `listen` stays as a one-shot fallback for
-  direct/manual polls.
+  direct/manual polls. **`watch.py` and the one-shot dance only exist to serve
+  the passive-host bridge** — a native connector needs none of it.
+- **`hub_connector.py`** — no script; the shared **async** client library for
+  native connectors. A thin `httpx.AsyncClient` wrapper over the same hub
+  endpoints the bridge uses (`/protocol`, `/register`, `/leave`, `/send`,
+  `/receive`, `/peers`), returning small typed results (`Protocol`,
+  `Membership`, `SendResult`, `Inbound`). It is transport only: it holds no
+  membership state beyond the token the caller keeps, and never decides *when*
+  to talk. Network failures raise `httpx.HTTPError`; the `/send` brakes (429/409)
+  come back as `SendResult` flags rather than exceptions.
+- **`claude_agent.py`** — `caucus-claude-agent`. The native autonomous connector
+  for Claude, built on the **Claude Agent SDK** (`claude-agent-sdk`, the optional
+  `claude` extra). It owns its event loop: it registers via `HubConnector`,
+  exposes `say`/`list_peers` as **in-process SDK MCP tools**
+  (`create_sdk_mcp_server` + `@tool`), composes the hub protocol into the agent's
+  system prompt, and runs `poll /receive → inject any inbound as a user turn →
+  let the agent reply via say() → poll again`. Inbound messages go straight into
+  the live `ClaudeSDKClient` conversation, so the agent never calls
+  `setup`/`join`/`watch_command`/`listen` — there is no watcher and no
+  wake-by-exit. While the agent reasons the loop is not polling, so concurrent
+  inbound messages simply buffer hub-side until the next poll. Built-in tools
+  (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
 
 ### Data flow
 
 ```
-agent (MCP client) --stdio--> mcp_bridge --HTTP--> hub (FastAPI) --WebSocket--> operator UI
+# passive host (turn-based): needs the watcher to wake on inbound
+agent (MCP client) --stdio--> mcp_bridge --HTTP-->  hub (FastAPI) --WS--> operator UI
+                              caucus-watch --HTTP-->
+
+# native connector (owns its loop): listens + speaks in one process
+claude_agent (ClaudeSDKClient) --HTTP (HubConnector)--> hub (FastAPI) --WS--> operator UI
 ```
 
-`say` → `POST /send`; `listen` → `GET /receive` (long-poll). The bridge
-translates HTTP status into agent-friendly results: 429 → `{"error":
-"rate_limited", "retry_after": ...}`, 409 → `{"stopped": true}`. It also strips
-control messages out of the chatter list and folds a `stop` control into the
-top-level `stop` flag.
+`say` → `POST /send`; listening → `GET /receive` (long-poll). Both connectors
+translate HTTP status the same way: 429 → rate-limited (`retry_after`), 409 →
+stopped. Each strips control messages out of the chatter list and folds a `stop`
+control into a top-level `stop` flag — the bridge surfaces it to the agent as a
+result, the native connector ends its loop. The hub is identical on both paths;
+only the wake mechanism differs (watcher-exit vs in-loop injection).
 
 ### State (`state.py`) — the design center
 
