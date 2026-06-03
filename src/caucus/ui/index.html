@@ -129,8 +129,6 @@
   .peer.empty { color: var(--dim); border-style: dashed; justify-content: center; }
 
   /* ─── Feed ─── */
-  .feed-wrap { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
-
   #feed {
     overflow-y: auto;
     padding: 24px 28px;
@@ -183,6 +181,7 @@
   }
   .route-badge.broadcast { color: var(--cyan); border-color: var(--cyan); }
   .route-badge.direct    { color: var(--amber); border-color: var(--amber); }
+  .route-badge.channel   { color: #5ad1b0; border-color: #5ad1b0; }
 
   /* ─── Message body — proportional readable font ─── */
   .body {
@@ -310,6 +309,44 @@
   }
   .msg.from-human .meta { border-bottom-color: rgba(192, 139, 255, 0.2); }
 
+  /* ─── Sidebar — Channels section ─── */
+  .channels-section { margin-top: 20px; }
+  .channel-row {
+    display: flex; flex-direction: column;
+    padding: 7px 9px; margin-bottom: 6px;
+    border: 1px solid var(--line); border-radius: 2px;
+    background: var(--panel-2); font-size: 13px;
+    gap: 4px;
+  }
+  .channel-name {
+    font-weight: 600; font-size: 12px; letter-spacing: 0.3px;
+  }
+  .channel-members {
+    font-size: 10.5px; color: var(--dim); line-height: 1.4;
+    padding-left: 4px;
+  }
+
+  /* ─── Feed filter bar ─── */
+  .feed-wrap { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
+  .filter-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .filter-bar label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px; letter-spacing: 2px; color: var(--dim);
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .filter-bar select {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 2px;
+    padding: 4px 8px;
+  }
+  .filter-bar select:focus { outline: none; border-color: var(--cyan); }
+
   /* ─── Composer — unchanged chrome ─── */
   .composer {
     border-top: 1px solid var(--line);
@@ -350,9 +387,21 @@
     <aside>
       <h2>Connected agents</h2>
       <div id="peers"></div>
+      <div class="channels-section">
+        <h2>Channels</h2>
+        <div id="channels"></div>
+      </div>
     </aside>
 
     <div class="feed-wrap">
+      <div class="filter-bar">
+        <label for="filter-select">filter</label>
+        <select id="filter-select">
+          <option value="all">All</option>
+          <option value="broadcast">Broadcast</option>
+          <option value="direct">Direct</option>
+        </select>
+      </div>
       <div id="feed"></div>
       <div class="composer">
         <div>
@@ -506,18 +555,40 @@
   // ─── DOM refs ─────────────────────────────────────────────────────────────
   const feed = document.getElementById("feed");
   const peersEl = document.getElementById("peers");
+  const channelsEl = document.getElementById("channels");
   const targetEl = document.getElementById("target");
+  const filterEl = document.getElementById("filter-select");
   const modeEl = document.getElementById("mode");
   const connEl = document.getElementById("conn");
   let ws = null;
+
+  // ─── Module-level state ───────────────────────────────────────────────────
+  let currentPeers = [];
+  let channels = {};      // latest complete channel map: { "#name": ["memberA", ...] }
+  let allMessages = [];   // every message received, in order, for feed re-render
 
   function fmtTime(ts) {
     const d = new Date(ts * 1000);
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
 
-  // ─── addMessage — WebSocket contract preserved exactly ───────────────────
-  function addMessage(m) {
+  // ─── passesFilter — predicate for active filter selection ────────────────
+  function passesFilter(m, filter) {
+    if (filter === "all") return true;
+    // Under non-all filters, suppress system and control noise
+    const kind = m.kind || "message";
+    if (kind === "system" || kind === "control") return false;
+    if (filter === "broadcast") return m.recipient === "all";
+    if (filter === "direct") {
+      return m.recipient !== "all" && !String(m.recipient).startsWith("#");
+    }
+    // specific channel filter (starts with "#")
+    if (filter.startsWith("#")) return m.recipient === filter;
+    return true;
+  }
+
+  // ─── buildMessageNode — constructs a .msg DOM node without appending ─────
+  function buildMessageNode(m) {
     const div = document.createElement("div");
     let cls = "msg " + (m.kind || "message");
     if (m.sender === "human") cls += " from-human";
@@ -531,16 +602,24 @@
     who.style.color = colorFor(m.sender);
     const arrow = document.createElement("span"); arrow.className = "arrow"; arrow.textContent = "→";
     const to = document.createElement("span");
-    if (m.recipient === "all") { to.className = "to-all"; to.textContent = "all"; }
-    else { to.textContent = m.recipient; to.style.color = colorFor(m.recipient); }
+    const isChannel = String(m.recipient).startsWith("#");
+    if (m.recipient === "all") {
+      to.className = "to-all"; to.textContent = "all";
+    } else if (isChannel) {
+      to.textContent = m.recipient; to.style.color = colorFor(m.recipient);
+    } else {
+      to.textContent = m.recipient; to.style.color = colorFor(m.recipient);
+    }
     const t = document.createElement("span"); t.style.marginLeft = "auto"; t.textContent = fmtTime(m.ts);
 
-    // Routing badge (broadcast vs direct) for non-system/non-control messages
+    // Routing badge: broadcast / channel / direct — for normal message-kind only
     const isNormal = m.kind === "message" || !m.kind;
     if (isNormal) {
       const badge = document.createElement("span");
       if (m.recipient === "all") {
         badge.className = "route-badge broadcast"; badge.textContent = "broadcast";
+      } else if (isChannel) {
+        badge.className = "route-badge channel"; badge.textContent = "channel";
       } else {
         badge.className = "route-badge direct"; badge.textContent = "direct";
       }
@@ -562,7 +641,31 @@
     }
 
     div.append(meta, body);
-    feed.appendChild(div);
+    return div;
+  }
+
+  // ─── renderFeed — re-render entire feed from allMessages + active filter ──
+  function renderFeed() {
+    const filter = filterEl.value;
+    feed.innerHTML = "";
+    for (const m of allMessages) {
+      if (passesFilter(m, filter)) {
+        // Strip slide-in animation on re-renders to avoid mass jank
+        const node = buildMessageNode(m);
+        node.style.animation = "none";
+        feed.appendChild(node);
+      }
+    }
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  // ─── addMessage — records to allMessages; appends live if filter passes ──
+  function addMessage(m) {
+    allMessages.push(m);
+    const filter = filterEl.value;
+    if (!passesFilter(m, filter)) return;
+    const node = buildMessageNode(m);
+    feed.appendChild(node);
     feed.scrollTop = feed.scrollHeight;
   }
 
@@ -572,11 +675,41 @@
     modeEl.className = "mode-badge mode-" + mode;
   }
 
-  // ─── setPeers — unchanged ────────────────────────────────────────────────
-  function setPeers(peers) {
-    peersEl.innerHTML = "";
+  // ─── rebuildTarget — builds #target from stored peers + channels ─────────
+  function rebuildTarget() {
     const current = targetEl.value;
     targetEl.innerHTML = '<option value="all">all (broadcast)</option>';
+    for (const p of currentPeers) {
+      const opt = document.createElement("option");
+      opt.value = p; opt.textContent = p;
+      targetEl.appendChild(opt);
+    }
+    for (const ch of Object.keys(channels)) {
+      const opt = document.createElement("option");
+      opt.value = ch; opt.textContent = `${ch} (channel)`;
+      targetEl.appendChild(opt);
+    }
+    targetEl.value = [...targetEl.options].some(o => o.value === current) ? current : "all";
+  }
+
+  // ─── rebuildFilterBar — rebuilds #filter-select channel options ───────────
+  function rebuildFilterBar() {
+    const current = filterEl.value;
+    // Remove any existing channel options (those starting with #)
+    [...filterEl.options].forEach(o => { if (o.value.startsWith("#")) o.remove(); });
+    for (const ch of Object.keys(channels)) {
+      const opt = document.createElement("option");
+      opt.value = ch; opt.textContent = ch;
+      filterEl.appendChild(opt);
+    }
+    // Keep selection if still valid, else revert to "all"
+    filterEl.value = [...filterEl.options].some(o => o.value === current) ? current : "all";
+  }
+
+  // ─── setPeers — stores peers, updates sidebar, rebuilds target ────────────
+  function setPeers(peers) {
+    currentPeers = peers;
+    peersEl.innerHTML = "";
     if (!peers.length) {
       const e = document.createElement("div");
       e.className = "peer empty"; e.textContent = "— none —";
@@ -589,12 +722,38 @@
       const name = document.createElement("span"); name.textContent = p; name.style.color = colorFor(p);
       row.append(dot, name);
       peersEl.appendChild(row);
-
-      const opt = document.createElement("option");
-      opt.value = p; opt.textContent = p;
-      targetEl.appendChild(opt);
     }
-    targetEl.value = [...targetEl.options].some(o => o.value === current) ? current : "all";
+    rebuildTarget();
+  }
+
+  // ─── setChannels — updates sidebar Channels section + target + filter ─────
+  function setChannels(ch) {
+    channels = ch || {};
+    channelsEl.innerHTML = "";
+    const names = Object.keys(channels);
+    if (!names.length) {
+      const e = document.createElement("div");
+      e.className = "peer empty"; e.textContent = "— none —";
+      channelsEl.appendChild(e);
+    }
+    for (const name of names) {
+      const members = channels[name] || [];
+      const row = document.createElement("div");
+      row.className = "channel-row";
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "channel-name";
+      nameSpan.textContent = name;
+      nameSpan.style.color = colorFor(name);
+      const membersSpan = document.createElement("span");
+      membersSpan.className = "channel-members";
+      membersSpan.textContent = members.length
+        ? members.join(", ")
+        : "no members";
+      row.append(nameSpan, membersSpan);
+      channelsEl.appendChild(row);
+    }
+    rebuildTarget();
+    rebuildFilterBar();
   }
 
   // ─── ctl / sendHuman — unchanged ─────────────────────────────────────────
@@ -612,7 +771,10 @@
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendHuman(); }
   });
 
-  // ─── connect — unchanged WebSocket event contract ────────────────────────
+  // ─── filter change — re-render feed from allMessages ─────────────────────
+  filterEl.addEventListener("change", renderFeed);
+
+  // ─── connect — WebSocket event contract extended for channels ─────────────
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ui`);
@@ -624,14 +786,20 @@
     ws.onmessage = (ev) => {
       const e = JSON.parse(ev.data);
       if (e.type === "snapshot") {
-        setMode(e.mode); setPeers(e.peers);
-        feed.innerHTML = ""; (e.log || []).forEach(addMessage);
+        allMessages = [];
+        setMode(e.mode);
+        setPeers(e.peers);
+        setChannels(e.channels || {});
+        feed.innerHTML = "";
+        (e.log || []).forEach(addMessage);
       } else if (e.type === "message") {
         addMessage(e.message);
       } else if (e.type === "mode") {
         setMode(e.mode);
       } else if (e.type === "peers") {
         setPeers(e.peers);
+      } else if (e.type === "channels") {
+        setChannels(e.channels || {});
       }
     };
   }
