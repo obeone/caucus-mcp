@@ -312,7 +312,8 @@ class HubConnector:
             channel: The ``#``-prefixed channel name to join.
 
         Returns:
-            ``True`` on success, ``False`` if the hub rejected the token (401).
+            ``True`` on success, ``False`` if the hub rejected the request — an
+            unknown token (401) or a rate-limit hit (429).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -321,7 +322,7 @@ class HubConnector:
         resp = await http.post(
             "/channels/join", json={"token": token, "channel": channel}
         )
-        if resp.status_code == 401:
+        if resp.status_code in (401, 429):
             return False
         resp.raise_for_status()
         return True
@@ -334,7 +335,8 @@ class HubConnector:
             channel: The ``#``-prefixed channel name to leave.
 
         Returns:
-            ``True`` on success, ``False`` if the hub rejected the token (401).
+            ``True`` on success, ``False`` if the hub rejected the request — an
+            unknown token (401) or a rate-limit hit (429).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -343,7 +345,7 @@ class HubConnector:
         resp = await http.post(
             "/channels/leave", json={"token": token, "channel": channel}
         )
-        if resp.status_code == 401:
+        if resp.status_code in (401, 429):
             return False
         resp.raise_for_status()
         return True

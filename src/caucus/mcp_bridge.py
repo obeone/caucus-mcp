@@ -355,6 +355,9 @@ def join_channel(channel: str) -> dict[str, object]:
         )
         if resp.status_code == 422:
             return {"error": "invalid_channel", "hint": "channel must start with '#'"}
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 
@@ -384,6 +387,9 @@ def leave_channel(channel: str) -> dict[str, object]:
         )
         if resp.status_code == 422:
             return {"error": "invalid_channel", "hint": "channel must start with '#'"}
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 

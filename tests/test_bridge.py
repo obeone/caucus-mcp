@@ -318,6 +318,17 @@ def test_channel_membership_tools_require_join(
     assert bridge.leave_channel("#x") == not_joined
 
 
+def test_join_channel_is_rate_limited_under_flood(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "ch-flooder")
+    bridge.join()
+    results = [bridge.join_channel(f"#c{i}") for i in range(12)]
+    assert any(r.get("error") == "rate_limited" for r in results)
+    rate_limited = next(r for r in results if r.get("error") == "rate_limited")
+    assert "retry_after" in rate_limited
+
+
 # --- watch_command -------------------------------------------------------
 
 
