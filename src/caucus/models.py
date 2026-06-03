@@ -120,10 +120,16 @@ class RegisterResponse(BaseModel):
 
 
 class SendRequest(BaseModel):
-    """Body for ``POST /send``."""
+    """Body for ``POST /send``.
+
+    ``to`` is bounded to the same 64-char ceiling as a project name
+    (:class:`RegisterRequest`) and a channel name (:class:`ChannelRequest`), so
+    the channel auto-subscribe on the send path cannot mint an unbounded
+    membership key for a ``#``-prefixed target.
+    """
 
     token: str
-    to: str = BROADCAST
+    to: str = Field(default=BROADCAST, max_length=64)
     content: str = Field(min_length=1, max_length=8192)
 
 

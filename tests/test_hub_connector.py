@@ -158,6 +158,16 @@ async def test_join_channel_unknown_token_is_false(live_hub: str) -> None:
         assert await hub.leave_channel("bogus-token", "#x") is False
 
 
+async def test_join_channel_rate_limited_returns_false(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-ch-flood", None)
+        results = [
+            await hub.join_channel(me.token, f"#c{i}") for i in range(12)
+        ]
+    # The hub's per-sender bucket trips 429, which the connector maps to False.
+    assert results.count(False) >= 1
+
+
 async def test_use_outside_context_raises() -> None:
     hub = HubConnector("http://127.0.0.1:8765")
     with pytest.raises(RuntimeError):

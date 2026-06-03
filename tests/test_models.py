@@ -68,6 +68,12 @@ def test_send_request_rejects_oversized_content() -> None:
         SendRequest(token="t", content="x" * 8193)
 
 
+def test_send_request_rejects_oversized_to() -> None:
+    # Bounds the channel auto-subscribe key on the send path.
+    with pytest.raises(ValidationError):
+        SendRequest(token="t", to="#" + "x" * 100, content="hi")
+
+
 def test_register_request_rejects_empty_and_oversized_project() -> None:
     with pytest.raises(ValidationError):
         RegisterRequest(project="")

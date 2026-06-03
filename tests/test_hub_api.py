@@ -203,6 +203,37 @@ def test_channel_leave_unknown_token_is_401(client: TestClient) -> None:
     assert resp.status_code == 401
 
 
+def test_send_to_oversized_channel_is_422(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/send", json={"token": token, "to": "#" + "x" * 100, "content": "hi"}
+    )
+    assert resp.status_code == 422
+
+
+def test_channel_join_is_rate_limited_under_flood(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    codes = [
+        client.post(
+            "/channels/join", json={"token": token, "channel": f"#c{i}"}
+        ).status_code
+        for i in range(12)
+    ]
+    assert 429 in codes
+
+
+def test_operator_can_speak_into_a_channel(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    client.post("/channels/join", json={"token": token, "channel": "#ops"})
+
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"say": "operator here", "to": "#ops"})
+
+    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    assert any("operator here" in m["content"] for m in got["messages"])
+
+
 # --- leave (graceful deregister) -----------------------------------------
 
 

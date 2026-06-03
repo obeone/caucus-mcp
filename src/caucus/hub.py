@@ -37,7 +37,7 @@ from .models import (
     SendResponse,
     is_channel,
 )
-from .state import HubState
+from .state import Client, HubState
 
 logger = logging.getLogger("caucus.hub")
 
@@ -195,28 +195,57 @@ async def channels() -> dict[str, dict[str, list[str]]]:
     return {"channels": state.channels()}
 
 
-@app.post("/channels/join")
-async def channel_join(req: ChannelRequest) -> dict[str, object]:
+def _check_rate_limit(client: Client) -> JSONResponse | None:
+    """Return a 429 response if the client's token bucket is empty, else ``None``.
+
+    Shared by the write endpoints so channel membership churn is held to the
+    same per-sender brake as ``/send`` — otherwise a join/leave loop could flood
+    every operator UI queue with membership events, bypassing the rate limiter.
+    """
+    assert client.bucket is not None
+    if not client.bucket.allow():
+        retry = round(client.bucket.retry_after(), 2)
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limited", "retry_after": retry},
+        )
+    return None
+
+
+@app.post("/channels/join", response_model=None)
+async def channel_join(req: ChannelRequest) -> dict[str, object] | JSONResponse:
     """Subscribe the caller to a private channel (self-join).
 
     Idempotent: re-joining a channel already subscribed to is a no-op success.
-    Rejected with 401 when the token is unknown.
+    Rejected with 401 when the token is unknown, and 429 when the caller exceeds
+    its rate limit (the same per-sender brake as ``/send``).
     """
-    if not state.subscribe(req.token, req.channel):
+    client = state.client_for(req.token)
+    if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
+    state.subscribe(req.token, req.channel)
     logger.info("channel join channel=%s", req.channel)
     return {"joined": True, "channel": req.channel}
 
 
-@app.post("/channels/leave")
-async def channel_leave(req: ChannelRequest) -> dict[str, object]:
+@app.post("/channels/leave", response_model=None)
+async def channel_leave(req: ChannelRequest) -> dict[str, object] | JSONResponse:
     """Unsubscribe the caller from a private channel.
 
     Idempotent: leaving a channel not subscribed to is a no-op success.
-    Rejected with 401 when the token is unknown.
+    Rejected with 401 when the token is unknown, and 429 when the caller exceeds
+    its rate limit (the same per-sender brake as ``/send``).
     """
-    if not state.unsubscribe(req.token, req.channel):
+    client = state.client_for(req.token)
+    if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
+    state.unsubscribe(req.token, req.channel)
     logger.info("channel leave channel=%s", req.channel)
     return {"left": True, "channel": req.channel}
 
