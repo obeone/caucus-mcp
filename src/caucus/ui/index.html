@@ -12,7 +12,7 @@
   JetBrains Mono: code blocks — distinct from the chrome monospace.
   Chakra Petch + IBM Plex Mono: chrome (header, labels, badges, composer) unchanged.
 -->
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<!-- Google Fonts injected after load so a hanging CDN never blocks window.onload -->
 <style>
   :root {
     --bg: #0a0e12;
@@ -321,6 +321,11 @@
   .channel-name {
     font-weight: 600; font-size: 12px; letter-spacing: 0.3px;
   }
+  .channel-topic {
+    font-size: 10.5px; color: var(--dim); line-height: 1.4;
+    padding-left: 4px; font-style: italic;
+  }
+  .channel-topic.empty { opacity: 0.5; }
   .channel-members {
     font-size: 10.5px; color: var(--dim); line-height: 1.4;
     padding-left: 4px;
@@ -564,7 +569,7 @@
 
   // ─── Module-level state ───────────────────────────────────────────────────
   let currentPeers = [];
-  let channels = {};      // latest complete channel map: { "#name": ["memberA", ...] }
+  let channels = {};      // latest complete channel map: { "#name": { topic: str|null, members: [...] } }
   let allMessages = [];   // every message received, in order, for feed re-render
 
   function fmtTime(ts) {
@@ -737,19 +742,29 @@
       channelsEl.appendChild(e);
     }
     for (const name of names) {
-      const members = channels[name] || [];
+      const entry = channels[name] || {};
+      const members = Array.isArray(entry.members) ? entry.members : [];
+      const topic = entry.topic || null;
       const row = document.createElement("div");
       row.className = "channel-row";
       const nameSpan = document.createElement("span");
       nameSpan.className = "channel-name";
       nameSpan.textContent = name;
       nameSpan.style.color = colorFor(name);
+      const topicSpan = document.createElement("span");
+      if (topic) {
+        topicSpan.className = "channel-topic";
+        topicSpan.textContent = topic;
+      } else {
+        topicSpan.className = "channel-topic empty";
+        topicSpan.textContent = "— no topic —";
+      }
       const membersSpan = document.createElement("span");
       membersSpan.className = "channel-members";
       membersSpan.textContent = members.length
         ? members.join(", ")
         : "no members";
-      row.append(nameSpan, membersSpan);
+      row.append(nameSpan, topicSpan, membersSpan);
       channelsEl.appendChild(row);
     }
     rebuildTarget();
@@ -804,6 +819,17 @@
     };
   }
   connect();
+
+  // ─── Non-blocking Google Fonts injection ──────────────────────────────────
+  // Injected AFTER window.onload so a hanging CDN can never delay that event.
+  // The page renders immediately on fallback fonts (Georgia/monospace per CSS
+  // variables); webfonts swap in when/if the CDN responds.
+  window.addEventListener("load", () => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap";
+    document.head.appendChild(link);
+  });
 </script>
 </body>
 </html>
