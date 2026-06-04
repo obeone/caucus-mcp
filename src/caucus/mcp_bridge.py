@@ -6,8 +6,10 @@ Room. After joining it exposes tools so the agent can talk to its peers and
 listen for replies. The natural loop is ``join()`` once, then ``say(...)`` and
 ``listen(...)`` until a stop control arrives. For focused side-conversations it
 also exposes private channels (``join_channel`` / ``leave_channel`` /
-``list_channels``): a ``#``-prefixed room whose traffic reaches only its
-members, so a subset of peers can work a sub-topic without spamming the rest.
+``list_channels`` / ``set_channel_topic``): a ``#``-prefixed room whose traffic
+reaches only its members, so a subset of peers can work a sub-topic without
+spamming the rest, each carrying an IRC-like topic so late joiners know its
+purpose.
 
 Configuration via environment variables:
 
@@ -213,6 +215,9 @@ def join(project: str | None = None) -> dict[str, object]:
         "hub": HUB_URL,
         "protocol_version": _known_protocol_version,
         "protocol_stale": stale,
+        # Open-channel directory (names, topics, members) so a late joiner can
+        # see what side rooms exist and what they are about, up front.
+        "channels": body.get("channels", {}),
     }
     if stale:
         result["protocol"] = body.get("protocol_text")
@@ -412,6 +417,49 @@ def list_channels() -> dict[str, object]:
         resp = http.get("/channels")
         resp.raise_for_status()
         return {"channels": dict(resp.json().get("channels", {}))}
+
+
+@mcp.tool()
+def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
+    """Set or change a private channel's topic so late joiners know its purpose.
+
+    A channel's topic is a one-line description (e.g. "Designing the v2 items
+    API"). Any member can set it; an empty ``topic`` clears it. The topic shows
+    up in ``list_channels`` and in the directory handed to peers when they join,
+    so an agent arriving later can scan topics and pick which rooms to join.
+
+    Requires ``setup`` then ``join`` first, and you must be a member of the
+    channel (send to it or ``join_channel`` it before setting its topic).
+
+    Args:
+        channel: The ``#``-prefixed channel name.
+        topic: The one-line topic to set; empty clears it.
+
+    Returns:
+        ``{"channel": "<name>", "topic": "<text>" | None}`` on success,
+        ``{"error": "invalid_channel"}`` for a bad name, ``{"error":
+        "not_a_member"}`` if you have not joined the channel, ``{"error":
+        "rate_limited", ...}`` when throttled, or the usual gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/channels/topic",
+            json={"token": _token, "channel": channel, "topic": topic},
+        )
+        if resp.status_code == 422:
+            return {"error": "invalid_channel", "hint": "channel must start with '#'"}
+        if resp.status_code == 403:
+            return {"error": "not_a_member", "hint": "join the channel first"}
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
 
 
 @mcp.tool()
