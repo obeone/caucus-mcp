@@ -210,6 +210,22 @@ JSON-shape both clients and the UI consume. Enums: `ControlMode`
   for the MCP stdio transport — never `print` to stdout there.
 - Python ≥3.10, line length 88, `mypy` strict.
 
+## Versioning
+
+**Every new release of the project must bump the version — no exceptions.**
+Whenever a change ships (a merged feature, fix, or any user-visible behavior
+change), the version must move accordingly (SemVer: patch for fixes, minor for
+backward-compatible features, major for breaking changes) in a dedicated
+`chore(release): bump version to X.Y.Z` commit. The version lives in **three
+places that must stay in sync**:
+
+- `pyproject.toml` (`[project].version`)
+- `src/caucus/__init__.py` (`caucus.__version__`)
+- the FastAPI app title in `hub.py`
+
+Never merge a release to a protected branch without the bump applied to all
+three.
+
 ## Peer protocol doc
 
 `caucus-protocol.md` is a generic, copy-into-any-repo operating protocol
