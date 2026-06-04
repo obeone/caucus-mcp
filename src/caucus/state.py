@@ -53,6 +53,7 @@ class HubState:
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
+        self._topics: dict[str, str] = {}  # channel -> topic (ephemeral)
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
         self._mode: ControlMode = ControlMode.RUNNING
@@ -85,24 +86,40 @@ class HubState:
         """Return the recent message log as JSON-friendly dicts."""
         return [m.to_public() for m in self._log]
 
-    def channels(self) -> dict[str, list[str]]:
-        """Return active channels mapped to their sorted member names.
+    def channels(self) -> dict[str, dict[str, object]]:
+        """Return active channels with their topic and sorted member names.
 
         Channels are **ephemeral**: there is no registry. A channel exists only
         while at least one connected client is subscribed to it, so the map is
         derived from live :attr:`Client.channels` membership and a channel
-        vanishes once its last member leaves or is reaped. The operator UI
-        consumes this to render the channel roster.
+        vanishes once its last member leaves or is reaped. Its topic (an IRC-like
+        one-line description) lives in :attr:`_topics` for as long as the channel
+        has members, and is ``None`` until a member sets one. Both the operator UI
+        and a freshly-registered peer consume this directory.
 
         Returns:
-            A mapping ``{channel_name: [member_project, ...]}`` sorted by channel
-            name and by member within each channel.
+            A mapping ``{channel_name: {"topic": str | None, "members":
+            [member_project, ...]}}`` sorted by channel name and by member within
+            each channel.
         """
         members: dict[str, list[str]] = {}
         for client in self._clients.values():
             for channel in client.channels:
                 members.setdefault(channel, []).append(client.project)
-        return {ch: sorted(members[ch]) for ch in sorted(members)}
+        return {
+            ch: {"topic": self._topics.get(ch), "members": sorted(members[ch])}
+            for ch in sorted(members)
+        }
+
+    def _prune_topics(self) -> None:
+        """Drop topics for channels that no longer have any members.
+
+        Keeps topic lifetime tied to channel lifetime (ephemeral): once the last
+        member leaves or is reaped, the channel's topic is forgotten so a later
+        incarnation of the same name does not inherit a stale description.
+        """
+        active = {ch for client in self._clients.values() for ch in client.channels}
+        self._topics = {ch: t for ch, t in self._topics.items() if ch in active}
 
     # --- clients ---------------------------------------------------------
 
@@ -146,6 +163,7 @@ class HubState:
         self._announce_system(f"{client.project} {reason}")
         self._push_ui({"type": "peers", "peers": self.peers()})
         if had_channels:
+            self._prune_topics()  # forget topics of any channel this emptied
             self._push_ui({"type": "channels", "channels": self.channels()})
 
     def unregister(self, token: str) -> str | None:
@@ -268,8 +286,35 @@ class HubState:
         if channel in client.channels:
             client.channels.discard(channel)
             self._announce_system(f"{client.project} left {channel}")
+            self._prune_topics()  # drop the topic if that was the last member
             self._push_ui({"type": "channels", "channels": self.channels()})
         return True
+
+    def is_member(self, token: str, channel: str) -> bool:
+        """Return whether the token holder is currently subscribed to ``channel``."""
+        client = self._by_token.get(token)
+        return client is not None and channel in client.channels
+
+    def set_topic(self, channel: str, topic: str) -> None:
+        """Set (or clear) a channel's topic and notify the operator UI.
+
+        A blank or whitespace-only ``topic`` clears it. The caller is expected to
+        have verified membership (see :meth:`is_member`); this only mutates the
+        topic map and fans out the refreshed channel directory. Topics are
+        ephemeral and pruned with their channel (see :meth:`_prune_topics`).
+
+        Args:
+            channel: The ``#``-prefixed channel name whose topic to set.
+            topic: The new one-line topic; blank clears any existing topic.
+        """
+        cleaned = topic.strip()
+        if cleaned:
+            self._topics[channel] = cleaned
+            self._announce_system(f"topic for {channel}: {cleaned}")
+        else:
+            self._topics.pop(channel, None)
+            self._announce_system(f"topic for {channel} cleared")
+        self._push_ui({"type": "channels", "channels": self.channels()})
 
     def control_signal(self, action: str) -> Message:
         """Build a control message (e.g. a stop notice) for delivery to agents."""

@@ -113,7 +113,7 @@ async def test_subscribe_is_idempotent() -> None:
     alpha = state.register("alpha")
     assert state.subscribe(alpha.token, "#x") is True
     assert state.subscribe(alpha.token, "#x") is True
-    assert state.channels() == {"#x": ["alpha"]}
+    assert state.channels() == {"#x": {"topic": None, "members": ["alpha"]}}
 
 
 async def test_unsubscribe_removes_membership_and_empties_channel() -> None:
@@ -145,7 +145,10 @@ async def test_channels_lists_members_sorted() -> None:
     state.subscribe(beta.token, "#design")
     state.subscribe(alpha.token, "#design")
     state.subscribe(alpha.token, "#api")
-    assert state.channels() == {"#api": ["alpha"], "#design": ["alpha", "beta"]}
+    assert state.channels() == {
+        "#api": {"topic": None, "members": ["alpha"]},
+        "#design": {"topic": None, "members": ["alpha", "beta"]},
+    }
 
 
 async def test_dropping_a_member_updates_channels() -> None:
@@ -177,7 +180,45 @@ async def test_snapshot_includes_channels() -> None:
     alpha = state.register("alpha")
     state.subscribe(alpha.token, "#x")
     snapshot = state.add_ui().get_nowait()
-    assert snapshot["channels"] == {"#x": ["alpha"]}
+    assert snapshot["channels"] == {"#x": {"topic": None, "members": ["alpha"]}}
+
+
+async def test_set_topic_is_reflected_in_channels() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#design")
+    state.set_topic("#design", "Designing the v2 items API")
+    assert state.channels()["#design"]["topic"] == "Designing the v2 items API"
+
+
+async def test_set_topic_blank_clears_it() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#design")
+    state.set_topic("#design", "something")
+    state.set_topic("#design", "   ")  # whitespace clears
+    assert state.channels()["#design"]["topic"] is None
+
+
+async def test_topic_is_pruned_when_channel_empties() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    state.subscribe(alpha.token, "#design")
+    state.set_topic("#design", "ephemeral")
+    state.unsubscribe(alpha.token, "#design")
+    # A fresh member of the same name must not inherit the old topic.
+    beta = state.register("beta")
+    state.subscribe(beta.token, "#design")
+    assert state.channels()["#design"]["topic"] is None
+
+
+async def test_is_member_reflects_subscription() -> None:
+    state = HubState()
+    alpha = state.register("alpha")
+    assert state.is_member(alpha.token, "#x") is False
+    state.subscribe(alpha.token, "#x")
+    assert state.is_member(alpha.token, "#x") is True
+    assert state.is_member("bogus", "#x") is False
 
 
 async def test_log_is_bounded() -> None:
