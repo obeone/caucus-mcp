@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .models import (
     ChannelRequest,
+    ChannelTopicRequest,
     ControlMode,
     ControlRequest,
     LeaveRequest,
@@ -52,7 +53,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -101,8 +102,14 @@ Private channels (side rooms):
   - Membership is explicit and self-served: join_channel("#api-shape") to start
     receiving it, leave_channel("#api-shape") when the sub-topic is resolved.
     Only members receive a channel's messages — non-members are not spammed.
+  - Give a channel a topic so a peer arriving later knows what it is for:
+    set_channel_topic("#api-shape", "Designing the v2 items API"). Any member
+    can set or change it. list_channels() returns every open channel with its
+    topic and members, and the same directory is handed to you when you join —
+    so a late arrival can scan topics and decide which rooms to join.
   - Channels are ephemeral and have NO history: a channel exists only while it
     has members, and a peer joining late sees nothing said before it joined.
+    A channel's topic lives only as long as the channel does.
   - This is a focus tool, not secrecy: the human operator always sees every
     channel and all its traffic, and can speak into any of them.
 
@@ -185,12 +192,13 @@ async def peers() -> dict[str, list[str]]:
 
 
 @app.get("/channels")
-async def channels() -> dict[str, dict[str, list[str]]]:
-    """List active private channels mapped to their members.
+async def channels() -> dict[str, dict[str, dict[str, object]]]:
+    """List active private channels with their topic and members.
 
     Channels are ephemeral (derived from live membership), so this only ever
-    lists channels with at least one connected member. Serves both agent
-    discovery and the operator console's channel roster.
+    lists channels with at least one connected member. Each entry is
+    ``{"topic": str | None, "members": [name, ...]}``. Serves both agent
+    discovery (including the late-joiner directory) and the operator console.
     """
     return {"channels": state.channels()}
 
@@ -250,6 +258,27 @@ async def channel_leave(req: ChannelRequest) -> dict[str, object] | JSONResponse
     return {"left": True, "channel": req.channel}
 
 
+@app.post("/channels/topic", response_model=None)
+async def channel_topic(req: ChannelTopicRequest) -> dict[str, object] | JSONResponse:
+    """Set (or clear) a channel's topic; members only.
+
+    A blank ``topic`` clears it. Rejected with 401 when the token is unknown,
+    403 when the caller is not a member of the channel (you cannot describe a
+    room you are not in), and 429 when the caller exceeds its rate limit.
+    """
+    client = state.client_for(req.token)
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
+    if not state.is_member(req.token, req.channel):
+        raise HTTPException(status_code=403, detail="not a channel member")
+    state.set_topic(req.channel, req.topic)
+    logger.info("channel topic channel=%s", req.channel)
+    return {"channel": req.channel, "topic": req.topic.strip() or None}
+
+
 @app.get("/protocol")
 async def protocol() -> dict[str, object]:
     """Return the current operating protocol and its revision.
@@ -267,6 +296,8 @@ async def register(req: RegisterRequest) -> RegisterResponse:
     Compares the caller's ``protocol_version`` against :data:`PROTOCOL_VERSION`.
     A caller that is behind (or has never read the protocol) gets
     ``protocol_stale=True`` plus the current :data:`PROTOCOL_TEXT` to re-read.
+    The current channel directory (names, topics, members) ships in the response
+    so a late-joining peer learns the open rooms without a follow-up call.
     """
     client = state.register(req.project)
     stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
@@ -282,6 +313,7 @@ async def register(req: RegisterRequest) -> RegisterResponse:
         protocol_version=PROTOCOL_VERSION,
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
+        channels=state.channels(),
     )
 
 

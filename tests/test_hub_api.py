@@ -166,7 +166,9 @@ def test_channel_message_reaches_only_members(client: TestClient) -> None:
 def test_send_to_channel_auto_subscribes_sender(client: TestClient) -> None:
     alpha = _register(client, "alpha")
     client.post("/send", json={"token": alpha, "to": "#api", "content": "opening"})
-    assert client.get("/channels").json()["channels"] == {"#api": ["alpha"]}
+    assert client.get("/channels").json()["channels"] == {
+        "#api": {"topic": None, "members": ["alpha"]}
+    }
 
 
 def test_channels_endpoint_lists_members(client: TestClient) -> None:
@@ -174,7 +176,9 @@ def test_channels_endpoint_lists_members(client: TestClient) -> None:
     beta = _register(client, "beta")
     client.post("/channels/join", json={"token": alpha, "channel": "#x"})
     client.post("/channels/join", json={"token": beta, "channel": "#x"})
-    assert client.get("/channels").json()["channels"] == {"#x": ["alpha", "beta"]}
+    assert client.get("/channels").json()["channels"] == {
+        "#x": {"topic": None, "members": ["alpha", "beta"]}
+    }
 
 
 def test_channel_join_unknown_token_is_401(client: TestClient) -> None:
@@ -201,6 +205,61 @@ def test_channel_leave_stops_delivery(client: TestClient) -> None:
 def test_channel_leave_unknown_token_is_401(client: TestClient) -> None:
     resp = client.post("/channels/leave", json={"token": "bogus", "channel": "#x"})
     assert resp.status_code == 401
+
+
+# --- channel topics ------------------------------------------------------
+
+
+def test_member_can_set_topic_and_it_shows_in_directory(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    client.post("/channels/join", json={"token": token, "channel": "#design"})
+    resp = client.post(
+        "/channels/topic",
+        json={"token": token, "channel": "#design", "topic": "v2 items API"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"channel": "#design", "topic": "v2 items API"}
+    assert client.get("/channels").json()["channels"]["#design"]["topic"] == "v2 items API"
+
+
+def test_non_member_cannot_set_topic(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/channels/join", json={"token": alpha, "channel": "#design"})
+    # beta never joined #design.
+    resp = client.post(
+        "/channels/topic",
+        json={"token": beta, "channel": "#design", "topic": "hijack"},
+    )
+    assert resp.status_code == 403
+
+
+def test_set_topic_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post(
+        "/channels/topic", json={"token": "bogus", "channel": "#x", "topic": "t"}
+    )
+    assert resp.status_code == 401
+
+
+def test_set_topic_rejects_non_hash_channel(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/channels/topic", json={"token": token, "channel": "design", "topic": "t"}
+    )
+    assert resp.status_code == 422
+
+
+def test_register_response_carries_channel_directory(client: TestClient) -> None:
+    opener = _register(client, "opener")
+    client.post("/channels/join", json={"token": opener, "channel": "#api"})
+    client.post(
+        "/channels/topic",
+        json={"token": opener, "channel": "#api", "topic": "Designing the API"},
+    )
+    # A peer registering now is told the open channels up front.
+    body = client.post("/register", json={"project": "latecomer"}).json()
+    assert body["channels"]["#api"]["topic"] == "Designing the API"
+    assert "opener" in body["channels"]["#api"]["members"]
 
 
 def test_send_to_oversized_channel_is_422(client: TestClient) -> None:
@@ -358,7 +417,9 @@ def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
         # subscribe announces a system message and pushes the channel map.
         events = [ws.receive_json(), ws.receive_json()]
     channels_events = [e for e in events if e["type"] == "channels"]
-    assert channels_events and channels_events[0]["channels"] == {"#x": ["alpha"]}
+    assert channels_events and channels_events[0]["channels"] == {
+        "#x": {"topic": None, "members": ["alpha"]}
+    }
 
 
 def _token(client: TestClient, project: str) -> str:

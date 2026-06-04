@@ -13,10 +13,12 @@ from pydantic import ValidationError
 from caucus.models import (
     BROADCAST,
     ChannelRequest,
+    ChannelTopicRequest,
     ControlMode,
     Message,
     MessageKind,
     RegisterRequest,
+    RegisterResponse,
     SendRequest,
     is_channel,
 )
@@ -111,3 +113,23 @@ def test_channel_request_rejects_bare_or_oversized_name() -> None:
         ChannelRequest(token="t", channel="#")  # below min_length
     with pytest.raises(ValidationError):
         ChannelRequest(token="t", channel="#" + "x" * 64)  # above max_length
+
+
+def test_channel_topic_request_defaults_to_blank_topic() -> None:
+    req = ChannelTopicRequest(token="t", channel="#x")
+    assert req.topic == ""  # blank means "clear the topic"
+
+
+def test_channel_topic_request_rejects_non_hash_channel() -> None:
+    with pytest.raises(ValidationError):
+        ChannelTopicRequest(token="t", channel="x", topic="hi")
+
+
+def test_channel_topic_request_rejects_oversized_topic() -> None:
+    with pytest.raises(ValidationError):
+        ChannelTopicRequest(token="t", channel="#x", topic="y" * 201)
+
+
+def test_register_response_channels_defaults_to_empty() -> None:
+    resp = RegisterResponse(token="t", project="p", protocol_version=1)
+    assert resp.channels == {}

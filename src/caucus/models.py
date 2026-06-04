@@ -117,6 +117,10 @@ class RegisterResponse(BaseModel):
     protocol_version: int
     protocol_stale: bool = False
     protocol_text: str | None = None
+    channels: dict[str, dict[str, object]] = Field(default_factory=dict)
+    """Snapshot of the open channels at registration, so a late-joining peer is
+    told the directory (names, topics, members) up front — no extra round-trip.
+    Each value is ``{"topic": str | None, "members": [name, ...]}``."""
 
 
 class SendRequest(BaseModel):
@@ -167,6 +171,26 @@ class ChannelRequest(BaseModel):
 
     token: str
     channel: str = Field(min_length=2, max_length=64)
+
+    @field_validator("channel")
+    @classmethod
+    def _must_be_channel(cls, value: str) -> str:
+        """Ensure the channel name carries the ``#`` prefix."""
+        if not value.startswith(CHANNEL_PREFIX):
+            raise ValueError(f"channel must start with {CHANNEL_PREFIX!r}")
+        return value
+
+
+class ChannelTopicRequest(BaseModel):
+    """Body for ``POST /channels/topic``.
+
+    ``channel`` is validated like :class:`ChannelRequest`. ``topic`` is bounded
+    and may be blank — a blank topic clears the channel's current topic.
+    """
+
+    token: str
+    channel: str = Field(min_length=2, max_length=64)
+    topic: str = Field(default="", max_length=200)
 
     @field_validator("channel")
     @classmethod
