@@ -4,3 +4,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .DS_Store
+
+# Per-user Claude Code project settings (autoMode + approved cache)
+.claude/settings.local.json
+.claude/.auto_mode_approved.json
+.claude/.automode-history/
