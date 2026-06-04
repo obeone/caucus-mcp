@@ -138,7 +138,37 @@ async def test_channels_lists_membership(live_hub: str) -> None:
         me = await hub.register("conn-ch-list", None)
         await hub.join_channel(me.token, "#conn-list-room")
         chans = await hub.channels()
-    assert "conn-ch-list" in chans.get("#conn-list-room", [])
+    entry = chans.get("#conn-list-room", {})
+    assert "conn-ch-list" in entry.get("members", [])
+    assert entry.get("topic") is None
+
+
+async def test_set_channel_topic_reflected_in_directory(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-topic", None)
+        await hub.join_channel(me.token, "#conn-topic-room")
+        ok = await hub.set_channel_topic(me.token, "#conn-topic-room", "the topic")
+        assert ok is True
+        chans = await hub.channels()
+    assert chans["#conn-topic-room"]["topic"] == "the topic"
+
+
+async def test_set_channel_topic_non_member_is_false(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        opener = await hub.register("conn-topic-owner", None)
+        await hub.join_channel(opener.token, "#conn-owned-room")
+        outsider = await hub.register("conn-outsider", None)
+        ok = await hub.set_channel_topic(outsider.token, "#conn-owned-room", "nope")
+    assert ok is False
+
+
+async def test_register_membership_carries_channel_directory(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        opener = await hub.register("conn-dir-opener", None)
+        await hub.join_channel(opener.token, "#conn-dir-room")
+        await hub.set_channel_topic(opener.token, "#conn-dir-room", "dir topic")
+        latecomer = await hub.register("conn-dir-latecomer", None)
+    assert latecomer.channels["#conn-dir-room"]["topic"] == "dir topic"
 
 
 async def test_leave_channel_stops_delivery(live_hub: str) -> None:

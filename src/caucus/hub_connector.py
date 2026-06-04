@@ -62,6 +62,9 @@ class Membership:
         protocol_stale: ``True`` when the hub's protocol moved past the version
             sent on register; ``protocol_text`` then carries the fresh copy.
         protocol_text: The fresh protocol text when stale, else ``None``.
+        channels: The open-channel directory at registration time, so a
+            late-joining agent learns the rooms up front. Maps each channel to
+            ``{"topic": str | None, "members": [name, ...]}``.
     """
 
     token: str
@@ -69,6 +72,7 @@ class Membership:
     protocol_version: int
     protocol_stale: bool
     protocol_text: str | None
+    channels: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -210,6 +214,7 @@ class HubConnector:
             protocol_version=int(body["protocol_version"]),
             protocol_stale=bool(body.get("protocol_stale")),
             protocol_text=body.get("protocol_text"),
+            channels=dict(body.get("channels", {})),
         )
 
     async def leave(self, token: str) -> None:
@@ -350,11 +355,12 @@ class HubConnector:
         resp.raise_for_status()
         return True
 
-    async def channels(self) -> dict[str, list[str]]:
-        """List active private channels mapped to their members.
+    async def channels(self) -> dict[str, dict[str, object]]:
+        """List active private channels with their topic and members.
 
         Returns:
-            A mapping ``{channel_name: [member_project, ...]}``.
+            A mapping ``{channel_name: {"topic": str | None, "members":
+            [member_project, ...]}}``.
 
         Raises:
             httpx.HTTPError: If the hub is unreachable or returns an error.
@@ -363,3 +369,31 @@ class HubConnector:
         resp = await http.get("/channels")
         resp.raise_for_status()
         return dict(resp.json().get("channels", {}))
+
+    async def set_channel_topic(self, token: str, channel: str, topic: str) -> bool:
+        """Set (or clear) a channel's topic; the caller must be a member.
+
+        A blank ``topic`` clears it. Topics let a late-joining peer learn what a
+        channel is for via :meth:`channels` or the registration directory.
+
+        Args:
+            token: The agent's access token.
+            channel: The ``#``-prefixed channel name.
+            topic: The one-line topic; blank clears it.
+
+        Returns:
+            ``True`` on success, ``False`` if the hub rejected the request — an
+            unknown token (401), a non-member (403), or a rate-limit hit (429).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/channels/topic",
+            json={"token": token, "channel": channel, "topic": topic},
+        )
+        if resp.status_code in (401, 403, 429):
+            return False
+        resp.raise_for_status()
+        return True
