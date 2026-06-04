@@ -114,21 +114,58 @@ def _default_project() -> str:
     return Path.cwd().name or "unknown"
 
 
-def compose_system_prompt(project: str, protocol_text: str) -> str:
+def _format_channel_directory(channels: dict[str, dict[str, object]]) -> str:
+    """Render the open-channel directory for the system prompt.
+
+    Args:
+        channels: The directory from registration, mapping each channel to
+            ``{"topic": str | None, "members": [name, ...]}``.
+
+    Returns:
+        A short ``[caucus channels]`` block listing each channel with its topic
+        and members, or an empty string when no channels are open.
+    """
+    if not channels:
+        return ""
+    lines = ["[caucus channels] open private channels right now:"]
+    for name in sorted(channels):
+        info = channels[name]
+        topic = info.get("topic") or "(no topic set)"
+        raw_members = info.get("members")
+        member_names = raw_members if isinstance(raw_members, list) else []
+        members = ", ".join(str(m) for m in member_names) or "(empty)"
+        lines.append(f"- {name} — {topic} [members: {members}]")
+    lines.append(
+        "Join any whose topic is relevant with join_channel; the rest you can "
+        "ignore."
+    )
+    return "\n".join(lines)
+
+
+def compose_system_prompt(
+    project: str,
+    protocol_text: str,
+    channels: dict[str, dict[str, object]] | None = None,
+) -> str:
     """Build the agent's system prompt: runtime framing plus the hub protocol.
 
     The hub protocol is written for the bridge runtime (it talks about
     ``setup``/``join``/``watch_command``/``listen``). This preamble re-frames it
     for the native connector, where joining and listening are automatic and the
-    agent only ever needs ``say``/``list_peers``.
+    agent only ever needs ``say``/``list_peers`` and the channel tools.
 
     Args:
         project: The name this agent is registered under.
         protocol_text: The operating protocol fetched from the hub.
+        channels: The open-channel directory at registration, so a late-joining
+            agent is told the existing rooms (and their topics) up front. ``None``
+            or empty omits the directory block.
 
     Returns:
         The composed system prompt.
     """
+    directory = _format_channel_directory(channels or {})
+    directory_block = f"\n\n{directory}" if directory else ""
     return (
         f'You are "{project}", an autonomous participant in a Caucus — a '
         "supervised room where independent AI agents coordinate across projects "
@@ -146,7 +183,9 @@ def compose_system_prompt(project: str, protocol_text: str) -> str:
         'channel: a "#"-prefixed name (e.g. "#api-shape"). say(to="#api-shape", '
         "...) talks in it and subscribes you; `join_channel`/`leave_channel` "
         "subscribe/unsubscribe explicitly. Only members receive a channel's "
-        "messages, so announce it in broadcast first if you want peers to join.\n"
+        "messages, so announce it in broadcast first if you want peers to join. "
+        "Give a channel a purpose with `set_channel_topic` so peers arriving "
+        "later know what it is for.\n"
         "- If a turn does not warrant a reply, simply stay silent — do not call "
         "say.\n"
         "- When the operator stops the room, your session ends; do not try to "
@@ -156,6 +195,7 @@ def compose_system_prompt(project: str, protocol_text: str) -> str:
         "cap the back-and-forth), adapting any 'listening'/'watcher' mechanics "
         "to this runtime where listening is automatic:\n\n"
         f"{protocol_text}"
+        f"{directory_block}"
     )
 
 
@@ -322,10 +362,23 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         text = f"left {channel}" if ok else f"could not leave {channel}"
         return {"content": [{"type": "text", "text": text}]}
 
+    @tool(
+        "set_channel_topic",
+        'Set a private channel\'s topic (e.g. "#api-shape" -> "Designing the v2 '
+        'items API") so a peer arriving later knows what it is for. You must be '
+        "a member; an empty topic clears it.",
+        {"channel": str, "topic": str},
+    )
+    async def set_channel_topic(args: dict[str, Any]) -> dict[str, Any]:
+        channel = args["channel"]
+        ok = await connector.set_channel_topic(token, channel, args.get("topic", ""))
+        text = f"topic set for {channel}" if ok else f"could not set topic for {channel}"
+        return {"content": [{"type": "text", "text": text}]}
+
     return create_sdk_mcp_server(
         name="caucus",
         version="1.0.0",
-        tools=[say, list_peers, join_channel, leave_channel],
+        tools=[say, list_peers, join_channel, leave_channel, set_channel_topic],
     )
 
 
@@ -358,13 +411,14 @@ async def run_session(
 
         server = _build_caucus_server(connector, me.token)
         options = ClaudeAgentOptions(
-            system_prompt=compose_system_prompt(me.project, proto.text),
+            system_prompt=compose_system_prompt(me.project, proto.text, me.channels),
             mcp_servers={"caucus": server},
             allowed_tools=[
                 "mcp__caucus__say",
                 "mcp__caucus__list_peers",
                 "mcp__caucus__join_channel",
                 "mcp__caucus__leave_channel",
+                "mcp__caucus__set_channel_topic",
             ],
             disallowed_tools=_BLOCKED_TOOLS,
             permission_mode="bypassPermissions",
