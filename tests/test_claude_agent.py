@@ -26,6 +26,27 @@ def test_compose_system_prompt_embeds_runtime_framing_and_protocol() -> None:
     assert "PROTOCOL BODY" in prompt
 
 
+def test_compose_system_prompt_includes_channel_directory() -> None:
+    prompt = claude_agent.compose_system_prompt(
+        "planner",
+        "PROTOCOL BODY",
+        {"#api-shape": {"topic": "Designing the API", "members": ["builder"]}},
+    )
+    assert "[caucus channels]" in prompt
+    assert "#api-shape" in prompt
+    assert "Designing the API" in prompt
+    assert "builder" in prompt
+
+
+def test_compose_system_prompt_omits_directory_when_no_channels() -> None:
+    assert "[caucus channels]" not in claude_agent.compose_system_prompt(
+        "planner", "PROTOCOL BODY", {}
+    )
+    assert "[caucus channels]" not in claude_agent.compose_system_prompt(
+        "planner", "PROTOCOL BODY", None
+    )
+
+
 def test_format_inbound_lists_each_message() -> None:
     out = claude_agent.format_inbound(
         [
