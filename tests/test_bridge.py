@@ -329,6 +329,41 @@ def test_join_channel_is_rate_limited_under_flood(
     assert "retry_after" in rate_limited
 
 
+def test_set_channel_topic_as_member(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "topic-setter")
+    bridge.join()
+    bridge.join_channel("#br-topic")
+    result = bridge.set_channel_topic("#br-topic", "the topic")
+    assert result == {"channel": "#br-topic", "topic": "the topic"}
+
+
+def test_set_channel_topic_non_member_errors(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "topic-outsider")
+    bridge.join()
+    result = bridge.set_channel_topic("#br-foreign", "nope")
+    assert result == {"error": "not_a_member", "hint": "join the channel first"}
+
+
+def test_join_surfaces_channel_directory(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    peer = _register_peer(live_hub, "br-dir-peer")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": peer, "channel": "#br-dir"})
+        http.post(
+            "/channels/topic",
+            json={"token": peer, "channel": "#br-dir", "topic": "dir topic"},
+        )
+    monkeypatch.setattr(bridge, "PROJECT", "br-dir-joiner")
+    result = bridge.join()
+    channels = result["channels"]
+    assert channels["#br-dir"]["topic"] == "dir topic"
+
+
 # --- watch_command -------------------------------------------------------
 
 
