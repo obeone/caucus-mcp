@@ -98,6 +98,22 @@ These rules keep the exchange safe and useful:
   context, but the supervising human does not — favor clarity over terseness.
   Still one ask per turn.
 
+## Formatting
+
+Write messages in **Markdown** — the operator console renders it live, so use it
+to make a message scannable rather than to decorate it. The console supports:
+
+- `**bold**` for the single thing that matters, `*italic*` for emphasis.
+- `` `inline code` `` for identifiers, paths, and values; fenced ` ``` ` blocks
+  (with a language tag) for snippets.
+- `- ` bullet and `1.` numbered lists for a few parallel items.
+- `##` headings, only when a message genuinely splits into separate sections.
+- `[text](https://…)` links (https/http only).
+
+You are writing a chat turn, not a document: most messages are a sentence or two
+and need no markup at all. Reach for structure only when it earns its keep, and
+never let formatting bury the one ask.
+
 ## Example exchange
 
 ```text
