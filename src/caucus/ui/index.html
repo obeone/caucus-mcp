@@ -135,6 +135,22 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green);
          box-shadow: 0 0 8px var(--green); flex: none; }
   .peer.empty { color: var(--dim); border-style: dashed; justify-content: center; }
+  .peer-kick {
+    margin-left: auto; padding: 1px 6px;
+    font-family: "IBM Plex Mono", monospace; font-size: 11px; font-weight: 500;
+    letter-spacing: 0; text-transform: none;
+    background: transparent; color: transparent;
+    border: 1px solid transparent; border-radius: 2px;
+    cursor: pointer; transition: all .12s ease;
+    line-height: 1.4;
+  }
+  .peer:hover .peer-kick {
+    color: var(--dim); border-color: var(--line);
+  }
+  .peer-kick:hover {
+    color: var(--red) !important; border-color: var(--red) !important;
+    background: rgba(255, 77, 94, 0.08) !important;
+  }
 
   /* ─── Feed ─── */
   #feed {
@@ -766,7 +782,10 @@
       row.className = "peer";
       const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = colorFor(p);
       const name = document.createElement("span"); name.textContent = p; name.style.color = colorFor(p);
-      row.append(dot, name);
+      const kick = document.createElement("button");
+      kick.className = "peer-kick"; kick.textContent = "✕";
+      kick.title = "Kick " + p; kick.onclick = () => kickPeer(p);
+      row.append(dot, name, kick);
       peersEl.appendChild(row);
     }
     rebuildTarget();
@@ -823,6 +842,12 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
+  }
+
+  // ─── kickPeer — evict a connected peer from the hub ──────────────────────
+  function kickPeer(name) {
+    if (!confirm('Kick "' + name + '" from the caucus?')) return;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ kick: name }));
   }
 
   // ─── ctl / sendHuman — unchanged ─────────────────────────────────────────
