@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
+
 from caucus import claude_agent
 from caucus.hub_connector import Inbound
 
@@ -154,3 +156,45 @@ async def test_run_loop_skips_quiet_polls() -> None:
     )
     assert len(client.queries) == 1
     assert "later" in client.queries[0]
+
+
+# --- NameInUseError → clean exit -----------------------------------------
+
+
+async def test_run_session_exits_cleanly_on_name_in_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_session returns without raising when register raises NameInUseError.
+
+    Stubs the connector so register() raises immediately, verifying the
+    except-NameInUseError handler swallows the error into a clean return.
+    """
+    from caucus.hub_connector import NameInUseError
+
+    class _FakeProtocol:
+        version = 8
+        text = "PROTOCOL"
+
+    class _FakeConnector:
+        async def fetch_protocol(self) -> _FakeProtocol:
+            return _FakeProtocol()
+
+        async def register(self, project: str, version: int, token: str | None = None) -> None:
+            raise NameInUseError("already taken")
+
+        async def __aenter__(self) -> _FakeConnector:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    monkeypatch.setattr(claude_agent, "HubConnector", lambda *a, **kw: _FakeConnector())
+
+    # Must return without raising — NameInUseError is swallowed into a clean exit.
+    await claude_agent.run_session(
+        hub_url="http://unused",
+        project="alpha",
+        mission=None,
+        model=None,
+        poll_timeout=0.0,
+    )

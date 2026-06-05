@@ -424,3 +424,85 @@ def test_leave_deletes_watcher_token_file(
     bridge.leave()
     assert bridge._token_file is None
     assert not os.path.exists(path)
+
+
+# --- duplicate-join protection -------------------------------------------
+
+
+def test_rejoin_same_bridge_sends_token_and_is_reaffirmed(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second join() from the same bridge re-sends the cached token.
+
+    The hub sees the matching token and returns REAFFIRMED (200), so the
+    result carries ``joined: True`` and the bridge still holds the same
+    project identity. This proves the token-reuse path prevents the
+    bridge from being refused as a duplicate of itself.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "reaffirm-me")
+    first = bridge.join()
+    assert first["joined"] is True
+    token_after_first = bridge._token
+
+    # Second join — the cached token is threaded through the POST body.
+    second = bridge.join()
+    assert second["joined"] is True
+    assert second["project"] == "reaffirm-me"
+    # The hub reaffirms: the token must stay the same (no new one issued).
+    assert bridge._token == token_after_first
+
+
+def test_join_returns_name_in_use_when_live_listener_holds_name(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh join() without a matching token is refused with name_in_use.
+
+    Simulate a live listener: register a peer directly, then spin a
+    background thread that holds a ``/receive`` long-poll so
+    ``active_polls > 0`` on the hub side.  A second bridge join (with no
+    cached token) must get back ``{"error": "name_in_use", ...}``.
+    """
+    import threading
+
+    name = "contested-peer"
+
+    # Register the peer and grab its token.
+    token = _register_peer(live_hub, name)
+
+    # Hold a long-poll in the background so active_polls becomes 1.
+    stop_event = threading.Event()
+
+    def _hold_poll() -> None:
+        with httpx.Client(base_url=live_hub, timeout=10.0) as http:
+            try:
+                http.get("/receive", params={"token": token, "timeout": 5})
+            except Exception:
+                pass
+        stop_event.set()
+
+    poller = threading.Thread(target=_hold_poll, daemon=True)
+    poller.start()
+
+    # Give the poll a moment to arrive at the hub so active_polls is set.
+    import time
+
+    time.sleep(0.15)
+
+    # Clear any cached token so this bridge looks like a fresh/different process.
+    monkeypatch.setattr(bridge, "_token", None)
+    monkeypatch.setattr(bridge, "PROJECT", name)
+
+    result = bridge.join()
+
+    # Clean up the poll thread.
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/leave", json={"token": token})
+    poller.join(timeout=3.0)
+
+    assert result.get("error") == "name_in_use"
+    assert result.get("project") == name
+    assert "note" in result
+    assert result.get("hub") == live_hub
+    # Bridge must not have updated its own membership on a refused join.
+    assert bridge._token is None
+    assert bridge._joined_as is None

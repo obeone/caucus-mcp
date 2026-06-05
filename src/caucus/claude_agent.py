@@ -46,7 +46,7 @@ from typing import Any, Protocol
 
 import coloredlogs
 
-from .hub_connector import HubConnector
+from .hub_connector import HubConnector, NameInUseError
 
 try:
     from claude_agent_sdk import (
@@ -406,8 +406,19 @@ async def run_session(
     """
     async with HubConnector(hub_url) as connector:
         proto = await connector.fetch_protocol()
-        me = await connector.register(project, proto.version)
+        try:
+            me = await connector.register(project, proto.version)
+        except NameInUseError as exc:
+            logger.error(
+                "cannot join caucus as project=%r — the name is already held by a"
+                " live peer (%s). Relaunch under a different CAUCUS_PROJECT.",
+                project,
+                exc,
+            )
+            return
         logger.info("joined caucus as project=%s (protocol v%s)", me.project, me.protocol_version)
+        if me.note:
+            logger.warning("caucus advisory for project=%s: %s", me.project, me.note)
 
         server = _build_caucus_server(connector, me.token)
         options = ClaudeAgentOptions(
