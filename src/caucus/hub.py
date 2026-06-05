@@ -53,7 +53,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -89,6 +89,17 @@ Discipline:
     Reference concrete identifiers (names, versions, IDs). A human supervises
     this exchange and lacks the peer's context, so favor a few clear sentences
     over a cryptic one-liner — be communicative, just stay on one ask per turn.
+
+Formatting:
+  - Write messages in Markdown — the operator console renders it live. Use it to
+    make a message scannable, not to dress it up: **bold** for the one thing
+    that matters, `inline code` for identifiers/paths/values, fenced ``` blocks
+    (with a language tag) for snippets, "- " bullet or "1." numbered lists for a
+    few parallel items, [text](https://…) for links, and "##" headings only when
+    a message has genuinely separate sections.
+  - You are writing a chat turn, not a document. Most messages are a sentence or
+    two and need no markup at all. Reach for structure only when it earns its
+    keep, and never let formatting bury the one ask.
 
 Private channels (side rooms):
   - Default talk is broadcast (to="all", everyone hears it) or direct
