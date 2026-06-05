@@ -12,6 +12,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 
 from .models import BROADCAST, ControlMode, Message, MessageKind, is_channel
 from .ratelimit import TokenBucket
@@ -30,6 +31,9 @@ class Client:
         channels: The private channels this client is subscribed to. A channel
             message reaches a client only if its name is in this set, so
             membership is per-client and explicit (self-join).
+        active_polls: Number of in-flight ``/receive`` long-polls currently
+            held for this client — i.e. live listeners. Used to tell a genuine
+            reconnect from a colliding duplicate at register time.
     """
 
     project: str
@@ -38,6 +42,35 @@ class Client:
     bucket: TokenBucket | None = None
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
+    active_polls: int = 0
+
+
+class RegisterOutcome(str, Enum):
+    """How a :meth:`HubState.register` call resolved against existing state."""
+
+    FRESH = "fresh"
+    """Brand-new peer, no prior record."""
+    REAFFIRMED = "reaffirmed"
+    """Same agent re-joined; a valid token was presented and matched."""
+    REPLACED = "replaced"
+    """Took over a record whose listener was gone (``active_polls == 0``)."""
+    CONTESTED = "contested"
+    """Name held by a live listener — caller refused, no token issued."""
+
+
+@dataclass(slots=True)
+class Registration:
+    """Result of :meth:`HubState.register`.
+
+    Attributes:
+        outcome: How the registration was resolved.
+        client: The client record, or ``None`` when ``outcome`` is
+            :attr:`RegisterOutcome.CONTESTED` (no token is issued in that
+            case).
+    """
+
+    outcome: RegisterOutcome
+    client: Client | None  # None only when outcome is CONTESTED
 
 
 class HubState:
@@ -123,12 +156,51 @@ class HubState:
 
     # --- clients ---------------------------------------------------------
 
-    def register(self, project: str) -> Client:
-        """Register (or re-register) a project and return its client record."""
+    def register(self, project: str, token: str | None = None) -> Registration:
+        """Register (or re-register) a project and return a :class:`Registration`.
+
+        The outcome depends on whether the name is already in use and whether
+        the caller can prove ownership via its previously-issued token:
+
+        * **FRESH** — no prior record; a new :class:`Client` is created.
+        * **REAFFIRMED** — ``token`` matches the existing client's token; the
+          caller is the same agent reconnecting. ``last_seen`` is refreshed;
+          no system notice is emitted.
+        * **REPLACED** — name exists but ``active_polls == 0`` (the prior
+          listener is gone) and no valid token is presented. The existing
+          client record is reused (same queue and channel memberships);
+          ``last_seen`` is refreshed. No new announce.
+        * **CONTESTED** — name exists, no valid token presented, AND the
+          existing client has ``active_polls > 0`` (a live listener is
+          present). The caller is refused; state is not mutated. An operator
+          warning is broadcast via :meth:`_announce_system`.
+
+        Args:
+            project: The human-readable project name to register.
+            token: The token previously issued for this project, if the caller
+                still holds it. Supplying the correct token causes a
+                REAFFIRMED outcome regardless of ``active_polls``.
+
+        Returns:
+            A :class:`Registration` describing the outcome and (when the
+            caller is accepted) the associated :class:`Client`.
+        """
         existing = self._clients.get(project)
         if existing is not None:
+            if token is not None and secrets.compare_digest(token, existing.token):
+                # Same agent re-joining: refresh and return without fanfare.
+                existing.last_seen = time.time()
+                return Registration(RegisterOutcome.REAFFIRMED, existing)
+            if existing.active_polls > 0:
+                # A live listener holds the name — refuse the newcomer.
+                self._announce_system(
+                    f"⚠️ {project} re-registered while a live listener held"
+                    " the name — duplicate refused"
+                )
+                return Registration(RegisterOutcome.CONTESTED, None)
+            # Dead/timed-out record: hand the slot to the newcomer.
             existing.last_seen = time.time()
-            return existing
+            return Registration(RegisterOutcome.REPLACED, existing)
         client = Client(
             project=project,
             token=secrets.token_urlsafe(24),
@@ -138,7 +210,28 @@ class HubState:
         self._by_token[client.token] = client
         self._announce_system(f"{project} joined")
         self._push_ui({"type": "peers", "peers": self.peers()})
-        return client
+        return Registration(RegisterOutcome.FRESH, client)
+
+    def kick(self, project: str) -> bool:
+        """Evict the named peer from the roster (operator action).
+
+        Looks up the client by project name; if found, drops it via
+        :meth:`_drop` (which announces a system notice and pushes a refreshed
+        peer list to the UI) and returns ``True``. Returns ``False`` when no
+        client with that name is connected, so the caller can distinguish a
+        genuine eviction from a no-op.
+
+        Args:
+            project: The project name of the peer to evict.
+
+        Returns:
+            ``True`` if a client was found and dropped, ``False`` otherwise.
+        """
+        client = self._clients.get(project)
+        if client is None:
+            return False
+        self._drop(client, "kicked by operator")
+        return True
 
     def client_for(self, token: str) -> Client | None:
         """Look up a client by token, refreshing its ``last_seen``."""

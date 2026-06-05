@@ -102,6 +102,9 @@ class RegisterRequest(BaseModel):
 
     project: str = Field(min_length=1, max_length=64)
     protocol_version: int | None = None
+    token: str | None = None
+    """The token previously issued for this project, if the caller still holds
+    it; lets the hub tell a genuine re-join from a colliding duplicate."""
 
 
 class RegisterResponse(BaseModel):
@@ -121,6 +124,9 @@ class RegisterResponse(BaseModel):
     """Snapshot of the open channels at registration, so a late-joining peer is
     told the directory (names, topics, members) up front — no extra round-trip.
     Each value is ``{"topic": str | None, "members": [name, ...]}``."""
+    note: str | None = None
+    """Optional human-readable advisory, e.g. when this registration took over
+    a timed-out session."""
 
 
 class SendRequest(BaseModel):
