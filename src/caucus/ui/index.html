@@ -86,6 +86,14 @@
 
   .spacer { flex: 1; }
 
+  .export-group { display: flex; gap: 6px; margin-right: 12px; }
+  .export-group select {
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 2px; padding: 0 8px;
+  }
+  .export-group select:focus { outline: none; border-color: var(--cyan); }
+
   .controls { display: flex; gap: 8px; }
   button {
     font-family: "Chakra Petch", sans-serif;
@@ -395,6 +403,14 @@
     <div id="mode" class="mode-badge mode-running">running</div>
     <span id="conn" class="conn">connecting…</span>
     <div class="spacer"></div>
+    <div class="export-group">
+      <select id="export-format" title="transcript format">
+        <option value="markdown">Markdown</option>
+        <option value="json">JSON</option>
+        <option value="text">Text</option>
+      </select>
+      <button onclick="exportChat()">Export</button>
+    </div>
     <div class="controls">
       <button class="pause" onclick="ctl('pause')">Pause</button>
       <button onclick="ctl('resume')">Resume</button>
@@ -794,6 +810,19 @@
     }
     rebuildTarget();
     rebuildFilterBar();
+  }
+
+  // ─── exportChat — download the server-side log transcript ────────────────
+  // The /export endpoint streams an attachment (Content-Disposition sets the
+  // filename), so a transient anchor click triggers a save without navigating.
+  function exportChat() {
+    const fmt = document.getElementById("export-format").value;
+    const a = document.createElement("a");
+    a.href = `/export?format=${encodeURIComponent(fmt)}`;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   // ─── ctl / sendHuman — unchanged ─────────────────────────────────────────
