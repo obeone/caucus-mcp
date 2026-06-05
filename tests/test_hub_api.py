@@ -75,6 +75,43 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
+# --- export --------------------------------------------------------------
+
+
+def test_export_defaults_to_json_attachment(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    _register(client, "beta")
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "ping"})
+
+    resp = client.get("/export")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    assert 'filename="caucus-chat.json"' in resp.headers["content-disposition"]
+    body = resp.json()
+    contents = [m["content"] for m in body["messages"]]
+    assert "ping" in contents
+    assert body["count"] == len(body["messages"])
+
+
+def test_export_markdown_alias_and_content(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    _register(client, "beta")
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "**bold** ask"})
+
+    resp = client.get("/export", params={"format": "md"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert 'filename="caucus-chat.md"' in resp.headers["content-disposition"]
+    assert "# Caucus chat export" in resp.text
+    assert "**bold** ask" in resp.text
+
+
+def test_export_unknown_format_falls_back_to_json(client: TestClient) -> None:
+    resp = client.get("/export", params={"format": "yaml"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+
+
 # --- send ----------------------------------------------------------------
 
 
