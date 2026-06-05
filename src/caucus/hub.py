@@ -22,9 +22,10 @@ from pathlib import Path
 import coloredlogs
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import __version__
+from . import export as export_mod
 from .models import (
     ChannelRequest,
     ChannelTopicRequest,
@@ -213,6 +214,26 @@ async def channels() -> dict[str, dict[str, dict[str, object]]]:
     discovery (including the late-joiner directory) and the operator console.
     """
     return {"channels": state.channels()}
+
+
+@app.get("/export")
+async def export(format: str = "json") -> Response:
+    """Download the recent message log as a transcript file.
+
+    A read-only operator convenience: serialises the same bounded log the UI
+    snapshot carries (:meth:`HubState.recent`) into a downloadable attachment.
+    Pick the shape with ``?format=``: ``json`` (default, machine-readable),
+    ``markdown`` (alias ``md``, human-readable, agent content kept verbatim), or
+    ``text`` (alias ``txt``, one flat line per message). Unknown values fall back
+    to JSON. The bounded log holds at most the last few hundred messages, so this
+    is a live snapshot, not a permanent archive.
+    """
+    body, media_type, filename = export_mod.render(state.recent(), format)
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _check_rate_limit(client: Client) -> JSONResponse | None:
