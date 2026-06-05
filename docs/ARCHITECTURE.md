@@ -38,7 +38,8 @@ denominator; everything else is a connector to it.
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
   endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`,
   `/peers`, `/channels` + `/channels/join` + `/channels/leave`)
-  plus a `/control` endpoint and a `/ui` WebSocket for the operator console
+  plus a `/control` endpoint, a read-only `/export` (download the recent log as
+  JSON / Markdown / text), and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
   The hub is the **single source of truth for the operating protocol**:
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
