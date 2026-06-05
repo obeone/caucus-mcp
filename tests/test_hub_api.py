@@ -8,8 +8,10 @@ focused, isolated cases.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
+import caucus.hub as hub_module
 from caucus.hub import PROTOCOL_VERSION
 from caucus.state import HubState
 
@@ -459,6 +461,95 @@ def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
     }
 
 
+# --- duplicate-join detection --------------------------------------------
+
+
+def test_register_duplicate_with_live_listener_is_refused(
+    client: TestClient, state: HubState
+) -> None:
+    """A second register for a name held by a live listener returns 409."""
+    body = client.post("/register", json={"project": "alpha"}).json()
+    assert body["token"]
+    # Simulate a live long-poll in flight on the underlying client object.
+    underlying = hub_module.state.client_for(body["token"])
+    assert underlying is not None
+    underlying.active_polls = 1
+
+    resp = client.post("/register", json={"project": "alpha"})
+
+    assert resp.status_code == 409
+    data = resp.json()
+    assert data["error"] == "name_in_use"
+    assert data["note"]
+
+
+def test_register_with_matching_token_is_reaffirmed(
+    client: TestClient, state: HubState
+) -> None:
+    """Presenting the correct token re-affirms even when active_polls > 0."""
+    body = client.post("/register", json={"project": "alpha"}).json()
+    token = body["token"]
+    # Simulate a live long-poll so a no-token re-register would be refused.
+    underlying = hub_module.state.client_for(token)
+    assert underlying is not None
+    underlying.active_polls = 1
+
+    resp = client.post("/register", json={"project": "alpha", "token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["token"] == token
+
+
 def _token(client: TestClient, project: str) -> str:
     """Re-register an already-known project to recover its (stable) token."""
     return str(client.post("/register", json={"project": project}).json()["token"])
+
+
+# --- active_polls accounting in /receive ---------------------------------
+
+
+def test_receive_active_polls_balanced_on_timeout(
+    client: TestClient, state: HubState
+) -> None:
+    """active_polls returns to 0 after a short-timeout /receive drains empty.
+
+    Drives the real endpoint with a sub-second timeout so the poll returns
+    promptly on an empty queue, then asserts the increment+decrement in the
+    finally block left active_polls at 0.
+    """
+    token = _register(client, "alpha")
+    underlying = state.client_for(token)
+    assert underlying is not None
+    assert underlying.active_polls == 0
+
+    resp = client.get("/receive", params={"token": token, "timeout": 0.2})
+    assert resp.status_code == 200
+    assert resp.json()["messages"] == []
+
+    assert underlying.active_polls == 0
+
+
+def test_receive_active_polls_balanced_on_disconnect(
+    client: TestClient, state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """active_polls returns to 0 when the disconnect-early-return path fires.
+
+    Monkeypatches Request.is_disconnected to return True so the endpoint
+    exits via the early-return branch; the finally block must still decrement.
+    """
+    import starlette.requests
+
+    async def _always_disconnected(self: object) -> bool:
+        return True
+
+    monkeypatch.setattr(starlette.requests.Request, "is_disconnected", _always_disconnected)
+
+    token = _register(client, "alpha")
+    underlying = state.client_for(token)
+    assert underlying is not None
+
+    resp = client.get("/receive", params={"token": token, "timeout": 0.2})
+    assert resp.status_code == 200
+    assert resp.json()["messages"] == []
+
+    assert underlying.active_polls == 0

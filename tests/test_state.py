@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 
 from caucus.models import BROADCAST, ControlMode, Message, MessageKind
-from caucus.state import HubState
+from caucus.state import HubState, RegisterOutcome
 
 
 def _msg(sender: str, recipient: str, content: str = "x") -> Message:
@@ -20,15 +20,16 @@ def _msg(sender: str, recipient: str, content: str = "x") -> Message:
 
 async def test_register_is_idempotent_per_project() -> None:
     state = HubState()
-    first = state.register("alpha")
-    second = state.register("alpha")
+    first = state.register("alpha").client
+    second = state.register("alpha").client
     assert first is second  # same record, token preserved
     assert state.peers() == ["alpha"]
 
 
 async def test_register_assigns_token_and_bucket() -> None:
     state = HubState()
-    client = state.register("alpha")
+    client = state.register("alpha").client
+    assert client is not None
     assert client.token
     assert client.bucket is not None
     assert state.client_for(client.token) is client
@@ -48,8 +49,10 @@ async def test_client_for_unknown_token_is_none() -> None:
 
 async def test_route_direct_message_reaches_only_recipient() -> None:
     state = HubState()
-    alpha = state.register("alpha")
-    beta = state.register("beta")
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
 
     delivered = state.route(_msg("alpha", "beta", "ping"))
 
@@ -66,9 +69,12 @@ async def test_route_to_unknown_recipient_delivers_to_nobody() -> None:
 
 async def test_broadcast_reaches_everyone_but_the_sender() -> None:
     state = HubState()
-    alpha = state.register("alpha")
-    beta = state.register("beta")
-    gamma = state.register("gamma")
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    gamma = state.register("gamma").client
+    assert alpha is not None
+    assert beta is not None
+    assert gamma is not None
 
     delivered = state.route(_msg("alpha", BROADCAST, "hello all"))
 
@@ -83,9 +89,12 @@ async def test_broadcast_reaches_everyone_but_the_sender() -> None:
 
 async def test_route_to_channel_reaches_only_members() -> None:
     state = HubState()
-    alpha = state.register("alpha")
-    beta = state.register("beta")
-    gamma = state.register("gamma")
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    gamma = state.register("gamma").client
+    assert alpha is not None
+    assert beta is not None
+    assert gamma is not None
     state.subscribe(alpha.token, "#design")  # sender is a member too
     state.subscribe(beta.token, "#design")
 
@@ -110,7 +119,8 @@ async def test_subscribe_unknown_token_is_false() -> None:
 
 async def test_subscribe_is_idempotent() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     assert state.subscribe(alpha.token, "#x") is True
     assert state.subscribe(alpha.token, "#x") is True
     assert state.channels() == {"#x": {"topic": None, "members": ["alpha"]}}
@@ -118,7 +128,8 @@ async def test_subscribe_is_idempotent() -> None:
 
 async def test_unsubscribe_removes_membership_and_empties_channel() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#x")
     assert state.unsubscribe(alpha.token, "#x") is True
     assert state.channels() == {}  # ephemeral: last member gone -> channel gone
@@ -127,7 +138,8 @@ async def test_unsubscribe_removes_membership_and_empties_channel() -> None:
 async def test_unsubscribe_stops_delivery() -> None:
     state = HubState()
     state.register("alpha")
-    beta = state.register("beta")
+    beta = state.register("beta").client
+    assert beta is not None
     state.subscribe(beta.token, "#x")
     state.unsubscribe(beta.token, "#x")
     assert state.route(_msg("alpha", "#x", "nope")) == []
@@ -140,8 +152,10 @@ async def test_unsubscribe_unknown_token_is_false() -> None:
 
 async def test_channels_lists_members_sorted() -> None:
     state = HubState()
-    alpha = state.register("alpha")
-    beta = state.register("beta")
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
     state.subscribe(beta.token, "#design")
     state.subscribe(alpha.token, "#design")
     state.subscribe(alpha.token, "#api")
@@ -153,7 +167,8 @@ async def test_channels_lists_members_sorted() -> None:
 
 async def test_dropping_a_member_updates_channels() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#x")
     state.unregister(alpha.token)
     assert state.channels() == {}
@@ -161,7 +176,8 @@ async def test_dropping_a_member_updates_channels() -> None:
 
 async def test_subscribe_pushes_channels_event_to_ui() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     queue = state.add_ui()
     queue.get_nowait()  # priming snapshot
 
@@ -177,7 +193,8 @@ async def test_subscribe_pushes_channels_event_to_ui() -> None:
 
 async def test_snapshot_includes_channels() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#x")
     snapshot = state.add_ui().get_nowait()
     assert snapshot["channels"] == {"#x": {"topic": None, "members": ["alpha"]}}
@@ -185,7 +202,8 @@ async def test_snapshot_includes_channels() -> None:
 
 async def test_set_topic_is_reflected_in_channels() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#design")
     state.set_topic("#design", "Designing the v2 items API")
     assert state.channels()["#design"]["topic"] == "Designing the v2 items API"
@@ -193,7 +211,8 @@ async def test_set_topic_is_reflected_in_channels() -> None:
 
 async def test_set_topic_blank_clears_it() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#design")
     state.set_topic("#design", "something")
     state.set_topic("#design", "   ")  # whitespace clears
@@ -202,19 +221,22 @@ async def test_set_topic_blank_clears_it() -> None:
 
 async def test_topic_is_pruned_when_channel_empties() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     state.subscribe(alpha.token, "#design")
     state.set_topic("#design", "ephemeral")
     state.unsubscribe(alpha.token, "#design")
     # A fresh member of the same name must not inherit the old topic.
-    beta = state.register("beta")
+    beta = state.register("beta").client
+    assert beta is not None
     state.subscribe(beta.token, "#design")
     assert state.channels()["#design"]["topic"] is None
 
 
 async def test_is_member_reflects_subscription() -> None:
     state = HubState()
-    alpha = state.register("alpha")
+    alpha = state.register("alpha").client
+    assert alpha is not None
     assert state.is_member(alpha.token, "#x") is False
     state.subscribe(alpha.token, "#x")
     assert state.is_member(alpha.token, "#x") is True
@@ -247,8 +269,10 @@ async def test_resume_reopens_transmit_gate() -> None:
 
 async def test_stop_floods_control_and_wakes_waiters() -> None:
     state = HubState()
-    alpha = state.register("alpha")
-    beta = state.register("beta")
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
 
     state.set_mode(ControlMode.STOPPED)
 
@@ -322,7 +346,8 @@ async def test_register_notifies_ui_with_system_and_peers() -> None:
 
 async def test_unregister_drops_peer_and_invalidates_token() -> None:
     state = HubState()
-    client = state.register("alpha")
+    client = state.register("alpha").client
+    assert client is not None
     state.register("beta")
 
     name = state.unregister(client.token)
@@ -341,7 +366,8 @@ async def test_unregister_unknown_token_is_none() -> None:
 
 async def test_unregister_notifies_ui_with_peers_and_system() -> None:
     state = HubState()
-    client = state.register("alpha")
+    client = state.register("alpha").client
+    assert client is not None
     queue = state.add_ui()
     queue.get_nowait()  # priming snapshot
 
@@ -357,8 +383,10 @@ async def test_unregister_notifies_ui_with_peers_and_system() -> None:
 
 async def test_reap_stale_drops_only_idle_clients() -> None:
     state = HubState()
-    stale = state.register("stale")
-    fresh = state.register("fresh")
+    stale = state.register("stale").client
+    fresh = state.register("fresh").client
+    assert stale is not None
+    assert fresh is not None
     # Backdate the stale peer well past a 30s TTL; leave the fresh one current.
     stale.last_seen -= 120.0
 
@@ -380,7 +408,8 @@ async def test_reap_stale_keeps_recently_seen_clients() -> None:
 
 async def test_reap_stale_uses_injected_now() -> None:
     state = HubState()
-    client = state.register("alpha")
+    client = state.register("alpha").client
+    assert client is not None
     # last_seen ~= time.time(); a far-future ``now`` makes it stale deterministically.
     reaped = state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
     assert reaped == ["alpha"]
@@ -389,7 +418,8 @@ async def test_reap_stale_uses_injected_now() -> None:
 async def test_receive_style_drain_after_route() -> None:
     """Mirror the hub's queue-draining: first await, then drain the rest."""
     state = HubState()
-    beta = state.register("beta")
+    beta = state.register("beta").client
+    assert beta is not None
     state.register("alpha")
     for i in range(3):
         state.route(_msg("alpha", "beta", f"m{i}"))
@@ -400,3 +430,77 @@ async def test_receive_style_drain_after_route() -> None:
         rest.append(beta.queue.get_nowait())
     contents = [first.content, *[m.content for m in rest]]
     assert contents == ["m0", "m1", "m2"]
+
+
+# --- new: duplicate-join detection ---------------------------------------
+
+
+async def test_register_returns_fresh_for_new_project() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.outcome is RegisterOutcome.FRESH
+    assert reg.client is not None
+    assert reg.client.project == "alpha"
+
+
+async def test_register_reaffirmed_with_matching_token() -> None:
+    state = HubState()
+    first = state.register("alpha")
+    assert first.client is not None
+    token = first.client.token
+
+    second = state.register("alpha", token=token)
+
+    assert second.outcome is RegisterOutcome.REAFFIRMED
+    assert second.client is first.client
+    assert state.peers() == ["alpha"]
+
+
+async def test_register_contested_when_live_listener() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.client is not None
+    reg.client.active_polls = 1
+
+    contested = state.register("alpha")  # no token
+
+    assert contested.outcome is RegisterOutcome.CONTESTED
+    assert contested.client is None
+    # Original client must be untouched.
+    assert state.peers() == ["alpha"]
+    assert state.client_for(reg.client.token) is reg.client
+
+
+async def test_register_replaced_when_no_live_listener() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.client is not None
+    assert reg.client.active_polls == 0  # default
+
+    replaced = state.register("alpha")  # no token, no live listener
+
+    assert replaced.outcome is RegisterOutcome.REPLACED
+    assert replaced.client is reg.client
+
+
+async def test_register_contested_bypassed_by_valid_token_even_with_live_listener() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.client is not None
+    reg.client.active_polls = 1
+    token = reg.client.token
+
+    reaffirmed = state.register("alpha", token=token)
+
+    assert reaffirmed.outcome is RegisterOutcome.REAFFIRMED
+    assert reaffirmed.client is reg.client
+
+
+async def test_kick_drops_live_peer() -> None:
+    state = HubState()
+    state.register("alpha")
+    state.register("beta")
+
+    assert state.kick("alpha") is True
+    assert state.peers() == ["beta"]
+    assert state.kick("ghost") is False

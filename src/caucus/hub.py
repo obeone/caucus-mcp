@@ -21,7 +21,7 @@ from pathlib import Path
 
 import coloredlogs
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import __version__
@@ -40,7 +40,7 @@ from .models import (
     SendResponse,
     is_channel,
 )
-from .state import Client, HubState
+from .state import Client, HubState, RegisterOutcome
 
 logger = logging.getLogger("caucus.hub")
 
@@ -322,8 +322,8 @@ async def protocol() -> dict[str, object]:
     return {"version": PROTOCOL_VERSION, "text": PROTOCOL_TEXT}
 
 
-@app.post("/register", response_model=RegisterResponse)
-async def register(req: RegisterRequest) -> RegisterResponse:
+@app.post("/register", response_model=None)
+async def register(req: RegisterRequest) -> RegisterResponse | JSONResponse:
     """Register a project and hand back its access token.
 
     Compares the caller's ``protocol_version`` against :data:`PROTOCOL_VERSION`.
@@ -331,12 +331,47 @@ async def register(req: RegisterRequest) -> RegisterResponse:
     ``protocol_stale=True`` plus the current :data:`PROTOCOL_TEXT` to re-read.
     The current channel directory (names, topics, members) ships in the response
     so a late-joining peer learns the open rooms without a follow-up call.
+
+    When the project name is already held by a live listener **and** no valid
+    token is presented, the hub refuses the request with HTTP 409 so the caller
+    knows it looks like a duplicate process.
+
+    When a valid ``token`` is presented and matches the existing record, the
+    registration is silently re-affirmed (REAFFIRMED outcome). When the prior
+    listener is gone (dead process / timed-out watcher), the slot is taken over
+    (REPLACED outcome) and a human-readable ``note`` advises the caller.
     """
-    client = state.register(req.project)
+    reg = state.register(req.project, req.token)
+    if reg.outcome is RegisterOutcome.CONTESTED:
+        logger.warning(
+            "duplicate join refused project=%s outcome=%s",
+            req.project,
+            reg.outcome.value,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "name_in_use",
+                "project": req.project,
+                "note": (
+                    "an active listener already holds this name; you look like"
+                    " a duplicate process — re-join under a different name."
+                ),
+            },
+        )
+    client = reg.client  # not None for FRESH / REAFFIRMED / REPLACED
+    assert client is not None
+    note = (
+        "you may be replacing a timed-out session and could be joining"
+        " mid-conversation."
+        if reg.outcome is RegisterOutcome.REPLACED
+        else None
+    )
     stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
     logger.info(
-        "registered project=%s (protocol_version=%s, stale=%s)",
+        "registered project=%s outcome=%s (protocol_version=%s, stale=%s)",
         req.project,
+        reg.outcome.value,
         req.protocol_version,
         stale,
     )
@@ -347,6 +382,7 @@ async def register(req: RegisterRequest) -> RegisterResponse:
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
         channels=state.channels(),
+        note=note,
     )
 
 
@@ -403,47 +439,69 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
 
 
 @app.get("/receive")
-async def receive(token: str, timeout: float = LONG_POLL_SECONDS) -> dict[str, object]:
+async def receive(
+    request: Request,
+    token: str,
+    timeout: float = LONG_POLL_SECONDS,
+) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
     Blocks up to ``timeout`` seconds. Honors the pause gate (holds messages
-    while paused) and surfaces a control ``stop`` signal immediately.
+    while paused) and surfaces a control ``stop`` signal immediately. Returns
+    early with an empty message list when the client disconnects mid-poll so
+    the live-listener counter is decremented promptly.
+
+    While this call is in flight, ``client.active_polls`` is incremented, which
+    lets :meth:`~caucus.state.HubState.register` distinguish a genuine
+    reconnect from a colliding duplicate process.
 
     Returns:
         ``{"messages": [...], "mode": "<mode>"}``. The list may be empty when
-        the poll times out, in which case the caller should poll again.
+        the poll times out or the client disconnects, in which case the caller
+        should poll again.
     """
     client = state.client_for(token)
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
 
-    deadline = asyncio.get_event_loop().time() + min(timeout, LONG_POLL_SECONDS)
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            return {"messages": [], "mode": state.mode.value}
+    client.active_polls += 1
+    try:
+        deadline = asyncio.get_event_loop().time() + min(timeout, LONG_POLL_SECONDS)
+        while True:
+            if await request.is_disconnected():
+                return {"messages": [], "mode": state.mode.value}
 
-        if state.mode is ControlMode.STOPPED:
-            stop = state.control_signal("stop")
-            return {"messages": [stop.to_public()], "mode": state.mode.value}
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return {"messages": [], "mode": state.mode.value}
 
-        # Pause gate: wait for resume (or stop) without draining the queue.
-        if not state.transmit.is_set():
+            if state.mode is ControlMode.STOPPED:
+                stop = state.control_signal("stop")
+                return {"messages": [stop.to_public()], "mode": state.mode.value}
+
+            # Pause gate: wait for resume (or stop) without draining the queue.
+            if not state.transmit.is_set():
+                try:
+                    await asyncio.wait_for(
+                        state.transmit.wait(), timeout=min(remaining, 1.0)
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
             try:
-                await asyncio.wait_for(state.transmit.wait(), timeout=min(remaining, 1.0))
+                first = await asyncio.wait_for(
+                    client.queue.get(), timeout=min(remaining, 1.0)
+                )
             except asyncio.TimeoutError:
-                pass
-            continue
+                continue
 
-        try:
-            first = await asyncio.wait_for(client.queue.get(), timeout=min(remaining, 1.0))
-        except asyncio.TimeoutError:
-            continue
-
-        messages = [first]
-        while not client.queue.empty():
-            messages.append(client.queue.get_nowait())
-        return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
+            messages = [first]
+            while not client.queue.empty():
+                messages.append(client.queue.get_nowait())
+            return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
+    finally:
+        client.active_polls -= 1
 
 
 @app.post("/control")
@@ -468,8 +526,11 @@ async def ui_socket(ws: WebSocket) -> None:
     """Bidirectional channel for the operator UI.
 
     Outbound: live feed events (messages, mode changes, peer lists).
-    Inbound: control commands, ``{"action": "pause"|"resume"|"stop"|"reset"}``,
-    and operator-authored messages, ``{"say": "...", "to": "<project>|all"}``.
+    Inbound:
+
+    * ``{"action": "pause"|"resume"|"stop"|"reset"}`` — control-mode change.
+    * ``{"say": "...", "to": "<project>|all"}`` — operator-authored message.
+    * ``{"kick": "<project>"}`` — evict the named peer from the roster.
     """
     await ws.accept()
     queue = state.add_ui()
@@ -500,6 +561,8 @@ async def ui_socket(ws: WebSocket) -> None:
                     kind=MessageKind.MESSAGE,
                 )
                 state.route(msg)
+            elif "kick" in data:
+                state.kick(str(data["kick"]))
     except WebSocketDisconnect:
         pass
     finally:
