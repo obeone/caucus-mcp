@@ -24,6 +24,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
+from . import __version__
 from .models import (
     ChannelRequest,
     ChannelTopicRequest,
@@ -183,7 +184,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await task
 
 
-app = FastAPI(title="Caucus Hub", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
 
 _UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
 
