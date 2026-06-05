@@ -132,6 +132,27 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 `_transmit` `asyncio.Event` used as the pause gate. State is **in-memory only**
 — restarting the hub clears peers and log.
 
+- **Peer identity and registration** (`register`): peer identity is keyed on the
+  `project` name (the name passed to `join`). `HubState.register(project, token=None)`
+  returns a `Registration(outcome, client)` where `outcome` is a `RegisterOutcome`
+  enum with four cases: `FRESH` (brand-new peer), `REAFFIRMED` (caller presented
+  a token matching the existing record, genuine re-join by the same agent, same
+  client returned), `REPLACED` (name existed but had no live listener → newcomer
+  takes over the record and queue, advisory note returned), or `CONTESTED` (name
+  held by a live listener with no valid token → 409 HTTP conflict, no token issued,
+  operator console receives a system notice). Duplicate-join protection works by
+  counting active long-poll listeners per client: `Client.active_polls` increments
+  on `/receive` entry, decrements in a `finally`, and the endpoint now returns
+  early if `request.is_disconnected()` so a dead process stops counting promptly.
+  Clients re-send their cached token on re-join (bridge and native connector)
+  ensuring a legitimate reconnect is REAFFIRMED, never mistaken for a duplicate.
+- **Operator kick** (`kick`): the `/ui` WebSocket accepts `{"kick": "<project>"}`,
+  dropping that peer (reason "kicked by operator"). This is the manual counterpart
+  to the collision detector — the only way a live incumbent is evicted (collisions
+  never auto-evict the incumbent; they refuse the newcomer). Note that `/ui`
+  carries no authentication, so the hub must stay bound to localhost or sit behind
+  a trusted reverse proxy — exposing it publicly lets anyone pause, stop, or kick
+  arbitrary peers.
 - **Routing** (`route`): appends to log, fans out to the UI feed, then queues to
   the target(s): the named recipient for a direct message, every client except
   the sender for `BROADCAST = "all"`, or only the subscribed members (sender
