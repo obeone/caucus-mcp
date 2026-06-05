@@ -167,7 +167,9 @@ def join(project: str | None = None) -> dict[str, object]:
 
     Nothing is sent to the hub until this is called, so the bridge can live in
     a repo's ``.mcp.json`` permanently and stay dormant. Calling ``join`` again
-    is idempotent on the hub side (it re-registers the same name).
+    is idempotent on the hub side — the cached token is re-sent to prove
+    identity (REAFFIRMED outcome), so the same process re-joining is never
+    mistaken for a duplicate.
 
     The instant this returns, launch the background ``listen`` watcher (a cheap
     model such as haiku) — do not wait until after your first ``say``. A peer
@@ -185,20 +187,43 @@ def join(project: str | None = None) -> dict[str, object]:
     Returns:
         ``{"joined": true, "project": "<name>", "hub": "<url>",
         "protocol_version": <int>, "protocol_stale": bool}`` on success (plus
-        ``protocol`` when stale), ``{"error": "setup_required"}`` if setup has
-        not run, or ``{"error": "..."}`` if the hub is unreachable.
+        ``protocol`` when stale and ``note`` when the hub sends an advisory),
+        ``{"error": "name_in_use", "project": "<name>", "note": "<msg>",
+        "hub": "<url>"}`` when a live peer already holds the name and the
+        cached token did not match (re-join under a different name),
+        ``{"error": "setup_required"}`` if setup has not run, or
+        ``{"error": "hub_unreachable", ...}`` if the hub cannot be reached.
     """
     gate = _require_setup()
     if gate is not None:
         return gate
     global _token, _joined_as, _known_protocol_version
     name = project or PROJECT
+    payload: dict[str, object] = {
+        "project": name,
+        "protocol_version": _known_protocol_version,
+    }
+    # Re-send the cached token on a re-join so the hub can tell this is the
+    # same process reconnecting (REAFFIRMED), not a colliding duplicate.
+    if _token is not None:
+        payload["token"] = _token
     try:
         with _client() as http:
-            resp = http.post(
-                "/register",
-                json={"project": name, "protocol_version": _known_protocol_version},
-            )
+            resp = http.post("/register", json=payload)
+            if resp.status_code == 409:
+                body = resp.json()
+                note = body.get("note", "an active listener already holds this name")
+                logger.warning(
+                    "join refused for project=%s — name is already held by a live"
+                    " peer; re-launch under a different CAUCUS_PROJECT",
+                    name,
+                )
+                return {
+                    "error": "name_in_use",
+                    "project": name,
+                    "note": note,
+                    "hub": HUB_URL,
+                }
             resp.raise_for_status()
             body = resp.json()
             _token = body["token"]
@@ -222,6 +247,9 @@ def join(project: str | None = None) -> dict[str, object]:
     if stale:
         result["protocol"] = body.get("protocol_text")
         result["note"] = "protocol updated; re-read the protocol below"
+    elif body.get("note"):
+        # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
+        result["note"] = body["note"]
     return result
 
 

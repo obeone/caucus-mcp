@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from caucus.hub_connector import HubConnector
+from caucus.hub_connector import HubConnector, NameInUseError
 
 
 @pytest.fixture(autouse=True)
@@ -202,3 +202,74 @@ async def test_use_outside_context_raises() -> None:
     hub = HubConnector("http://127.0.0.1:8765")
     with pytest.raises(RuntimeError):
         await hub.peers()
+
+
+# --- duplicate-join protection -------------------------------------------
+
+
+async def test_register_raises_name_in_use_error_on_409() -> None:
+    """``register`` raises :class:`NameInUseError` when the hub returns 409.
+
+    Uses an ``httpx`` mock transport so no live hub is needed. The 409 body
+    matches the hub's contract: ``{"error": "name_in_use", "project": ...,
+    "note": "..."}``.
+    """
+    note_text = (
+        "an active listener already holds this name; you look like a duplicate"
+        " process — re-join under a different name."
+    )
+
+    class _Mock409Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"error": "name_in_use", "project": "dupe", "note": note_text},
+            )
+
+    connector = HubConnector("http://stub")
+    connector._http = httpx.AsyncClient(
+        base_url="http://stub", transport=_Mock409Transport()
+    )
+    try:
+        with pytest.raises(NameInUseError, match="active listener"):
+            await connector.register("dupe", 1)
+    finally:
+        await connector._http.aclose()
+        connector._http = None
+
+
+async def test_register_reaffirmed_with_token(live_hub: str) -> None:
+    """Re-registering with the correct token succeeds (REAFFIRMED outcome).
+
+    The second ``register`` call passes the token obtained from the first;
+    the hub recognises the agent and returns 200 with the same token.
+    """
+    async with HubConnector(live_hub) as hub:
+        proto = await hub.fetch_protocol()
+        first = await hub.register("conn-reaffirm", proto.version)
+        # Re-join passing the token — must not raise and must return the
+        # same token (REAFFIRMED: no new credential is issued).
+        second = await hub.register("conn-reaffirm", proto.version, token=first.token)
+    assert second.token == first.token
+    assert second.project == "conn-reaffirm"
+
+
+async def test_register_note_is_populated_on_replaced(live_hub: str) -> None:
+    """The ``note`` field on :class:`Membership` carries the hub advisory.
+
+    Force a REPLACED outcome: register a peer (no active poll, so
+    ``active_polls == 0``), then re-register under the same name *without* a
+    token.  Because no poll is in flight the hub treats this as a takeover of
+    a dead/timed-out slot (REPLACED) and returns a ``note`` advising that the
+    new agent may be joining mid-conversation.
+    """
+    async with HubConnector(live_hub) as hub:
+        proto = await hub.fetch_protocol()
+        # First registration — no poll started, so active_polls stays 0.
+        await hub.register("conn-replaced-note", proto.version)
+        # Re-register without a token — REPLACED outcome, note present.
+        second = await hub.register("conn-replaced-note", proto.version)
+    assert second.note is not None
+    assert "mid-conversation" in second.note

@@ -37,6 +37,16 @@ logger = logging.getLogger("caucus.connector")
 DEFAULT_TIMEOUT = 35.0
 
 
+class NameInUseError(RuntimeError):
+    """Raised when ``/register`` is refused because a live peer already holds the name.
+
+    The hub returns HTTP 409 with ``error: "name_in_use"`` when the project name
+    is currently held by an active listener and no matching token is presented.
+    The caller should either wait for the existing peer to leave, or re-launch
+    under a different ``CAUCUS_PROJECT``.
+    """
+
+
 @dataclass(slots=True)
 class Protocol:
     """The operating protocol as served by the hub at ``/protocol``.
@@ -65,6 +75,9 @@ class Membership:
         channels: The open-channel directory at registration time, so a
             late-joining agent learns the rooms up front. Maps each channel to
             ``{"topic": str | None, "members": [name, ...]}``.
+        note: Optional human-readable advisory from the hub, e.g. when this
+            registration took over a timed-out session. ``None`` on ordinary
+            joins.
     """
 
     token: str
@@ -73,6 +86,7 @@ class Membership:
     protocol_stale: bool
     protocol_text: str | None
     channels: dict[str, dict[str, object]] = field(default_factory=dict)
+    note: str | None = None
 
 
 @dataclass(slots=True)
@@ -187,25 +201,49 @@ class HubConnector:
         body = resp.json()
         return Protocol(version=int(body["version"]), text=str(body["text"]))
 
-    async def register(self, project: str, protocol_version: int | None) -> Membership:
+    async def register(
+        self,
+        project: str,
+        protocol_version: int | None,
+        token: str | None = None,
+    ) -> Membership:
         """Register ``project`` with the hub and obtain an access token.
+
+        When ``token`` is provided (a previously-issued credential), the hub
+        treats this as a re-join by the same agent and responds with a
+        REAFFIRMED outcome rather than refusing it as a duplicate. Pass the
+        token whenever re-registering an existing session.
 
         Args:
             project: Name to register under.
             protocol_version: Protocol revision the caller has read, so the hub
                 can flag drift. Pass the version from :meth:`fetch_protocol`.
+            token: The access token previously issued for this project, or
+                ``None`` on a first join. Re-sending it proves identity and
+                prevents the hub from treating the re-join as a duplicate.
 
         Returns:
             The :class:`Membership` describing the registered peer.
 
         Raises:
+            NameInUseError: If the hub refuses the join with HTTP 409 because
+                a live listener already holds the project name and the presented
+                token (if any) did not match.
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.post(
-            "/register",
-            json={"project": project, "protocol_version": protocol_version},
-        )
+        payload: dict[str, object] = {
+            "project": project,
+            "protocol_version": protocol_version,
+        }
+        if token is not None:
+            payload["token"] = token
+        resp = await http.post("/register", json=payload)
+        if resp.status_code == 409:
+            body = resp.json()
+            raise NameInUseError(
+                body.get("note") or "name already in use"
+            )
         resp.raise_for_status()
         body = resp.json()
         return Membership(
@@ -215,6 +253,7 @@ class HubConnector:
             protocol_stale=bool(body.get("protocol_stale")),
             protocol_text=body.get("protocol_text"),
             channels=dict(body.get("channels", {})),
+            note=body.get("note") or None,
         )
 
     async def leave(self, token: str) -> None:
