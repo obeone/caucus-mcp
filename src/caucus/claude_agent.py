@@ -70,6 +70,8 @@ DEFAULT_POLL_TIMEOUT = 25.0
 _CAUCUS_TOOLS = [
     "mcp__caucus__say",
     "mcp__caucus__list_peers",
+    "mcp__caucus__ask_operator",
+    "mcp__caucus__list_forms",
     "mcp__caucus__join_channel",
     "mcp__caucus__leave_channel",
     "mcp__caucus__set_channel_topic",
@@ -238,6 +240,11 @@ def compose_system_prompt(
         'with "[caucus inbound]", each naming the sender and recipient.\n'
         "- To speak, use the `say` tool (set `to` to a peer name, or to=\"all\" "
         "to broadcast). Use `list_peers` to see who is connected.\n"
+        "- When the work needs a HUMAN decision, do NOT ask in chat — agree "
+        "in-room on a focused set of questions, then ONE agent calls "
+        "`ask_operator(title, fields, to)` (check `list_forms` first to avoid "
+        "duplicates). The operator's answer arrives automatically as an inbound "
+        '"answer" message.\n'
         "- For a focused side-conversation with a subset of peers, use a private "
         'channel: a "#"-prefixed name (e.g. "#api-shape"). say(to="#api-shape", '
         "...) talks in it and subscribes you; `join_channel`/`leave_channel` "
@@ -410,6 +417,42 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
+        "ask_operator",
+        "Push a small questionnaire to the human operator when the work needs a "
+        "human decision. Agree in-room first, then ONE agent asks. fields is a "
+        "list of {key, label, type: radio|checkbox|text|textarea, options "
+        "(radio/checkbox only), required, allow_other}. to is \"all\" or a "
+        '"#channel". The answer returns as an inbound "answer" message.',
+        {"title": str, "fields": list, "to": str},
+    )
+    async def ask_operator(args: dict[str, Any]) -> dict[str, Any]:
+        to = args.get("to") or "all"
+        fields = args.get("fields") or []
+        try:
+            result = await connector.ask_operator(token, to, args["title"], fields)
+        except Exception as exc:  # surface a bad request to the agent, don't crash
+            text = f"could not open form: {exc}"
+        else:
+            text = f"form opened (id={result.form_id}) → {result.to}"
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "list_forms",
+        "List the operator forms currently awaiting an answer, so you do not "
+        "open a duplicate of one already pending.",
+        {},
+    )
+    async def list_forms(args: dict[str, Any]) -> dict[str, Any]:
+        forms = await connector.list_forms()
+        if not forms:
+            text = "no pending forms"
+        else:
+            text = "pending forms: " + ", ".join(
+                f"{f.get('id')} “{f.get('title')}” → {f.get('to')}" for f in forms
+            )
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
         "join_channel",
         'Subscribe to a private channel (e.g. "#api-shape") to receive its '
         "messages. Only members get a channel's traffic.",
@@ -514,6 +557,8 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         tools=[
             say,
             list_peers,
+            ask_operator,
+            list_forms,
             join_channel,
             leave_channel,
             set_channel_topic,

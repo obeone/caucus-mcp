@@ -131,6 +131,8 @@ class Inbound:
     Attributes:
         messages: Ordinary chatter messages (control signals removed), each in
             the hub's public shape (``sender``, ``recipient``, ``content``, …).
+            Operator-form answers (kind ``answer``) are kept here too, carrying
+            their bundle in ``meta`` — the field is passed through untouched.
         mode: The room's current control mode (``running``/``paused``/``stopped``).
         stop: ``True`` when a control ``stop`` was present; the caller should
             end the exchange.
@@ -139,6 +141,20 @@ class Inbound:
     messages: list[dict[str, object]]
     mode: str | None
     stop: bool
+
+
+@dataclass(slots=True)
+class AskResult:
+    """The outcome of a ``/ask`` — an opened operator form.
+
+    Attributes:
+        form_id: The hub-assigned id of the pending form.
+        to: The audience the eventual answer will route to (``"all"`` or a
+            ``#channel``).
+    """
+
+    form_id: str
+    to: str
 
 
 class HubConnector:
@@ -404,6 +420,57 @@ class HubConnector:
         resp = await http.get("/peers")
         resp.raise_for_status()
         return list(resp.json().get("peers", []))
+
+    async def ask_operator(
+        self,
+        token: str,
+        to: str,
+        title: str,
+        fields: list[dict[str, object]],
+    ) -> AskResult:
+        """Open an operator form and return its id.
+
+        The answer bundle later returns through :meth:`receive` as an inbound
+        message of kind ``answer`` carrying the answers in its ``meta``.
+
+        Args:
+            token: The asker's access token.
+            to: Audience for the answer — ``"all"`` or a ``#channel``.
+            title: Short headline for the form.
+            fields: The field specs, each ``{key, label, type, options,
+                required, allow_other}`` (options only for radio/checkbox).
+
+        Returns:
+            An :class:`AskResult` with the new form's id and audience.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes
+                (e.g. 401 unknown token, 409 stopped, 422 bad target/field, 429
+                rate limited).
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/ask",
+            json={"token": token, "to": to, "title": title, "fields": fields},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return AskResult(form_id=str(body["form_id"]), to=str(body["to"]))
+
+    async def list_forms(self) -> list[dict[str, object]]:
+        """List the operator forms currently awaiting an answer.
+
+        Returns:
+            The pending forms in the hub's public shape (``id``, ``title``,
+            ``asker``, ``to``, ``fields``, ``status``, ``answers``, ``ts``).
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error.
+        """
+        http = self._require_http()
+        resp = await http.get("/forms")
+        resp.raise_for_status()
+        return list(resp.json().get("forms", []))
 
     async def join_channel(self, token: str, channel: str) -> bool:
         """Subscribe the token holder to a private channel (self-join).
