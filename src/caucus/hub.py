@@ -35,11 +35,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from . import __version__
 from . import export as export_mod
 from .models import (
+    BROADCAST,
     AckRequest,
+    AskRequest,
+    AskResponse,
     ChannelRequest,
     ChannelTopicRequest,
     ControlMode,
     ControlRequest,
+    Field,
     FloorRequest,
     LeaveRequest,
     Message,
@@ -66,7 +70,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -206,6 +210,27 @@ The talking stick (when something grave is getting drowned):
     kicked, or times out, the hub automatically hands the stick to the next hand
     or puts it away. The human operator can always speak regardless of any stick,
     and can force a stick closed at any time — their word is final.
+
+Asking the human (operator forms):
+  - When the work needs a HUMAN decision (a choice, an approval, a value only
+    the operator can give), do NOT each ask separately and do NOT scatter the
+    question across several say()s. Agree in-room on a small, restricted set of
+    questions first, then have ONE agent push a single form with
+    ask_operator(title, fields, to).
+  - Before pushing, call list_forms(). If a pending form already covers the
+    need, do not open a duplicate — wait for its answer.
+  - Each field is {key, label, type, options, required, allow_other}, where
+    type is one of radio | checkbox | text | textarea. options are for
+    radio/checkbox only (omit them for text/textarea). Keep the set focused:
+    ask only what the human must decide, with clear labels.
+  - The operator fills a wizard — one card per field, a recap, then Submit or
+    Cancel. The answer returns to you as a normal inbound message of kind
+    "answer", carrying the bundle in its meta (form_id, title, status, answers).
+    A cancellation returns the same way with status "cancelled" and no answers —
+    do NOT blindly re-ask after a cancel; treat it as the human declining.
+  - Scope with to: "all" routes the answer to the whole room, or a "#channel"
+    routes it to only that side-room's members. Pick the narrowest audience that
+    needs the decision.
 
 Listening (important):
   - Start the watcher the moment you join(), not after your first say(). The
@@ -590,6 +615,62 @@ def _resolve_receive_token(authorization: str | None, token: str | None) -> str 
     return token
 
 
+@app.post("/ask", response_model=None)
+async def ask(req: AskRequest) -> AskResponse | JSONResponse:
+    """Open an operator form on behalf of an agent.
+
+    One agent (after the agents agree in-room) pushes a small questionnaire to
+    the human operator; the answer bundle later returns to the form's audience as
+    a normal inbound ``answer`` message. Rejected with 401 for an unknown token,
+    409 when the room is stopped, and 429 when the asker exceeds its rate limit
+    (the same per-sender brake as ``/send``). The audience ``to`` must be
+    :data:`BROADCAST` or a ``#channel`` (anything else is 422); for a channel the
+    asker is auto-subscribed so it receives the channel-scoped answer, mirroring
+    ``/send``.
+    """
+    client = state.client_for(req.token)
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    if state.mode is ControlMode.STOPPED:
+        raise HTTPException(status_code=409, detail="room stopped")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
+    if req.to != BROADCAST and not is_channel(req.to):
+        raise HTTPException(
+            status_code=422, detail="form target must be 'all' or a #channel"
+        )
+    if is_channel(req.to):
+        state.subscribe(client.token, req.to)
+    fields = [
+        Field(
+            key=spec.key,
+            label=spec.label,
+            type=spec.type,
+            options=list(spec.options),
+            required=spec.required,
+            allow_other=spec.allow_other,
+        )
+        for spec in req.fields
+    ]
+    form = state.create_form(
+        asker=client.project, to=req.to, title=req.title, fields=fields
+    )
+    logger.info("form %s %s -> %s (%d fields)", form.id, client.project, req.to, len(fields))
+    return AskResponse(form_id=form.id, to=form.to)
+
+
+@app.get("/forms")
+async def forms() -> dict[str, list[dict[str, object]]]:
+    """List the currently pending operator forms.
+
+    Read-only and unauthenticated, like ``/peers``: an agent calls this before
+    pushing a form so it does not duplicate one already awaiting the operator.
+    Resolved forms are dropped, so this only lists pending ones.
+    """
+    return {"forms": state.list_forms()}
+
+
 @app.get("/receive")
 async def receive(
     request: Request,
@@ -792,6 +873,9 @@ async def ui_socket(ws: WebSocket) -> None:
     * ``{"kick": "<project>"}`` — evict the named peer from the roster.
     * ``{"floor": {"action": "clear", "scope": "<scope>"}}`` — force a talking
       stick closed regardless of who holds it (operator override).
+    * ``{"answer": {"id": "<form_id>", "answers": {...}}}`` — submit a form's
+      answers; routed to the form's audience as an ``answer`` message.
+    * ``{"cancel_form": "<form_id>"}`` — cancel a pending form.
     """
     await ws.accept()
     queue = state.add_ui()
@@ -832,6 +916,15 @@ async def ui_socket(ws: WebSocket) -> None:
                     and isinstance(floor_cmd.get("scope"), str)
                 ):
                     state.clear_floor(floor_cmd["scope"])
+            elif "answer" in data:
+                answer = data["answer"]
+                if isinstance(answer, dict):
+                    form_id = str(answer.get("id", ""))
+                    raw = answer.get("answers")
+                    answers = raw if isinstance(raw, dict) else {}
+                    state.answer_form(form_id, answers)
+            elif "cancel_form" in data:
+                state.cancel_form(str(data["cancel_form"]))
     except WebSocketDisconnect:
         pass
     finally:
