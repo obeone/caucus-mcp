@@ -14,7 +14,16 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 
-from .models import BROADCAST, ControlMode, Message, MessageKind, is_channel
+from .models import (
+    BROADCAST,
+    ControlMode,
+    Field,
+    Form,
+    FormStatus,
+    Message,
+    MessageKind,
+    is_channel,
+)
 from .ratelimit import TokenBucket
 
 
@@ -160,6 +169,7 @@ class HubState:
         # one floor per scope; while one is held the hub bars every other peer's
         # send to that scope (see :meth:`floor_blocks`). In-memory only.
         self._floors: dict[str, Floor] = {}  # scope -> Floor
+        self._forms: dict[str, Form] = {}  # form id -> pending Form
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
         self._mode: ControlMode = ControlMode.RUNNING
@@ -1119,6 +1129,154 @@ class HubState:
             kind=MessageKind.CONTROL,
         )
 
+    # --- operator forms --------------------------------------------------
+
+    def create_form(
+        self, asker: str, to: str, title: str, fields: list[Field]
+    ) -> Form:
+        """Open a pending operator form and announce it to the UI.
+
+        Stores the :class:`Form` as PENDING, pushes a ``form`` event so the
+        operator console can raise the wizard, and drops a short readable system
+        notice into the feed so the room (and the human) can see a form was
+        opened. The caller is expected to have validated ``to`` (broadcast or a
+        channel) and converted the field specs.
+
+        Args:
+            asker: Project name of the agent opening the form.
+            to: Audience for the eventual answer — :data:`BROADCAST` or a channel.
+            title: Short headline shown atop the wizard.
+            fields: The ordered questions to ask.
+
+        Returns:
+            The newly created (pending) :class:`Form`.
+        """
+        form = Form(title=title, asker=asker, to=to, fields=fields)
+        self._forms[form.id] = form
+        self._push_ui({"type": "form", "form": form.to_public()})
+        self._announce_system(f"📋 {asker} opened form “{title}” → {to}")
+        return form
+
+    def answer_form(self, form_id: str, answers: dict[str, object]) -> Form | None:
+        """Resolve a pending form with the operator's answers and route them.
+
+        Looks up the pending form; returns ``None`` if it is unknown or already
+        resolved. Otherwise marks it ANSWERED, stores ``answers``, removes it
+        from the pending map, and routes a single :attr:`MessageKind.ANSWER`
+        message (``sender="human"``) to the form's audience carrying the answer
+        bundle in ``meta``. Because :meth:`route` excludes the sender, every real
+        agent — including the asker — receives it; a channel form reaches only
+        that channel's members. Finally fans a ``form_resolved`` event to the UI.
+
+        Args:
+            form_id: Identifier of the form to resolve.
+            answers: The operator's answers keyed by field ``key``.
+
+        Returns:
+            The resolved :class:`Form`, or ``None`` if it was unknown/not pending.
+        """
+        form = self._forms.get(form_id)
+        if form is None or form.status is not FormStatus.PENDING:
+            return None
+        form.status = FormStatus.ANSWERED
+        form.answers = answers
+        del self._forms[form_id]
+        recap = self._render_form_recap(form, answers)
+        self.route(
+            Message(
+                sender="human",
+                recipient=form.to,
+                content=recap,
+                kind=MessageKind.ANSWER,
+                meta={
+                    "form_id": form.id,
+                    "title": form.title,
+                    "status": "answered",
+                    "answers": answers,
+                },
+            )
+        )
+        self._push_ui(
+            {
+                "type": "form_resolved",
+                "id": form.id,
+                "status": "answered",
+                "answers": answers,
+            }
+        )
+        return form
+
+    def cancel_form(self, form_id: str) -> Form | None:
+        """Cancel a pending form and tell its audience it was dropped.
+
+        Mirrors :meth:`answer_form` for the cancellation path: marks the form
+        CANCELLED (answers stay ``None``), pops it from the pending map, routes a
+        single :attr:`MessageKind.ANSWER` message announcing the cancellation
+        (so agents do not keep waiting), and pushes a ``form_resolved`` event.
+
+        Args:
+            form_id: Identifier of the form to cancel.
+
+        Returns:
+            The cancelled :class:`Form`, or ``None`` if it was unknown/not pending.
+        """
+        form = self._forms.get(form_id)
+        if form is None or form.status is not FormStatus.PENDING:
+            return None
+        form.status = FormStatus.CANCELLED
+        del self._forms[form_id]
+        self.route(
+            Message(
+                sender="human",
+                recipient=form.to,
+                content=f"form “{form.title}” cancelled by operator",
+                kind=MessageKind.ANSWER,
+                meta={
+                    "form_id": form.id,
+                    "title": form.title,
+                    "status": "cancelled",
+                    "answers": None,
+                },
+            )
+        )
+        self._push_ui(
+            {"type": "form_resolved", "id": form.id, "status": "cancelled"}
+        )
+        return form
+
+    def list_forms(self) -> list[dict[str, object]]:
+        """Return the currently pending forms as JSON-friendly dicts.
+
+        Resolved forms are popped on answer/cancel, so this only ever lists
+        forms still awaiting the operator.
+        """
+        return [f.to_public() for f in self._forms.values()]
+
+    @staticmethod
+    def _render_form_recap(form: Form, answers: dict[str, object]) -> str:
+        """Build a human-readable recap of a form's answers.
+
+        Args:
+            form: The form being resolved (for its title and field labels).
+            answers: The operator's answers keyed by field ``key``.
+
+        Returns:
+            A multi-line ``answers to form "<title>": ...`` recap, one line per
+            field, rendering list answers (checkboxes) as comma-separated values.
+        """
+        labels = {f.key: f.label for f in form.fields}
+        lines = [f"answers to form “{form.title}”:"]
+        for key, label in labels.items():
+            value = answers.get(key)
+            if isinstance(value, list):
+                rendered = ", ".join(str(v) for v in value) or "(none)"
+            elif value in (None, ""):
+                rendered = "(no answer)"
+            else:
+                rendered = str(value)
+            lines.append(f"- {label}: {rendered}")
+        return "\n".join(lines)
+
     # --- control mode ----------------------------------------------------
 
     def set_mode(self, mode: ControlMode) -> None:
@@ -1156,7 +1314,8 @@ class HubState:
         self._ui.add(q)
         q.put_nowait({"type": "snapshot", "mode": self._mode.value,
                       "peers": self.peers(), "channels": self.channels(),
-                      "floors": self.floors_public(), "log": self.recent()})
+                      "floors": self.floors_public(),
+                      "forms": self.list_forms(), "log": self.recent()})
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:
