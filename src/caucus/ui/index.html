@@ -1049,6 +1049,7 @@
   let channels = {};      // latest complete channel map: { "#name": { topic: str|null, members: [...] } }
   let allMessages = [];   // every message received, in order, for feed re-render
   let floors = {};        // active talking sticks: { "<scope>": { scope, holder, reason, hands, since } }
+  let _radioGroupSeq = 0; // monotonic counter — unique name per rendered radio group
 
   // Pending forms map: id → form object
   let pendingForms = new Map();
@@ -1618,6 +1619,10 @@
 
   // ─── validateFieldValue ───────────────────────────────────────────────────
   function validateFieldValue(field, val) {
+    // Sentinel returned by radio/checkbox getValue when "Other…" is selected
+    // but its free-text box was left empty — give a targeted message regardless
+    // of whether the field is required (the operator clearly intends to fill it).
+    if (val === "__other_empty__") return "Please fill in the 'Other' value.";
     if (!field.required) return null;
     if (field.type === "checkbox") {
       if (!Array.isArray(val) || val.length === 0) return "Please select at least one option.";
@@ -1640,7 +1645,7 @@
     let otherInput = null;
     let otherWrapper = null;
 
-    const name = "wiz_radio_" + field.key + "_" + Date.now();
+    const name = "wiz_radio_" + field.key + "_" + (++_radioGroupSeq);
 
     for (const opt of opts) {
       const label = document.createElement("label");
@@ -1701,7 +1706,9 @@
       const checked = optionsEl.querySelector("input[type=radio]:checked");
       if (!checked) return field.required ? null : "";
       if (checked.value === "__other__") {
-        return (otherInput ? otherInput.value.trim() : "") || (field.required ? null : "");
+        const text = otherInput ? otherInput.value.trim() : "";
+        // Return a distinct sentinel so validateFieldValue can emit the right message
+        return text || "__other_empty__";
       }
       return checked.value;
     };
@@ -1772,16 +1779,24 @@
 
     return () => {
       const chosen = [];
+      let otherCheckedEmpty = false;
       optionsEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
         if (!cb.checked) return;
         if (cb.value === "__other__") {
           const v = otherInput ? otherInput.value.trim() : "";
-          if (v) chosen.push(v);
-          // If "Other" checked but no text, field.required check handles it
+          if (v) {
+            chosen.push(v);
+          } else {
+            // "Other" is checked but the text box is empty — flag it so
+            // validateFieldValue can surface the right message.
+            otherCheckedEmpty = true;
+          }
         } else {
           chosen.push(cb.value);
         }
       });
+      // Signal "Other empty" only when no other selections compensate
+      if (otherCheckedEmpty && chosen.length === 0) return "__other_empty__";
       return chosen;
     };
   }
