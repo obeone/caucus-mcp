@@ -600,6 +600,129 @@ def _token(client: TestClient, project: str) -> str:
     return str(client.post("/register", json={"project": project}).json()["token"])
 
 
+# --- operator forms ------------------------------------------------------
+
+
+def _radio_field() -> dict[str, object]:
+    """A minimal valid radio field spec."""
+    return {"key": "ok", "label": "Proceed?", "type": "radio", "options": ["yes", "no"]}
+
+
+def test_ask_happy_path_opens_form(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["form_id"]
+    assert body["to"] == "all"
+    # The form now shows up as pending.
+    forms = client.get("/forms").json()["forms"]
+    assert len(forms) == 1
+    assert forms[0]["title"] == "Deploy?"
+
+
+def test_ask_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post(
+        "/ask", json={"token": "bogus", "title": "t", "fields": [_radio_field()]}
+    )
+    assert resp.status_code == 401
+
+
+def test_ask_when_stopped_is_409(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    client.post("/control", json={"action": "stop"})
+    resp = client.post(
+        "/ask", json={"token": token, "title": "t", "fields": [_radio_field()]}
+    )
+    assert resp.status_code == 409
+
+
+def test_ask_rejects_bad_target(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/ask",
+        json={"token": token, "to": "beta", "title": "t", "fields": [_radio_field()]},
+    )
+    assert resp.status_code == 422
+
+
+def test_ask_rejects_text_field_with_options(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/ask",
+        json={
+            "token": token,
+            "title": "t",
+            "fields": [{"key": "k", "label": "l", "type": "text", "options": ["x"]}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_ask_to_channel_subscribes_asker(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post(
+        "/ask",
+        json={
+            "token": token,
+            "to": "#deploy",
+            "title": "t",
+            "fields": [_radio_field()],
+        },
+    )
+    assert resp.status_code == 200
+    assert "alpha" in client.get("/channels").json()["channels"]["#deploy"]["members"]
+
+
+def test_forms_endpoint_lists_pending(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    assert client.get("/forms").json()["forms"] == []
+    client.post(
+        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
+    )
+    assert len(client.get("/forms").json()["forms"]) == 1
+
+
+def test_ui_answer_round_trip_reaches_asker(client: TestClient) -> None:
+    """Open a form, answer it over /ui, and the asker's /receive gets it."""
+    token = _register(client, "alpha")
+    form_id = client.post(
+        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
+    ).json()["form_id"]
+
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
+
+    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    answers = [m for m in got["messages"] if m["kind"] == "answer"]
+    assert answers
+    assert answers[0]["meta"]["form_id"] == form_id
+    assert answers[0]["meta"]["status"] == "answered"
+    assert answers[0]["meta"]["answers"] == {"ok": "yes"}
+    # The form is no longer pending.
+    assert client.get("/forms").json()["forms"] == []
+
+
+def test_ui_cancel_form_notifies_asker(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    form_id = client.post(
+        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
+    ).json()["form_id"]
+
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"cancel_form": form_id})
+
+    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    answers = [m for m in got["messages"] if m["kind"] == "answer"]
+    assert answers
+    assert answers[0]["meta"]["status"] == "cancelled"
+    assert client.get("/forms").json()["forms"] == []
+
+
 # --- active_polls accounting in /receive ---------------------------------
 
 

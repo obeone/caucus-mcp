@@ -463,6 +463,60 @@ def test_join_surfaces_channel_directory(
     assert channels["#br-dir"]["topic"] == "dir topic"
 
 
+# --- operator forms ------------------------------------------------------
+
+
+def _radio_field() -> dict[str, object]:
+    return {"key": "ok", "label": "Proceed?", "type": "radio", "options": ["yes", "no"]}
+
+
+def test_ask_operator_opens_form(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "form-asker")
+    bridge.join()
+    result = bridge.ask_operator("Deploy?", [_radio_field()])
+    assert result["form_id"]
+    assert result["to"] == "all"
+    assert any(f["title"] == "Deploy?" for f in bridge.list_forms()["forms"])
+
+
+def test_ask_operator_requires_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "form-unjoined")
+    assert bridge.ask_operator("t", [_radio_field()]) == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
+
+
+def test_ask_operator_rejects_bad_target(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "form-bad-target")
+    bridge.join()
+    result = bridge.ask_operator("t", [_radio_field()], to="some-peer")
+    assert result["error"] == "invalid_form"
+
+
+def test_list_forms_reflects_pending(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "form-lister")
+    bridge.join()
+    bridge.ask_operator("Pending one", [_radio_field()])
+    titles = [f["title"] for f in bridge.list_forms()["forms"]]
+    assert "Pending one" in titles
+
+
+def test_form_tools_refuse_before_setup(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_setup_done", False)
+    expected = {"error": "setup_required", "hint": "call setup() first"}
+    assert bridge.ask_operator("t", [_radio_field()]) == expected
+    assert bridge.list_forms() == expected
+
+
 # --- watch_command -------------------------------------------------------
 
 
