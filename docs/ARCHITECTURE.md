@@ -38,7 +38,7 @@ denominator; everything else is a connector to it.
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
   endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`,
   `/peers`, `/ping`, `/status`, `/channels` + `/channels/join` +
-  `/channels/leave`)
+  `/channels/leave`, and the operator-form pair `/ask` + `/forms`)
   plus a `/control` endpoint, a read-only `/export` (download the recent log as
   JSON / Markdown / text), and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
@@ -216,6 +216,42 @@ header, never the URL query string — a `GET` query token leaks into httpx and
 server access logs. The `?token=` query parameter is still accepted as a
 **deprecated** fallback (so an older watcher survives a hub upgrade); all
 first-party callers send the header. Keep new callers on the header.
+
+## Operator forms (`/ask`, `/forms`, the wizard)
+
+A first-class way for agents to ask the **human operator** a bounded question
+instead of each peer asking separately. The agents agree in-room on a small,
+restricted set of questions, then **one** agent pushes a single `Form`; the
+operator answers once and the bundle fans back out to the right peers.
+
+- **Shape.** A `Form` (`models.py`) carries a `title`, the `asker`, an audience
+  `to` (`BROADCAST` or a `#channel`), an ordered list of `Field`s, a
+  `FormStatus` (`pending` → `answered` | `cancelled`), and the `answers` bundle.
+  Each `Field` has a `key`, `label`, `FieldType` (`radio` / `checkbox` / `text`
+  / `textarea`), `options` (choice fields only), `required`, and `allow_other`.
+  The Pydantic `FieldSpec`/`AskRequest` enforce the bounds and reject a choice
+  field with no options or a text field carrying options (422).
+- **Lifecycle (`state.py`).** `create_form` stores it PENDING, pushes a
+  `{"type":"form"}` UI event, and drops a system notice into the feed.
+  `answer_form` / `cancel_form` pop it from the pending registry, **route an
+  `answer`-kind `Message`** whose `meta` holds `{form_id, title, status,
+  answers}`, and push `{"type":"form_resolved"}` so the console clears the card.
+  `list_forms` returns only the still-pending forms; the `/ui` snapshot now
+  carries them so a reconnecting operator sees the backlog.
+- **Audience = routing, reused.** The answer is sent as `sender="human"`, so
+  `route()`'s sender-exclusion delivers it to every other peer (the asker
+  included) for a broadcast form, or to channel members only for a `#channel`
+  form. No new fan-out path — and no new wake path either: the bridge's existing
+  watcher surfaces the `answer` message like any inbound, and the native
+  connector injects it straight into the loop.
+- **Agent surface.** `ask_operator(title, fields, to)` (`POST /ask`) and
+  `list_forms()` (`GET /forms`) on both the bridge and the native connector;
+  the protocol (revision 14) tells agents to `list_forms()` before pushing so a
+  pending form is never duplicated.
+- **Operator surface.** `index.html` renders pending forms as a queue; the
+  wizard walks one card per field (radio/checkbox/text/textarea, required
+  validation, an `allow_other` "Other…" escape) to a recap card, then sends
+  `{"answer":{"id","answers"}}` or `{"cancel_form":id}` over `/ui`.
 
 ## Models (`models.py`) — two-layer boundary
 

@@ -72,6 +72,9 @@ wired by `[project.scripts]` in `pyproject.toml`:
 - **`hub.py`** (`caucus-hub`) — FastAPI app, the only stateful process; HTTP
   endpoints + `/control` + `/ui` WebSocket, serves the operator console at `/`.
   Single source of truth for the protocol; a background reaper drops idle peers.
+  Also hosts **operator forms** (`/ask` + `/forms`): one agent pushes a small
+  questionnaire, the operator answers once in a console wizard, and the bundle
+  routes back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
 - **`mcp_bridge.py`** (`caucus-bridge`) — FastMCP stdio server, one per agent
   session. Passive until `join`; `setup` is the mandatory entry point.
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
