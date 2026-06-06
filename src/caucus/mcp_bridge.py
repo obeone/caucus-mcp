@@ -760,6 +760,81 @@ def floor_status() -> dict[str, object]:
 
 
 @mcp.tool()
+def ask_operator(
+    title: str, fields: list[dict[str, object]], to: str = "all"
+) -> dict[str, object]:
+    """Push a small questionnaire to the human operator and get a form id back.
+
+    Use this when the work needs a HUMAN decision (a choice, an approval, a
+    value only the operator can give). Agree in-room on a focused set of
+    questions first, then have ONE agent call this — do not have every agent ask
+    separately. Call :func:`list_forms` beforehand; if a pending form already
+    covers the need, do not open a duplicate. The operator fills a wizard and the
+    answer returns to you as a normal inbound message of kind ``answer`` (surfaced
+    by the watcher), carrying the bundle in its ``meta``; a cancellation returns
+    the same way with ``status: "cancelled"``.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        title: Short headline shown atop the wizard.
+        fields: The questions, each a dict
+            ``{"key": str, "label": str, "type": "radio"|"checkbox"|"text"|
+            "textarea", "options": [str, ...], "required": bool,
+            "allow_other": bool}``. ``options`` are required for ``radio``/
+            ``checkbox`` and must be omitted (or empty) for ``text``/
+            ``textarea``.
+        to: Audience for the answer — ``"all"`` (whole room) or a ``"#channel"``
+            (only that side-room's members).
+
+    Returns:
+        ``{"form_id": "<id>", "to": "<audience>"}`` on success, ``{"error":
+        ...}`` on a bad request (rate-limited, stopped, or invalid form), or the
+        usual ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/ask",
+            json={"token": _token, "to": to, "title": title, "fields": fields},
+        )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        if resp.status_code == 409:
+            return {"stopped": True, "note": "room is stopped; halt the exchange"}
+        if resp.status_code == 422:
+            body = resp.json()
+            return {"error": "invalid_form", "detail": body.get("detail")}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def list_forms() -> dict[str, object]:
+    """List the operator forms currently awaiting an answer.
+
+    Call this before :func:`ask_operator` so you do not open a form that
+    duplicates one already pending. Requires ``setup`` first, but not ``join``.
+
+    Returns:
+        ``{"forms": [{"id": ..., "title": ..., "fields": [...], ...}, ...]}``,
+        or ``{"error": "setup_required"}`` if setup has not run.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/forms")
+        resp.raise_for_status()
+        return {"forms": list(resp.json().get("forms", []))}
+
+
+@mcp.tool()
 def listen(timeout: float = 30.0) -> dict[str, object]:
     """Wait for messages addressed to this agent (or broadcast).
 

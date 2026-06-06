@@ -105,7 +105,9 @@ def _drain(payload: dict[str, object]) -> tuple[bool, bool]:
 
     Splits the control ``stop`` signal from ordinary chatter (the bridge's
     ``listen`` does the same), emits each chatter message to stdout, and emits a
-    stop notice when present.
+    stop notice when present. Only the ``control`` kind is filtered out, so
+    operator-form answers (kind ``answer``) print like any other message and
+    wake the passive host with the operator's decision.
 
     Args:
         payload: The decoded ``/receive`` body (``{"messages": [...], ...}``).
