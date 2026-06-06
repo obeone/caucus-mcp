@@ -367,6 +367,20 @@
       0 4px 18px rgba(192,139,255,0.18);
   }
   .msg.to-human .meta { border-bottom-color: rgba(192, 139, 255, 0.28); }
+  /* answer: amber stripe — form answers submitted by operator */
+  .msg.answer {
+    border-left-color: var(--amber);
+    background: rgba(255, 178, 46, 0.04);
+    box-shadow: inset 0 1px 0 rgba(255,178,46,0.06), 0 1px 4px rgba(0,0,0,0.25);
+    margin-bottom: 6px;
+    padding: 9px 14px 9px 16px;
+  }
+  .msg.answer .meta { border-bottom-color: rgba(255, 178, 46, 0.18); }
+  .msg.answer .body {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px; line-height: 1.5;
+    color: var(--amber);
+  }
 
   /* ─── Sidebar — Channels section ─── */
   .channels-section { margin-top: 20px; }
@@ -391,7 +405,7 @@
   }
 
   /* ─── Feed filter bar ─── */
-  .feed-wrap { display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
+  .feed-wrap { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 0; }
   .filter-bar {
     display: flex; align-items: center; gap: 10px;
     padding: 7px 20px;
@@ -410,6 +424,87 @@
     padding: 4px 8px;
   }
   .filter-bar select:focus { outline: none; border-color: var(--cyan); }
+
+  /* ─── Pending forms area ─── */
+  #forms-area {
+    display: none; /* hidden when empty */
+    flex-direction: column;
+    gap: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  #forms-area.has-forms { display: flex; }
+
+  .forms-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 20px 5px;
+    position: sticky; top: 0; z-index: 1;
+    background: var(--panel);
+    border-bottom: 1px solid rgba(255,178,46,0.15);
+  }
+  .forms-header-label {
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 10px; font-weight: 700; letter-spacing: 3px;
+    color: var(--amber); text-transform: uppercase;
+  }
+  .forms-header-count {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px; color: var(--dim);
+    background: rgba(255,178,46,0.12);
+    border: 1px solid rgba(255,178,46,0.25);
+    border-radius: 2px; padding: 1px 6px;
+  }
+  #forms-list {
+    display: flex; flex-direction: column; gap: 0;
+  }
+
+  .form-entry {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 20px;
+    border-left: 3px solid var(--amber);
+    border-bottom: 1px solid rgba(255,178,46,0.08);
+    animation: slidein .18s cubic-bezier(.2,.7,.4,1);
+    background: rgba(255, 178, 46, 0.03);
+  }
+  .form-entry:last-child { border-bottom: none; }
+
+  .form-entry-meta {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column; gap: 1px;
+  }
+  .form-entry-title {
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
+    color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .form-entry-sub {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px; color: var(--dim); letter-spacing: 0.3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .form-entry-actions { display: flex; gap: 6px; flex: none; }
+
+  .btn-answer {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 2px; font-size: 10px;
+    padding: 5px 12px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--amber);
+    border: 1px solid var(--amber); text-transform: uppercase;
+    transition: all .12s ease;
+  }
+  .btn-answer:hover { background: var(--amber); color: #0a0e12; }
+
+  .btn-dismiss {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px; font-weight: 500; letter-spacing: 0;
+    padding: 4px 8px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--dim);
+    border: 1px solid transparent; text-transform: none;
+    transition: all .12s ease;
+  }
+  .btn-dismiss:hover { color: var(--red); border-color: var(--red); background: rgba(255,77,94,0.08); }
 
   /* ─── Composer — unchanged chrome ─── */
   .composer {
@@ -482,6 +577,223 @@
   .floor-clear:hover {
     background: var(--amber); color: #0a0e12;
   }
+  /* ─── Form wizard modal ─── */
+  #wizard-backdrop {
+    display: none;
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(10, 14, 18, 0.88);
+    backdrop-filter: blur(3px);
+    align-items: center; justify-content: center;
+    animation: fadein .16s ease;
+  }
+  #wizard-backdrop.open { display: flex; }
+  @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+
+  #wizard {
+    width: min(560px, 92vw);
+    background: var(--panel);
+    border: 1px solid var(--amber);
+    border-top: 3px solid var(--amber);
+    border-radius: 0 0 4px 4px;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.7), 0 0 40px -12px rgba(255,178,46,0.2);
+    display: flex; flex-direction: column;
+    max-height: 90vh;
+    animation: wizard-in .2s cubic-bezier(.2,.7,.4,1);
+  }
+  @keyframes wizard-in {
+    from { opacity: 0; transform: translateY(-18px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .wizard-head {
+    padding: 16px 22px 12px;
+    border-bottom: 1px solid var(--line);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .wizard-title {
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 15px; font-weight: 700; letter-spacing: 1px;
+    color: var(--ink);
+  }
+  .wizard-sub {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px; color: var(--dim); letter-spacing: 0.5px;
+  }
+  .wizard-progress {
+    margin-top: 10px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .wizard-progress-bar {
+    flex: 1; height: 2px;
+    background: var(--line); border-radius: 1px; overflow: hidden;
+  }
+  .wizard-progress-fill {
+    height: 100%; background: var(--amber);
+    border-radius: 1px; transition: width .2s ease;
+  }
+  .wizard-progress-label {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px; color: var(--dim); letter-spacing: 1px;
+    white-space: nowrap;
+  }
+
+  .wizard-body {
+    padding: 22px;
+    overflow-y: auto; flex: 1;
+  }
+
+  /* ─── Wizard field label ─── */
+  .wizard-field-label {
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 13px; font-weight: 700; letter-spacing: 0.5px;
+    color: var(--ink); margin-bottom: 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .wizard-required {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 10px; letter-spacing: 1px; color: var(--amber);
+    background: rgba(255,178,46,0.1); border: 1px solid rgba(255,178,46,0.2);
+    border-radius: 2px; padding: 1px 5px;
+  }
+
+  /* ─── Radio / checkbox options ─── */
+  .wizard-options { display: flex; flex-direction: column; gap: 8px; }
+
+  .wizard-option {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 13px; border-radius: 2px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    cursor: pointer; transition: border-color .1s, background .1s;
+    user-select: none;
+  }
+  .wizard-option:hover { border-color: var(--amber); background: rgba(255,178,46,0.04); }
+  .wizard-option.selected {
+    border-color: var(--amber);
+    background: rgba(255,178,46,0.08);
+  }
+  .wizard-option input[type="radio"],
+  .wizard-option input[type="checkbox"] {
+    accent-color: var(--amber);
+    width: 14px; height: 14px; flex: none;
+    cursor: pointer;
+    font-family: inherit; font-size: inherit;
+    background: var(--bg); border-color: var(--line);
+    padding: 0;
+  }
+  .wizard-option-text {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px; color: var(--ink);
+  }
+
+  /* "Other…" free-text input that appears when "Other" chosen */
+  .wizard-other-input {
+    margin-top: 6px; margin-left: 24px;
+    display: none;
+  }
+  .wizard-other-input.visible { display: block; }
+  .wizard-other-input input {
+    width: 100%;
+    font-family: "IBM Plex Mono", monospace; font-size: 12.5px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--amber); border-radius: 2px;
+    padding: 7px 10px;
+    outline: none;
+  }
+  .wizard-other-input input:focus { border-color: var(--cyan); }
+
+  /* ─── Text / textarea inputs ─── */
+  .wizard-text-input,
+  .wizard-textarea-input {
+    width: 100%;
+    font-family: "IBM Plex Mono", monospace; font-size: 13px;
+    background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 2px;
+    padding: 9px 11px;
+    outline: none; resize: vertical;
+    transition: border-color .1s;
+  }
+  .wizard-text-input:focus,
+  .wizard-textarea-input:focus { border-color: var(--cyan); }
+  .wizard-textarea-input { min-height: 90px; line-height: 1.5; }
+
+  /* ─── Validation error ─── */
+  .wizard-error {
+    margin-top: 8px;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px; color: var(--red);
+    letter-spacing: 0.5px;
+    display: none;
+  }
+  .wizard-error.visible { display: block; }
+
+  /* ─── Recap card ─── */
+  .recap-list { display: flex; flex-direction: column; gap: 10px; }
+  .recap-item {
+    border-left: 2px solid var(--amber);
+    padding: 8px 12px;
+    background: var(--panel-2);
+    border-radius: 0 2px 2px 0;
+  }
+  .recap-item-label {
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 10px; letter-spacing: 1.5px; color: var(--dim);
+    text-transform: uppercase; margin-bottom: 4px;
+  }
+  .recap-item-value {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12.5px; color: var(--ink); line-height: 1.5;
+  }
+  .recap-item-value.empty { color: var(--dim); font-style: italic; }
+
+  /* ─── Wizard footer ─── */
+  .wizard-foot {
+    padding: 14px 22px;
+    border-top: 1px solid var(--line);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .wizard-foot .spacer { flex: 1; }
+
+  .btn-wiz-back {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 2px; font-size: 11px;
+    padding: 7px 14px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--dim);
+    border: 1px solid var(--line); text-transform: uppercase;
+    transition: all .12s ease;
+  }
+  .btn-wiz-back:hover { border-color: var(--ink); color: var(--ink); }
+
+  .btn-wiz-next {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 2px; font-size: 11px;
+    padding: 7px 16px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--amber);
+    border: 1px solid var(--amber); text-transform: uppercase;
+    transition: all .12s ease;
+  }
+  .btn-wiz-next:hover { background: var(--amber); color: #0a0e12; }
+
+  .btn-wiz-submit {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 2px; font-size: 11px;
+    padding: 7px 20px; border-radius: 2px; cursor: pointer;
+    background: var(--amber); color: #0a0e12;
+    border: 1px solid var(--amber); text-transform: uppercase;
+    transition: all .12s ease;
+    box-shadow: 0 0 16px -6px var(--amber);
+  }
+  .btn-wiz-submit:hover { background: #ffc74d; border-color: #ffc74d; }
+
+  .btn-wiz-cancel {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 2px; font-size: 11px;
+    padding: 7px 14px; border-radius: 2px; cursor: pointer;
+    background: transparent; color: var(--red);
+    border: 1px solid var(--red); text-transform: uppercase;
+    transition: all .12s ease;
+  }
+  .btn-wiz-cancel:hover { background: var(--red); color: #0a0e12; }
 </style>
 </head>
 <body>
@@ -528,6 +840,16 @@
           <option value="direct">Direct</option>
         </select>
       </div>
+
+      <!-- Pending forms tray — hidden when empty, amber-accented -->
+      <div id="forms-area">
+        <div class="forms-header">
+          <span class="forms-header-label">Pending forms</span>
+          <span class="forms-header-count" id="forms-count">0</span>
+        </div>
+        <div id="forms-list"></div>
+      </div>
+
       <div id="feed"></div>
       <div class="composer">
         <div>
@@ -539,6 +861,24 @@
       </div>
     </div>
   </main>
+
+  <!-- Form wizard modal -->
+  <div id="wizard-backdrop" role="dialog" aria-modal="true" aria-labelledby="wizard-title-text">
+    <div id="wizard">
+      <div class="wizard-head">
+        <div class="wizard-title" id="wizard-title-text"></div>
+        <div class="wizard-sub" id="wizard-sub-text"></div>
+        <div class="wizard-progress">
+          <div class="wizard-progress-bar">
+            <div class="wizard-progress-fill" id="wizard-progress-fill"></div>
+          </div>
+          <div class="wizard-progress-label" id="wizard-progress-label"></div>
+        </div>
+      </div>
+      <div class="wizard-body" id="wizard-body"></div>
+      <div class="wizard-foot" id="wizard-foot"></div>
+    </div>
+  </div>
 
 <script>
   // ─── Colour palette ────────────────────────────────────────────────────────
@@ -696,6 +1036,12 @@
   const filterEl = document.getElementById("filter-select");
   const modeEl = document.getElementById("mode");
   const connEl = document.getElementById("conn");
+  const formsArea = document.getElementById("forms-area");
+  const formsList = document.getElementById("forms-list");
+  const formsCount = document.getElementById("forms-count");
+  const wizardBackdrop = document.getElementById("wizard-backdrop");
+  const wizardBody = document.getElementById("wizard-body");
+  const wizardFoot = document.getElementById("wizard-foot");
   let ws = null;
 
   // ─── Module-level state ───────────────────────────────────────────────────
@@ -703,6 +1049,17 @@
   let channels = {};      // latest complete channel map: { "#name": { topic: str|null, members: [...] } }
   let allMessages = [];   // every message received, in order, for feed re-render
   let floors = {};        // active talking sticks: { "<scope>": { scope, holder, reason, hands, since } }
+
+  // Pending forms map: id → form object
+  let pendingForms = new Map();
+
+  // Active wizard state
+  let wizardState = null;
+  // {
+  //   form,          // the form object
+  //   step,          // current step index (0..fields.length = recap)
+  //   answers,       // { key: value } collected so far
+  // }
 
   function fmtTime(ts) {
     const d = new Date(ts * 1000);
@@ -778,7 +1135,7 @@
       meta.append(who, arrow, to, t);
     }
 
-    // Body — markdown for message/human, plain-escaped for system/control
+    // Body — markdown for message/human, plain-escaped for system/control/answer
     const body = document.createElement("div");
     body.className = "body";
     const useMarkdown = (m.kind === "message" || !m.kind || m.sender === "human");
@@ -1055,7 +1412,553 @@
   // ─── filter change — re-render feed from allMessages ─────────────────────
   filterEl.addEventListener("change", renderFeed);
 
-  // ─── connect — WebSocket event contract extended for channels ─────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── FORMS — pending forms tray ──────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // addPendingForm — register a form and add its tray entry
+  function addPendingForm(form) {
+    if (pendingForms.has(form.id)) return; // idempotent
+    pendingForms.set(form.id, form);
+    renderFormsTray();
+  }
+
+  // removePendingForm — deregister form, close wizard if open for this form
+  function removePendingForm(id) {
+    if (!pendingForms.has(id)) return;
+    pendingForms.delete(id);
+    renderFormsTray();
+    // If wizard is open for this form, close it silently (resolved externally)
+    if (wizardState && wizardState.form.id === id) {
+      closeWizard(/* sendCancel= */ false);
+    }
+  }
+
+  // renderFormsTray — rebuild the forms-list DOM from pendingForms
+  function renderFormsTray() {
+    formsList.innerHTML = "";
+    const count = pendingForms.size;
+    formsCount.textContent = String(count);
+
+    if (count === 0) {
+      formsArea.classList.remove("has-forms");
+      return;
+    }
+    formsArea.classList.add("has-forms");
+
+    for (const form of pendingForms.values()) {
+      const entry = document.createElement("div");
+      entry.className = "form-entry";
+      entry.dataset.formId = form.id;
+
+      const meta = document.createElement("div");
+      meta.className = "form-entry-meta";
+
+      const titleEl = document.createElement("div");
+      titleEl.className = "form-entry-title";
+      titleEl.textContent = form.title;
+
+      const subEl = document.createElement("div");
+      subEl.className = "form-entry-sub";
+      const fieldCount = Array.isArray(form.fields) ? form.fields.length : 0;
+      subEl.textContent = `from ${form.asker}  ·  to ${form.to}  ·  ${fieldCount} field${fieldCount !== 1 ? "s" : ""}`;
+
+      meta.append(titleEl, subEl);
+
+      const actions = document.createElement("div");
+      actions.className = "form-entry-actions";
+
+      const answerBtn = document.createElement("button");
+      answerBtn.className = "btn-answer";
+      answerBtn.textContent = "Answer";
+      answerBtn.onclick = () => openWizard(form.id);
+
+      const dismissBtn = document.createElement("button");
+      dismissBtn.className = "btn-dismiss";
+      dismissBtn.textContent = "✕";
+      dismissBtn.title = "Cancel / dismiss this form";
+      dismissBtn.onclick = () => cancelForm(form.id);
+
+      actions.append(answerBtn, dismissBtn);
+      entry.append(meta, actions);
+      formsList.appendChild(entry);
+    }
+  }
+
+  // cancelForm — send cancel_form WS message and remove from tray
+  function cancelForm(id) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ cancel_form: id }));
+    removePendingForm(id);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── WIZARD — one card per field + recap ─────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function openWizard(formId) {
+    const form = pendingForms.get(formId);
+    if (!form) return;
+    wizardState = { form, step: 0, answers: {} };
+    wizardBackdrop.classList.add("open");
+    document.getElementById("wizard-title-text").textContent = form.title;
+    document.getElementById("wizard-sub-text").textContent =
+      `from ${form.asker}  ·  to ${form.to}  ·  ${fmtTime(form.ts)}`;
+    renderWizardStep();
+    // Focus the modal for keyboard nav
+    wizardBackdrop.focus();
+  }
+
+  // closeWizard — hide modal; optionally send cancel message
+  function closeWizard(sendCancel = true) {
+    if (!wizardState) return;
+    const id = wizardState.form.id;
+    wizardState = null;
+    wizardBackdrop.classList.remove("open");
+    wizardBody.innerHTML = "";
+    wizardFoot.innerHTML = "";
+    if (sendCancel) cancelForm(id);
+  }
+
+  // totalSteps = fields.length + 1 (recap)
+  function totalSteps(form) {
+    return (Array.isArray(form.fields) ? form.fields.length : 0) + 1;
+  }
+
+  // renderWizardStep — render either a field card or the recap card
+  function renderWizardStep() {
+    const { form, step } = wizardState;
+    const fields = Array.isArray(form.fields) ? form.fields : [];
+    const total = totalSteps(form);
+    const isRecap = step >= fields.length;
+
+    // Progress bar
+    const pct = isRecap ? 100 : Math.round((step / total) * 100);
+    document.getElementById("wizard-progress-fill").style.width = pct + "%";
+    document.getElementById("wizard-progress-label").textContent = isRecap
+      ? "Review"
+      : `Step ${step + 1} / ${total}`;
+
+    wizardBody.innerHTML = "";
+    wizardFoot.innerHTML = "";
+
+    if (isRecap) {
+      renderRecapCard(fields);
+    } else {
+      renderFieldCard(fields[step]);
+    }
+  }
+
+  // ─── renderFieldCard — single field step ─────────────────────────────────
+  function renderFieldCard(field) {
+    const { answers } = wizardState;
+    wizardBody.innerHTML = "";
+
+    // Label + required marker
+    const labelRow = document.createElement("div");
+    labelRow.className = "wizard-field-label";
+    const labelText = document.createElement("span");
+    labelText.textContent = field.label;
+    labelRow.appendChild(labelText);
+    if (field.required) {
+      const req = document.createElement("span");
+      req.className = "wizard-required";
+      req.textContent = "required";
+      labelRow.appendChild(req);
+    }
+    wizardBody.appendChild(labelRow);
+
+    // Field control
+    let getValueFn; // () => value | null (null = validation fail)
+    let focusFn = () => {};
+
+    if (field.type === "radio") {
+      getValueFn = renderRadioField(wizardBody, field, answers[field.key]);
+    } else if (field.type === "checkbox") {
+      getValueFn = renderCheckboxField(wizardBody, field, answers[field.key]);
+    } else if (field.type === "text") {
+      const { getValue, focus } = renderTextField(wizardBody, field, answers[field.key]);
+      getValueFn = getValue; focusFn = focus;
+    } else if (field.type === "textarea") {
+      const { getValue, focus } = renderTextareaField(wizardBody, field, answers[field.key]);
+      getValueFn = getValue; focusFn = focus;
+    } else {
+      // Unknown type — treat as text
+      const { getValue, focus } = renderTextField(wizardBody, field, answers[field.key]);
+      getValueFn = getValue; focusFn = focus;
+    }
+
+    // Validation error slot
+    const errEl = document.createElement("div");
+    errEl.className = "wizard-error";
+    errEl.id = "wizard-field-error";
+    wizardBody.appendChild(errEl);
+
+    // Footer
+    renderWizardFooter({
+      onBack: wizardState.step > 0 ? () => { wizardState.step--; renderWizardStep(); } : null,
+      onNext: () => {
+        const val = getValueFn();
+        const err = validateFieldValue(field, val);
+        if (err) {
+          errEl.textContent = err;
+          errEl.classList.add("visible");
+          return;
+        }
+        errEl.classList.remove("visible");
+        wizardState.answers[field.key] = val;
+        wizardState.step++;
+        renderWizardStep();
+      },
+      isRecap: false,
+    });
+
+    // Autofocus (cheap UX win — defer so DOM is ready)
+    requestAnimationFrame(focusFn);
+  }
+
+  // ─── validateFieldValue ───────────────────────────────────────────────────
+  function validateFieldValue(field, val) {
+    if (!field.required) return null;
+    if (field.type === "checkbox") {
+      if (!Array.isArray(val) || val.length === 0) return "Please select at least one option.";
+    } else if (field.type === "radio") {
+      if (!val || String(val).trim() === "") return "Please select an option.";
+    } else {
+      if (!val || String(val).trim() === "") return "This field is required.";
+    }
+    return null;
+  }
+
+  // ─── renderRadioField — returns getValueFn ────────────────────────────────
+  function renderRadioField(container, field, currentVal) {
+    const opts = Array.isArray(field.options) ? [...field.options] : [];
+    const hasOther = field.allow_other === true;
+    const optionsEl = document.createElement("div");
+    optionsEl.className = "wizard-options";
+
+    // Track which label wraps "Other" and the associated input
+    let otherInput = null;
+    let otherWrapper = null;
+
+    const name = "wiz_radio_" + field.key + "_" + Date.now();
+
+    for (const opt of opts) {
+      const label = document.createElement("label");
+      label.className = "wizard-option";
+      const inp = document.createElement("input");
+      inp.type = "radio"; inp.name = name; inp.value = opt;
+      if (currentVal === opt) { inp.checked = true; label.classList.add("selected"); }
+      const txt = document.createElement("span");
+      txt.className = "wizard-option-text"; txt.textContent = opt;
+
+      inp.addEventListener("change", () => {
+        optionsEl.querySelectorAll(".wizard-option").forEach(l => l.classList.remove("selected"));
+        label.classList.add("selected");
+        if (otherWrapper) otherWrapper.classList.remove("visible");
+      });
+
+      label.append(inp, txt);
+      optionsEl.appendChild(label);
+    }
+
+    if (hasOther) {
+      const otherLabel = document.createElement("label");
+      otherLabel.className = "wizard-option";
+      const otherInp = document.createElement("input");
+      otherInp.type = "radio"; otherInp.name = name; otherInp.value = "__other__";
+      const txt = document.createElement("span");
+      txt.className = "wizard-option-text"; txt.textContent = "Other…";
+
+      otherWrapper = document.createElement("div");
+      otherWrapper.className = "wizard-other-input";
+      otherInput = document.createElement("input");
+      otherInput.type = "text"; otherInput.placeholder = "Please specify…";
+
+      // If currentVal is set and doesn't match any known option, it's "other"
+      const isCurrentOther = currentVal && !opts.includes(currentVal);
+      if (isCurrentOther) {
+        otherInp.checked = true; otherLabel.classList.add("selected");
+        otherWrapper.classList.add("visible");
+        otherInput.value = currentVal;
+      }
+
+      otherInp.addEventListener("change", () => {
+        optionsEl.querySelectorAll(".wizard-option").forEach(l => l.classList.remove("selected"));
+        otherLabel.classList.add("selected");
+        otherWrapper.classList.add("visible");
+        requestAnimationFrame(() => otherInput.focus());
+      });
+
+      otherWrapper.appendChild(otherInput);
+      otherLabel.append(otherInp, txt);
+      optionsEl.appendChild(otherLabel);
+      optionsEl.appendChild(otherWrapper);
+    }
+
+    container.appendChild(optionsEl);
+
+    return () => {
+      const checked = optionsEl.querySelector("input[type=radio]:checked");
+      if (!checked) return field.required ? null : "";
+      if (checked.value === "__other__") {
+        return (otherInput ? otherInput.value.trim() : "") || (field.required ? null : "");
+      }
+      return checked.value;
+    };
+  }
+
+  // ─── renderCheckboxField — returns getValueFn ─────────────────────────────
+  function renderCheckboxField(container, field, currentVal) {
+    const opts = Array.isArray(field.options) ? [...field.options] : [];
+    const hasOther = field.allow_other === true;
+    const currentArr = Array.isArray(currentVal) ? currentVal : [];
+    const optionsEl = document.createElement("div");
+    optionsEl.className = "wizard-options";
+
+    let otherInput = null;
+    let otherWrapper = null;
+
+    for (const opt of opts) {
+      const label = document.createElement("label");
+      label.className = "wizard-option";
+      const inp = document.createElement("input");
+      inp.type = "checkbox"; inp.value = opt;
+      if (currentArr.includes(opt)) { inp.checked = true; label.classList.add("selected"); }
+      const txt = document.createElement("span");
+      txt.className = "wizard-option-text"; txt.textContent = opt;
+
+      inp.addEventListener("change", () => {
+        label.classList.toggle("selected", inp.checked);
+      });
+
+      label.append(inp, txt);
+      optionsEl.appendChild(label);
+    }
+
+    if (hasOther) {
+      const otherLabel = document.createElement("label");
+      otherLabel.className = "wizard-option";
+      const otherCb = document.createElement("input");
+      otherCb.type = "checkbox"; otherCb.value = "__other__";
+      const txt = document.createElement("span");
+      txt.className = "wizard-option-text"; txt.textContent = "Other…";
+
+      otherWrapper = document.createElement("div");
+      otherWrapper.className = "wizard-other-input";
+      otherInput = document.createElement("input");
+      otherInput.type = "text"; otherInput.placeholder = "Please specify…";
+
+      // Detect if current answers contain an "other" value (not in known opts)
+      const currentOther = currentArr.find(v => !opts.includes(v));
+      if (currentOther) {
+        otherCb.checked = true; otherLabel.classList.add("selected");
+        otherWrapper.classList.add("visible");
+        otherInput.value = currentOther;
+      }
+
+      otherCb.addEventListener("change", () => {
+        otherLabel.classList.toggle("selected", otherCb.checked);
+        otherWrapper.classList.toggle("visible", otherCb.checked);
+        if (otherCb.checked) requestAnimationFrame(() => otherInput.focus());
+      });
+
+      otherWrapper.appendChild(otherInput);
+      otherLabel.append(otherCb, txt);
+      optionsEl.appendChild(otherLabel);
+      optionsEl.appendChild(otherWrapper);
+    }
+
+    container.appendChild(optionsEl);
+
+    return () => {
+      const chosen = [];
+      optionsEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
+        if (!cb.checked) return;
+        if (cb.value === "__other__") {
+          const v = otherInput ? otherInput.value.trim() : "";
+          if (v) chosen.push(v);
+          // If "Other" checked but no text, field.required check handles it
+        } else {
+          chosen.push(cb.value);
+        }
+      });
+      return chosen;
+    };
+  }
+
+  // ─── renderTextField — returns { getValue, focus } ────────────────────────
+  function renderTextField(container, field, currentVal) {
+    const inp = document.createElement("input");
+    inp.type = "text"; inp.className = "wizard-text-input";
+    inp.placeholder = field.label || "";
+    inp.value = currentVal || "";
+    container.appendChild(inp);
+    return {
+      getValue: () => inp.value.trim() || (field.required ? null : ""),
+      focus: () => inp.focus(),
+    };
+  }
+
+  // ─── renderTextareaField — returns { getValue, focus } ────────────────────
+  function renderTextareaField(container, field, currentVal) {
+    const ta = document.createElement("textarea");
+    ta.className = "wizard-textarea-input";
+    ta.placeholder = field.label || "";
+    ta.value = currentVal || "";
+    container.appendChild(ta);
+    return {
+      getValue: () => ta.value.trim() || (field.required ? null : ""),
+      focus: () => ta.focus(),
+    };
+  }
+
+  // ─── renderRecapCard — final summary before submit ────────────────────────
+  function renderRecapCard(fields) {
+    const { answers } = wizardState;
+
+    const recapList = document.createElement("div");
+    recapList.className = "recap-list";
+
+    for (const field of fields) {
+      const item = document.createElement("div");
+      item.className = "recap-item";
+
+      const lbl = document.createElement("div");
+      lbl.className = "recap-item-label";
+      lbl.textContent = field.label;
+
+      const val = answers[field.key];
+      const valEl = document.createElement("div");
+      const displayStr = formatAnswerForRecap(val);
+      if (displayStr === "") {
+        valEl.className = "recap-item-value empty";
+        valEl.textContent = "(no answer)";
+      } else {
+        valEl.className = "recap-item-value";
+        valEl.textContent = displayStr;
+      }
+
+      item.append(lbl, valEl);
+      recapList.appendChild(item);
+    }
+
+    wizardBody.appendChild(recapList);
+
+    // Footer for recap
+    renderWizardFooter({
+      onBack: () => { wizardState.step--; renderWizardStep(); },
+      onNext: null,
+      isRecap: true,
+    });
+  }
+
+  function formatAnswerForRecap(val) {
+    if (val === undefined || val === null) return "";
+    if (Array.isArray(val)) return val.length ? val.join(", ") : "";
+    return String(val);
+  }
+
+  // ─── renderWizardFooter — shared footer renderer ──────────────────────────
+  function renderWizardFooter({ onBack, onNext, isRecap }) {
+    wizardFoot.innerHTML = "";
+
+    // Cancel always on left
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "btn-wiz-cancel";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = () => closeWizard(/* sendCancel= */ true);
+
+    const spacer = document.createElement("div");
+    spacer.className = "spacer";
+
+    wizardFoot.append(cancelBtn, spacer);
+
+    if (onBack) {
+      const backBtn = document.createElement("button");
+      backBtn.className = "btn-wiz-back";
+      backBtn.textContent = "← Back";
+      backBtn.onclick = onBack;
+      wizardFoot.appendChild(backBtn);
+    }
+
+    if (isRecap) {
+      const submitBtn = document.createElement("button");
+      submitBtn.className = "btn-wiz-submit";
+      submitBtn.textContent = "Submit";
+      submitBtn.onclick = submitForm;
+      wizardFoot.appendChild(submitBtn);
+    } else if (onNext) {
+      const nextBtn = document.createElement("button");
+      nextBtn.className = "btn-wiz-next";
+      nextBtn.textContent = "Next →";
+      nextBtn.onclick = onNext;
+      wizardFoot.appendChild(nextBtn);
+    }
+  }
+
+  // ─── submitForm — build answers payload and send ──────────────────────────
+  function submitForm() {
+    if (!wizardState) return;
+    const { form, answers } = wizardState;
+
+    // Build the answers object: omit fields with empty/null values
+    const payload = {};
+    for (const field of (form.fields || [])) {
+      const val = answers[field.key];
+      if (val === undefined || val === null) continue;
+      if (Array.isArray(val) && val.length === 0) continue;
+      if (val === "") continue;
+      payload[field.key] = val;
+    }
+
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ answer: { id: form.id, answers: payload } }));
+    }
+
+    const id = form.id;
+    wizardState = null;
+    wizardBackdrop.classList.remove("open");
+    wizardBody.innerHTML = "";
+    wizardFoot.innerHTML = "";
+    // Remove from tray (server will also send form_resolved, but be optimistic)
+    removePendingForm(id);
+  }
+
+  // ─── Keyboard shortcuts on wizard backdrop ────────────────────────────────
+  wizardBackdrop.setAttribute("tabindex", "-1");
+  wizardBackdrop.addEventListener("keydown", (e) => {
+    if (!wizardBackdrop.classList.contains("open")) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeWizard(/* sendCancel= */ true);
+    }
+    // Enter on recap submits; Enter on a field step advances (if not in textarea)
+    if (e.key === "Enter" && !e.shiftKey) {
+      if (!wizardState) return;
+      const form = wizardState.form;
+      const fields = Array.isArray(form.fields) ? form.fields : [];
+      const isRecap = wizardState.step >= fields.length;
+      if (isRecap) {
+        e.preventDefault();
+        submitForm();
+      } else {
+        // Don't intercept Enter in textarea — that should insert newline
+        if (e.target && e.target.tagName === "TEXTAREA") return;
+        // Click the Next button
+        const nextBtn = wizardFoot.querySelector(".btn-wiz-next");
+        if (nextBtn) { e.preventDefault(); nextBtn.click(); }
+      }
+    }
+  });
+
+  // Click backdrop (outside the wizard card) → cancel
+  wizardBackdrop.addEventListener("click", (e) => {
+    if (e.target === wizardBackdrop) closeWizard(/* sendCancel= */ true);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ─── connect — WebSocket event contract extended for forms ────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ui`);
@@ -1074,6 +1977,12 @@
         setFloors(e.floors || {});
         feed.innerHTML = "";
         (e.log || []).forEach(addMessage);
+        // Restore pending forms from snapshot
+        pendingForms.clear();
+        for (const form of (e.forms || [])) {
+          if (form.status === "pending") pendingForms.set(form.id, form);
+        }
+        renderFormsTray();
       } else if (e.type === "message") {
         addMessage(e.message);
       } else if (e.type === "mode") {
@@ -1084,6 +1993,12 @@
         setChannels(e.channels || {});
       } else if (e.type === "floor") {
         setFloors(e.floors || {});
+      } else if (e.type === "form") {
+        // New pending form pushed by the hub
+        if (e.form && e.form.status === "pending") addPendingForm(e.form);
+      } else if (e.type === "form_resolved") {
+        // Form answered or cancelled by any means
+        removePendingForm(e.id);
       }
     };
   }
