@@ -11,7 +11,8 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ValidationInfo, field_validator
+from pydantic import Field as PydField
 
 BROADCAST = "all"
 """Recipient value meaning "send to every connected peer except the sender"."""
@@ -50,6 +51,24 @@ class MessageKind(str, Enum):
     MESSAGE = "message"
     CONTROL = "control"
     SYSTEM = "system"
+    ANSWER = "answer"
+
+
+class FieldType(str, Enum):
+    """The input shape of a single :class:`Form` field, driving the UI widget."""
+
+    RADIO = "radio"
+    CHECKBOX = "checkbox"
+    TEXT = "text"
+    TEXTAREA = "textarea"
+
+
+class FormStatus(str, Enum):
+    """Lifecycle state of an operator :class:`Form`."""
+
+    PENDING = "pending"
+    ANSWERED = "answered"
+    CANCELLED = "cancelled"
 
 
 def _new_id() -> str:
@@ -65,7 +84,12 @@ class Message:
         sender: Project name of the author, or ``"human"`` for operator input.
         recipient: A project name, or :data:`BROADCAST` for everyone.
         content: The free-form text payload.
-        kind: Whether this is chatter, a control signal, or a system notice.
+        kind: Whether this is chatter, a control signal, a system notice, or an
+            operator-form answer.
+        meta: Optional structured side-channel payload. Used to carry an
+            operator form's answer bundle (``form_id``, ``title``, ``status``,
+            ``answers``) on an :attr:`MessageKind.ANSWER` message; ``None`` for
+            ordinary chatter.
         id: Unique identifier, assigned automatically.
         ts: Unix timestamp (seconds) of creation.
         seq: Monotone hub-assigned sequence number, set by
@@ -77,6 +101,89 @@ class Message:
     recipient: str
     content: str
     kind: MessageKind = MessageKind.MESSAGE
+    meta: dict[str, object] | None = None
+    id: str = field(default_factory=_new_id)
+    ts: float = field(default_factory=time.time)
+    seq: int = 0
+
+    def to_public(self) -> dict[str, object]:
+        """Serialise to a JSON-friendly dict for clients and the UI.
+
+        ``meta`` is included only when it is set, so ordinary chatter keeps the
+        same shape it always had and only answer messages carry the extra key.
+        """
+        public: dict[str, object] = {
+            "id": self.id,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "content": self.content,
+            "kind": self.kind.value,
+            "ts": self.ts,
+            "seq": self.seq,
+        }
+        if self.meta is not None:
+            public["meta"] = self.meta
+        return public
+
+
+@dataclass(slots=True)
+class Field:
+    """One question in an operator :class:`Form`.
+
+    Attributes:
+        key: Stable machine identifier the answer is keyed by.
+        label: Human-readable prompt shown to the operator.
+        type: The input shape (see :class:`FieldType`).
+        options: Choices for ``radio``/``checkbox`` fields; empty for free text.
+        required: Whether the operator must supply a value.
+        allow_other: Whether the operator may type a value outside ``options``.
+    """
+
+    key: str
+    label: str
+    type: FieldType
+    options: list[str] = field(default_factory=list)
+    required: bool = False
+    allow_other: bool = False
+
+    def to_public(self) -> dict[str, object]:
+        """Serialise to a JSON-friendly dict for clients and the UI."""
+        return {
+            "key": self.key,
+            "label": self.label,
+            "type": self.type.value,
+            "options": list(self.options),
+            "required": self.required,
+            "allow_other": self.allow_other,
+        }
+
+
+@dataclass(slots=True)
+class Form:
+    """A small questionnaire one agent pushes to the human operator.
+
+    The operator fills a wizard (one card per :class:`Field`, a recap, then
+    Submit or Cancel) in the console; the answer bundle returns to the relevant
+    agents as a normal inbound :attr:`MessageKind.ANSWER` message.
+
+    Attributes:
+        title: Short headline shown atop the wizard.
+        asker: Project name of the agent that opened the form.
+        to: Audience the answer is routed to — :data:`BROADCAST` or a channel.
+        fields: The ordered questions to ask.
+        status: Lifecycle state (see :class:`FormStatus`).
+        answers: The operator's answers keyed by field ``key``; ``None`` until
+            answered (and stays ``None`` on cancellation).
+        id: Unique identifier, assigned automatically.
+        ts: Unix timestamp (seconds) of creation.
+    """
+
+    title: str
+    asker: str
+    to: str
+    fields: list[Field]
+    status: FormStatus = FormStatus.PENDING
+    answers: dict[str, object] | None = None
     id: str = field(default_factory=_new_id)
     ts: float = field(default_factory=time.time)
     seq: int = 0
@@ -85,10 +192,12 @@ class Message:
         """Serialise to a JSON-friendly dict for clients and the UI."""
         return {
             "id": self.id,
-            "sender": self.sender,
-            "recipient": self.recipient,
-            "content": self.content,
-            "kind": self.kind.value,
+            "title": self.title,
+            "asker": self.asker,
+            "to": self.to,
+            "fields": [f.to_public() for f in self.fields],
+            "status": self.status.value,
+            "answers": self.answers,
             "ts": self.ts,
             "seq": self.seq,
         }
@@ -105,7 +214,7 @@ class RegisterRequest(BaseModel):
     response as stale and ships the current protocol text.
     """
 
-    project: str = Field(min_length=1, max_length=64)
+    project: str = PydField(min_length=1, max_length=64)
     protocol_version: int | None = None
     token: str | None = None
     """The token previously issued for this project, if the caller still holds
@@ -125,7 +234,7 @@ class RegisterResponse(BaseModel):
     protocol_version: int
     protocol_stale: bool = False
     protocol_text: str | None = None
-    channels: dict[str, dict[str, object]] = Field(default_factory=dict)
+    channels: dict[str, dict[str, object]] = PydField(default_factory=dict)
     """Snapshot of the open channels at registration, so a late-joining peer is
     told the directory (names, topics, members) up front — no extra round-trip.
     Each value is ``{"topic": str | None, "members": [name, ...]}``."""
@@ -144,8 +253,8 @@ class SendRequest(BaseModel):
     """
 
     token: str
-    to: str = Field(default=BROADCAST, max_length=64)
-    content: str = Field(min_length=1, max_length=8192)
+    to: str = PydField(default=BROADCAST, max_length=64)
+    content: str = PydField(min_length=1, max_length=8192)
 
 
 class SendResponse(BaseModel):
@@ -181,7 +290,7 @@ class ChannelRequest(BaseModel):
     """
 
     token: str
-    channel: str = Field(min_length=2, max_length=64)
+    channel: str = PydField(min_length=2, max_length=64)
 
     @field_validator("channel")
     @classmethod
@@ -200,8 +309,8 @@ class ChannelTopicRequest(BaseModel):
     """
 
     token: str
-    channel: str = Field(min_length=2, max_length=64)
-    topic: str = Field(default="", max_length=200)
+    channel: str = PydField(min_length=2, max_length=64)
+    topic: str = PydField(default="", max_length=200)
 
     @field_validator("channel")
     @classmethod
@@ -227,7 +336,7 @@ class AckRequest(BaseModel):
     """
 
     token: str
-    seq: int = Field(ge=0)
+    seq: int = PydField(ge=0)
 
 
 class StatusRequest(BaseModel):
@@ -240,7 +349,7 @@ class StatusRequest(BaseModel):
     """
 
     token: str
-    status: str = Field(default="", max_length=280)
+    status: str = PydField(default="", max_length=280)
 
 
 class FloorRequest(BaseModel):
@@ -257,8 +366,8 @@ class FloorRequest(BaseModel):
 
     token: str
     action: str  # take | pass | drop | raise | lower
-    scope: str = Field(default=BROADCAST, max_length=64)
-    reason: str = Field(default="", max_length=280)
+    scope: str = PydField(default=BROADCAST, max_length=64)
+    reason: str = PydField(default="", max_length=280)
 
     @field_validator("scope")
     @classmethod
@@ -269,3 +378,68 @@ class FloorRequest(BaseModel):
                 f"scope must be {BROADCAST!r} or a {CHANNEL_PREFIX!r}-channel"
             )
         return value
+
+
+class FieldSpec(BaseModel):
+    """One field of an operator form, as it crosses the HTTP boundary.
+
+    Mirrors the internal :class:`Field` dataclass with bounds and a consistency
+    check: choice fields (``radio``/``checkbox``) require at least one option,
+    while free-text fields (``text``/``textarea``) must carry none — an option
+    list on a text field is a caller mistake, rejected with 422.
+    """
+
+    key: str = PydField(min_length=1, max_length=64)
+    label: str = PydField(min_length=1, max_length=200)
+    type: FieldType
+    options: list[str] = PydField(default_factory=list, max_length=32)
+    required: bool = False
+    allow_other: bool = False
+
+    @field_validator("options")
+    @classmethod
+    def _bound_option_lengths(cls, value: list[str]) -> list[str]:
+        """Reject any single option longer than 200 chars."""
+        for option in value:
+            if len(option) > 200:
+                raise ValueError("each option must be at most 200 characters")
+        return value
+
+    @field_validator("options")
+    @classmethod
+    def _options_match_type(
+        cls, value: list[str], info: ValidationInfo
+    ) -> list[str]:
+        """Ensure choice fields carry options and text fields carry none.
+
+        Runs after ``type`` is validated (declaration order), so ``info.data``
+        holds the resolved field type. Choice fields without options, or text
+        fields with options, are rejected so a form never reaches the operator
+        with an unrenderable field.
+        """
+        field_type = info.data.get("type")
+        if field_type in (FieldType.RADIO, FieldType.CHECKBOX) and not value:
+            raise ValueError(f"{field_type.value} fields require at least one option")
+        if field_type in (FieldType.TEXT, FieldType.TEXTAREA) and value:
+            raise ValueError(f"{field_type.value} fields must not carry options")
+        return value
+
+
+class AskRequest(BaseModel):
+    """Body for ``POST /ask`` — one agent opens an operator form.
+
+    ``to`` is the audience the answer routes to, bounded like a project/channel
+    name. The endpoint further restricts it to :data:`BROADCAST` or a channel.
+    """
+
+    token: str
+    to: str = PydField(default=BROADCAST, max_length=64)
+    title: str = PydField(min_length=1, max_length=200)
+    fields: list[FieldSpec] = PydField(min_length=1, max_length=20)
+
+
+class AskResponse(BaseModel):
+    """Reply for ``POST /ask``."""
+
+    form_id: str
+    to: str
