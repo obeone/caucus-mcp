@@ -10,12 +10,24 @@ from __future__ import annotations
 
 import asyncio
 
-from caucus.models import BROADCAST, ControlMode, Message, MessageKind
+from caucus.models import (
+    BROADCAST,
+    ControlMode,
+    Field,
+    FieldType,
+    FormStatus,
+    Message,
+    MessageKind,
+)
 from caucus.state import HubState, RegisterOutcome
 
 
 def _msg(sender: str, recipient: str, content: str = "x") -> Message:
     return Message(sender=sender, recipient=recipient, content=content)
+
+
+def _radio(key: str = "ok", label: str = "Proceed?") -> Field:
+    return Field(key=key, label=label, type=FieldType.RADIO, options=["yes", "no"])
 
 
 async def test_register_is_idempotent_per_project() -> None:
@@ -897,3 +909,170 @@ async def test_ping_reaped_peer_reports_reaped_state() -> None:
     assert result["reaped_age"] is not None
     # A reaped peer keeps the status it had when it went quiet.
     assert result["status"] == "was mid-task"
+
+
+# --- operator forms ------------------------------------------------------
+
+
+async def test_create_form_pushes_ui_event_and_announces() -> None:
+    state = HubState()
+    queue = state.add_ui()
+    queue.get_nowait()  # priming snapshot
+
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+
+    events: list[dict[str, object]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    types = {e["type"] for e in events}
+    assert "form" in types  # the wizard event
+    assert "message" in types  # the readable system notice
+    form_event = next(e for e in events if e["type"] == "form")
+    assert form_event["form"]["id"] == form.id
+    assert form_event["form"]["status"] == "pending"
+
+
+async def test_create_form_lists_as_pending() -> None:
+    state = HubState()
+    state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    forms = state.list_forms()
+    assert len(forms) == 1
+    assert forms[0]["title"] == "Deploy?"
+    assert forms[0]["status"] == "pending"
+
+
+async def test_answer_form_routes_answer_to_broadcast_audience() -> None:
+    state = HubState()
+    asker = state.register("alpha").client
+    beta = state.register("beta").client
+    assert asker is not None
+    assert beta is not None
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+
+    resolved = state.answer_form(form.id, {"ok": "yes"})
+
+    assert resolved is not None
+    assert resolved.status is FormStatus.ANSWERED
+    # sender="human", so even the asker receives the answer.
+    for client in (asker, beta):
+        msg = client.queue.get_nowait()
+        assert msg.kind is MessageKind.ANSWER
+        assert msg.meta == {
+            "form_id": form.id,
+            "title": "Deploy?",
+            "status": "answered",
+            "answers": {"ok": "yes"},
+        }
+
+
+async def test_answer_form_for_channel_reaches_only_members() -> None:
+    state = HubState()
+    asker = state.register("alpha").client
+    beta = state.register("beta").client
+    gamma = state.register("gamma").client
+    assert asker is not None
+    assert beta is not None
+    assert gamma is not None
+    # Mirror the /ask path: asker and one peer are channel members.
+    state.subscribe(asker.token, "#deploy")
+    state.subscribe(beta.token, "#deploy")
+    form = state.create_form("alpha", "#deploy", "Deploy?", [_radio()])
+
+    state.answer_form(form.id, {"ok": "no"})
+
+    # Members (asker + beta) get it; non-member gamma does not.
+    assert asker.queue.get_nowait().kind is MessageKind.ANSWER
+    assert beta.queue.get_nowait().kind is MessageKind.ANSWER
+    assert gamma.queue.empty()
+
+
+async def test_answer_form_pushes_resolved_event() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    queue = state.add_ui()
+    queue.get_nowait()  # priming snapshot
+
+    state.answer_form(form.id, {"ok": "yes"})
+
+    events: list[dict[str, object]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    resolved = [e for e in events if e["type"] == "form_resolved"]
+    assert resolved and resolved[0]["status"] == "answered"
+    assert resolved[0]["answers"] == {"ok": "yes"}
+
+
+async def test_answer_form_unknown_id_is_none() -> None:
+    state = HubState()
+    assert state.answer_form("nope", {}) is None
+
+
+async def test_answer_form_twice_is_none_after_resolve() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    assert state.answer_form(form.id, {"ok": "yes"}) is not None
+    # Popped on resolve, so a second answer finds nothing.
+    assert state.answer_form(form.id, {"ok": "no"}) is None
+
+
+async def test_cancel_form_routes_cancellation_and_keeps_answers_none() -> None:
+    state = HubState()
+    beta = state.register("beta").client
+    state.register("alpha")
+    assert beta is not None
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+
+    resolved = state.cancel_form(form.id)
+
+    assert resolved is not None
+    assert resolved.status is FormStatus.CANCELLED
+    assert resolved.answers is None
+    msg = beta.queue.get_nowait()
+    assert msg.kind is MessageKind.ANSWER
+    assert msg.meta == {
+        "form_id": form.id,
+        "title": "Deploy?",
+        "status": "cancelled",
+        "answers": None,
+    }
+
+
+async def test_cancel_form_pushes_resolved_event() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    queue = state.add_ui()
+    queue.get_nowait()  # priming snapshot
+
+    state.cancel_form(form.id)
+
+    events: list[dict[str, object]] = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    resolved = [e for e in events if e["type"] == "form_resolved"]
+    assert resolved and resolved[0]["status"] == "cancelled"
+
+
+async def test_cancel_form_unknown_id_is_none() -> None:
+    state = HubState()
+    assert state.cancel_form("nope") is None
+
+
+async def test_list_forms_empties_after_resolve() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    assert len(state.list_forms()) == 1
+    state.answer_form(form.id, {"ok": "yes"})
+    assert state.list_forms() == []
+
+
+async def test_snapshot_includes_forms() -> None:
+    state = HubState()
+    state.register("alpha")
+    state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    snapshot = state.add_ui().get_nowait()
+    assert len(snapshot["forms"]) == 1
+    assert snapshot["forms"][0]["title"] == "Deploy?"

@@ -12,9 +12,15 @@ from pydantic import ValidationError
 
 from caucus.models import (
     BROADCAST,
+    AskRequest,
     ChannelRequest,
     ChannelTopicRequest,
     ControlMode,
+    Field,
+    FieldSpec,
+    FieldType,
+    Form,
+    FormStatus,
     Message,
     MessageKind,
     RegisterRequest,
@@ -134,3 +140,107 @@ def test_channel_topic_request_rejects_oversized_topic() -> None:
 def test_register_response_channels_defaults_to_empty() -> None:
     resp = RegisterResponse(token="t", project="p", protocol_version=1)
     assert resp.channels == {}
+
+
+# --- operator forms ------------------------------------------------------
+
+
+def test_message_to_public_includes_meta_only_when_set() -> None:
+    plain = Message(sender="a", recipient="b", content="hi")
+    assert "meta" not in plain.to_public()
+
+    answered = Message(
+        sender="human",
+        recipient=BROADCAST,
+        content="recap",
+        kind=MessageKind.ANSWER,
+        meta={"form_id": "f1", "status": "answered"},
+    )
+    public = answered.to_public()
+    assert public["kind"] == "answer"
+    assert public["meta"] == {"form_id": "f1", "status": "answered"}
+
+
+def test_field_to_public_shape() -> None:
+    fld = Field(key="env", label="Target env", type=FieldType.RADIO, options=["dev", "prod"])
+    assert fld.to_public() == {
+        "key": "env",
+        "label": "Target env",
+        "type": "radio",
+        "options": ["dev", "prod"],
+        "required": False,
+        "allow_other": False,
+    }
+
+
+def test_form_to_public_shape() -> None:
+    fld = Field(key="ok", label="Proceed?", type=FieldType.RADIO, options=["yes", "no"])
+    form = Form(title="Deploy", asker="alpha", to=BROADCAST, fields=[fld])
+    public = form.to_public()
+    assert public["title"] == "Deploy"
+    assert public["asker"] == "alpha"
+    assert public["to"] == BROADCAST
+    assert public["status"] == "pending"
+    assert public["answers"] is None
+    assert public["fields"] == [fld.to_public()]
+    assert public["id"] == form.id
+    assert public["ts"] == form.ts
+
+
+def test_form_defaults_to_pending() -> None:
+    form = Form(title="t", asker="a", to=BROADCAST, fields=[])
+    assert form.status is FormStatus.PENDING
+    assert len(form.id) == 12
+
+
+def test_field_spec_radio_requires_options() -> None:
+    with pytest.raises(ValidationError):
+        FieldSpec(key="k", label="l", type=FieldType.RADIO, options=[])
+
+
+def test_field_spec_checkbox_requires_options() -> None:
+    with pytest.raises(ValidationError):
+        FieldSpec(key="k", label="l", type=FieldType.CHECKBOX, options=[])
+
+
+def test_field_spec_text_rejects_options() -> None:
+    with pytest.raises(ValidationError):
+        FieldSpec(key="k", label="l", type=FieldType.TEXT, options=["x"])
+
+
+def test_field_spec_textarea_rejects_options() -> None:
+    with pytest.raises(ValidationError):
+        FieldSpec(key="k", label="l", type=FieldType.TEXTAREA, options=["x"])
+
+
+def test_field_spec_text_field_is_valid_without_options() -> None:
+    spec = FieldSpec(key="note", label="Note", type=FieldType.TEXT)
+    assert spec.options == []
+
+
+def test_field_spec_rejects_oversized_option() -> None:
+    with pytest.raises(ValidationError):
+        FieldSpec(key="k", label="l", type=FieldType.RADIO, options=["x" * 201])
+
+
+def test_ask_request_defaults_to_broadcast() -> None:
+    req = AskRequest(
+        token="t",
+        title="Pick one",
+        fields=[FieldSpec(key="k", label="l", type=FieldType.RADIO, options=["a"])],
+    )
+    assert req.to == BROADCAST
+
+
+def test_ask_request_requires_at_least_one_field() -> None:
+    with pytest.raises(ValidationError):
+        AskRequest(token="t", title="empty", fields=[])
+
+
+def test_ask_request_rejects_empty_title() -> None:
+    with pytest.raises(ValidationError):
+        AskRequest(
+            token="t",
+            title="",
+            fields=[FieldSpec(key="k", label="l", type=FieldType.TEXT)],
+        )

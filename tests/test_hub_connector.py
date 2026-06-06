@@ -273,3 +273,45 @@ async def test_register_note_is_populated_on_replaced(live_hub: str) -> None:
         second = await hub.register("conn-replaced-note", proto.version)
     assert second.note is not None
     assert "mid-conversation" in second.note
+
+
+# --- operator forms ------------------------------------------------------
+
+
+def _radio_field() -> dict[str, object]:
+    return {"key": "ok", "label": "Proceed?", "type": "radio", "options": ["yes", "no"]}
+
+
+async def test_ask_operator_opens_form_and_lists(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-asker", None)
+        result = await hub.ask_operator(me.token, "all", "Deploy?", [_radio_field()])
+        assert result.form_id
+        assert result.to == "all"
+
+        forms = await hub.list_forms()
+    assert any(f["title"] == "Deploy?" for f in forms)
+
+
+async def test_receive_passes_answer_meta_through(live_hub: str) -> None:
+    """``receive`` keeps an ``answer`` message's ``meta`` bundle intact.
+
+    Route an ``answer`` message directly through the live hub's HTTP ``/send``
+    is not possible (kind is server-assigned), so this asserts the parsing
+    contract on the connector side: an inbound answer dict (with ``meta``) is
+    not stripped. We exercise it by routing through the shared in-process state
+    the ``live_hub`` fixture serves, then polling with the connector.
+    """
+    from caucus import hub as hub_module
+    from caucus.models import BROADCAST, Field, FieldType
+
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-form-meta", None)
+        fld = Field(key="ok", label="Proceed?", type=FieldType.RADIO, options=["yes"])
+        form = hub_module.state.create_form("conn-form-meta", BROADCAST, "Q", [fld])
+        hub_module.state.answer_form(form.id, {"ok": "yes"})
+        inbound = await hub.receive(me.token, 3.0)
+    answers = [m for m in inbound.messages if m.get("kind") == "answer"]
+    assert answers
+    assert answers[0]["meta"]["form_id"] == form.id
+    assert answers[0]["meta"]["answers"] == {"ok": "yes"}
