@@ -82,7 +82,7 @@ class HubState:
         bucket_capacity: float = 5.0,
         bucket_refill: float = 0.5,
         log_size: int = 500,
-        client_ttl: float = 90.0,
+        client_ttl: float = 300.0,
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
@@ -95,8 +95,12 @@ class HubState:
         self._bucket_capacity = bucket_capacity
         self._bucket_refill = bucket_refill
         # Idle clients are reaped once their ``last_seen`` is older than this.
-        # A live watcher refreshes ``last_seen`` on every ``/receive`` poll
-        # (~25s), so the default sits well above that to avoid false reaps.
+        # A live watcher refreshes ``last_seen`` while it polls ``/receive``,
+        # but the bridge watcher is one-shot: it exits on every inbound message
+        # and stays down for the whole turn the agent spends composing a reply
+        # (no polling in that window). The default must therefore comfortably
+        # exceed a realistic agent turn so a peer is not reaped mid-reply — see
+        # ``client_for``, which also revives a recently reaped token.
         self.client_ttl = client_ttl
 
     # --- properties ------------------------------------------------------
