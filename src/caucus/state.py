@@ -34,6 +34,11 @@ class Client:
         active_polls: Number of in-flight ``/receive`` long-polls currently
             held for this client — i.e. live listeners. Used to tell a genuine
             reconnect from a colliding duplicate at register time.
+        reaped_at: When the idle reaper moved this client to the revival
+            graveyard, or ``None`` while it is live. A reaped client keeps its
+            token, queue, and channel memberships so any authenticated call can
+            revive it (see :meth:`HubState._revive`) instead of forcing a fresh
+            join with a brand-new token.
     """
 
     project: str
@@ -43,6 +48,7 @@ class Client:
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
     active_polls: int = 0
+    reaped_at: float | None = None
 
 
 class RegisterOutcome(str, Enum):
@@ -83,9 +89,14 @@ class HubState:
         bucket_refill: float = 0.5,
         log_size: int = 500,
         client_ttl: float = 300.0,
+        reaped_grace: float = 1800.0,
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
+        # Idle-reaped clients awaiting revival, keyed by their still-valid token.
+        # Off the roster and out of routing, but resurrectable on any
+        # authenticated call until their grace window lapses.
+        self._reaped: dict[str, Client] = {}  # token -> reaped Client
         self._topics: dict[str, str] = {}  # channel -> topic (ephemeral)
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
@@ -102,6 +113,10 @@ class HubState:
         # exceed a realistic agent turn so a peer is not reaped mid-reply — see
         # ``client_for``, which also revives a recently reaped token.
         self.client_ttl = client_ttl
+        # How long a reaped token stays revivable before it is truly forgotten.
+        # Generous on purpose: a peer that goes quiet for a while should still
+        # be able to pick its identity back up rather than re-join from scratch.
+        self.reaped_grace = reaped_grace
 
     # --- properties ------------------------------------------------------
 
@@ -169,7 +184,10 @@ class HubState:
         * **FRESH** — no prior record; a new :class:`Client` is created.
         * **REAFFIRMED** — ``token`` matches the existing client's token; the
           caller is the same agent reconnecting. ``last_seen`` is refreshed;
-          no system notice is emitted.
+          no system notice is emitted. Also returned when ``token`` matches a
+          *reaped* identity for this name (idle-dropped but still in its grace
+          window): the client is revived in place with the same token (a
+          "reconnected" notice is emitted in that case — see :meth:`_revive`).
         * **REPLACED** — name exists but ``active_polls == 0`` (the prior
           listener is gone) and no valid token is presented. The existing
           client record is reused (same queue and channel memberships);
@@ -205,6 +223,20 @@ class HubState:
             # Dead/timed-out record: hand the slot to the newcomer.
             existing.last_seen = time.time()
             return Registration(RegisterOutcome.REPLACED, existing)
+        # No live record under this name. The caller may be the same agent
+        # reviving a reaped identity: if it still holds the reaped token (and
+        # the name has not been handed to someone else), restore it in place
+        # with the same token rather than minting a fresh one.
+        if token is not None:
+            reaped = self._reaped.get(token)
+            if (
+                reaped is not None
+                and reaped.project == project
+                and secrets.compare_digest(token, reaped.token)
+            ):
+                revived = self._revive(reaped)
+                if revived is not None:
+                    return Registration(RegisterOutcome.REAFFIRMED, revived)
         client = Client(
             project=project,
             token=secrets.token_urlsafe(24),
@@ -238,30 +270,85 @@ class HubState:
         return True
 
     def client_for(self, token: str) -> Client | None:
-        """Look up a client by token, refreshing its ``last_seen``."""
+        """Look up a client by token, refreshing its ``last_seen``.
+
+        A live token returns its client directly. A token whose client was
+        idle-reaped but is still within its grace window is *revived* in place
+        (same token, queue, and channels) and returned, so an agent that holds
+        a valid token never sees a 401 just because it paused longer than the
+        idle TTL — e.g. while composing a long reply. Returns ``None`` only for
+        a token that is genuinely unknown (never issued, or past its grace
+        window) or whose name has since been claimed by another live peer.
+        """
         client = self._by_token.get(token)
         if client is not None:
             client.last_seen = time.time()
-        return client
+            return client
+        reaped = self._reaped.get(token)
+        if reaped is not None:
+            return self._revive(reaped)
+        return None
 
-    def _drop(self, client: Client, reason: str) -> None:
+    def _drop(self, client: Client, reason: str, *, revivable: bool = False) -> None:
         """Remove ``client`` from the roster and notify the operator UI.
 
-        Shared by graceful deregister (:meth:`unregister`) and idle reaping
-        (:meth:`reap_stale`). Pops both lookup maps, announces a system notice
-        carrying ``reason`` (e.g. ``"left"`` / ``"timed out"``), and pushes the
-        refreshed peer list so the UI roster reflects reality at once. When the
-        dropped client held channel memberships, the refreshed channel map is
-        pushed too, so the UI roster and any emptied channel disappear together.
+        Shared by graceful deregister (:meth:`unregister`), operator kick
+        (:meth:`kick`), and idle reaping (:meth:`reap_stale`). Pops both active
+        lookup maps, announces a system notice carrying ``reason`` (e.g.
+        ``"left"`` / ``"timed out"``), and pushes the refreshed peer list so the
+        UI roster reflects reality at once. When the dropped client held channel
+        memberships, the refreshed channel map is pushed too, so the UI roster
+        and any emptied channel disappear together.
+
+        Args:
+            client: The client to remove.
+            reason: Human-readable cause, surfaced in the operator notice.
+            revivable: When ``True`` (idle reaping) the client is parked in the
+                revival graveyard keyed by its still-valid token instead of
+                being forgotten, so a later authenticated call can resurrect it
+                (see :meth:`_revive`). When ``False`` (explicit leave / kick)
+                the drop is terminal and the token dies with it.
         """
         had_channels = bool(client.channels)
         self._clients.pop(client.project, None)
         self._by_token.pop(client.token, None)
+        if revivable:
+            client.reaped_at = time.time()
+            self._reaped[client.token] = client
         self._announce_system(f"{client.project} {reason}")
         self._push_ui({"type": "peers", "peers": self.peers()})
         if had_channels:
             self._prune_topics()  # forget topics of any channel this emptied
             self._push_ui({"type": "channels", "channels": self.channels()})
+
+    def _revive(self, client: Client) -> Client | None:
+        """Resurrect a reaped ``client`` back onto the active roster.
+
+        Restores the client in place — same token, queue, and channel
+        memberships — and re-announces it as reconnected. Fails (returning
+        ``None``) when the name has meanwhile been claimed by another live peer:
+        the reaped identity is then discarded for good rather than stomping the
+        new holder. The token is removed from the graveyard either way.
+
+        Args:
+            client: The reaped client (present in :attr:`_reaped`) to restore.
+
+        Returns:
+            The revived client, or ``None`` if its name was already reassigned.
+        """
+        self._reaped.pop(client.token, None)
+        if client.project in self._clients:
+            # Someone else took the name while we were away — stay dead.
+            return None
+        client.reaped_at = None
+        client.last_seen = time.time()
+        self._clients[client.project] = client
+        self._by_token[client.token] = client
+        self._announce_system(f"{client.project} reconnected")
+        self._push_ui({"type": "peers", "peers": self.peers()})
+        if client.channels:
+            self._push_ui({"type": "channels", "channels": self.channels()})
+        return client
 
     def unregister(self, token: str) -> str | None:
         """Drop the client holding ``token`` (an explicit, graceful leave).
@@ -281,9 +368,13 @@ class HubState:
     def reap_stale(self, ttl: float, *, now: float | None = None) -> list[str]:
         """Drop clients idle longer than ``ttl`` seconds; return their names.
 
-        A live agent's background watcher refreshes ``last_seen`` on every
-        ``/receive`` poll, so only genuinely gone peers (killed process, dead
-        watcher) cross the threshold. Each reaped peer is announced to the UI.
+        A live agent's background watcher refreshes ``last_seen`` while it polls
+        ``/receive``, so peers cross the threshold once that polling stops
+        (killed process, dead watcher, or a reply turn that outlasts the TTL).
+        Each reaped peer is announced to the UI and parked in the revival
+        graveyard (``revivable=True``) so it can be resurrected by any later
+        authenticated call. The same sweep also forgets graveyard entries whose
+        :attr:`reaped_grace` window has lapsed — those tokens are dead for good.
 
         Args:
             ttl: Maximum idle time, in seconds, before a client is reaped.
@@ -293,10 +384,20 @@ class HubState:
         Returns:
             The names of the clients that were reaped (possibly empty).
         """
-        cutoff = (time.time() if now is None else now) - ttl
+        ref = time.time() if now is None else now
+        cutoff = ref - ttl
         stale = [c for c in self._clients.values() if c.last_seen < cutoff]
         for client in stale:
-            self._drop(client, "timed out")
+            self._drop(client, "timed out", revivable=True)
+        # Forget reaped identities whose grace window has lapsed; their tokens
+        # are now truly dead and a re-join would mint a fresh one.
+        grace_cutoff = ref - self.reaped_grace
+        for token in [
+            t
+            for t, c in self._reaped.items()
+            if c.reaped_at is not None and c.reaped_at < grace_cutoff
+        ]:
+            self._reaped.pop(token, None)
         return [c.project for c in stale]
 
     # --- messaging -------------------------------------------------------

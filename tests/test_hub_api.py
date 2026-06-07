@@ -124,6 +124,31 @@ def test_send_with_unknown_token_is_401(client: TestClient) -> None:
     assert resp.status_code == 401
 
 
+def test_send_after_reap_revives_instead_of_401(
+    client: TestClient, state: HubState
+) -> None:
+    """The agent's exact complaint: a /send after an idle reap must not 401.
+
+    A peer that paused past the idle TTL (e.g. while composing a long reply)
+    gets reaped, yet it still holds a valid token. The next /send revives it in
+    place rather than forcing a re-join under a fresh token.
+    """
+    alpha = _register(client, "alpha")
+    _register(client, "beta")
+    # Backdate alpha and drop it through the real idle reaper.
+    alpha_client = state.client_for(alpha)
+    assert alpha_client is not None
+    alpha_client.last_seen -= 1000.0
+    assert state.reap_stale(ttl=30.0) == ["alpha"]
+    assert state.peers() == ["beta"]
+
+    resp = client.post(
+        "/send", json={"token": alpha, "to": "beta", "content": "back"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert "alpha" in state.peers()  # revived onto the roster, same token
+
+
 def test_direct_message_is_delivered(client: TestClient) -> None:
     alpha = _register(client, "alpha")
     _register(client, "beta")
