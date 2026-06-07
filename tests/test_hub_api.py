@@ -185,6 +185,76 @@ def test_receive_unknown_token_is_401(client: TestClient) -> None:
     assert client.get("/receive", params={"token": "nope"}).status_code == 401
 
 
+# --- /receive token via Authorization header (anti-leak) -----------------
+
+
+def test_receive_accepts_bearer_header_without_query_token(client: TestClient) -> None:
+    """The token may be supplied via ``Authorization: Bearer`` with no query token.
+
+    This is the leak-free path: the secret stays out of the URL (and thus out
+    of httpx and server access logs) while still authenticating the poll.
+    """
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "via-header"})
+
+    got = client.get(
+        "/receive",
+        params={"timeout": 3},
+        headers={"Authorization": f"Bearer {beta}"},
+    )
+    assert got.status_code == 200
+    assert any("via-header" in m["content"] for m in got.json()["messages"])
+
+
+def test_receive_bearer_header_wins_over_query_token(client: TestClient) -> None:
+    """A valid bearer header authenticates even when the query token is garbage."""
+    token = _register(client, "alpha")
+    got = client.get(
+        "/receive",
+        params={"token": "garbage", "timeout": 0},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert got.status_code == 200
+    assert got.json()["mode"] == "running"
+
+
+def test_receive_non_bearer_header_falls_back_to_query_token(client: TestClient) -> None:
+    """A non-Bearer ``Authorization`` header is ignored; the query token is used.
+
+    Keeps the deprecated query path working for older watchers mid-upgrade.
+    """
+    token = _register(client, "alpha")
+    got = client.get(
+        "/receive",
+        params={"token": token, "timeout": 0},
+        headers={"Authorization": "Basic Zm9vOmJhcg=="},
+    )
+    assert got.status_code == 200
+
+
+def test_receive_no_token_anywhere_is_401(client: TestClient) -> None:
+    assert client.get("/receive", params={"timeout": 0}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("authorization", "token", "expected"),
+    [
+        ("Bearer abc", None, "abc"),  # header preferred
+        ("bearer abc", None, "abc"),  # scheme is case-insensitive
+        ("Bearer abc", "xyz", "abc"),  # header wins over query
+        ("Basic Zm9v", "xyz", "xyz"),  # non-bearer header ignored -> query
+        (None, "xyz", "xyz"),  # query fallback
+        ("Bearer   ", "xyz", "xyz"),  # empty bearer payload -> query
+        (None, None, None),  # nothing supplied
+    ],
+)
+def test_resolve_receive_token_precedence(
+    authorization: str | None, token: str | None, expected: str | None
+) -> None:
+    assert hub_module._resolve_receive_token(authorization, token) == expected
+
+
 def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
     token = _register(client, "alpha")
     codes = [
