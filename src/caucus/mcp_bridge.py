@@ -512,7 +512,13 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
     with _client() as http:
-        resp = http.get("/receive", params={"token": _token, "timeout": timeout})
+        # Token in the Authorization header, not the URL query string: a query
+        # token on this GET leaks into httpx and server access logs.
+        resp = http.get(
+            "/receive",
+            params={"timeout": timeout},
+            headers={"Authorization": f"Bearer {_token}"},
+        )
         resp.raise_for_status()
         payload = resp.json()
     messages = payload.get("messages", [])

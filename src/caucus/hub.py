@@ -21,7 +21,15 @@ from pathlib import Path
 
 import coloredlogs
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from . import __version__
@@ -438,13 +446,44 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     return SendResponse(message_id=msg.id, delivered_to=delivered)
 
 
+def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:
+    """Resolve the ``/receive`` access token: ``Authorization`` header, then query.
+
+    The header form is preferred because ``/receive`` is a long-poll ``GET``:
+    its token would otherwise ride in the URL query string, where httpx and the
+    server's own access logs record it in clear, leaking the secret. The query
+    parameter is kept as a **deprecated** fallback so a peer running an
+    older watcher keeps working through a hub upgrade; new callers must use the
+    header.
+
+    Args:
+        authorization: Raw ``Authorization`` header value, if any.
+        token: The deprecated ``?token=`` query parameter, if any.
+
+    Returns:
+        The bearer token from the header when present and well-formed, else the
+        query token, else ``None``.
+    """
+    if authorization and authorization[:7].lower() == "bearer ":
+        bearer = authorization[7:].strip()
+        if bearer:
+            return bearer
+    return token
+
+
 @app.get("/receive")
 async def receive(
     request: Request,
-    token: str,
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
+
+    The access token is read from the ``Authorization: Bearer <token>`` header
+    (preferred) or, as a deprecated fallback, the ``?token=`` query parameter
+    -- see :func:`_resolve_receive_token`. Prefer the header: a query token
+    leaks into httpx and access logs because this is a ``GET``.
 
     Blocks up to ``timeout`` seconds. Honors the pause gate (holds messages
     while paused) and surfaces a control ``stop`` signal immediately. Returns
@@ -460,7 +499,8 @@ async def receive(
         the poll times out or the client disconnects, in which case the caller
         should poll again.
     """
-    client = state.client_for(token)
+    resolved = _resolve_receive_token(authorization, token)
+    client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
 

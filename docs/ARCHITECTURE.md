@@ -183,6 +183,12 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 this ordering intact (server poll < bridge HTTP timeout) or you get spurious
 disconnects.
 
+`/receive` reads its access token from the `Authorization: Bearer <token>`
+header, never the URL query string — a `GET` query token leaks into httpx and
+server access logs. The `?token=` query parameter is still accepted as a
+**deprecated** fallback (so an older watcher survives a hub upgrade); all
+first-party callers send the header. Keep new callers on the header.
+
 ## Models (`models.py`) — two-layer boundary
 
 Internal state uses `@dataclass(slots=True)` (`Message`, `Client`, `TokenBucket`).

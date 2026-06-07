@@ -160,8 +160,12 @@ def watch(hub: str, token: str, timeout: float) -> int:
     with httpx.Client(base_url=base, timeout=timeout + _HTTP_TIMEOUT_SLACK) as http:
         while True:
             try:
+                # Token in the Authorization header, not the URL query string:
+                # a query token on this GET leaks into httpx and access logs.
                 resp = http.get(
-                    "/receive", params={"token": token, "timeout": timeout}
+                    "/receive",
+                    params={"timeout": timeout},
+                    headers={"Authorization": f"Bearer {token}"},
                 )
             except httpx.HTTPError as exc:
                 logger.warning("poll failed (%s); retrying in %.0fs", exc, backoff)
