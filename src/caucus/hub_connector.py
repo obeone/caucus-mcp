@@ -321,7 +321,13 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/receive", params={"token": token, "timeout": timeout})
+        # Token in the Authorization header, never the URL query string: this is
+        # a GET, so a query token leaks into httpx and server access logs.
+        resp = await http.get(
+            "/receive",
+            params={"timeout": timeout},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         resp.raise_for_status()
         payload = resp.json()
         raw = payload.get("messages", [])
