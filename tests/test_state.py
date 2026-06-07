@@ -394,8 +394,11 @@ async def test_reap_stale_drops_only_idle_clients() -> None:
 
     assert reaped == ["stale"]
     assert state.peers() == ["fresh"]
-    assert state.client_for(stale.token) is None
     assert state.client_for(fresh.token) is fresh
+    # The reaped peer leaves the roster but its token stays revivable: the next
+    # authenticated call resurrects it in place rather than rejecting it.
+    assert state.client_for(stale.token) is stale
+    assert "stale" in state.peers()
 
 
 async def test_reap_stale_keeps_recently_seen_clients() -> None:
@@ -413,6 +416,91 @@ async def test_reap_stale_uses_injected_now() -> None:
     # last_seen ~= time.time(); a far-future ``now`` makes it stale deterministically.
     reaped = state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
     assert reaped == ["alpha"]
+
+
+async def test_reaped_token_revives_via_client_for() -> None:
+    """A reaped peer's token resurrects it on the next authenticated call."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+    assert state.peers() == []  # off the roster after reaping
+
+    revived = state.client_for(token)
+    assert revived is client  # same record, same token, no 401
+    assert revived.token == token
+    assert state.peers() == ["alpha"]  # back on the roster
+
+
+async def test_reaped_token_revives_via_register() -> None:
+    """Re-joining with the reaped token reaffirms the identity in place."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+
+    reg = state.register("alpha", token=token)
+    assert reg.outcome is RegisterOutcome.REAFFIRMED
+    assert reg.client is client
+    assert reg.client.token == token  # no fresh token minted
+    assert state.peers() == ["alpha"]
+
+
+async def test_revival_restores_channel_membership() -> None:
+    """A revived peer keeps the channels it held before being reaped."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    state.subscribe(client.token, "#room")
+    state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+    assert state.channels() == {}  # off the roster, channel emptied
+
+    state.client_for(client.token)  # revive
+    assert "alpha" in state.channels()["#room"]["members"]
+
+
+async def test_revival_refused_when_name_reclaimed() -> None:
+    """If a fresh peer grabbed the freed name, the reaped token stays dead."""
+    state = HubState()
+    old = state.register("alpha").client
+    assert old is not None
+    old_token = old.token
+    state.reap_stale(ttl=30.0, now=old.last_seen + 1000.0)
+
+    # A different process claims the freed name and gets its own token.
+    new = state.register("alpha").client
+    assert new is not None
+    assert new.token != old_token
+
+    # The stale token cannot revive — the slot is occupied; the live holder
+    # is left untouched.
+    assert state.client_for(old_token) is None
+    assert state.client_for(new.token) is new
+
+
+async def test_reaped_token_forgotten_after_grace() -> None:
+    """Past the grace window the reaped token is purged and cannot revive."""
+    state = HubState(reaped_grace=100.0)
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    base = client.last_seen + 1000.0
+    state.reap_stale(ttl=30.0, now=base)  # parks it in the graveyard
+    state.reap_stale(ttl=30.0, now=base + 200.0)  # grace lapsed -> forgotten
+    assert state.client_for(token) is None
+
+
+async def test_explicit_leave_token_is_not_revivable() -> None:
+    """A graceful leave is terminal: the token dies, no graveyard entry."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    state.unregister(token)
+    assert state.client_for(token) is None
+    assert state.peers() == []
 
 
 async def test_receive_style_drain_after_route() -> None:
