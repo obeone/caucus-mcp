@@ -53,8 +53,9 @@ import sys
 import time
 from pathlib import Path
 
-import coloredlogs
 import httpx
+
+from .logging_setup import configure_logging
 
 logger = logging.getLogger("caucus.watch")
 
@@ -239,11 +240,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    coloredlogs.install(
-        level=os.environ.get("CAUCUS_LOG_LEVEL", "INFO"),
-        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,  # keep stdout clean: it is the agent's signal channel
-    )
+    # stderr keeps stdout clean (the agent's signal channel); configure_logging
+    # also silences httpx so the token in the /receive URL never hits stderr.
+    configure_logging(sys.stderr)
 
     try:
         token = _resolve_token(args.token, args.token_file)
