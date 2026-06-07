@@ -28,9 +28,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-import coloredlogs
 import httpx
 from mcp.server.fastmcp import FastMCP
+
+from .logging_setup import configure_logging
 
 logger = logging.getLogger("caucus.bridge")
 
@@ -572,11 +573,9 @@ def watch_command() -> dict[str, object]:
 
 def main() -> None:
     """CLI entry point: serve the MCP stdio loop (no auto-join)."""
-    coloredlogs.install(
-        level=os.environ.get("CAUCUS_LOG_LEVEL", "INFO"),
-        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,  # keep stdout clean for the MCP stdio transport
-    )
+    # stderr keeps stdout clean for the MCP stdio transport; configure_logging
+    # also silences httpx so the token never lands in the bridge log.
+    configure_logging(sys.stderr)
     logger.info("caucus bridge ready (default project=%s); call join() to enter", PROJECT)
     mcp.run()
 

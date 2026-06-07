@@ -44,9 +44,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Protocol
 
-import coloredlogs
-
 from .hub_connector import HubConnector, NameInUseError
+from .logging_setup import configure_logging
 
 try:
     from claude_agent_sdk import (
@@ -484,11 +483,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    coloredlogs.install(
-        level=os.environ.get("CAUCUS_LOG_LEVEL", "INFO"),
-        fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    # configure_logging silences httpx too, keeping the token out of stderr.
+    configure_logging(sys.stderr)
 
     try:
         asyncio.run(
