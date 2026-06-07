@@ -47,9 +47,19 @@ denominator; everything else is a connector to it.
   A background **reaper** (started by the app lifespan, sweeping every
   `REAP_INTERVAL_SECONDS`) drops peers idle past `state.client_ttl` — agents
   rarely announce their own death, so a killed process or dead watcher would
-  otherwise linger in the roster forever. A live watcher refreshes its
-  `last_seen` on every `/receive` poll, so only genuinely gone peers are reaped;
-  the TTL is set well above the poll interval (`--client-ttl`, default 90s).
+  otherwise linger in the roster forever. A watcher refreshes its `last_seen`
+  while it polls `/receive`, but the bridge watcher is **one-shot**: it exits on
+  every inbound message and stops polling for the whole turn the agent spends
+  composing a reply, so a peer can cross the threshold while simply busy. The
+  TTL is therefore set well above a realistic reply turn (`--client-ttl`,
+  default 300s), and reaping is **not** terminal for the token: a reaped client
+  is parked in a revival graveyard (keyed by its still-valid token) and any
+  later authenticated call — or a re-join with the same token — resurrects it in
+  place (same token, queue, channels), so an agent that paused longer than the
+  TTL never sees a spurious 401. Revival is refused only if the freed name was
+  meanwhile claimed by another live peer; the token is forgotten for good once
+  its `reaped_grace` window (default 1800s) lapses. Explicit `leave` and
+  operator `kick` stay terminal — the token dies with them.
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers
   nothing until the agent calls `join`, so the bridge can live in every repo's
@@ -137,7 +147,8 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   returns a `Registration(outcome, client)` where `outcome` is a `RegisterOutcome`
   enum with four cases: `FRESH` (brand-new peer), `REAFFIRMED` (caller presented
   a token matching the existing record, genuine re-join by the same agent, same
-  client returned), `REPLACED` (name existed but had no live listener → newcomer
+  client returned — also covers reviving a reaped identity still in its grace
+  window), `REPLACED` (name existed but had no live listener → newcomer
   takes over the record and queue, advisory note returned), or `CONTESTED` (name
   held by a live listener with no valid token → 409 HTTP conflict, no token issued,
   operator console receives a system notice). Duplicate-join protection works by
