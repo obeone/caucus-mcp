@@ -68,6 +68,9 @@ class Message:
         kind: Whether this is chatter, a control signal, or a system notice.
         id: Unique identifier, assigned automatically.
         ts: Unix timestamp (seconds) of creation.
+        seq: Monotone hub-assigned sequence number, set by
+            :meth:`~caucus.state.HubState.route`; ``0`` until routed.
+            Clients use this to ACK delivery and replay missed messages.
     """
 
     sender: str
@@ -76,6 +79,7 @@ class Message:
     kind: MessageKind = MessageKind.MESSAGE
     id: str = field(default_factory=_new_id)
     ts: float = field(default_factory=time.time)
+    seq: int = 0
 
     def to_public(self) -> dict[str, object]:
         """Serialise to a JSON-friendly dict for clients and the UI."""
@@ -86,6 +90,7 @@ class Message:
             "content": self.content,
             "kind": self.kind.value,
             "ts": self.ts,
+            "seq": self.seq,
         }
 
 
@@ -211,3 +216,15 @@ class ControlRequest(BaseModel):
     """Body for ``POST /control``."""
 
     action: str  # pause | resume | stop | reset
+
+
+class AckRequest(BaseModel):
+    """Body for ``POST /ack``.
+
+    Acknowledges receipt of all messages up to and including ``seq``.
+    The hub prunes the sender's unacked buffer and will not replay messages
+    at or below this sequence number on the next reconnect.
+    """
+
+    token: str
+    seq: int = Field(ge=0)

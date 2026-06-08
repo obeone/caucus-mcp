@@ -35,6 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from . import __version__
 from . import export as export_mod
 from .models import (
+    AckRequest,
     ChannelRequest,
     ChannelTopicRequest,
     ControlMode,
@@ -477,6 +478,7 @@ async def receive(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
+    ack_seq: int | None = Query(default=None),
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
@@ -494,6 +496,16 @@ async def receive(
     lets :meth:`~caucus.state.HubState.register` distinguish a genuine
     reconnect from a colliding duplicate process.
 
+    Messages returned to the caller are appended to :attr:`~caucus.state.Client.unacked`
+    so they can be replayed if the client disconnects before acknowledging them.
+    Pass ``ack_seq=<seq>`` to piggyback an ACK on the next poll, confirming
+    receipt of all messages up to that sequence number without an extra round-trip.
+
+    Args:
+        ack_seq: Optional piggyback ACK — the highest ``seq`` the caller has
+            successfully processed. Equivalent to ``POST /ack`` but saves a
+            round-trip by folding the ACK into the next poll.
+
     Returns:
         ``{"messages": [...], "mode": "<mode>"}``. The list may be empty when
         the poll times out or the client disconnects, in which case the caller
@@ -503,6 +515,11 @@ async def receive(
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
+
+    # Piggyback ACK: acknowledge previously delivered messages before waiting
+    # for new ones, saving the caller an extra round-trip.
+    if ack_seq is not None:
+        state.ack(client.token, ack_seq)
 
     client.active_polls += 1
     try:
@@ -539,9 +556,29 @@ async def receive(
             messages = [first]
             while not client.queue.empty():
                 messages.append(client.queue.get_nowait())
+            # Track delivered messages for potential replay on reconnect.
+            for msg in messages:
+                client.unacked.append(msg)
             return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
     finally:
         client.active_polls -= 1
+
+
+@app.post("/ack")
+async def ack(req: AckRequest) -> dict[str, object]:
+    """Acknowledge receipt of all messages up to and including ``seq``.
+
+    Prunes the caller's unacked buffer so the hub does not replay confirmed
+    messages on the next reconnect. Callers that prefer a separate round-trip
+    over the piggyback ``ack_seq`` parameter on ``GET /receive`` can use this
+    endpoint instead — both are equivalent.
+
+    Rejected with 401 when the token is unknown.
+    """
+    if not state.ack(req.token, req.seq):
+        raise HTTPException(status_code=401, detail="unknown token")
+    logger.debug("ack token=... seq=%d", req.seq)
+    return {"acked": True, "seq": req.seq}
 
 
 @app.post("/control")
