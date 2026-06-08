@@ -39,6 +39,14 @@ class Client:
             token, queue, and channel memberships so any authenticated call can
             revive it (see :meth:`HubState._revive`) instead of forcing a fresh
             join with a brand-new token.
+        last_acked_seq: The highest message sequence number the client has
+            explicitly acknowledged via ``POST /ack`` or the ``ack_seq``
+            piggyback on ``GET /receive``. Messages at or below this value
+            are pruned from :attr:`unacked` and will not be replayed.
+        unacked: Ring buffer of messages returned by ``/receive`` but not yet
+            acknowledged. Bounded to 200 entries; when the client reconnects
+            after a gap, messages with ``seq > last_acked_seq`` are re-injected
+            into :attr:`queue` so no delivery is silently lost.
     """
 
     project: str
@@ -49,6 +57,8 @@ class Client:
     channels: set[str] = field(default_factory=set)
     active_polls: int = 0
     reaped_at: float | None = None
+    last_acked_seq: int = 0
+    unacked: deque[Message] = field(default_factory=lambda: deque(maxlen=200))
 
 
 class RegisterOutcome(str, Enum):
@@ -97,6 +107,11 @@ class HubState:
         # Off the roster and out of routing, but resurrectable on any
         # authenticated call until their grace window lapses.
         self._reaped: dict[str, Client] = {}  # token -> reaped Client
+        # Secondary index for reaped clients by project name, kept in sync with
+        # _reaped to allow O(1) lookup in route() for direct-addressed messages.
+        self._reaped_by_project: dict[str, Client] = {}  # project -> reaped Client
+        # Monotone counter; incremented and stamped onto every routed message.
+        self._seq: int = 0
         self._topics: dict[str, str] = {}  # channel -> topic (ephemeral)
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
@@ -315,6 +330,9 @@ class HubState:
         if revivable:
             client.reaped_at = time.time()
             self._reaped[client.token] = client
+            self._reaped_by_project[client.project] = client
+        else:
+            self._reaped_by_project.pop(client.project, None)
         self._announce_system(f"{client.project} {reason}")
         self._push_ui({"type": "peers", "peers": self.peers()})
         if had_channels:
@@ -324,11 +342,21 @@ class HubState:
     def _revive(self, client: Client) -> Client | None:
         """Resurrect a reaped ``client`` back onto the active roster.
 
-        Restores the client in place — same token, queue, and channel
-        memberships — and re-announces it as reconnected. Fails (returning
-        ``None``) when the name has meanwhile been claimed by another live peer:
-        the reaped identity is then discarded for good rather than stomping the
-        new holder. The token is removed from the graveyard either way.
+        Restores the client in place — same token, queue, channel memberships,
+        and unacked buffer — then re-announces it as reconnected. Any messages
+        that were delivered (returned by ``/receive``) but not yet acknowledged
+        are re-injected into the client's queue in sequence order so no
+        delivery is silently lost. Messages that arrived while the client was
+        reaped are already in the queue (placed there by the routing fix in
+        :meth:`route`); unacked messages are prepended so they arrive first.
+
+        Emits a broadcast ``SYSTEM`` notice that includes the downtime duration,
+        so other peers know they may need to resend anything sent during the gap.
+
+        Fails (returning ``None``) when the name has meanwhile been claimed by
+        another live peer: the reaped identity is then discarded for good
+        rather than stomping the new holder. Both indices are cleaned up either
+        way.
 
         Args:
             client: The reaped client (present in :attr:`_reaped`) to restore.
@@ -337,14 +365,60 @@ class HubState:
             The revived client, or ``None`` if its name was already reassigned.
         """
         self._reaped.pop(client.token, None)
+        self._reaped_by_project.pop(client.project, None)
         if client.project in self._clients:
             # Someone else took the name while we were away — stay dead.
             return None
+
+        # Compute downtime before clearing reaped_at.
+        downtime: float | None = (
+            time.time() - client.reaped_at if client.reaped_at is not None else None
+        )
+
         client.reaped_at = None
         client.last_seen = time.time()
         self._clients[client.project] = client
         self._by_token[client.token] = client
-        self._announce_system(f"{client.project} reconnected")
+
+        # Re-inject unacked messages (delivered but not ACKed) back to the
+        # front of the queue, ahead of any messages that arrived during absence.
+        # Drain the queue first so we can prepend, then re-add what was there.
+        pending_during_absence: list[Message] = []
+        while not client.queue.empty():
+            pending_during_absence.append(client.queue.get_nowait())
+
+        replayed = [
+            m for m in client.unacked if m.seq > client.last_acked_seq
+        ]
+        replayed.sort(key=lambda m: m.seq)
+        for msg in replayed:
+            client.queue.put_nowait(msg)
+        for msg in pending_during_absence:
+            client.queue.put_nowait(msg)
+
+        # Build and broadcast the reconnect notice to all peers.
+        if downtime is not None:
+            mins, secs = divmod(int(downtime), 60)
+            duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            content = (
+                f"{client.project} reconnected after {duration_str} away"
+            )
+            if replayed:
+                content += f" ({len(replayed)} message(s) replayed)"
+        else:
+            content = f"{client.project} reconnected"
+
+        notice = Message(
+            sender="hub",
+            recipient="all",
+            content=content,
+            kind=MessageKind.SYSTEM,
+        )
+        # Use route() so the notice gets a seq, lands in peer queues, and is
+        # logged — at this point client is already in _clients so it also
+        # receives the notice, which is harmless and informative.
+        self.route(notice)
+
         self._push_ui({"type": "peers", "peers": self.peers()})
         if client.channels:
             self._push_ui({"type": "channels", "channels": self.channels()})
@@ -397,8 +471,36 @@ class HubState:
             for t, c in self._reaped.items()
             if c.reaped_at is not None and c.reaped_at < grace_cutoff
         ]:
-            self._reaped.pop(token, None)
+            expired = self._reaped.pop(token, None)
+            if expired is not None:
+                self._reaped_by_project.pop(expired.project, None)
         return [c.project for c in stale]
+
+    def ack(self, token: str, seq: int) -> bool:
+        """Acknowledge receipt of all messages up to and including ``seq``.
+
+        Advances the client's :attr:`~Client.last_acked_seq` and prunes the
+        :attr:`~Client.unacked` buffer so acknowledged messages are not
+        replayed on the next reconnect. Works for both live and reaped clients
+        (a dying watcher can ACK just before the process exits).
+
+        Args:
+            token: The access token of the acknowledging client.
+            seq: The highest sequence number the client has successfully
+                processed. All messages at or below this value are confirmed.
+
+        Returns:
+            ``True`` if the token is known and the ACK was recorded, ``False``
+            if the token is unknown (never issued or past its grace window).
+        """
+        client = self.client_for(token)
+        if client is None:
+            return False
+        if seq > client.last_acked_seq:
+            client.last_acked_seq = seq
+            while client.unacked and client.unacked[0].seq <= seq:
+                client.unacked.popleft()
+        return True
 
     # --- messaging -------------------------------------------------------
 
@@ -413,6 +515,9 @@ class HubState:
           members delivers to nobody (the sender still sees its own send echoed
           in the UI feed).
         * anything else — a direct address to the single named peer, if present.
+          If the named peer is currently reaped (idle-dropped but still within
+          its grace window), the message is enqueued directly on the reaped
+          client so it is waiting when the peer reconnects.
 
         The UI feed always receives the message regardless of mode, so the
         operator sees channel traffic they are not a member of.
@@ -420,6 +525,9 @@ class HubState:
         Returns:
             The list of project names the message was queued for.
         """
+        self._seq += 1
+        msg.seq = self._seq
+
         self._log.append(msg)
         self._push_ui({"type": "message", "message": msg.to_public()})
 
@@ -432,7 +540,11 @@ class HubState:
                 if msg.recipient in c.channels and c.project != msg.sender
             ]
         else:
-            target = self._clients.get(msg.recipient)
+            target: Client | None = self._clients.get(msg.recipient)
+            # Also deliver to reaped clients within their grace window so
+            # messages sent during an absence are not silently dropped.
+            if target is None:
+                target = self._reaped_by_project.get(msg.recipient)
             targets = [target] if target is not None else []
 
         for client in targets:
