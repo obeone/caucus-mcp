@@ -48,6 +48,7 @@ def test_to_public_shape_and_enum_serialisation() -> None:
         "content": "stop",
         "kind": "control",  # serialised to the enum *value*, not the member
         "ts": msg.ts,
+        "seq": 0,  # unrouted message; route() stamps the hub-assigned value
     }
 
 

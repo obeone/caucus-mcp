@@ -592,3 +592,179 @@ async def test_kick_drops_live_peer() -> None:
     assert state.kick("alpha") is True
     assert state.peers() == ["beta"]
     assert state.kick("ghost") is False
+
+
+# --- seq, ACK, replay, and rejoin-announce ---------------------------------
+
+
+async def test_route_stamps_monotone_seq() -> None:
+    """Every routed message gets a strictly increasing seq."""
+    state = HubState()
+    state.register("alpha")
+    state.register("beta")
+
+    m1 = _msg("alpha", "beta", "first")
+    m2 = _msg("alpha", "beta", "second")
+    state.route(m1)
+    state.route(m2)
+
+    assert m1.seq == 1
+    assert m2.seq == 2
+
+
+async def test_route_to_reaped_client_delivers_to_queue() -> None:
+    """Messages sent while a peer is reaped land in its queue for revival."""
+    state = HubState()
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
+
+    # Backdate beta only so the reaper targets it but not alpha.
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+    assert "beta" not in state.peers()
+
+    # Alpha sends to beta while it is reaped.
+    delivered = state.route(_msg("alpha", "beta", "ping"))
+
+    # The message is in beta's queue even though beta is off the roster.
+    assert delivered == ["beta"]
+    assert not beta.queue.empty()
+    assert beta.queue.get_nowait().content == "ping"
+
+
+async def test_ack_advances_last_acked_seq_and_prunes_unacked() -> None:
+    """ack() trims the unacked buffer up to the given seq."""
+    state = HubState()
+    beta = state.register("beta").client
+    assert beta is not None
+
+    # Manually populate unacked as the /receive endpoint would.
+    m1 = _msg("hub", "beta", "one")
+    m2 = _msg("hub", "beta", "two")
+    m3 = _msg("hub", "beta", "three")
+    state.route(m1)
+    state.route(m2)
+    state.route(m3)
+    # Simulate /receive draining and tracking them.
+    for msg in (m1, m2, m3):
+        beta.queue.get_nowait()
+        beta.unacked.append(msg)
+
+    assert len(beta.unacked) == 3
+
+    result = state.ack(beta.token, m2.seq)
+
+    assert result is True
+    assert beta.last_acked_seq == m2.seq
+    # Only m3 (seq > m2.seq) remains.
+    assert len(beta.unacked) == 1
+    assert list(beta.unacked)[0].seq == m3.seq
+
+
+async def test_ack_unknown_token_returns_false() -> None:
+    state = HubState()
+    assert state.ack("bogus-token", 42) is False
+
+
+async def test_revive_replays_unacked_before_messages_from_absence() -> None:
+    """On revival, unacked messages arrive before messages sent during absence."""
+    state = HubState()
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
+
+    # Deliver two messages to beta and simulate /receive returning them.
+    m_pre1 = _msg("alpha", "beta", "pre-reap-1")
+    m_pre2 = _msg("alpha", "beta", "pre-reap-2")
+    state.route(m_pre1)
+    state.route(m_pre2)
+    beta.queue.get_nowait()
+    beta.unacked.append(m_pre1)
+    beta.queue.get_nowait()
+    beta.unacked.append(m_pre2)
+
+    # Reap beta only (backdate so alpha is not collateral).
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+
+    # Alpha sends to beta during its absence.
+    m_absent = _msg("alpha", "beta", "during-absence")
+    state.route(m_absent)
+
+    # Revive beta (via client_for using its token).
+    revived = state.client_for(beta.token)
+    assert revived is beta
+
+    # Queue must contain: m_pre1, m_pre2 (replay), then m_absent, then the
+    # reconnect notice the revive broadcasts.
+    received = []
+    while not beta.queue.empty():
+        received.append(beta.queue.get_nowait())
+
+    contents = [m.content for m in received]
+    # Unacked messages come first, then the absent-period message.
+    pre_idx1 = contents.index("pre-reap-1")
+    pre_idx2 = contents.index("pre-reap-2")
+    absent_idx = contents.index("during-absence")
+    assert pre_idx1 < absent_idx
+    assert pre_idx2 < absent_idx
+
+
+async def test_revive_broadcasts_reconnect_notice_with_downtime() -> None:
+    """The reconnect broadcast reaches live peers and names the downtime."""
+    state = HubState()
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
+
+    # Backdate beta only so the reaper targets it but not alpha.
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+    assert "alpha" in state.peers()  # alpha must still be live
+    assert "beta" not in state.peers()
+    # Clear alpha's queue of any reap-related system noise.
+    while not alpha.queue.empty():
+        alpha.queue.get_nowait()
+
+    # Revive beta; the reconnect notice should land in alpha's queue.
+    state.client_for(beta.token)
+
+    messages = []
+    while not alpha.queue.empty():
+        messages.append(alpha.queue.get_nowait())
+
+    notice_contents = [m.content for m in messages if "reconnected" in m.content]
+    assert notice_contents, "no reconnect notice received by alpha"
+    notice = notice_contents[0]
+    assert "beta" in notice
+    # The downtime should appear in the notice (some form of "Xs" or "Xm Ys").
+    assert "away" in notice
+
+
+async def test_reap_stale_cleans_reaped_by_project_after_grace() -> None:
+    """Once the grace window lapses, _reaped_by_project is also pruned.
+
+    The key constraint: ``_drop()`` stamps ``reaped_at = time.time()``
+    (real wall-clock), not the injected ``now``.  To keep the client IN the
+    graveyard between the two sweeps, the first simulated ``now`` must be
+    close enough to real time that ``grace_cutoff = now - reaped_grace``
+    stays below ``reaped_at``.  A 50s offset well within the 100s grace
+    window satisfies that; the second sweep uses a 300s offset to cross the
+    grace boundary.
+    """
+    state = HubState(reaped_grace=100.0)
+    client = state.register("alpha").client
+    assert client is not None
+    # First sweep: now = last_seen + 50 → cutoff = last_seen + 20 → stale.
+    # grace_cutoff = last_seen + 50 - 100 = last_seen - 50 < reaped_at → kept.
+    state.reap_stale(ttl=30.0, now=client.last_seen + 50.0)
+    assert state._reaped_by_project.get("alpha") is client  # still in graveyard
+
+    # Second sweep: grace_cutoff = last_seen + 300 - 100 = last_seen + 200
+    # > reaped_at ≈ last_seen → grace lapsed, entry purged.
+    state.reap_stale(ttl=30.0, now=client.last_seen + 300.0)
+    assert "alpha" not in state._reaped_by_project

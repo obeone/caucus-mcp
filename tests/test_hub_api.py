@@ -624,6 +624,101 @@ def test_receive_active_polls_balanced_on_timeout(
     assert underlying.active_polls == 0
 
 
+def test_receive_adds_messages_to_unacked(
+    client: TestClient, state: HubState
+) -> None:
+    """Messages returned by /receive are tracked in the client's unacked buffer."""
+    token_a = _register(client, "alpha")
+    token_b = _register(client, "beta")
+    client.post("/send", json={"token": token_a, "to": "beta", "content": "hello"})
+
+    beta = state.client_for(token_b)
+    assert beta is not None
+
+    resp = client.get(
+        "/receive",
+        headers={"Authorization": f"Bearer {token_b}"},
+        params={"timeout": 0.1},
+    )
+    assert resp.status_code == 200
+    msgs = resp.json()["messages"]
+    assert len(msgs) == 1
+    assert msgs[0]["content"] == "hello"
+    assert msgs[0]["seq"] > 0
+
+    # The message must now be in the unacked buffer.
+    assert len(beta.unacked) == 1
+    assert list(beta.unacked)[0].content == "hello"
+
+
+def test_receive_ack_seq_piggyback_prunes_unacked(
+    client: TestClient, state: HubState
+) -> None:
+    """Passing ack_seq on /receive confirms prior messages without a round-trip."""
+    token_a = _register(client, "alpha")
+    token_b = _register(client, "beta")
+
+    # Send two messages; receive the first one.
+    client.post("/send", json={"token": token_a, "to": "beta", "content": "msg1"})
+    resp = client.get(
+        "/receive",
+        headers={"Authorization": f"Bearer {token_b}"},
+        params={"timeout": 0.1},
+    )
+    assert resp.status_code == 200
+    seq1 = resp.json()["messages"][0]["seq"]
+
+    beta = state.client_for(token_b)
+    assert beta is not None
+    assert len(beta.unacked) == 1  # msg1 sitting in unacked
+
+    # Send a second message; poll again with ack_seq=seq1 to confirm msg1.
+    client.post("/send", json={"token": token_a, "to": "beta", "content": "msg2"})
+    resp2 = client.get(
+        "/receive",
+        headers={"Authorization": f"Bearer {token_b}"},
+        params={"timeout": 0.1, "ack_seq": seq1},
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["messages"][0]["content"] == "msg2"
+
+    # After the piggyback, only msg2 should remain in unacked.
+    assert len(beta.unacked) == 1
+    assert list(beta.unacked)[0].content == "msg2"
+    assert beta.last_acked_seq == seq1
+
+
+def test_ack_endpoint_records_seq(client: TestClient, state: HubState) -> None:
+    """POST /ack advances last_acked_seq and prunes the unacked buffer."""
+    token_a = _register(client, "alpha")
+    token_b = _register(client, "beta")
+    client.post("/send", json={"token": token_a, "to": "beta", "content": "ping"})
+
+    # Receive the message so it ends up in unacked.
+    resp = client.get(
+        "/receive",
+        headers={"Authorization": f"Bearer {token_b}"},
+        params={"timeout": 0.1},
+    )
+    seq = resp.json()["messages"][0]["seq"]
+
+    beta = state.client_for(token_b)
+    assert beta is not None
+    assert len(beta.unacked) == 1
+
+    ack_resp = client.post("/ack", json={"token": token_b, "seq": seq})
+    assert ack_resp.status_code == 200
+    assert ack_resp.json() == {"acked": True, "seq": seq}
+
+    assert beta.last_acked_seq == seq
+    assert len(beta.unacked) == 0
+
+
+def test_ack_endpoint_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post("/ack", json={"token": "bogus", "seq": 1})
+    assert resp.status_code == 401
+
+
 def test_receive_active_polls_balanced_on_disconnect(
     client: TestClient, state: HubState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
