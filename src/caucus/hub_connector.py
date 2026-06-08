@@ -304,15 +304,25 @@ class HubConnector:
             delivered_to=list(body.get("delivered_to", [])),
         )
 
-    async def receive(self, token: str, timeout: float) -> Inbound:
+    async def receive(
+        self, token: str, timeout: float, *, ack_seq: int | None = None
+    ) -> Inbound:
         """Long-poll for inbound messages addressed to the token holder.
 
         Splits a control ``stop`` from ordinary chatter, exactly as the bridge's
         ``listen`` does, so the caller gets a clean ``(messages, stop)`` view.
 
+        Pass ``ack_seq`` to piggyback an ACK on the poll, confirming receipt of
+        all messages up to that sequence number without a separate round-trip.
+        Callers that track the last ``seq`` seen in a previous batch should
+        pass it here on the next call; the hub then prunes its replay buffer and
+        will not re-deliver those messages on reconnect.
+
         Args:
             token: The access token to poll with.
             timeout: Per-poll long-poll ceiling in seconds (the hub caps it).
+            ack_seq: Optional highest sequence number already processed by the
+                caller. Equivalent to calling :meth:`ack` before polling.
 
         Returns:
             An :class:`Inbound` batch; ``messages`` is empty on a quiet poll.
@@ -323,9 +333,12 @@ class HubConnector:
         http = self._require_http()
         # Token in the Authorization header, never the URL query string: this is
         # a GET, so a query token leaks into httpx and server access logs.
+        params: dict[str, str | int | float | bool | None] = {"timeout": timeout}
+        if ack_seq is not None:
+            params["ack_seq"] = ack_seq
         resp = await http.get(
             "/receive",
-            params={"timeout": timeout},
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
@@ -336,6 +349,28 @@ class HubConnector:
             m.get("kind") == "control" and m.get("content") == "stop" for m in raw
         )
         return Inbound(messages=messages, mode=payload.get("mode"), stop=stop)
+
+    async def ack(self, token: str, seq: int) -> None:
+        """Acknowledge receipt of all messages up to and including ``seq``.
+
+        Tells the hub it can prune its per-client replay buffer up to this
+        sequence number. Prefer the :meth:`receive` ``ack_seq`` piggyback when
+        possible to save a round-trip; use this method when you need an explicit
+        mid-session ACK between polls.
+
+        Best-effort: network failures are logged and swallowed, not raised,
+        because a missed ACK is safe — the hub will simply replay those messages
+        on the next reconnect.
+
+        Args:
+            token: The access token of the acknowledging client.
+            seq: The highest sequence number successfully processed.
+        """
+        http = self._require_http()
+        try:
+            await http.post("/ack", json={"token": token, "seq": seq})
+        except httpx.HTTPError as exc:
+            logger.debug("ack failed (best-effort): %s", exc)
 
     async def peers(self) -> list[str]:
         """List the project names currently connected to the hub.

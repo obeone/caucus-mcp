@@ -77,6 +77,12 @@ _setup_done: bool = False
 # so the hub can flag drift. ``None`` until setup has run.
 _known_protocol_version: int | None = None
 
+# Highest message seq ACKed in this bridge session. Piggybacked on the next
+# :func:`listen` call so the hub can prune the unacked buffer without a
+# separate round-trip. Resets to 0 when the process starts; the hub handles
+# cross-session replay via the token-keyed unacked buffer.
+_last_acked_seq: int = 0
+
 
 def _client() -> httpx.Client:
     """Return an HTTP client with a timeout that outlasts the hub long-poll."""
@@ -500,6 +506,11 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     listening). If a control ``stop`` arrives, the result contains
     ``{"stop": true}`` and the agent should end the exchange.
 
+    Each call piggybacks an ACK for the previous batch so the hub can prune
+    its replay buffer without an extra round-trip. The ``seq`` field on each
+    returned message is the hub-assigned sequence number; it is informational
+    only — the bridge tracks and ACKs it automatically.
+
     Args:
         timeout: Maximum seconds to wait for inbound traffic.
 
@@ -511,17 +522,26 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
         return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
+    global _last_acked_seq
     with _client() as http:
         # Token in the Authorization header, not the URL query string: a query
         # token on this GET leaks into httpx and server access logs.
+        # Piggyback ACK for the previous batch to avoid a separate round-trip.
+        params: dict[str, str | int | float | bool | None] = {"timeout": timeout}
+        if _last_acked_seq:
+            params["ack_seq"] = _last_acked_seq
         resp = http.get(
             "/receive",
-            params={"timeout": timeout},
+            params=params,
             headers={"Authorization": f"Bearer {_token}"},
         )
         resp.raise_for_status()
         payload = resp.json()
     messages = payload.get("messages", [])
+    # Advance the local ACK cursor so the next listen() piggybacks it.
+    seqs = [int(m["seq"]) for m in messages if isinstance(m, dict) and m.get("seq")]
+    if seqs:
+        _last_acked_seq = max(max(seqs), _last_acked_seq)
     stop = any(m.get("kind") == "control" and m.get("content") == "stop" for m in messages)
     chatter = [m for m in messages if m.get("kind") != "control"]
     return {"messages": chatter, "mode": payload.get("mode"), "stop": stop}
