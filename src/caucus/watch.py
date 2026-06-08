@@ -187,7 +187,27 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 continue
 
             backoff = _BACKOFF_MIN
-            emitted, stop = _drain(resp.json())
+            payload = resp.json()
+            emitted, stop = _drain(payload)
+            if emitted:
+                # ACK the highest seq we just emitted so the hub does not
+                # replay these messages if we exit before the next poll.
+                # Best-effort: a failure here is harmless — the hub will
+                # replay on the next watcher invocation, which is idempotent.
+                messages = payload.get("messages", [])
+                max_seq = max(
+                    (
+                        int(m["seq"])
+                        for m in messages
+                        if isinstance(m, dict) and m.get("seq")
+                    ),
+                    default=0,
+                )
+                if max_seq:
+                    try:
+                        http.post("/ack", json={"token": token, "seq": max_seq})
+                    except httpx.HTTPError as exc:
+                        logger.debug("ACK failed (best-effort): %s", exc)
             if stop or emitted:
                 return 0
 
