@@ -62,6 +62,8 @@ def test_gated_tools_refuse_before_setup(
     assert bridge.list_peers() == expected
     assert bridge.say("hi") == expected
     assert bridge.listen(timeout=0) == expected
+    assert bridge.ping("someone") == expected
+    assert bridge.set_status("busy") == expected
 
 
 def test_whoami_is_available_before_setup(
@@ -153,6 +155,55 @@ def test_list_peers_includes_self(bridge, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(bridge, "PROJECT", "peers-test")
     bridge.join()
     assert "peers-test" in bridge.list_peers()["peers"]
+
+
+# --- ping & status -------------------------------------------------------
+
+
+def test_ping_absent_peer(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "pinger")
+    # ping needs only setup, not join — scout before entering.
+    result = bridge.ping("nobody-here")
+    assert result == {"peer": "nobody-here", "state": "absent", "present": False}
+
+
+def test_ping_reports_live_peer(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _register_peer(live_hub, "live-peer")
+    monkeypatch.setattr(bridge, "PROJECT", "pinger")
+    result = bridge.ping("live-peer")
+    assert result["state"] == "live"
+    assert result["present"] is True
+
+
+def test_set_status_without_join_errors(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_token", None)
+    assert bridge.set_status("busy") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
+
+
+def test_set_status_then_ping_surfaces_it(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "statuser")
+    bridge.join()
+    assert bridge.set_status("implementing the parser") == {
+        "status": "implementing the parser"
+    }
+    assert bridge.ping("statuser")["status"] == "implementing the parser"
+
+
+def test_set_status_blank_clears(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "clearer")
+    bridge.join()
+    bridge.set_status("busy")
+    assert bridge.set_status("") == {"status": None}
+    assert bridge.ping("clearer")["status"] is None
 
 
 # --- say -----------------------------------------------------------------
