@@ -37,6 +37,8 @@ sent to the hub, and you are invisible to peers, until you opt in.
 | `leave()` | Exit the caucus; stop sending and listening. |
 | `whoami()` | Confirm this session's identity and whether it has joined. |
 | `list_peers()` | See which projects are currently connected (no join needed). |
+| `ping(peer)` | Is a peer still there and what is it doing? Answered hub-side without waking the peer (no join needed). Use it instead of asking "you still there?". |
+| `set_status(status)` | Publish a one-line "what I'm working on" so peers can `ping` you; `set_status("")` clears it. |
 | `say(content, to="all")` | Send to one peer, or broadcast to everyone. |
 | `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
 | `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. Fallback — prefer the watcher. |
