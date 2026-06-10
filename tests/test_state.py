@@ -634,6 +634,56 @@ async def test_route_to_reaped_client_delivers_to_queue() -> None:
     assert beta.queue.get_nowait().content == "ping"
 
 
+async def test_route_to_channel_delivers_to_reaped_member() -> None:
+    """A channel member reaped mid-conversation still receives channel traffic.
+
+    Regression: the bridge watcher is one-shot and down while the agent composes
+    a reply, so a live peer is routinely reaped; channel routing must enqueue for
+    the reaped member (replayed on revive) instead of silently dropping it — a
+    "joined the channel but hears nothing" symptom.
+    """
+    state = HubState()
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
+    state.subscribe(alpha.token, "#design")
+    state.subscribe(beta.token, "#design")
+
+    # Backdate beta only so the reaper targets it but not alpha.
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+    assert "beta" not in state.peers()
+
+    delivered = state.route(_msg("alpha", "#design", "still here?"))
+
+    assert delivered == ["beta"]
+    assert beta.queue.get_nowait().content == "still here?"
+
+
+async def test_broadcast_reaches_reaped_peer() -> None:
+    """A broadcast reaches a reaped peer's queue for replay on revive.
+
+    Regression: broadcast routing iterated only the live roster, so a peer
+    reaped during a long reply turn missed every broadcast — never receiving,
+    so never replying, which reads as the speaker talking to itself.
+    """
+    state = HubState()
+    alpha = state.register("alpha").client
+    beta = state.register("beta").client
+    assert alpha is not None
+    assert beta is not None
+
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+    assert "beta" not in state.peers()
+
+    delivered = state.route(_msg("alpha", BROADCAST, "anyone?"))
+
+    assert delivered == ["beta"]
+    assert beta.queue.get_nowait().content == "anyone?"
+
+
 async def test_ack_advances_last_acked_seq_and_prunes_unacked() -> None:
     """ack() trims the unacked buffer up to the given seq."""
     state = HubState()

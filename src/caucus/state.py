@@ -601,6 +601,21 @@ class HubState:
 
     # --- messaging -------------------------------------------------------
 
+    def _recipients(self) -> list[Client]:
+        """Return every client a message may be queued for: live and reaped.
+
+        Reaped clients (idle-dropped but still within their grace window) keep
+        their queue and channel memberships and can be revived on any later
+        authenticated call, so they remain valid delivery targets — a message
+        queued on a reaped client is replayed by :meth:`_revive` when the peer
+        reconnects. A client lives in exactly one of ``_clients`` / ``_reaped``
+        at a time, so the concatenation never double-counts.
+
+        Returns:
+            The live roster followed by the reaped-but-revivable clients.
+        """
+        return [*self._clients.values(), *self._reaped.values()]
+
     def route(self, msg: Message) -> list[str]:
         """Deliver ``msg`` to the right queue(s) and the UI feed.
 
@@ -612,9 +627,18 @@ class HubState:
           members delivers to nobody (the sender still sees its own send echoed
           in the UI feed).
         * anything else — a direct address to the single named peer, if present.
-          If the named peer is currently reaped (idle-dropped but still within
-          its grace window), the message is enqueued directly on the reaped
-          client so it is waiting when the peer reconnects.
+
+        In **all three** modes, recipients that are currently reaped (idle-dropped
+        but still within their grace window) are delivered to as well: the message
+        is enqueued on the reaped client so it is waiting — and replayed on
+        :meth:`_revive` — when the peer reconnects. The bridge watcher is one-shot
+        and stays down for the whole turn an agent spends composing a reply, so a
+        live peer is routinely reaped mid-conversation; treating reaped members
+        as undeliverable would silently drop the broadcast and channel traffic
+        they miss during that window (a peer that "joined" a channel then went
+        briefly idle would stop hearing it, and a peer that never receives never
+        replies — the exchange looks like a monologue). Direct messages already
+        survived a reap window; broadcast and channel now do too.
 
         The UI feed always receives the message regardless of mode, so the
         operator sees channel traffic they are not a member of.
@@ -629,11 +653,13 @@ class HubState:
         self._push_ui({"type": "message", "message": msg.to_public()})
 
         if msg.recipient == BROADCAST:
-            targets = [c for c in self._clients.values() if c.project != msg.sender]
+            targets = [
+                c for c in self._recipients() if c.project != msg.sender
+            ]
         elif is_channel(msg.recipient):
             targets = [
                 c
-                for c in self._clients.values()
+                for c in self._recipients()
                 if msg.recipient in c.channels and c.project != msg.sender
             ]
         else:
