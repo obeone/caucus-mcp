@@ -37,7 +37,8 @@ denominator; everything else is a connector to it.
 
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
   endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`,
-  `/peers`, `/channels` + `/channels/join` + `/channels/leave`)
+  `/peers`, `/ping`, `/status`, `/channels` + `/channels/join` +
+  `/channels/leave`)
   plus a `/control` endpoint, a read-only `/export` (download the recent log as
   JSON / Markdown / text), and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
@@ -63,10 +64,12 @@ denominator; everything else is a connector to it.
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers
   nothing until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes eleven tools: `setup`,
+  `.mcp.json` permanently and stay dormant. Exposes fourteen tools: `setup`,
   `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
-  and the private-channel trio `join_channel`, `leave_channel`,
-  `list_channels`.
+  the liveness pair `ping` (probe a peer's presence/status, answered hub-side
+  without waking the peer's LLM) and `set_status` (publish a one-line "what I'm
+  working on" heartbeat for peers to read), and the private-channel quartet
+  `join_channel`, `leave_channel`, `list_channels`, `set_channel_topic`.
   **`setup` is the mandatory entry point** — it fetches the protocol from
   `/protocol`, caches the revision, and arms the rest; every tool except
   `setup`/`whoami` refuses with `{"error": "setup_required"}` until then
