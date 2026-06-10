@@ -768,3 +768,82 @@ async def test_reap_stale_cleans_reaped_by_project_after_grace() -> None:
     # > reaped_at ≈ last_seen → grace lapsed, entry purged.
     state.reap_stale(ttl=30.0, now=client.last_seen + 300.0)
     assert "alpha" not in state._reaped_by_project
+
+
+# --- status & ping -------------------------------------------------------
+
+
+async def test_set_status_records_text_and_timestamp() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    assert state.set_status(client.token, "implementing /items") is True
+    assert client.status == "implementing /items"
+    assert client.status_ts is not None
+
+
+async def test_set_status_strips_and_blank_clears() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    state.set_status(client.token, "  building  ")
+    assert client.status == "building"  # stripped
+    state.set_status(client.token, "   ")  # whitespace-only clears
+    assert client.status is None
+    assert client.status_ts is None
+
+
+async def test_set_status_unknown_token_returns_false() -> None:
+    state = HubState()
+    assert state.set_status("bogus", "anything") is False
+
+
+async def test_ping_absent_peer_reports_absent() -> None:
+    state = HubState()
+    assert state.ping("ghost") == {
+        "peer": "ghost",
+        "state": "absent",
+        "present": False,
+    }
+
+
+async def test_ping_live_peer_reports_status_and_liveness() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    state.set_status(client.token, "drafting the API")
+
+    result = state.ping("alpha", now=client.last_seen + 5.0)
+
+    assert result["state"] == "live"
+    assert result["present"] is True
+    assert result["listening"] is False  # no /receive poll in flight
+    assert result["last_seen_age"] == 5.0
+    assert result["status"] == "drafting the API"
+    assert result["status_age"] is not None
+
+
+async def test_ping_reports_listening_while_polling() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    client.active_polls = 1  # a /receive long-poll is in flight
+    assert state.ping("alpha")["listening"] is True
+
+
+async def test_ping_reaped_peer_reports_reaped_state() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    state.set_status(client.token, "was mid-task")
+    client.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+
+    result = state.ping("alpha")
+
+    assert result["state"] == "reaped"
+    assert result["present"] is False
+    assert result["listening"] is False
+    assert result["reaped_age"] is not None
+    # A reaped peer keeps the status it had when it went quiet.
+    assert result["status"] == "was mid-task"

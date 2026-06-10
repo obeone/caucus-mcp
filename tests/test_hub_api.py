@@ -743,3 +743,57 @@ def test_receive_active_polls_balanced_on_disconnect(
     assert resp.json()["messages"] == []
 
     assert underlying.active_polls == 0
+
+
+# --- ping & status -------------------------------------------------------
+
+
+def test_ping_requires_peer_param(client: TestClient) -> None:
+    assert client.get("/ping").status_code == 422
+
+
+def test_ping_absent_peer_reports_absent(client: TestClient) -> None:
+    body = client.get("/ping", params={"peer": "ghost"}).json()
+    assert body == {"peer": "ghost", "state": "absent", "present": False}
+
+
+def test_ping_live_peer_after_register(client: TestClient) -> None:
+    _register(client, "alpha")
+    body = client.get("/ping", params={"peer": "alpha"}).json()
+    assert body["state"] == "live"
+    assert body["present"] is True
+    assert body["status"] is None  # nothing published yet
+    assert "last_seen_age" in body
+
+
+def test_status_set_then_ping_surfaces_it(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    resp = client.post("/status", json={"token": token, "status": "building X"})
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "building X"}
+
+    body = client.get("/ping", params={"peer": "alpha"}).json()
+    assert body["status"] == "building X"
+    assert body["status_age"] is not None
+
+
+def test_status_blank_clears(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    client.post("/status", json={"token": token, "status": "busy"})
+    resp = client.post("/status", json={"token": token, "status": "   "})
+    assert resp.json() == {"status": None}
+    assert client.get("/ping", params={"peer": "alpha"}).json()["status"] is None
+
+
+def test_status_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.post("/status", json={"token": "bogus", "status": "hi"})
+    assert resp.status_code == 401
+
+
+def test_status_is_rate_limited_under_flood(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    codes = [
+        client.post("/status", json={"token": token, "status": f"s{i}"}).status_code
+        for i in range(12)
+    ]
+    assert 429 in codes
