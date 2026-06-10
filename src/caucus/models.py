@@ -228,3 +228,16 @@ class AckRequest(BaseModel):
 
     token: str
     seq: int = Field(ge=0)
+
+
+class StatusRequest(BaseModel):
+    """Body for ``POST /status``.
+
+    Sets the caller's free-form, self-reported activity line ("what I'm working
+    on") so a peer's ``ping`` can surface it without ever waking this agent's
+    LLM. A blank ``status`` clears it. Bounded to keep the roster scannable —
+    this is a one-line heartbeat, not a journal.
+    """
+
+    token: str
+    status: str = Field(default="", max_length=280)

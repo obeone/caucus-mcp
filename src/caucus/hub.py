@@ -47,6 +47,7 @@ from .models import (
     RegisterResponse,
     SendRequest,
     SendResponse,
+    StatusRequest,
     is_channel,
 )
 from .state import Client, HubState, RegisterOutcome
@@ -64,7 +65,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -156,6 +157,21 @@ Listening (important):
     wait back to the operator ("tell me when it's done"): asynchronous peer
     notification is the whole point of the room, and a dead watcher silently
     drops the very message you were waiting for.
+
+Checking on a peer (ping & status):
+  - Wondering whether a peer is still alive and working? Do NOT message it
+    ("you still there?") — that burns its whole turn just to answer "yes". Call
+    ping("<peer>") instead: the hub answers from its own bookkeeping WITHOUT
+    waking the peer's LLM. You get its state (live / reaped / absent), how long
+    since it last talked to the hub, whether a listener is attached right now,
+    and its self-reported status. A "live" peer with a small last_seen and no
+    active listener is normally just heads-down composing a reply — not dead.
+    "reaped" means idle-dropped but still revivable (your direct messages still
+    queue for it); "absent" means truly gone.
+  - So that ping can answer "is it working on its task?", publish what you are
+    doing: set_status("implementing the /items endpoint") when you pick up
+    work, and refresh it as the work moves. Keep it to one line; clear it with
+    set_status("") when idle. This is a heartbeat for your peers, not a log.
 """
 
 state = HubState()
@@ -211,6 +227,20 @@ async def index() -> FileResponse:
 async def peers() -> dict[str, list[str]]:
     """List currently connected project names."""
     return {"peers": state.peers()}
+
+
+@app.get("/ping")
+async def ping(peer: str = Query(min_length=1, max_length=64)) -> dict[str, object]:
+    """Report a peer's liveness and self-reported status without disturbing it.
+
+    A presence probe answered entirely from the hub's in-memory bookkeeping, so
+    the target agent's turn is never consumed — the whole point of a ping is to
+    learn "is it still there, and what is it doing?" for ~0 cost to the peer.
+    Open (no token), like ``/peers``: liveness is no more sensitive than the
+    roster. See :meth:`~caucus.state.HubState.ping` for the response shape
+    (``state`` is ``live`` / ``reaped`` / ``absent``).
+    """
+    return state.ping(peer)
 
 
 @app.get("/channels")
@@ -579,6 +609,27 @@ async def ack(req: AckRequest) -> dict[str, object]:
         raise HTTPException(status_code=401, detail="unknown token")
     logger.debug("ack token=... seq=%d", req.seq)
     return {"acked": True, "seq": req.seq}
+
+
+@app.post("/status", response_model=None)
+async def status_set(req: StatusRequest) -> dict[str, object] | JSONResponse:
+    """Set (or clear) the caller's self-reported activity line.
+
+    The status is what a peer's ``/ping`` surfaces to answer "is it working on
+    its task?" — so an agent publishes a one-line "what I'm doing" here when it
+    picks up work and refreshes it as the work moves. A blank ``status`` clears
+    it. Rejected with 401 when the token is unknown, and 429 when the caller
+    exceeds its rate limit (the same per-sender brake as ``/send``).
+    """
+    client = state.client_for(req.token)
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
+    state.set_status(req.token, req.status)
+    logger.info("status project=%s", client.project)
+    return {"status": req.status.strip() or None}
 
 
 @app.post("/control")

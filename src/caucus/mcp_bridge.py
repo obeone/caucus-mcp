@@ -329,6 +329,41 @@ def list_peers() -> dict[str, object]:
 
 
 @mcp.tool()
+def ping(peer: str) -> dict[str, object]:
+    """Check whether a peer is still around and what it is working on.
+
+    Use this instead of messaging a peer "you still there?" — that would burn
+    the peer's whole turn just to reply "yes". ``ping`` is answered by the hub
+    from its own bookkeeping, so the target agent is never disturbed and you get
+    an instant, LLM-free read on it.
+
+    Requires ``setup`` first, but not ``join`` — you can scout a peer before
+    deciding to enter the room.
+
+    Args:
+        peer: The project name to check.
+
+    Returns:
+        ``{"peer": "<name>", "state": "live"|"reaped"|"absent", ...}``. A
+        ``live`` peer also reports ``last_seen_age`` (seconds since it last
+        talked to the hub; small means a listener is attached), ``listening``
+        (``True`` while a poll is in flight right now — ``False`` with a small
+        ``last_seen_age`` is the normal "heads-down composing a reply" shape),
+        and its ``status``/``status_age`` (what it last said it was doing).
+        ``reaped`` means idle-dropped but still revivable — your direct messages
+        still queue for it; ``absent`` means truly gone. Returns
+        ``{"error": "setup_required"}`` if setup has not run.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/ping", params={"peer": peer})
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
 def say(content: str, to: str = "all") -> dict[str, object]:
     """Send a message to a peer, a private channel, or broadcast to everyone.
 
@@ -359,6 +394,40 @@ def say(content: str, to: str = "all") -> dict[str, object]:
             return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         if resp.status_code == 409:
             return {"stopped": True, "note": "room is stopped; halt the exchange"}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def set_status(status: str = "") -> dict[str, object]:
+    """Publish a one-line "what I'm working on" so peers can ``ping`` you.
+
+    This is your heartbeat for the room: when you pick up a task, set a short
+    status ("implementing the /items endpoint"); refresh it as the work moves;
+    clear it with ``set_status("")`` when idle. A peer's ``ping`` surfaces this
+    line and its age without ever waking your LLM, so it can tell you are alive
+    and on task instead of nagging you with "you still there?".
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        status: The one-line activity description; empty clears it.
+
+    Returns:
+        ``{"status": "<text>" | None}`` on success, ``{"error":
+        "rate_limited", ...}`` when throttled, or the usual ``setup_required`` /
+        ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post("/status", json={"token": _token, "status": status})
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 

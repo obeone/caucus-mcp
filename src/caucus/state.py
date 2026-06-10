@@ -47,6 +47,13 @@ class Client:
             acknowledged. Bounded to 200 entries; when the client reconnects
             after a gap, messages with ``seq > last_acked_seq`` are re-injected
             into :attr:`queue` so no delivery is silently lost.
+        status: The client's self-reported activity line ("what I'm working
+            on"), or ``None`` when never set or cleared. Surfaced by
+            :meth:`HubState.ping` so a peer can see what this agent is up to
+            without waking its LLM.
+        status_ts: When :attr:`status` was last set, or ``None`` while unset.
+            Lets a pinging peer judge how fresh the status is (a stale line is a
+            hint the agent may be heads-down and not updating it).
     """
 
     project: str
@@ -59,6 +66,8 @@ class Client:
     reaped_at: float | None = None
     last_acked_seq: int = 0
     unacked: deque[Message] = field(default_factory=lambda: deque(maxlen=200))
+    status: str | None = None
+    status_ts: float | None = None
 
 
 class RegisterOutcome(str, Enum):
@@ -501,6 +510,94 @@ class HubState:
             while client.unacked and client.unacked[0].seq <= seq:
                 client.unacked.popleft()
         return True
+
+    def set_status(self, token: str, status: str) -> bool:
+        """Set (or clear) the token holder's self-reported activity line.
+
+        The status is a one-line "what I'm working on" heartbeat an agent
+        publishes for the benefit of peers that :meth:`ping` it — it lets the
+        hub answer "is it still working on its task?" without ever waking the
+        agent's LLM. A blank or whitespace-only ``status`` clears it. Works for
+        both live and reaped clients (a peer revived on this very call keeps the
+        status it set), since it routes through :meth:`client_for`.
+
+        Args:
+            token: Access token of the client setting its status.
+            status: The one-line activity description; blank clears it.
+
+        Returns:
+            ``True`` if the token is known and the status was recorded,
+            ``False`` if the token is unknown (never issued or past its grace
+            window).
+        """
+        client = self.client_for(token)
+        if client is None:
+            return False
+        cleaned = status.strip()
+        client.status = cleaned or None
+        client.status_ts = time.time() if cleaned else None
+        return True
+
+    def ping(self, name: str, *, now: float | None = None) -> dict[str, object]:
+        """Report a peer's liveness and self-reported status, LLM-free.
+
+        Answers "is ``name`` still there, and what is it doing?" entirely from
+        the hub's own bookkeeping, so the target agent's turn is never consumed.
+        Three states are distinguished:
+
+        * **live** — the name is on the active roster. ``last_seen_age`` is how
+          long since its last hub interaction (a live watcher refreshes this by
+          polling ``/receive``, so a small age means a listener is attached),
+          and ``listening`` is ``True`` while a ``/receive`` long-poll is in
+          flight right now. A small ``last_seen_age`` with ``listening`` false
+          is the normal "heads-down composing a reply" shape (the one-shot
+          watcher is down for that window).
+        * **reaped** — idle-dropped but still inside its revival grace window:
+          off the roster yet resurrectable, with ``reaped_age`` since it was
+          parked. Direct messages still queue for it (see :meth:`route`).
+        * **absent** — no live or reaped record under this name.
+
+        Args:
+            name: The project name to inspect.
+            now: Reference timestamp (defaults to :func:`time.time`); injectable
+                for deterministic tests.
+
+        Returns:
+            A JSON-friendly dict. Always carries ``peer`` and ``state``; the
+            live/reaped shapes add ``present``, ``last_seen_age``,
+            ``listening``, ``status`` and ``status_age`` (plus ``reaped_age``
+            when reaped). The ``absent`` shape is just ``peer``/``state``/
+            ``present``.
+        """
+        ref = time.time() if now is None else now
+
+        def _age(ts: float | None) -> float | None:
+            return round(ref - ts, 1) if ts is not None else None
+
+        client = self._clients.get(name)
+        if client is not None:
+            return {
+                "peer": name,
+                "state": "live",
+                "present": True,
+                "last_seen_age": _age(client.last_seen),
+                "listening": client.active_polls > 0,
+                "status": client.status,
+                "status_age": _age(client.status_ts),
+            }
+        reaped = self._reaped_by_project.get(name)
+        if reaped is not None:
+            return {
+                "peer": name,
+                "state": "reaped",
+                "present": False,
+                "last_seen_age": _age(reaped.last_seen),
+                "reaped_age": _age(reaped.reaped_at),
+                "listening": False,
+                "status": reaped.status,
+                "status_age": _age(reaped.status_ts),
+            }
+        return {"peer": name, "state": "absent", "present": False}
 
     # --- messaging -------------------------------------------------------
 
