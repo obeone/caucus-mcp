@@ -170,9 +170,15 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 - **Routing** (`route`): appends to log, fans out to the UI feed, then queues to
   the target(s): the named recipient for a direct message, every client except
   the sender for `BROADCAST = "all"`, or only the subscribed members (sender
-  excluded) for a `#`-prefixed private channel. Channel membership lives in
-  `Client.channels` and is ephemeral — `channels()` derives the live map and a
-  channel vanishes once its last member leaves or is reaped.
+  excluded) for a `#`-prefixed private channel. In **all three** modes the target
+  set spans both the live roster and reaped-but-revivable clients (`_recipients()`),
+  so a peer reaped mid-conversation (its one-shot watcher down while it composes a
+  reply) still has the message queued on its reaped record and replayed on
+  `_revive` — otherwise broadcast and channel traffic it missed would be silently
+  dropped, leaving a "joined the channel but hears nothing" peer that never
+  replies. Channel membership lives in `Client.channels` and is ephemeral —
+  `channels()` derives the live map and a channel vanishes once its last member
+  leaves or is reaped.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds messages without draining queues; `STOPPED` floods a `stop` control
   into every queue and *sets* `_transmit` so blocked waiters wake and observe
