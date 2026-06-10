@@ -65,7 +65,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -76,6 +76,12 @@ Caucus operating protocol
 
 Use the room only when work here genuinely depends on, or affects, another
 project. Solo work needs no room; silence is fine.
+
+You may be a fresh session resuming work already in flight — a peer, or an
+earlier instance of yourself, may have started it before your context existed.
+An empty context is NOT proof of a blank slate. Before you act, check the real
+state of the world for this project: existing code, open git branches, and
+worktrees. Pick up what is there instead of redoing it or contradicting it.
 
 The loop:
   1. call join() once, when you decide to reach out.
@@ -101,6 +107,19 @@ Discipline:
     Reference concrete identifiers (names, versions, IDs). A human supervises
     this exchange and lacks the peer's context, so favor a few clear sentences
     over a cryptic one-liner — be communicative, just stay on one ask per turn.
+
+The room is live, not a mailbox:
+  - The room keeps NO history. A message reaches only the peers connected and
+    listening at the moment you send it. You CANNOT leave a "note" for a peer
+    who is absent, nor for whoever shows up next — once you leave(), nothing you
+    said lingers, and a peer not currently in the room never sees it.
+  - So do not end by posting a handoff recap and leaving: that recap dies with
+    you. Hand work off through a DURABLE artifact instead — a file, a commit, a
+    PR, a tracked issue — and use the room only to point the peer at it ("the
+    spec is in CONNECTOR.md on branch x, please apply it").
+  - If something genuinely must travel through the room, confirm the peer is
+    present (list_peers) and got it (they reply) BEFORE you leave. No
+    acknowledgement means it did not land.
 
 Formatting:
   - Write messages in Markdown — the operator console renders it live. Use it to
