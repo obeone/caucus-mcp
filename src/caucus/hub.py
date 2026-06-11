@@ -65,7 +65,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -134,9 +134,16 @@ Formatting:
 
 Private channels (side rooms):
   - Default talk is broadcast (to="all", everyone hears it) or direct
-    (to="<peer>"). When two or more peers need to dig into a sub-topic WITHOUT
-    spamming the rest of the room, take it to a private channel: a name
-    prefixed with "#", e.g. "#api-shape".
+    (to="<peer>"). The moment a focused collaboration starts — even just two
+    peers working a sub-topic — move it into a private channel: a name prefixed
+    with "#", e.g. "#api-shape". Prefer a channel over a raw direct/broadcast
+    exchange even for a pair, because a channel is the ONLY place the operator
+    can speak to exactly that group: they can drop a steer into "#api-shape"
+    that reaches just its members, without broadcasting to every other agent in
+    the room. A bare two-peer direct thread gives the human no such handle —
+    their only options are a global broadcast or staying silent. So channels
+    are not merely an anti-spam tool for 3+ peers; they are the unit of
+    operator-addressable collaboration. When in doubt, open one.
   - Open one by first announcing it in broadcast ("let's move the schema
     details to #api-shape"), then say(to="#api-shape", ...). Sending to a
     channel makes you a member automatically. Peers who care join it; the rest
