@@ -8,6 +8,7 @@ listen → inject → reply control flow driven against lightweight fakes.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -123,10 +124,16 @@ def test_agent_text_ignores_non_text_messages() -> None:
 
 
 class _FakeClient:
-    """Records queries and yields no response messages."""
+    """Records queries and interrupts; supports the async-context protocol.
+
+    Stands in for :class:`ClaudeSDKClient`: it tracks the user turns driven into
+    it, counts ``interrupt`` calls, and yields no response messages so a turn
+    completes instantly.
+    """
 
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.interrupts = 0
 
     async def query(self, prompt: str) -> None:
         self.queries.append(prompt)
@@ -134,6 +141,25 @@ class _FakeClient:
     async def receive_response(self) -> AsyncIterator[Any]:
         for _ in ():  # empty async generator
             yield None
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _factory(*clients: _FakeClient) -> Any:
+    """Return a client factory yielding each client in turn (one per lifecycle).
+
+    A single client covers the no-reset cases; pass two to exercise the reset
+    path, where the second client is built after the operator wipes the context.
+    """
+    pool = iter(clients)
+    return lambda: next(pool)
 
 
 class _FakeConnector:
@@ -154,7 +180,7 @@ async def test_run_loop_injects_inbound_then_ends_on_stop() -> None:
         [Inbound([{"sender": "a", "recipient": "all", "content": "hi"}], "running", False)]
     )
     await claude_agent._run_loop(
-        client, connector, "tok", poll_timeout=0.0, mission=None  # type: ignore[arg-type]
+        _factory(client), connector, "tok", poll_timeout=0.0, mission=None
     )
     assert len(client.queries) == 1
     assert "[caucus inbound]" in client.queries[0]
@@ -165,7 +191,7 @@ async def test_run_loop_mission_opens_the_exchange() -> None:
     client = _FakeClient()
     connector = _FakeConnector([])  # first poll returns the auto-stop
     await claude_agent._run_loop(
-        client, connector, "tok", poll_timeout=0.0, mission="negotiate the API"  # type: ignore[arg-type]
+        _factory(client), connector, "tok", poll_timeout=0.0, mission="negotiate the API"
     )
     assert len(client.queries) == 1
     assert "[caucus mission]" in client.queries[0]
@@ -176,7 +202,7 @@ async def test_run_loop_stop_first_injects_nothing() -> None:
     client = _FakeClient()
     connector = _FakeConnector([Inbound([], "running", True)])
     await claude_agent._run_loop(
-        client, connector, "tok", poll_timeout=0.0, mission=None  # type: ignore[arg-type]
+        _factory(client), connector, "tok", poll_timeout=0.0, mission=None
     )
     assert client.queries == []
 
@@ -190,10 +216,74 @@ async def test_run_loop_skips_quiet_polls() -> None:
         ]
     )
     await claude_agent._run_loop(
-        client, connector, "tok", poll_timeout=0.0, mission=None  # type: ignore[arg-type]
+        _factory(client), connector, "tok", poll_timeout=0.0, mission=None
     )
     assert len(client.queries) == 1
     assert "later" in client.queries[0]
+
+
+# --- operator control: interrupt / reset --------------------------------
+
+
+async def test_poll_inbound_interrupt_aborts_turn_without_ending() -> None:
+    """An ``interrupt`` command calls interrupt() but neither stops nor resets."""
+    client = _FakeClient()
+    connector = _FakeConnector(
+        [Inbound([], "running", False, commands=["interrupt"])]
+    )
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    await claude_agent._poll_inbound(
+        connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+    )
+    assert client.interrupts == 1
+    assert stop.is_set()  # ends via the connector's auto-stop, not the interrupt
+    assert not reset.is_set()
+
+
+async def test_poll_inbound_reset_interrupts_and_signals_rebuild() -> None:
+    """A ``reset`` command aborts the turn and sets the reset event, then returns."""
+    client = _FakeClient()
+    connector = _FakeConnector(
+        [Inbound([], "running", False, commands=["reset"])]
+    )
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    await claude_agent._poll_inbound(
+        connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+    )
+    assert client.interrupts == 1
+    assert reset.is_set()
+    assert not stop.is_set()
+
+
+async def test_run_loop_reset_rebuilds_client_with_fresh_context() -> None:
+    """An operator reset tears down the first client and builds a second one."""
+    first, second = _FakeClient(), _FakeClient()
+    connector = _FakeConnector(
+        [
+            Inbound([{"sender": "a", "recipient": "all", "content": "hi"}], "running", False),
+            Inbound([], "running", False, commands=["reset"]),
+            Inbound([{"sender": "b", "recipient": "all", "content": "again"}], "running", False),
+        ]
+    )
+    await claude_agent._run_loop(
+        _factory(first, second), connector, "tok", poll_timeout=0.0, mission=None
+    )
+    # The reset aborted the first client and rebuilt onto the second, which is
+    # the one that answers the post-reset traffic.
+    assert first.interrupts == 1
+    assert any("again" in q for q in second.queries)
+
+
+async def test_safe_interrupt_swallows_errors() -> None:
+    """A client whose interrupt() raises does not blow up the poller."""
+
+    class _Boom:
+        async def interrupt(self) -> None:
+            raise RuntimeError("no turn in flight")
+
+    await claude_agent._safe_interrupt(_Boom())  # type: ignore[arg-type]
 
 
 # --- NameInUseError → clean exit -----------------------------------------
@@ -286,7 +376,11 @@ def _capture_options(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         async def __aexit__(self, *args: Any) -> None:
             pass
 
-    async def _noop_loop(*args: Any, **kwargs: Any) -> None:
+    async def _noop_loop(client_factory: Any, *args: Any, **kwargs: Any) -> None:
+        # run_session now defers client construction to a factory (so an operator
+        # reset can rebuild the client on a clean context). Build one here so the
+        # options it carries are captured, then return without listening.
+        client_factory()
         return None
 
     monkeypatch.setattr(claude_agent, "HubConnector", lambda *a, **kw: _RegisteringConnector())
