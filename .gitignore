@@ -9,3 +9,4 @@ __pycache__/
 .claude/settings.local.json
 .claude/.auto_mode_approved.json
 .claude/.automode-history/
+.worktrees
