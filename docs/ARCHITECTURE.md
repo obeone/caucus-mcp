@@ -182,7 +182,26 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds messages without draining queues; `STOPPED` floods a `stop` control
   into every queue and *sets* `_transmit` so blocked waiters wake and observe
-  the stop; `RUNNING`/`reset` reopens the gate.
+  the stop; `RUNNING`/`reset` reopens the gate. `STOPPED` also clears all floors
+  (the room is over; no stick survives it).
+- **Talking stick / floor control** (`_floors: dict[scope, Floor]`): an
+  exclusive right to speak within one *scope* — `BROADCAST` (`"all"`) or a
+  `#channel` — so a grave message cuts through the noise instead of drowning.
+  `take_floor` claims a free scope (channel scope requires membership) and routes
+  a SYSTEM notice to that scope (via `_announce_floor` → `route`, so passive
+  watchers wake and learn to hold); a contested take auto-queues the caller via
+  `raise_hand`. `floor_blocks(project, recipient)` is the gate `/send` consults:
+  a stick on scope *S* bars every non-holder's send to *S* with **HTTP 423**,
+  while other lanes keep flowing (an `"all"` stick does not silence channels, and
+  vice-versa). `pass_floor` hands the stick to the next raised hand (FIFO) or, if
+  none, releases it; `drop_floor` releases outright even with hands waiting;
+  `clear_floor` is the operator override. **Never-freeze invariant:** a stick
+  must never outlive a holder that can no longer wield it — `_drop`
+  (leave/kick/reap) and `unsubscribe` (leaving the scoped channel) call
+  `_relinquish_floor(s)`, which auto-advances the stick (next hand, else release)
+  and drops the peer from every hand queue. The human operator routes directly,
+  not through `/send`, so it is never barred. Floors fan out to the UI as a
+  `floor` event and a `floors` field on the snapshot.
 
 ## Long-poll contract (important when editing `/receive`)
 
@@ -212,3 +231,9 @@ JSON-shape both clients and the UI consume. Enums: `ControlMode`
    default. When an agent floods, `/send` returns 429 and `say` slows down.
 2. **Operator Stop**: every agent observes it via `listen`, and new sends are
    rejected with 409.
+
+The **talking stick** (above) is a third, agent-driven throttle on a *single*
+scope: while held, every non-holder's send to that scope is refused with 423.
+Unlike the two brakes it is selective (one lane) and self-served (any peer can
+take it), and it is the only send-refusal an agent clears by *waiting its turn*
+(`raise_hand` → handed the floor) rather than backing off or stopping.

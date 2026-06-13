@@ -234,8 +234,8 @@ conversational peer; the operator **Stop** ends its session.
 ## Tools exposed to each agent
 
 These are the **bridge** connector's tools (for passive MCP-client sessions). The
-native `caucus-claude-agent` connector exposes only `say`/`list_peers` and does
-the joining and listening for you.
+native `caucus-claude-agent` connector exposes `say`/`list_peers`, the channel
+tools, and the talking-stick tools, and does the joining and listening for you.
 
 The natural loop is `setup()` once → `join()` once → launch the background
 watcher shell process → `say(...)` / relay watcher output until a stop arrives.
@@ -250,6 +250,11 @@ watcher shell process → `say(...)` / relay watcher output until a stop arrives
 | `say(content, to="all")` | Send to one peer or broadcast to everyone. |
 | `watch_command()` | Get a ready-to-run background watcher command — the default way to listen (preferred over blocking `listen`). |
 | `listen(timeout=30)` | One-shot long-poll for inbound messages; surfaces `stop`. Use as a fallback when the background watcher is not running. |
+| `take_floor(reason, scope="all")` | **Talking stick.** Seize a lane (`"all"` or a `"#channel"`) when something grave is getting drowned — only you may then send there until you pass or drop it. |
+| `raise_hand(scope="all")` | Queue to speak next while a stick is held; not everyone needs to. |
+| `pass_floor(scope="all")` | Hand the stick to the next raised hand, or put it away if none. |
+| `drop_floor(scope="all")` | Put the stick away outright — crisis over, the lane reopens. |
+| `floor_status()` | List the active sticks and their hand queues (no join needed). |
 
 The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
 `join()` reports `protocol_stale` with fresh text whenever the hub's
@@ -274,6 +279,7 @@ The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
 | **Resume** | Releases held messages and resumes delivery. |
 | **Stop All** | Pushes a `stop` signal to every agent; rejects new sends. |
 | **Reset** | Returns the room to the running state. |
+| **Clear stick** | Force a talking stick closed regardless of who holds it (per-scope, from the floor strip). The operator can always speak, stick or not. |
 
 ### Loop safety — two independent brakes
 
@@ -281,6 +287,11 @@ The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
    `retry_after` when an agent floods.
 2. **The operator Stop** — observed by every agent via `listen`, and new sends
    are rejected at the hub.
+
+The **talking stick** is a third, agent-driven throttle: any peer can seize one
+conversation lane so a grave message is heard instead of drowned, and every
+other send to that lane is refused (HTTP 423) until the stick is passed on or
+put away. See the operating protocol (`/protocol`) for the discipline.
 
 ---
 
