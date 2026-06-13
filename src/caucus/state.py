@@ -95,6 +95,13 @@ so the queue behaves like a ring buffer once full.
 """
 
 
+# Per-agent control commands the operator can aim at a single connected agent
+# (as opposed to the room-wide pause/resume/stop/reset of :class:`ControlMode`).
+# Delivered as CONTROL messages on the target's priority queue, so they reach a
+# paused agent. ``stop`` stays room-wide and is not part of this set.
+OPERATOR_COMMANDS = frozenset({"interrupt", "reset"})
+
+
 @dataclass(slots=True)
 class Client:
     """A connected agent (one MCP client session).
@@ -102,7 +109,14 @@ class Client:
     Attributes:
         project: Human-readable project name, unique per client.
         token: Opaque credential used on every subsequent call.
-        queue: Pending messages addressed to this client.
+        queue: Pending peer chatter addressed to this client. Held back by the
+            pause gate (see :meth:`HubState.set_mode`) so a paused room freezes
+            agent-to-agent traffic.
+        priority_queue: Pending operator-originated traffic — steering messages
+            (``sender == "human"``) and per-agent control commands
+            (``kind == CONTROL``, e.g. ``interrupt``/``reset``). Drained by
+            ``GET /receive`` **even while the room is paused**, so the operator
+            keeps a live grip on an agent it has frozen.
         bucket: Per-client send rate limiter.
         last_seen: Timestamp of the most recent interaction.
         channels: The private channels this client is subscribed to. A channel
@@ -152,6 +166,12 @@ class Client:
     queue: asyncio.Queue[Message] = field(
         default_factory=lambda: asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
     )
+    # Operator-originated traffic (human messages + CONTROL commands) lands here
+    # instead of the gated queue, so ``/receive`` delivers it even while the room
+    # is paused. Left unbounded on purpose: the only writers are the trusted
+    # operator and the hub itself, and it drains continuously, so no adversarial
+    # peer can grow it — unlike the gated ``queue`` above, which is capped.
+    priority_queue: asyncio.Queue[Message] = field(default_factory=asyncio.Queue)
     bucket: TokenBucket | None = None
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
@@ -1118,6 +1138,13 @@ class HubState:
         The UI feed always receives the message regardless of mode, so the
         operator sees channel traffic they are not a member of.
 
+        Operator-originated traffic — a ``"human"`` message or any
+        :attr:`~caucus.models.MessageKind.CONTROL` command — is queued on each
+        recipient's :attr:`Client.priority_queue` instead of its gated
+        :attr:`Client.queue`, so ``GET /receive`` delivers it even while the
+        room is paused (the operator can steer or interrupt a frozen agent).
+        Peer chatter takes the normal queue and stays subject to the pause gate.
+
         Returns:
             The list of project names the message was queued for.
         """
@@ -1153,10 +1180,18 @@ class HubState:
                 target = self._reaped_by_project.get(msg.recipient)
             targets = [target] if target is not None else []
 
+        priority = msg.sender == "human" or msg.kind is MessageKind.CONTROL
         for client in targets:
-            # Drop-oldest on overflow (ring buffer) so a stuck recipient can
-            # never crash routing or exhaust memory — see :meth:`_safe_put`.
-            self._safe_put(client, msg)
+            if priority:
+                # Operator/human traffic goes on the ungated priority queue so it
+                # reaches even a paused peer. It is unbounded (trusted source,
+                # always draining), so a plain put_nowait cannot overflow.
+                client.priority_queue.put_nowait(msg)
+            else:
+                # Peer chatter takes the gated, bounded queue. Drop-oldest on
+                # overflow (ring buffer) so a stuck recipient can never crash
+                # routing or exhaust memory — see :meth:`_safe_put`.
+                self._safe_put(client, msg)
         delivered = [c.project for c in targets]
         # Feed the optional disk-log sink last, once routing is settled. The
         # sink only enqueues onto an asyncio.Queue, so this never blocks.
@@ -1752,6 +1787,43 @@ class HubState:
                 rendered = str(value)
             lines.append(f"- {label}: {rendered}")
         return "\n".join(lines)
+
+    def operator_command(self, project: str, command: str) -> bool:
+        """Aim a per-agent control command at one connected agent.
+
+        Unlike the room-wide :meth:`set_mode` (pause/resume/stop/reset), this
+        targets a single agent — ``interrupt`` to abort its current turn,
+        ``reset`` to wipe its conversation context — and is delivered as a
+        :attr:`~caucus.models.MessageKind.CONTROL` message on the target's
+        priority queue, so it reaches the agent even while the room is paused.
+        A reaped-but-revivable agent is a valid target too: the command waits on
+        its priority queue and is picked up when it reconnects.
+
+        The command rides through :meth:`route`, so it is sequenced, logged, and
+        surfaced on the operator UI feed like any other message.
+
+        Args:
+            project: The name of the agent to command.
+            command: One of :data:`OPERATOR_COMMANDS` (``"interrupt"`` /
+                ``"reset"``).
+
+        Returns:
+            ``True`` if the command was accepted and routed; ``False`` if the
+            command is unknown or no live/reaped agent holds that name.
+        """
+        if command not in OPERATOR_COMMANDS:
+            return False
+        target = self._clients.get(project) or self._reaped_by_project.get(project)
+        if target is None:
+            return False
+        msg = Message(
+            sender="human",
+            recipient=project,
+            content=command,
+            kind=MessageKind.CONTROL,
+        )
+        self.route(msg)
+        return True
 
     # --- control mode ----------------------------------------------------
 

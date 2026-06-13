@@ -566,6 +566,39 @@ def test_ui_socket_operator_say_is_broadcast(client: TestClient) -> None:
     assert event["message"]["content"] == "stand down"
 
 
+def test_ui_operator_say_pierces_pause(client: TestClient) -> None:
+    """A paused room still lets the operator inject a steering message."""
+    alpha = _register(client, "alpha")
+    client.post("/control", json={"action": "pause"})
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"say": "course-correct", "to": "alpha"})
+        ws.receive_json()  # the routed message echoed onto the UI feed
+
+    got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    assert got["mode"] == "paused"
+    assert any("course-correct" in m["content"] for m in got["messages"])
+
+
+def test_ui_operator_command_pierces_pause(client: TestClient) -> None:
+    """An interrupt command reaches a paused agent as a control message."""
+    alpha = _register(client, "alpha")
+    client.post("/control", json={"action": "pause"})
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"command": "interrupt", "to": "alpha"})
+        ws.receive_json()  # the routed control message echoed onto the UI feed
+
+    got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    assert got["mode"] == "paused"
+    assert any(
+        m["kind"] == "control" and m["content"] == "interrupt"
+        for m in got["messages"]
+    )
+
+
 def test_ui_socket_sees_peer_join(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
         assert ws.receive_json()["type"] == "auth_ok"
