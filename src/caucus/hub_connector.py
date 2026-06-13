@@ -136,11 +136,17 @@ class Inbound:
         mode: The room's current control mode (``running``/``paused``/``stopped``).
         stop: ``True`` when a control ``stop`` was present; the caller should
             end the exchange.
+        commands: Per-agent operator control commands present in the batch, in
+            arrival order — e.g. ``["interrupt"]`` or ``["reset"]``. These are
+            CONTROL messages the operator aimed at this agent (distinct from the
+            room-wide ``stop``); a connector that owns its event loop acts on
+            them out of band (interrupt the current turn, reset the context).
     """
 
     messages: list[dict[str, object]]
     mode: str | None
     stop: bool
+    commands: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -377,8 +383,10 @@ class HubConnector:
     ) -> Inbound:
         """Long-poll for inbound messages addressed to the token holder.
 
-        Splits a control ``stop`` from ordinary chatter, exactly as the bridge's
-        ``listen`` does, so the caller gets a clean ``(messages, stop)`` view.
+        Splits control signals from ordinary chatter, like the bridge's
+        ``listen``: the room-wide ``stop`` surfaces as :attr:`Inbound.stop`, any
+        per-agent operator commands as :attr:`Inbound.commands`, and the rest as
+        :attr:`Inbound.messages`.
 
         Pass ``ack_seq`` to piggyback an ACK on the poll, confirming receipt of
         all messages up to that sequence number without a separate round-trip.
@@ -413,10 +421,15 @@ class HubConnector:
         payload = resp.json()
         raw = payload.get("messages", [])
         messages = [m for m in raw if m.get("kind") != "control"]
-        stop = any(
-            m.get("kind") == "control" and m.get("content") == "stop" for m in raw
+        controls = [str(m.get("content")) for m in raw if m.get("kind") == "control"]
+        stop = "stop" in controls
+        commands = [c for c in controls if c != "stop"]
+        return Inbound(
+            messages=messages,
+            mode=payload.get("mode"),
+            stop=stop,
+            commands=commands,
         )
-        return Inbound(messages=messages, mode=payload.get("mode"), stop=stop)
 
     async def ack(self, token: str, seq: int) -> None:
         """Acknowledge receipt of all messages up to and including ``seq``.

@@ -93,6 +93,46 @@ async def test_receive_surfaces_stop_without_control_chatter(live_hub: str) -> N
     assert all(m.get("kind") != "control" for m in inbound.messages)
 
 
+async def test_receive_splits_operator_commands_from_chatter() -> None:
+    """``receive`` peels per-agent control commands into ``Inbound.commands``.
+
+    A batch mixing chatter, the room ``stop``, and an operator ``interrupt``
+    must surface chatter under ``messages``, the stop under ``stop``, and the
+    interrupt under ``commands`` — uses a mock transport, no live hub.
+    """
+
+    class _MockReceiveTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "mode": "paused",
+                    "messages": [
+                        {"sender": "a", "recipient": "all", "content": "hi", "kind": "message"},
+                        {"sender": "human", "recipient": "me", "content": "interrupt", "kind": "control"},
+                        {"sender": "hub", "recipient": "all", "content": "stop", "kind": "control"},
+                    ],
+                },
+            )
+
+    connector = HubConnector("http://stub")
+    connector._http = httpx.AsyncClient(
+        base_url="http://stub", transport=_MockReceiveTransport()
+    )
+    try:
+        inbound = await connector.receive("tok", 0.0)
+    finally:
+        await connector._http.aclose()
+        connector._http = None
+
+    assert [m["content"] for m in inbound.messages] == ["hi"]
+    assert inbound.stop is True
+    assert inbound.commands == ["interrupt"]
+    assert inbound.mode == "paused"
+
+
 async def test_send_when_stopped_reports_stopped(live_hub: str) -> None:
     async with HubConnector(live_hub) as hub:
         me = await hub.register("conn-stopped-tx", None)
