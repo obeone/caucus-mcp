@@ -110,12 +110,18 @@ denominator; everything else is a connector to it.
   `claude` extra). It owns its event loop: it registers via `HubConnector`,
   exposes `say`/`list_peers` as **in-process SDK MCP tools**
   (`create_sdk_mcp_server` + `@tool`), composes the hub protocol into the agent's
-  system prompt, and runs `poll /receive → inject any inbound as a user turn →
-  let the agent reply via say() → poll again`. Inbound messages go straight into
-  the live `ClaudeSDKClient` conversation, so the agent never calls
+  system prompt, and runs **two cooperating tasks per client lifecycle**: a
+  *poller* (`_poll_inbound`) that owns the `/receive` long-poll, and a *driver*
+  (`_drive_turns`) that turns queued inbound into `ClaudeSDKClient` turns. Inbound
+  messages go straight into the live conversation, so the agent never calls
   `setup`/`join`/`watch_command`/`listen` — there is no watcher and no
-  wake-by-exit. While the agent reasons the loop is not polling, so concurrent
-  inbound messages simply buffer hub-side until the next poll. Built-in tools
+  wake-by-exit. The poll/reason split is what lets the operator reach an agent
+  that is **mid-turn**: the poller reacts to per-agent control commands out of
+  band — `interrupt` calls `ClaudeSDKClient.interrupt()` to abort the current
+  turn, `reset` aborts and rebuilds the client from the same options (a clean
+  context window), and `stop` ends the session after draining queued turns. A
+  single sequential loop could not poll and reason at once, so it would only
+  notice an interrupt once the turn was already over. Built-in tools
   (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
 - **`mcp_http.py`** (no script): an in-process **Streamable HTTP** MCP server the
   hub mounts at `--mcp-path` (default `/mcp`), on by default for a loopback bind
@@ -189,12 +195,24 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   to the collision detector — the only way a live incumbent is evicted (collisions
   never auto-evict the incumbent; they refuse the newcomer). Note that `/ui`
   carries no authentication, so the hub must stay bound to localhost or sit behind
-  a trusted reverse proxy — exposing it publicly lets anyone pause, stop, or kick
-  arbitrary peers.
+  a trusted reverse proxy — exposing it publicly lets anyone pause, stop, kick,
+  or steer arbitrary peers.
+- **Operator commands** (`operator_command`): the `/ui` WebSocket also accepts
+  `{"command": "interrupt"|"reset", "to": "<project>"}`, a **per-agent** control
+  signal (distinct from the room-wide `set_mode`). It routes a CONTROL message to
+  that agent's priority queue, so it reaches even a paused agent; the native
+  connector acts on it (abort the current turn / rebuild with a clean context).
+  Unknown commands or unknown agents are a no-op (`False`).
 - **Routing** (`route`): appends to log, fans out to the UI feed, then queues to
   the target(s): the named recipient for a direct message, every client except
   the sender for `BROADCAST = "all"`, or only the subscribed members (sender
-  excluded) for a `#`-prefixed private channel. In **all three** modes the target
+  excluded) for a `#`-prefixed private channel. Each recipient has **two** queues:
+  operator-originated traffic (`sender == "human"` or any CONTROL command) is
+  queued on `Client.priority_queue`, everything else on the gated `Client.queue`.
+  `/receive` drains the priority queue even while the room is paused, so the
+  operator keeps a live grip (steer / interrupt / reset) on a frozen agent;
+  CONTROL messages are not buffered for replay (a stale `interrupt` must not
+  resurface on reconnect). In **all three** modes the target
   set spans both the live roster and reaped-but-revivable clients (`_recipients()`),
   so a peer reaped mid-conversation (its one-shot watcher down while it composes a
   reply) still has the message queued on its reaped record and replayed on
@@ -204,10 +222,11 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   `channels()` derives the live map and a channel vanishes once its last member
   leaves or is reaped.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
-  holds messages without draining queues; `STOPPED` floods a `stop` control
-  into every queue and *sets* `_transmit` so blocked waiters wake and observe
-  the stop; `RUNNING`/`reset` reopens the gate. `STOPPED` also clears all floors
-  (the room is over; no stick survives it).
+  holds the **chatter** queue without draining it (the priority queue still
+  flows — see Routing); `STOPPED` floods a `stop` control into every queue and
+  *sets* `_transmit` so blocked waiters wake and observe the stop; `RUNNING`/
+  `reset` reopens the gate. `STOPPED` also clears all floors (the room is over;
+  no stick survives it).
 - **Talking stick / floor control** (`_floors: dict[scope, Floor]`): an
   exclusive right to speak within one *scope* — `BROADCAST` (`"all"`) or a
   `#channel` — so a grave message cuts through the noise instead of drowning.
