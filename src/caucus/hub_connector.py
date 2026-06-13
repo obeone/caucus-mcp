@@ -93,9 +93,10 @@ class Membership:
 class SendResult:
     """The outcome of a ``/send``, with the hub's brakes surfaced as flags.
 
-    Exactly one of ``ok`` / ``rate_limited`` / ``stopped`` is meaningful:
-    a successful send sets ``ok`` with ``message_id`` and ``delivered_to``; a
-    429 sets ``rate_limited`` with ``retry_after``; a 409 sets ``stopped``.
+    Exactly one of ``ok`` / ``rate_limited`` / ``stopped`` / ``floor_held`` is
+    meaningful: a successful send sets ``ok`` with ``message_id`` and
+    ``delivered_to``; a 429 sets ``rate_limited`` with ``retry_after``; a 409
+    sets ``stopped``; a 423 sets ``floor_held`` with holder/reason/scope details.
 
     Attributes:
         ok: ``True`` when the message was accepted and routed.
@@ -104,6 +105,11 @@ class SendResult:
         rate_limited: ``True`` when the sender's token bucket is empty (HTTP 429).
         retry_after: Seconds to back off before retrying, when rate limited.
         stopped: ``True`` when the operator has stopped the room (HTTP 409).
+        floor_held: ``True`` when a talking-stick holder bars the sender (HTTP 423).
+        floor_holder: The project that currently holds the stick, when floor_held.
+        floor_reason: The reason the holder took the stick, when floor_held.
+        floor_scope: The scope (``"all"`` or ``"#channel"``) where the stick is
+            held, when floor_held.
     """
 
     ok: bool
@@ -112,6 +118,10 @@ class SendResult:
     rate_limited: bool = False
     retry_after: float | None = None
     stopped: bool = False
+    floor_held: bool = False
+    floor_holder: str | None = None
+    floor_reason: str | None = None
+    floor_scope: str | None = None
 
 
 @dataclass(slots=True)
@@ -282,7 +292,8 @@ class HubConnector:
 
         Returns:
             A :class:`SendResult`: ``ok`` on success, ``rate_limited`` on 429,
-            ``stopped`` on 409.
+            ``stopped`` on 409, ``floor_held`` on 423 (a talking-stick holder
+            bars this sender in the target scope).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -296,6 +307,14 @@ class HubConnector:
             return SendResult(ok=False, rate_limited=True, retry_after=body.get("retry_after"))
         if resp.status_code == 409:
             return SendResult(ok=False, stopped=True)
+        if resp.status_code == 423:
+            body = resp.json()
+            return SendResult(
+                ok=False, floor_held=True,
+                floor_holder=body.get("held_by"),
+                floor_reason=body.get("reason"),
+                floor_scope=body.get("scope"),
+            )
         resp.raise_for_status()
         body = resp.json()
         return SendResult(
@@ -477,3 +496,152 @@ class HubConnector:
             return False
         resp.raise_for_status()
         return True
+
+    async def take_floor(
+        self, token: str, scope: str, reason: str
+    ) -> dict[str, object]:
+        """Claim the talking stick for a scope, blocking others from sending.
+
+        While the stick is held, ``/send`` calls from non-holders in the same
+        scope return HTTP 423.  Pass the stick with :meth:`pass_floor` or
+        release it with :meth:`drop_floor` when the critical exchange is over.
+
+        Args:
+            token: The caller's access token.
+            scope: The scope to hold: ``"all"`` for the whole room, or a
+                ``"#channel"`` name for a private channel.
+            reason: A short human-readable rationale shown to barred senders.
+
+        Returns:
+            The hub's response dict, typically ``{"ok": True}`` on success or
+            ``{"ok": False, "error": "floor_held", ...}`` when another peer
+            already holds the stick and the caller is queued.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "take", "scope": scope, "reason": reason},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def pass_floor(self, token: str, scope: str) -> dict[str, object]:
+        """Pass the talking stick to the next queued peer (or release it if empty).
+
+        Only the current holder may call this.  If peers have raised their hand
+        the stick moves to the first in the queue; otherwise it is released.
+
+        Args:
+            token: The caller's access token (must be the current holder).
+            scope: The scope whose stick to pass: ``"all"`` or a ``"#channel"``.
+
+        Returns:
+            The hub's response dict, e.g. ``{"ok": True, "passed_to": "peer-x"}``
+            or ``{"ok": True, "released": True}`` when the queue was empty.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "pass", "scope": scope},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def drop_floor(self, token: str, scope: str) -> dict[str, object]:
+        """Unconditionally release the talking stick for a scope.
+
+        Unlike :meth:`pass_floor` this discards the queue and releases the floor
+        immediately, regardless of pending hands.
+
+        Args:
+            token: The caller's access token (must be the current holder).
+            scope: The scope whose stick to drop: ``"all"`` or a ``"#channel"``.
+
+        Returns:
+            The hub's response dict, typically ``{"ok": True}``.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "drop", "scope": scope},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def raise_hand(self, token: str, scope: str) -> dict[str, object]:
+        """Signal intent to speak next by joining the talking-stick queue.
+
+        Use this when ``say`` returns ``floor_held`` to request the next turn
+        without retrying immediately.  The current holder will see you in the
+        queue when deciding whether to :meth:`pass_floor`.
+
+        Args:
+            token: The caller's access token.
+            scope: The scope where the hand should be raised: ``"all"`` or a
+                ``"#channel"``.
+
+        Returns:
+            The hub's response dict, e.g. ``{"ok": True, "position": 2}``.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "raise", "scope": scope},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def lower_hand(self, token: str, scope: str) -> dict[str, object]:
+        """Withdraw from the talking-stick queue without taking the floor.
+
+        Undoes a previous :meth:`raise_hand` if the situation has resolved and
+        speaking is no longer needed.
+
+        Args:
+            token: The caller's access token.
+            scope: The scope where the hand should be lowered: ``"all"`` or a
+                ``"#channel"``.
+
+        Returns:
+            The hub's response dict, typically ``{"ok": True}``.
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "lower", "scope": scope},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def floors(self) -> dict[str, dict[str, object]]:
+        """Fetch the current talking-stick state for all active scopes.
+
+        Open endpoint — no token required.
+
+        Returns:
+            A mapping ``{scope: {...}}`` describing each active floor hold,
+            e.g. ``{"all": {"holder": "peer-x", "reason": "...", "hands": [...],
+            "since": ...}}``. Empty dict when no stick is held anywhere.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error.
+        """
+        http = self._require_http()
+        resp = await http.get("/floor")
+        resp.raise_for_status()
+        return dict(resp.json().get("floors", {}))
