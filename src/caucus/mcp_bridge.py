@@ -9,7 +9,9 @@ also exposes private channels (``join_channel`` / ``leave_channel`` /
 ``list_channels`` / ``set_channel_topic``): a ``#``-prefixed room whose traffic
 reaches only its members, so a subset of peers can work a sub-topic without
 spamming the rest, each carrying an IRC-like topic so late joiners know its
-purpose.
+purpose. Floor control (``take_floor`` / ``raise_hand`` / ``pass_floor`` /
+``drop_floor`` / ``floor_status``) lets agents claim the talking stick to
+prevent message storms during critical moments.
 
 Configuration via environment variables:
 
@@ -380,7 +382,9 @@ def say(content: str, to: str = "all") -> dict[str, object]:
     Returns:
         A dict with the delivered message id and the recipients, or an error
         with ``retry_after`` when rate-limited, or a ``stopped`` flag when the
-        operator has stopped the room.
+        operator has stopped the room, or ``{"error": "floor_held", ...}`` when
+        a talking stick bars the sender in the target scope (call
+        ``raise_hand`` to queue for the floor, or wait for ``drop_floor``).
     """
     gate = _require_setup()
     if gate is not None:
@@ -394,6 +398,15 @@ def say(content: str, to: str = "all") -> dict[str, object]:
             return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         if resp.status_code == 409:
             return {"stopped": True, "note": "room is stopped; halt the exchange"}
+        if resp.status_code == 423:
+            body = resp.json()
+            return {
+                "error": "floor_held",
+                "held_by": body.get("held_by"),
+                "scope": body.get("scope"),
+                "reason": body.get("reason"),
+                "hint": body.get("hint"),
+            }
         resp.raise_for_status()
         return dict(resp.json())
 
@@ -564,6 +577,186 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
             return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
+
+
+@mcp.tool()
+def take_floor(reason: str, scope: str = "all") -> dict[str, object]:
+    """Grab the talking stick to cut through noise when something grave is getting drowned.
+
+    Use this when an urgent, critical concern risks being buried in ongoing
+    chatter — e.g. a security issue, a blocking contradiction, or an
+    irreversible decision about to be made on wrong premises. Once you hold
+    the floor in a scope, ``say`` calls by other peers in that scope are
+    rejected with ``floor_held`` until you ``pass_floor`` or ``drop_floor``.
+    If someone else already holds the floor you are automatically queued
+    (the hub returns ``floor_held``); call ``raise_hand`` instead to signal
+    interest without blocking.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        reason: A short, honest description of why you need the floor — this
+            is shown to peers so they understand the interruption.
+        scope: ``"all"`` to hold the floor room-wide, or a ``"#channel"``
+            name to hold it only within that channel.
+
+    Returns:
+        ``{"ok": true}`` on success, ``{"ok": false, "error": "floor_held",
+        ...}`` when someone else already holds the floor in that scope (you
+        are queued), or ``{"error": "rate_limited", "retry_after": ...}``
+        when throttled, or the usual ``setup_required`` / ``not_joined``
+        gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/floor",
+            json={"token": _token, "action": "take", "scope": scope, "reason": reason},
+        )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def raise_hand(scope: str = "all") -> dict[str, object]:
+    """Signal interest in speaking without seizing the floor outright.
+
+    When another peer currently holds the floor, ``raise_hand`` queues you
+    to receive it automatically when they call ``pass_floor`` or
+    ``drop_floor``. If no one holds the floor this is a lightweight
+    advisory; you can still call ``take_floor`` to claim it.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        scope: ``"all"`` to raise your hand room-wide, or a ``"#channel"``
+            name to raise it within that channel only.
+
+    Returns:
+        ``{"ok": true}`` on success, ``{"error": "rate_limited",
+        "retry_after": ...}`` when throttled, or the usual
+        ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/floor",
+            json={"token": _token, "action": "raise", "scope": scope, "reason": ""},
+        )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def pass_floor(scope: str = "all") -> dict[str, object]:
+    """Hand the talking stick to the next peer waiting in the queue.
+
+    You must currently hold the floor in the given scope. If another peer
+    has raised their hand the floor transfers to them immediately; if the
+    queue is empty the stick is put away and all peers in that scope can
+    speak freely again.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        scope: ``"all"`` to pass the room-wide floor, or a ``"#channel"``
+            name to pass it within that channel only.
+
+    Returns:
+        ``{"ok": true}`` on success, ``{"ok": false, "error":
+        "not_holder"}`` when you do not hold the floor in that scope,
+        ``{"error": "rate_limited", "retry_after": ...}`` when throttled,
+        or the usual ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/floor",
+            json={"token": _token, "action": "pass", "scope": scope, "reason": ""},
+        )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def drop_floor(scope: str = "all") -> dict[str, object]:
+    """Relinquish the talking stick outright — crisis over, room unblocked.
+
+    Unlike ``pass_floor`` (which hands to the next queued peer),
+    ``drop_floor`` unconditionally releases the floor and clears the
+    queue, letting all peers speak freely again. Use it when the urgent
+    situation is resolved and normal conversation can resume.
+
+    Requires ``setup`` then ``join`` first.
+
+    Args:
+        scope: ``"all"`` to drop the room-wide floor, or a ``"#channel"``
+            name to drop it within that channel only.
+
+    Returns:
+        ``{"ok": true}`` on success, ``{"ok": false, "error":
+        "not_holder"}`` when you do not hold the floor in that scope,
+        ``{"error": "rate_limited", "retry_after": ...}`` when throttled,
+        or the usual ``setup_required`` / ``not_joined`` gate errors.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.post(
+            "/floor",
+            json={"token": _token, "action": "drop", "scope": scope, "reason": ""},
+        )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+def floor_status() -> dict[str, object]:
+    """Report the current floor-control state for all active scopes.
+
+    Requires ``setup`` first, but not ``join`` — useful to scout which
+    scopes are currently gated before deciding to join or speak.
+
+    Returns:
+        ``{"floors": {"all": {"scope": "all", "holder": "<name>",
+        "reason": "<text>", "hands": [...], "since": <timestamp>}, ...}}``
+        keyed by scope. An empty dict means no floors are currently held.
+        Returns ``{"error": "setup_required"}`` if setup has not run.
+    """
+    gate = _require_setup()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/floor")
+        resp.raise_for_status()
+        return {"floors": dict(resp.json().get("floors", {}))}
 
 
 @mcp.tool()
