@@ -53,7 +53,7 @@
       repeating-linear-gradient(0deg, var(--grain) 0 1px, transparent 1px 3px),
       radial-gradient(120% 80% at 50% -10%, rgba(56, 198, 217, 0.07), transparent 60%);
     display: grid;
-    grid-template-rows: auto 1fr;
+    grid-template-rows: auto auto 1fr;
     height: 100vh;
   }
 
@@ -431,6 +431,57 @@
   .conn { font-size: 11px; letter-spacing: 2px; color: var(--dim); }
   .conn.live { color: var(--green); }
   .conn.dead { color: var(--red); }
+
+  /* ─── Talking-stick floor strip ─── */
+  #floor-strip {
+    display: none; /* hidden when no active floors */
+    flex-direction: column; gap: 8px;
+    padding: 10px 20px;
+    border-bottom: 2px solid var(--amber);
+    background: rgba(255, 178, 46, 0.07);
+    box-shadow: inset 0 -1px 0 rgba(255,178,46,0.18), 0 2px 12px rgba(255,178,46,0.08);
+  }
+  #floor-strip.active { display: flex; }
+
+  .floor-entry {
+    display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px;
+    font-family: "IBM Plex Mono", monospace; font-size: 12px;
+    padding: 6px 10px;
+    border: 1px solid rgba(255,178,46,0.35); border-radius: 2px;
+    background: rgba(255,178,46,0.04);
+  }
+  .floor-label {
+    font-family: "Chakra Petch", sans-serif;
+    font-weight: 700; letter-spacing: 3px; font-size: 11px;
+    color: var(--amber); text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .floor-holder { font-weight: 600; font-size: 13px; }
+  .floor-scope {
+    color: var(--dim); font-size: 11px; letter-spacing: 1px; white-space: nowrap;
+  }
+  .floor-scope b { color: var(--cyan); }
+  .floor-reason {
+    color: var(--ink); font-style: italic; font-size: 11.5px; flex: 1;
+    min-width: 0; word-break: break-word;
+  }
+  .floor-hands {
+    color: var(--dim); font-size: 11px; white-space: nowrap;
+  }
+  .floor-hands b { color: var(--green); }
+  .floor-clear {
+    margin-left: auto; padding: 2px 8px;
+    font-family: "Chakra Petch", sans-serif;
+    font-size: 10px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase;
+    background: transparent; color: var(--amber);
+    border: 1px solid var(--amber); border-radius: 2px;
+    cursor: pointer; transition: all .12s ease;
+    flex: none;
+  }
+  .floor-clear:hover {
+    background: var(--amber); color: #0a0e12;
+  }
 </style>
 </head>
 <body>
@@ -454,6 +505,9 @@
       <button onclick="ctl('reset')">Reset</button>
     </div>
   </header>
+
+  <!-- ─── Talking-stick floor strip — visible only when ≥1 floor is active ─── -->
+  <div id="floor-strip"></div>
 
   <main>
     <aside>
@@ -648,6 +702,7 @@
   let currentPeers = [];
   let channels = {};      // latest complete channel map: { "#name": { topic: str|null, members: [...] } }
   let allMessages = [];   // every message received, in order, for feed re-render
+  let floors = {};        // active talking sticks: { "<scope>": { scope, holder, reason, hands, since } }
 
   function fmtTime(ts) {
     const d = new Date(ts * 1000);
@@ -895,6 +950,74 @@
     rebuildFilterBar();
   }
 
+  // ─── clearFloor — operator override: force a talking stick closed ────────
+  function clearFloor(scope) {
+    if (!confirm('Force the talking stick for ' + scope + ' closed?')) return;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ floor: { action: 'clear', scope } }));
+  }
+
+  // ─── setFloors — stores floor state and renders the talking-stick strip ──
+  function setFloors(f) {
+    floors = f || {};
+    const strip = document.getElementById('floor-strip');
+    strip.innerHTML = '';
+    const scopes = Object.keys(floors);
+    if (!scopes.length) {
+      strip.classList.remove('active');
+      return;
+    }
+    strip.classList.add('active');
+    for (const scope of scopes) {
+      const entry = floors[scope];
+      const holder = entry.holder || '?';
+      const scopeLabel = scope === 'all' ? 'ALL / whole room' : scope;
+      const hands = Array.isArray(entry.hands) ? entry.hands : [];
+
+      const row = document.createElement('div');
+      row.className = 'floor-entry';
+
+      const label = document.createElement('span');
+      label.className = 'floor-label';
+      label.textContent = '🪧 TALKING STICK';
+
+      const holderSpan = document.createElement('span');
+      holderSpan.className = 'floor-holder';
+      holderSpan.textContent = holder;
+      holderSpan.style.color = colorFor(holder);
+
+      const scopeSpan = document.createElement('span');
+      scopeSpan.className = 'floor-scope';
+      scopeSpan.innerHTML = 'scope: <b>' + escapeHtml(scopeLabel) + '</b>';
+
+      row.append(label, holderSpan, scopeSpan);
+
+      if (entry.reason) {
+        const reasonSpan = document.createElement('span');
+        reasonSpan.className = 'floor-reason';
+        reasonSpan.textContent = '"' + entry.reason + '"';
+        row.append(reasonSpan);
+      }
+
+      const handsSpan = document.createElement('span');
+      handsSpan.className = 'floor-hands';
+      if (hands.length) {
+        handsSpan.innerHTML = '✋ waiting: <b>' + hands.map(escapeHtml).join(', ') + '</b>';
+      } else {
+        handsSpan.textContent = 'no hands raised';
+      }
+      row.append(handsSpan);
+
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'floor-clear';
+      clearBtn.textContent = 'CLEAR';
+      clearBtn.title = 'Force talking stick for ' + scope + ' closed';
+      clearBtn.onclick = () => clearFloor(scope);
+      row.append(clearBtn);
+
+      strip.appendChild(row);
+    }
+  }
+
   // ─── exportChat — download the server-side log transcript ────────────────
   // The /export endpoint streams an attachment (Content-Disposition sets the
   // filename), so a transient anchor click triggers a save without navigating.
@@ -948,6 +1071,7 @@
         setMode(e.mode);
         setPeers(e.peers);
         setChannels(e.channels || {});
+        setFloors(e.floors || {});
         feed.innerHTML = "";
         (e.log || []).forEach(addMessage);
       } else if (e.type === "message") {
@@ -958,6 +1082,8 @@
         setPeers(e.peers);
       } else if (e.type === "channels") {
         setChannels(e.channels || {});
+      } else if (e.type === "floor") {
+        setFloors(e.floors || {});
       }
     };
   }
