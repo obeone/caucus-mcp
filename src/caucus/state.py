@@ -98,6 +98,40 @@ class Registration:
     client: Client | None  # None only when outcome is CONTESTED
 
 
+@dataclass(slots=True)
+class Floor:
+    """An active talking stick over one conversation scope.
+
+    The talking stick (or "floor") is an exclusive right to speak within a
+    single scope — either :data:`~caucus.models.BROADCAST` (the whole room) or a
+    private channel. While a floor is held, the hub refuses every other peer's
+    ``/send`` to that scope (HTTP 423), so a grave message cuts through the noise
+    instead of drowning in it. A peer that also needs to speak in the scope
+    queues behind the holder by *raising a hand*; the holder hands the stick to
+    the next raised hand, or puts it away when the queue empties and the crisis
+    has passed. The human operator can always speak (they route directly, not
+    through ``/send``) and can force-clear any floor.
+
+    Floors are keyed by scope, so several can be active at once — at most one per
+    scope. State is in-memory only, like the rest of :class:`HubState`.
+
+    Attributes:
+        scope: The conversation lane this stick governs — ``"all"`` (the whole
+            room) or a ``#``-prefixed channel name.
+        holder: Project name of the peer currently holding the stick.
+        reason: Why the stick was taken — the crisis the holder needs heard.
+        hands: FIFO queue of project names waiting to speak next. Deduplicated
+            and never contains the current holder; emptied as the stick passes.
+        since: When the current holder took (or was handed) the stick.
+    """
+
+    scope: str
+    holder: str
+    reason: str
+    hands: list[str] = field(default_factory=list)
+    since: float = field(default_factory=time.time)
+
+
 class HubState:
     """Central, mutable state shared by all hub endpoints."""
 
@@ -122,6 +156,10 @@ class HubState:
         # Monotone counter; incremented and stamped onto every routed message.
         self._seq: int = 0
         self._topics: dict[str, str] = {}  # channel -> topic (ephemeral)
+        # Active talking sticks, keyed by scope ("all" or a "#channel"). At most
+        # one floor per scope; while one is held the hub bars every other peer's
+        # send to that scope (see :meth:`floor_blocks`). In-memory only.
+        self._floors: dict[str, Floor] = {}  # scope -> Floor
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
         self._mode: ControlMode = ControlMode.RUNNING
@@ -347,6 +385,9 @@ class HubState:
         if had_channels:
             self._prune_topics()  # forget topics of any channel this emptied
             self._push_ui({"type": "channels", "channels": self.channels()})
+        # A departing peer must never freeze a floor it held: hand the stick on
+        # (or put it away), and drop it from any hand queue it was waiting in.
+        self._relinquish_floors(client.project)
 
     def _revive(self, client: Client) -> Client | None:
         """Resurrect a reaped ``client`` back onto the active roster.
@@ -721,6 +762,9 @@ class HubState:
             self._announce_system(f"{client.project} left {channel}")
             self._prune_topics()  # drop the topic if that was the last member
             self._push_ui({"type": "channels", "channels": self.channels()})
+            # You cannot hold (or queue for) the stick of a channel you just
+            # left: pass it on, or drop yourself from its hand queue.
+            self._relinquish_floor(channel, client.project)
         return True
 
     def is_member(self, token: str, channel: str) -> bool:
@@ -748,6 +792,323 @@ class HubState:
             self._topics.pop(channel, None)
             self._announce_system(f"topic for {channel} cleared")
         self._push_ui({"type": "channels", "channels": self.channels()})
+
+    # --- talking stick (floor control) -----------------------------------
+
+    @staticmethod
+    def _scope_label(scope: str) -> str:
+        """Human-readable name for a floor scope (``"all"`` → "the whole room")."""
+        return "the whole room" if scope == BROADCAST else scope
+
+    def _floor_public(self, floor: Floor) -> dict[str, object]:
+        """Serialise a :class:`Floor` to a JSON-friendly dict for clients/UI."""
+        return {
+            "scope": floor.scope,
+            "holder": floor.holder,
+            "reason": floor.reason or None,
+            "hands": list(floor.hands),
+            "since": floor.since,
+        }
+
+    def floors_public(self) -> dict[str, dict[str, object]]:
+        """Return every active floor keyed by scope, sorted by scope name.
+
+        Consumed by the operator UI (snapshot and ``floor`` events) and by agents
+        scouting whether a stick is up before they speak. An empty map means no
+        stick is held and every scope is open.
+        """
+        return {
+            scope: self._floor_public(floor)
+            for scope, floor in sorted(self._floors.items())
+        }
+
+    def _push_floor_ui(self) -> None:
+        """Fan the current floor map out to every connected UI listener."""
+        self._push_ui({"type": "floor", "floors": self.floors_public()})
+
+    def _announce_floor(self, scope: str, content: str) -> None:
+        """Route a floor SYSTEM notice to a scope's members and the UI feed.
+
+        Unlike :meth:`_announce_system` (UI only), this goes through
+        :meth:`route` so the notice also lands in the queues of the peers being
+        silenced — waking a passive watcher so the agent actually learns a stick
+        is up (or has moved/closed) rather than discovering it only when its next
+        send bounces.
+        """
+        notice = Message(
+            sender="hub", recipient=scope, content=content, kind=MessageKind.SYSTEM
+        )
+        self.route(notice)
+
+    def _add_hand(self, floor: Floor, project: str) -> int:
+        """Append ``project`` to ``floor``'s hand queue (idempotent); return its 1-based position."""
+        if project not in floor.hands:
+            floor.hands.append(project)
+        return floor.hands.index(project) + 1
+
+    def take_floor(self, token: str, scope: str, reason: str) -> dict[str, object]:
+        """Claim the talking stick for ``scope`` so only the caller may speak there.
+
+        On success the caller becomes the holder and a SYSTEM notice is routed to
+        the scope (the whole room for ``"all"``, the channel's members otherwise)
+        announcing the floor and its reason, so silenced peers learn at once to
+        hold and raise a hand. If a *different* peer already holds the scope's
+        stick, the caller is instead queued behind it (its hand is raised
+        automatically) and told who holds it. Re-taking a stick the caller
+        already holds just refreshes the reason.
+
+        Args:
+            token: The caller's access token.
+            scope: ``"all"`` (the whole room) or a ``#``-prefixed channel name.
+            reason: Why the stick is being taken — the crisis to surface.
+
+        Returns:
+            ``{"ok": True, "scope", "holder", "reason"}`` when granted, or
+            ``{"ok": False, "error": ...}`` — ``unknown_token``, ``bad_scope``
+            (not ``all`` or a channel), ``not_a_member`` (channel scope the
+            caller has not joined), or ``floor_held`` (someone else holds it; the
+            payload adds ``held_by``, ``reason`` and the caller's queue
+            ``position``).
+        """
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        if scope != BROADCAST and not is_channel(scope):
+            return {"ok": False, "error": "bad_scope", "scope": scope}
+        if is_channel(scope) and scope not in client.channels:
+            return {"ok": False, "error": "not_a_member", "scope": scope}
+        floor = self._floors.get(scope)
+        if floor is not None and floor.holder != client.project:
+            position = self._add_hand(floor, client.project)
+            self._push_floor_ui()
+            return {
+                "ok": False,
+                "error": "floor_held",
+                "scope": scope,
+                "held_by": floor.holder,
+                "reason": floor.reason or None,
+                "position": position,
+            }
+        cleaned = reason.strip()
+        if floor is None:
+            floor = Floor(scope=scope, holder=client.project, reason=cleaned)
+            self._floors[scope] = floor
+            label = self._scope_label(scope)
+            detail = f" — {cleaned}" if cleaned else ""
+            self._announce_floor(
+                scope,
+                f"🪧 {client.project} took the talking stick for {label}{detail}. "
+                f"Only {client.project} speaks here now; everyone else: hold and "
+                "raise_hand() to claim the next turn.",
+            )
+        elif cleaned:
+            floor.reason = cleaned
+        self._push_floor_ui()
+        return {
+            "ok": True,
+            "scope": scope,
+            "holder": floor.holder,
+            "reason": floor.reason or None,
+        }
+
+    def raise_hand(self, token: str, scope: str) -> dict[str, object]:
+        """Queue the caller to speak next in ``scope`` while its stick is held.
+
+        A no-op-but-success when the caller already holds the stick (position 0).
+        Not everyone has to raise a hand — only peers that genuinely need a turn.
+
+        Args:
+            token: The caller's access token.
+            scope: The floor scope to queue for.
+
+        Returns:
+            ``{"ok": True, "scope", "position"}`` (1-based queue position; 0 when
+            the caller is the holder), or ``{"ok": False, "error": ...}`` —
+            ``unknown_token`` or ``no_floor`` (no stick is up for that scope).
+        """
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        floor = self._floors.get(scope)
+        if floor is None:
+            return {"ok": False, "error": "no_floor", "scope": scope}
+        if floor.holder == client.project:
+            return {"ok": True, "scope": scope, "position": 0}
+        position = self._add_hand(floor, client.project)
+        self._push_floor_ui()
+        return {"ok": True, "scope": scope, "position": position}
+
+    def lower_hand(self, token: str, scope: str) -> dict[str, object]:
+        """Withdraw the caller from ``scope``'s hand queue (idempotent)."""
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        floor = self._floors.get(scope)
+        if floor is None:
+            return {"ok": False, "error": "no_floor", "scope": scope}
+        if client.project in floor.hands:
+            floor.hands.remove(client.project)
+            self._push_floor_ui()
+        return {"ok": True, "scope": scope}
+
+    def pass_floor(self, token: str, scope: str) -> dict[str, object]:
+        """Hand the stick to the next raised hand, or put it away if none remain.
+
+        Only the current holder may pass. When a hand is waiting it becomes the
+        new holder and a SYSTEM notice naming it is routed to the scope; when the
+        queue is empty the stick is put away and the scope reopens.
+
+        Args:
+            token: The caller's access token (must be the holder).
+            scope: The floor scope being passed.
+
+        Returns:
+            ``{"ok": True, "scope", "passed_to": <name>}`` when handed on,
+            ``{"ok": True, "scope", "released": True}`` when put away, or
+            ``{"ok": False, "error": ...}`` — ``unknown_token``, ``no_floor``, or
+            ``not_holder`` (with ``held_by``).
+        """
+        result = self._holder_gate(token, scope)
+        if result is not None:
+            return result
+        floor = self._floors[scope]
+        new_holder = self._advance_floor(floor)
+        if new_holder is None:
+            return {"ok": True, "scope": scope, "released": True}
+        return {"ok": True, "scope": scope, "passed_to": new_holder}
+
+    def drop_floor(self, token: str, scope: str) -> dict[str, object]:
+        """Put the stick away outright (crisis over), even with hands still up.
+
+        Only the holder may drop. Unlike :meth:`pass_floor`, this does not hand
+        on to a waiting hand — it ends the floor for the scope and clears the
+        queue. Use it when the crisis has passed; use ``pass_floor`` to keep the
+        floor alive for the next speaker.
+
+        Returns:
+            ``{"ok": True, "scope", "released": True}``, or ``{"ok": False,
+            "error": ...}`` — ``unknown_token``, ``no_floor``, or ``not_holder``.
+        """
+        result = self._holder_gate(token, scope)
+        if result is not None:
+            return result
+        floor = self._floors[scope]
+        self._release_floor(floor, by=floor.holder, note="crisis over")
+        return {"ok": True, "scope": scope, "released": True}
+
+    def clear_floor(self, scope: str) -> bool:
+        """Force a floor closed regardless of who holds it (operator action).
+
+        The operator's override: end the stick for ``scope`` even if its holder
+        is unresponsive. Returns ``True`` if a floor was cleared, ``False`` if no
+        stick was up for that scope.
+        """
+        floor = self._floors.get(scope)
+        if floor is None:
+            return False
+        self._release_floor(floor, by="operator", note="cleared by operator")
+        return True
+
+    def _holder_gate(self, token: str, scope: str) -> dict[str, object] | None:
+        """Return an error dict if ``token`` is not the holder of ``scope``, else ``None``."""
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        floor = self._floors.get(scope)
+        if floor is None:
+            return {"ok": False, "error": "no_floor", "scope": scope}
+        if floor.holder != client.project:
+            return {
+                "ok": False,
+                "error": "not_holder",
+                "scope": scope,
+                "held_by": floor.holder,
+            }
+        return None
+
+    def _advance_floor(self, floor: Floor) -> str | None:
+        """Pass ``floor`` to its next raised hand, or release it if none remain.
+
+        Returns the new holder's name, or ``None`` when the stick was put away
+        (no hands waiting). Always announces the change to the scope and pushes
+        the refreshed floor map to the UI.
+        """
+        prev = floor.holder
+        label = self._scope_label(floor.scope)
+        if floor.hands:
+            new_holder = floor.hands.pop(0)
+            floor.holder = new_holder
+            floor.since = time.time()
+            detail = f" (reason: {floor.reason})" if floor.reason else ""
+            self._announce_floor(
+                floor.scope,
+                f"🪧 Talking stick for {label} passed {prev} → {new_holder}. "
+                f"{new_holder} holds the floor now{detail}; everyone else still "
+                "holds and may raise_hand().",
+            )
+            self._push_floor_ui()
+            return new_holder
+        self._release_floor(floor, by=prev, note="no hands left")
+        return None
+
+    def _release_floor(self, floor: Floor, *, by: str, note: str) -> None:
+        """Put ``floor`` away: drop it from the registry, announce, refresh UI."""
+        self._floors.pop(floor.scope, None)
+        label = self._scope_label(floor.scope)
+        self._announce_floor(
+            floor.scope,
+            f"🟢 {by} put the talking stick away for {label} ({note}) — "
+            f"{label} is open again.",
+        )
+        self._push_floor_ui()
+
+    def _relinquish_floor(self, scope: str, project: str) -> None:
+        """Release/advance one scope's floor when ``project`` can no longer hold it.
+
+        If ``project`` holds the scope's stick it is passed on (or put away); if
+        it was merely queued, it is dropped from the hand queue.
+        """
+        floor = self._floors.get(scope)
+        if floor is None:
+            return
+        if floor.holder == project:
+            self._advance_floor(floor)
+        elif project in floor.hands:
+            floor.hands.remove(project)
+            self._push_floor_ui()
+
+    def _relinquish_floors(self, project: str) -> None:
+        """Release/advance every floor touched by a departing ``project``.
+
+        Called when a peer leaves, is kicked, or is reaped: any stick it held is
+        handed on (or put away) so the scope never freezes, and it is dropped
+        from every hand queue it was waiting in.
+        """
+        for scope in list(self._floors):
+            self._relinquish_floor(scope, project)
+
+    def floor_blocks(self, project: str, recipient: str) -> Floor | None:
+        """Return the floor barring ``project`` from sending to ``recipient``, if any.
+
+        A send is barred only when a stick is up for the exact ``recipient``
+        scope and the sender is not its holder. Floors are per-scope, so an
+        ``"all"`` stick bars broadcasts while channels and direct messages still
+        flow, and a channel stick bars only that channel — matching the lane the
+        holder chose to seize. The human operator never routes through ``/send``,
+        so it is never blocked.
+
+        Args:
+            project: The prospective sender's project name.
+            recipient: The message's target scope (``"all"``, a channel, or a
+                peer name).
+
+        Returns:
+            The blocking :class:`Floor`, or ``None`` when the send is allowed.
+        """
+        floor = self._floors.get(recipient)
+        if floor is not None and floor.holder != project:
+            return floor
+        return None
 
     def control_signal(self, action: str) -> Message:
         """Build a control message (e.g. a stop notice) for delivery to agents."""
@@ -777,6 +1138,11 @@ class HubState:
             self._transmit.set()  # unblock waiters so they see STOPPED
             self._log.append(stop)
             self._push_ui({"type": "message", "message": stop.to_public()})
+            # The room is over; no stick survives it. Clear silently — the stop
+            # notice already tells everyone the exchange has ended.
+            if self._floors:
+                self._floors.clear()
+                self._push_floor_ui()
         else:  # RUNNING
             self._transmit.set()
         self._push_ui({"type": "mode", "mode": mode.value})
@@ -790,7 +1156,7 @@ class HubState:
         self._ui.add(q)
         q.put_nowait({"type": "snapshot", "mode": self._mode.value,
                       "peers": self.peers(), "channels": self.channels(),
-                      "log": self.recent()})
+                      "floors": self.floors_public(), "log": self.recent()})
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:

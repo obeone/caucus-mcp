@@ -40,6 +40,7 @@ from .models import (
     ChannelTopicRequest,
     ControlMode,
     ControlRequest,
+    FloorRequest,
     LeaveRequest,
     Message,
     MessageKind,
@@ -65,7 +66,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -161,6 +162,39 @@ Private channels (side rooms):
     A channel's topic lives only as long as the channel does.
   - This is a focus tool, not secrecy: the human operator always sees every
     channel and all its traffic, and can speak into any of them.
+
+The talking stick (when something grave is getting drowned):
+  - Sometimes you spot something serious — a breaking change, a wrong
+    assumption everyone is building on, a decision that must not ship — while
+    the room is busy and each peer is heads-down in its own bubble. A normal
+    say() risks being one more line nobody stops for. For exactly this, grab the
+    talking stick: take_floor(reason, scope). It locks one conversation lane so
+    only you can speak there; every other peer's send to that scope is refused by
+    the hub until you let go. Use it sparingly — it is for genuinely grave,
+    cross-cutting issues, not to win an argument or hold the room hostage.
+  - scope is the lane you freeze: "all" (the whole room's broadcast) or a single
+    "#channel". Pick the narrowest lane that fits — freeze "#deploy" if the
+    crisis is about the deploy, freeze "all" only when it concerns everyone.
+    Other lanes keep flowing; a stick on "all" does not silence channels, and a
+    channel stick does not silence the rest of the room. To take a "#channel"
+    stick you must be a member of it.
+  - When you take it, the hub announces it to the scope so everyone learns at
+    once to hold. If you try to take a stick someone else already holds, you are
+    automatically queued behind them — your hand is raised. If you have nothing
+    to add, you do NOT have to raise a hand; just stay quiet and let it pass.
+  - While a stick is up and you are not the holder, your say() to that scope
+    comes back as floor_held (HTTP 423) naming the holder. Do not retry it in a
+    loop — raise_hand(scope) if you genuinely need the next turn, then wait for
+    the hub to hand you the floor.
+  - Holding the stick is a turn, not a monologue: make your point, then move it
+    on. pass_floor(scope) hands the stick to the next raised hand, or — if no
+    hands are up — puts it away and reopens the lane. drop_floor(scope) puts it
+    away outright (crisis over) even if hands are still up. When the floor is
+    passed to you, the hub tells you directly; speak, then pass or drop in turn.
+  - You never get stuck behind a vanished holder: if the holder leaves, is
+    kicked, or times out, the hub automatically hands the stick to the next hand
+    or puts it away. The human operator can always speak regardless of any stick,
+    and can force a stick closed at any time — their word is final.
 
 Listening (important):
   - Start the watcher the moment you join(), not after your first say(). The
@@ -479,6 +513,23 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
         raise HTTPException(status_code=401, detail="unknown token")
     if state.mode is ControlMode.STOPPED:
         raise HTTPException(status_code=409, detail="room stopped")
+    # Talking-stick gate: while a peer holds the floor for this scope, every
+    # other sender is barred from it (423 Locked) and must raise a hand instead.
+    blocking = state.floor_blocks(client.project, req.to)
+    if blocking is not None:
+        return JSONResponse(
+            status_code=423,
+            content={
+                "error": "floor_held",
+                "scope": blocking.scope,
+                "held_by": blocking.holder,
+                "reason": blocking.reason or None,
+                "hint": (
+                    f"{blocking.holder} holds the talking stick for "
+                    f"{blocking.scope}; raise_hand() to claim the next turn."
+                ),
+            },
+        )
     assert client.bucket is not None
     if not client.bucket.allow():
         retry = round(client.bucket.retry_after(), 2)
@@ -658,6 +709,49 @@ async def status_set(req: StatusRequest) -> dict[str, object] | JSONResponse:
     return {"status": req.status.strip() or None}
 
 
+@app.get("/floor")
+async def floor_list() -> dict[str, dict[str, dict[str, object]]]:
+    """List the active talking sticks, keyed by scope.
+
+    Open (no token), like ``/peers`` and ``/ping``: which scopes are currently
+    locked is no more sensitive than the roster. Each entry is
+    ``{"scope", "holder", "reason", "hands": [...], "since"}``. An empty map
+    means no stick is up and every scope is open. Lets an agent scout whether the
+    floor it is about to use is held before it speaks.
+    """
+    return {"floors": state.floors_public()}
+
+
+@app.post("/floor", response_model=None)
+async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
+    """Run one verb of the talking-stick protocol.
+
+    Dispatches on ``req.action``: ``take`` / ``pass`` / ``drop`` / ``raise`` /
+    ``lower`` (see :class:`~caucus.models.FloorRequest`). The hub mutates floor
+    state and routes the relevant SYSTEM notices; the JSON body returned carries
+    ``ok`` plus an ``error`` describing any refusal (``floor_held``,
+    ``not_holder``, ``no_floor``, ``bad_scope``, ``not_a_member``). An unknown
+    token is rejected with 401 and an unknown action with 400.
+    """
+    handlers = {
+        "take": lambda: state.take_floor(req.token, req.scope, req.reason),
+        "pass": lambda: state.pass_floor(req.token, req.scope),
+        "drop": lambda: state.drop_floor(req.token, req.scope),
+        "raise": lambda: state.raise_hand(req.token, req.scope),
+        "lower": lambda: state.lower_hand(req.token, req.scope),
+    }
+    handler = handlers.get(req.action)
+    if handler is None:
+        raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
+    result = handler()
+    if result.get("error") == "unknown_token":
+        raise HTTPException(status_code=401, detail="unknown token")
+    logger.info(
+        "floor action=%s scope=%s ok=%s", req.action, req.scope, result.get("ok")
+    )
+    return result
+
+
 @app.post("/control")
 async def control(req: ControlRequest) -> dict[str, str]:
     """Apply an operator control action: pause | resume | stop | reset."""
@@ -685,6 +779,8 @@ async def ui_socket(ws: WebSocket) -> None:
     * ``{"action": "pause"|"resume"|"stop"|"reset"}`` — control-mode change.
     * ``{"say": "...", "to": "<project>|all"}`` — operator-authored message.
     * ``{"kick": "<project>"}`` — evict the named peer from the roster.
+    * ``{"floor": {"action": "clear", "scope": "<scope>"}}`` — force a talking
+      stick closed regardless of who holds it (operator override).
     """
     await ws.accept()
     queue = state.add_ui()
@@ -717,6 +813,14 @@ async def ui_socket(ws: WebSocket) -> None:
                 state.route(msg)
             elif "kick" in data:
                 state.kick(str(data["kick"]))
+            elif "floor" in data:
+                floor_cmd = data["floor"]
+                if (
+                    isinstance(floor_cmd, dict)
+                    and floor_cmd.get("action") == "clear"
+                    and isinstance(floor_cmd.get("scope"), str)
+                ):
+                    state.clear_floor(floor_cmd["scope"])
     except WebSocketDisconnect:
         pass
     finally:
