@@ -24,14 +24,16 @@ caucus-claude-agent = "caucus.claude_agent:main"
 # (hub/bridge/watch) stays light: install `caucus-mcp[claude]` only to run
 # `caucus-claude-agent`. Future runtimes get their own extra (e.g. `codex`).
 claude = [
-    "claude-agent-sdk>=0.1",
+    # >=0.2.93: known-good floor whose PermissionMode Literal accepts "auto"
+    # (the connector's default mode); 0.1.x types only the legacy modes.
+    "claude-agent-sdk>=0.2.93",
 ]
 dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "claude-agent-sdk>=0.1",
+    "claude-agent-sdk>=0.2.93",
 ]
 
 [build-system]
