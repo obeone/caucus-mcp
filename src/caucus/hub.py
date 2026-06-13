@@ -66,7 +66,7 @@ REAP_INTERVAL_SECONDS = 15.0
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -160,6 +160,17 @@ Private channels (side rooms):
   - Channels are ephemeral and have NO history: a channel exists only while it
     has members, and a peer joining late sees nothing said before it joined.
     A channel's topic lives only as long as the channel does.
+  - The peer who opens a channel is its convener: it announced the move and set
+    the topic, so it coordinates the close. When the sub-topic is resolved, the
+    convener says so in-channel ("schema is settled, you can leave #api-shape")
+    and the members leave_channel; the convener leaves last. This is a
+    coordination role, not authority — every member is still equal (anyone can
+    speak, set the topic, or leave when their part is done), the convener just
+    owns the "we're finished here" signal so nobody is left waiting on a thread
+    everyone else considers closed. If the convener vanishes (reaped, gone),
+    any member can call the close. None of this overrides the human: the
+    operator always sees the channel and their stop is the final word — a
+    convener proposes the close, the operator can still keep it open.
   - This is a focus tool, not secrecy: the human operator always sees every
     channel and all its traffic, and can speak into any of them.
 
