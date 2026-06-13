@@ -17,6 +17,34 @@ from caucus import claude_agent
 from caucus.hub_connector import Inbound
 
 
+# --- tool policy ---------------------------------------------------------
+
+
+def test_tool_policy_talker_is_caucus_only() -> None:
+    """A talker may use only caucus tools and is blocked from every built-in."""
+    allowed, disallowed = claude_agent.tool_policy("talker")
+    assert allowed == claude_agent._CAUCUS_TOOLS
+    assert disallowed == claude_agent._BUILTIN_TOOLS
+    assert "Bash" not in allowed
+    assert "Bash" in disallowed
+
+
+def test_tool_policy_worker_adds_builtins_and_blocks_nothing() -> None:
+    """A worker keeps caucus tools and additionally wields the built-ins."""
+    allowed, disallowed = claude_agent.tool_policy("worker")
+    assert disallowed == []
+    for caucus_tool in claude_agent._CAUCUS_TOOLS:
+        assert caucus_tool in allowed
+    assert "Bash" in allowed
+    assert "Edit" in allowed
+
+
+def test_tool_policy_rejects_unknown_type() -> None:
+    """An unknown profile name is a hard error, not a silent talker fallback."""
+    with pytest.raises(ValueError, match="unknown agent type"):
+        claude_agent.tool_policy("hacker")
+
+
 # --- pure helpers --------------------------------------------------------
 
 
@@ -198,3 +226,99 @@ async def test_run_session_exits_cleanly_on_name_in_use(
         model=None,
         poll_timeout=0.0,
     )
+
+
+# --- option wiring (type + permission mode → ClaudeAgentOptions) ---------
+
+
+class _FakeMe:
+    project = "alpha"
+    protocol_version = 8
+    note = None
+    channels: dict[str, Any] = {}
+    token = "tok"
+
+
+class _RegisteringConnector:
+    """Connector stub that registers cleanly so run_session reaches options build."""
+
+    async def fetch_protocol(self) -> Any:
+        class _P:
+            version = 8
+            text = "PROTOCOL"
+
+        return _P()
+
+    async def register(self, project: str, version: int, token: str | None = None) -> _FakeMe:
+        return _FakeMe()
+
+    async def leave(self, token: str) -> None:
+        return None
+
+    async def __aenter__(self) -> _RegisteringConnector:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        pass
+
+
+def _capture_options(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Wire run_session to a fake SDK client and capture the options it builds."""
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(self, options: Any) -> None:
+            captured["options"] = options
+
+        async def __aenter__(self) -> _FakeClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    async def _noop_loop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(claude_agent, "HubConnector", lambda *a, **kw: _RegisteringConnector())
+    monkeypatch.setattr(claude_agent, "ClaudeSDKClient", _FakeClient)
+    monkeypatch.setattr(claude_agent, "_run_loop", _noop_loop)
+    return captured
+
+
+async def test_run_session_defaults_to_talker_with_auto_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default session is a talker gated by the 'auto' permission mode."""
+    captured = _capture_options(monkeypatch)
+    await claude_agent.run_session(
+        hub_url="http://unused",
+        project="alpha",
+        mission=None,
+        model=None,
+        poll_timeout=0.0,
+    )
+    opts = captured["options"]
+    assert opts.permission_mode == "auto"
+    assert "Bash" in opts.disallowed_tools
+    assert "mcp__caucus__say" in opts.allowed_tools
+
+
+async def test_run_session_worker_gets_builtins_and_chosen_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker session grants the built-ins and honours an explicit mode."""
+    captured = _capture_options(monkeypatch)
+    await claude_agent.run_session(
+        hub_url="http://unused",
+        project="alpha",
+        mission=None,
+        model=None,
+        poll_timeout=0.0,
+        agent_type="worker",
+        permission_mode="bypassPermissions",
+    )
+    opts = captured["options"]
+    assert opts.permission_mode == "bypassPermissions"
+    assert opts.disallowed_tools == []
+    assert "Bash" in opts.allowed_tools
+    assert "mcp__caucus__say" in opts.allowed_tools

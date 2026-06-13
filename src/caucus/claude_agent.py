@@ -42,7 +42,7 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from .hub_connector import HubConnector, NameInUseError
 from .logging_setup import configure_logging
@@ -65,9 +65,25 @@ logger = logging.getLogger("caucus.claude")
 # Default per-poll long-poll ceiling, kept under the connector's HTTP timeout.
 DEFAULT_POLL_TIMEOUT = 25.0
 
-# Built-in Claude Code tools blocked so the connector stays a pure conversational
-# participant: it should talk in the room, not touch the filesystem or shell.
-_BLOCKED_TOOLS = [
+# The in-process caucus MCP tools — the room-facing surface every agent type
+# keeps, whatever else it is allowed to do.
+_CAUCUS_TOOLS = [
+    "mcp__caucus__say",
+    "mcp__caucus__list_peers",
+    "mcp__caucus__join_channel",
+    "mcp__caucus__leave_channel",
+    "mcp__caucus__set_channel_topic",
+    "mcp__caucus__take_floor",
+    "mcp__caucus__raise_hand",
+    "mcp__caucus__pass_floor",
+    "mcp__caucus__drop_floor",
+]
+
+# Built-in Claude Code tools (filesystem, shell, web, sub-agents). A ``talker``
+# is blocked from all of these so it stays a pure conversational participant —
+# it talks in the room, it does not touch the host. A ``worker`` is granted
+# them so it can actually act on the repo it speaks for.
+_BUILTIN_TOOLS = [
     "Bash",
     "BashOutput",
     "KillShell",
@@ -82,6 +98,50 @@ _BLOCKED_TOOLS = [
     "Task",
     "TodoWrite",
 ]
+
+#: The agent profiles ``--type`` accepts. ``talker`` is the safe default (caucus
+#: tools only); ``worker`` additionally wields the built-in Claude Code tools.
+AgentType = Literal["talker", "worker"]
+AGENT_TYPES: tuple[AgentType, ...] = ("talker", "worker")
+
+#: ``permission_mode`` values the SDK understands; ``auto`` is the default and
+#: lets Claude Code's auto-approval classifier gate sensitive actions.
+PERMISSION_MODES: tuple[str, ...] = (
+    "auto",
+    "default",
+    "acceptEdits",
+    "plan",
+    "bypassPermissions",
+    "dontAsk",
+)
+DEFAULT_PERMISSION_MODE = "auto"
+
+
+def tool_policy(agent_type: str) -> tuple[list[str], list[str]]:
+    """Return ``(allowed_tools, disallowed_tools)`` for an agent profile.
+
+    A ``talker`` may use only the caucus tools and is explicitly blocked from
+    every built-in Claude Code tool, keeping it a pure conversational peer. A
+    ``worker`` keeps the caucus tools and additionally gains the built-ins, so
+    it can act on the repo it represents.
+
+    Args:
+        agent_type: One of :data:`AGENT_TYPES`.
+
+    Returns:
+        A ``(allowed, disallowed)`` pair to feed straight into
+        :class:`ClaudeAgentOptions`.
+
+    Raises:
+        ValueError: If ``agent_type`` is not a known profile.
+    """
+    if agent_type == "worker":
+        return [*_CAUCUS_TOOLS, *_BUILTIN_TOOLS], []
+    if agent_type == "talker":
+        return list(_CAUCUS_TOOLS), list(_BUILTIN_TOOLS)
+    raise ValueError(
+        f"unknown agent type {agent_type!r}; expected one of {AGENT_TYPES}"
+    )
 
 
 class _AgentClient(Protocol):
@@ -472,6 +532,8 @@ async def run_session(
     mission: str | None,
     model: str | None,
     poll_timeout: float,
+    agent_type: str = "talker",
+    permission_mode: str = DEFAULT_PERMISSION_MODE,
 ) -> None:
     """Join the caucus and run the agent until the room stops or is interrupted.
 
@@ -486,7 +548,14 @@ async def run_session(
         model: Optional model override (e.g. ``"claude-sonnet-4-6"``); ``None``
             uses the SDK default.
         poll_timeout: Per-poll long-poll ceiling in seconds.
+        agent_type: Tool profile to run under — see :func:`tool_policy`.
+            ``"talker"`` (caucus tools only) is the safe default; ``"worker"``
+            additionally wields the built-in Claude Code tools.
+        permission_mode: How the SDK gates tool calls (one of
+            :data:`PERMISSION_MODES`). Defaults to ``"auto"`` — Claude Code's
+            auto-approval classifier decides which actions need confirmation.
     """
+    allowed_tools, disallowed_tools = tool_policy(agent_type)
     async with HubConnector(hub_url) as connector:
         proto = await connector.fetch_protocol()
         try:
@@ -502,24 +571,19 @@ async def run_session(
         logger.info("joined caucus as project=%s (protocol v%s)", me.project, me.protocol_version)
         if me.note:
             logger.warning("caucus advisory for project=%s: %s", me.project, me.note)
+        logger.info(
+            "running as type=%s with permission_mode=%s", agent_type, permission_mode
+        )
 
         server = _build_caucus_server(connector, me.token)
         options = ClaudeAgentOptions(
             system_prompt=compose_system_prompt(me.project, proto.text, me.channels),
             mcp_servers={"caucus": server},
-            allowed_tools=[
-                "mcp__caucus__say",
-                "mcp__caucus__list_peers",
-                "mcp__caucus__join_channel",
-                "mcp__caucus__leave_channel",
-                "mcp__caucus__set_channel_topic",
-                "mcp__caucus__take_floor",
-                "mcp__caucus__raise_hand",
-                "mcp__caucus__pass_floor",
-                "mcp__caucus__drop_floor",
-            ],
-            disallowed_tools=_BLOCKED_TOOLS,
-            permission_mode="bypassPermissions",
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            # argparse/env already constrain this to PERMISSION_MODES; cast so the
+            # SDK's PermissionMode Literal is satisfied without re-importing it.
+            permission_mode=cast(Any, permission_mode),
             model=model,
         )
 
@@ -564,6 +628,26 @@ def main() -> None:
         help="Optional model override (e.g. claude-sonnet-4-6); default is the SDK's.",
     )
     parser.add_argument(
+        "--type",
+        dest="agent_type",
+        choices=AGENT_TYPES,
+        default=os.environ.get("CAUCUS_AGENT_TYPE", "talker"),
+        help=(
+            "Tool profile: 'talker' (default) speaks only in the room; 'worker' "
+            "also wields the built-in Claude Code tools to act on its repo."
+        ),
+    )
+    parser.add_argument(
+        "--permission-mode",
+        dest="permission_mode",
+        choices=PERMISSION_MODES,
+        default=os.environ.get("CAUCUS_PERMISSION_MODE", DEFAULT_PERMISSION_MODE),
+        help=(
+            "How the SDK gates tool calls (default: %(default)s — the auto-approval "
+            "classifier decides which actions need confirmation)."
+        ),
+    )
+    parser.add_argument(
         "--poll-timeout",
         type=float,
         default=DEFAULT_POLL_TIMEOUT,
@@ -582,6 +666,8 @@ def main() -> None:
                 mission=args.mission,
                 model=args.model,
                 poll_timeout=args.poll_timeout,
+                agent_type=args.agent_type,
+                permission_mode=args.permission_mode,
             )
         )
     except KeyboardInterrupt:
