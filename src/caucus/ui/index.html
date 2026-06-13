@@ -206,6 +206,14 @@
   .route-badge.broadcast { color: var(--cyan); border-color: var(--cyan); }
   .route-badge.direct    { color: var(--amber); border-color: var(--amber); }
   .route-badge.channel   { color: #5ad1b0; border-color: #5ad1b0; }
+  .route-badge.to-human  {
+    color: #0d0f12; background: var(--human); border-color: var(--human);
+    opacity: 1;
+  }
+
+  /* ─── Clickable names — pick a reply target from sidebar / meta line ─── */
+  .pick-target { cursor: pointer; }
+  .pick-target:hover { text-decoration: underline; filter: brightness(1.25); }
 
   /* ─── Message body — proportional readable font ─── */
   .body {
@@ -347,6 +355,18 @@
     box-shadow: inset 0 1px 0 rgba(192,139,255,0.08), 0 1px 4px rgba(0,0,0,0.25);
   }
   .msg.from-human .meta { border-bottom-color: rgba(192, 139, 255, 0.2); }
+
+  /* to-human: a message aimed at the operator — lift it above peer chatter */
+  .msg.to-human {
+    border-left-color: var(--human);
+    border-left-width: 5px;
+    background: rgba(192, 139, 255, 0.10);
+    box-shadow:
+      inset 0 1px 0 rgba(192,139,255,0.12),
+      0 0 0 1px rgba(192,139,255,0.30),
+      0 4px 18px rgba(192,139,255,0.18);
+  }
+  .msg.to-human .meta { border-bottom-color: rgba(192, 139, 255, 0.28); }
 
   /* ─── Sidebar — Channels section ─── */
   .channels-section { margin-top: 20px; }
@@ -654,6 +674,10 @@
     const div = document.createElement("div");
     let cls = "msg " + (m.kind || "message");
     if (m.sender === "human") cls += " from-human";
+    // Messages addressed straight at the operator deserve to pop out of the
+    // peer-to-peer chatter — flag the card so CSS can lift it.
+    const toHuman = m.recipient === "human";
+    if (toHuman) cls += " to-human";
     div.className = cls;
 
     // Meta line (monospace chrome — unchanged structure)
@@ -662,6 +686,10 @@
     const who = document.createElement("span");
     who.className = "who"; who.textContent = m.sender;
     who.style.color = colorFor(m.sender);
+    // A click on a sender (other than the human or system) replies to them.
+    if (m.sender && m.sender !== "human" && m.sender !== "system") {
+      makeTargetClickable(who, m.sender);
+    }
     const arrow = document.createElement("span"); arrow.className = "arrow"; arrow.textContent = "→";
     const to = document.createElement("span");
     const isChannel = String(m.recipient).startsWith("#");
@@ -671,6 +699,7 @@
       // channel and direct recipients render the same here; the routing badge
       // below is what distinguishes them.
       to.textContent = m.recipient; to.style.color = colorFor(m.recipient);
+      makeTargetClickable(to, m.recipient);
     }
     const t = document.createElement("span"); t.style.marginLeft = "auto"; t.textContent = fmtTime(m.ts);
 
@@ -682,6 +711,8 @@
         badge.className = "route-badge broadcast"; badge.textContent = "broadcast";
       } else if (isChannel) {
         badge.className = "route-badge channel"; badge.textContent = "channel";
+      } else if (toHuman) {
+        badge.className = "route-badge to-human"; badge.textContent = "for you";
       } else {
         badge.className = "route-badge direct"; badge.textContent = "direct";
       }
@@ -767,6 +798,24 @@
     targetEl.value = [...targetEl.options].some(o => o.value === current) ? current : "all";
   }
 
+  // ─── selectTarget — point the reply target at a peer / channel / "all" ────
+  // Wired to clicks on names in the sidebar and in message meta lines. Only
+  // switches when the value is an actual option (a live peer or channel), so a
+  // click on a departed peer or a plain "all" badge is a harmless no-op.
+  function selectTarget(value) {
+    if (![...targetEl.options].some(o => o.value === value)) return;
+    targetEl.value = value;
+    // Mirror native <select> behaviour so any change listeners stay in sync.
+    targetEl.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  // ─── makeTargetClickable — turn a name span into a target selector ────────
+  function makeTargetClickable(el, value) {
+    el.classList.add("pick-target");
+    el.title = `Reply to ${value}`;
+    el.onclick = () => selectTarget(value);
+  }
+
   // ─── rebuildFilterBar — rebuilds #filter-select channel options ───────────
   function rebuildFilterBar() {
     const current = filterEl.value;
@@ -795,6 +844,7 @@
       row.className = "peer";
       const dot = document.createElement("span"); dot.className = "dot"; dot.style.background = colorFor(p);
       const name = document.createElement("span"); name.textContent = p; name.style.color = colorFor(p);
+      makeTargetClickable(name, p);
       const kick = document.createElement("button");
       kick.className = "peer-kick"; kick.textContent = "✕";
       kick.title = "Kick " + p; kick.onclick = () => kickPeer(p);
@@ -824,6 +874,7 @@
       nameSpan.className = "channel-name";
       nameSpan.textContent = name;
       nameSpan.style.color = colorFor(name);
+      makeTargetClickable(nameSpan, name);
       const topicSpan = document.createElement("span");
       if (topic) {
         topicSpan.className = "channel-topic";
