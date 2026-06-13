@@ -393,7 +393,7 @@ def _utc_iso(ts: float) -> str:
 
 
 # ===========================================================================
-# 7. CLAUDE_AGENT backoff — _run_loop catches HTTPError and retries
+# 7. CLAUDE_AGENT backoff — _poll_inbound catches HTTPError and retries
 # ===========================================================================
 
 
@@ -432,16 +432,18 @@ class _ConnectorErrorThenStop:
         return Inbound(messages=[], mode="running", stop=True)
 
 
-async def test_run_loop_survives_http_error_from_receive(
+async def test_poll_inbound_survives_http_error_from_receive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_run_loop must catch httpx.HTTPError from connector.receive() and retry.
+    """_poll_inbound must catch httpx.HTTPError from connector.receive() and retry.
 
-    A transient hub error (connection refused, 5xx, etc.) must not propagate
-    out of the loop; instead the loop backs off and retries. After recovery
-    (the next receive returns a stop signal) the loop exits cleanly.
+    A transient hub error (connection refused, 5xx, etc.) must not propagate out
+    of the poller; instead it backs off and retries. After recovery (the next
+    receive returns a stop signal) the poller sets the stop event and returns.
+    The backoff moved here from _run_loop when the loop was split into a poller
+    and a driver so operator control lands mid-turn.
     """
-    from caucus.claude_agent import _run_loop
+    from caucus.claude_agent import _BACKOFF_MIN, _poll_inbound
 
     # Monkeypatch asyncio.sleep to avoid real delays in the backoff.
     slept: list[float] = []
@@ -453,25 +455,32 @@ async def test_run_loop_survives_http_error_from_receive(
 
     client = _FakeClientNoOp()
     connector = _ConnectorErrorThenStop()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    stop = asyncio.Event()
+    reset = asyncio.Event()
 
     # Must return without raising — the HTTPError is handled internally.
-    await _run_loop(
-        client,  # type: ignore[arg-type]
+    await _poll_inbound(
         connector,  # type: ignore[arg-type]
         "tok",
-        poll_timeout=0.0,
-        mission=None,
+        client,  # type: ignore[arg-type]
+        turns,
+        0.0,
+        stop,
+        reset,
     )
 
-    # The loop polled at least twice: once (error) and once (stop).
+    # The poller polled at least twice: once (error) and once (stop).
     assert connector._call_count >= 2, (
         f"expected at least 2 receive() calls, got {connector._call_count}"
     )
     # The backoff sleep was triggered at least once.
     assert len(slept) >= 1, "expected at least one backoff sleep"
     # The first backoff must be within _BACKOFF_MIN (plus some tolerance).
-    from caucus.claude_agent import _BACKOFF_MIN
     assert slept[0] == pytest.approx(_BACKOFF_MIN)
+    # The stop signal ended the poller and no chatter reached the driver queue.
+    assert stop.is_set()
+    assert turns.empty()
     # The agent client was not queried (no messages were received before stop).
     assert client.queries == []
 

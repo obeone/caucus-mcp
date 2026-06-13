@@ -10,10 +10,18 @@ architecture we want for an agent whose whole job is to live in the room.
 This module is that better fit for Claude: an autonomous agent that **owns its
 own event loop**. It talks to the hub directly through
 :class:`caucus.hub_connector.HubConnector`, exposes ``say``/``list_peers`` as
-in-process SDK MCP tools, and runs a simple loop::
+in-process SDK MCP tools, and runs two cooperating tasks per client lifecycle::
 
-    poll /receive  ->  inject any inbound as a user turn  ->  let the agent
-    reason and reply via say()  ->  poll again
+    poller:  poll /receive  ->  enqueue inbound as a turn / obey operator control
+    driver:  await a queued turn  ->  let the agent reason and reply via say()
+
+Splitting the poll from the reasoning is what lets the human operator reach an
+agent that is *mid-turn*: a single sequential loop cannot long-poll and reason
+at the same time, so it could only notice an ``interrupt``/``reset`` once the
+turn was already over. The poller owns the long-poll and reacts out of band —
+aborting the current turn (``interrupt``), rebuilding the client with a clean
+context (``reset``), or ending the session (``stop``) — while the driver turns
+queued inbound into conversation.
 
 There is no watcher, no wake-by-exit, no protocol-version relaunch contract:
 inbound messages are fed straight into the live :class:`ClaudeSDKClient`
@@ -41,8 +49,9 @@ import logging
 import os
 import re
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Literal, Protocol, cast
 
 import httpx
@@ -160,9 +169,10 @@ def tool_policy(agent_type: str) -> tuple[list[str], list[str]]:
 class _AgentClient(Protocol):
     """Structural type for the SDK client, so the loop is testable with a fake.
 
-    Captures only what :func:`_run_loop` needs: send a turn and stream its
-    response. The real :class:`ClaudeSDKClient` satisfies this; tests pass a
-    lightweight stand-in.
+    Captures only what the loop needs: open/close the session as an async
+    context manager, send a turn and stream its response, and abort the
+    in-flight turn. The real :class:`ClaudeSDKClient` satisfies this; tests pass
+    a lightweight stand-in.
     """
 
     async def query(self, prompt: str) -> None:
@@ -171,6 +181,23 @@ class _AgentClient(Protocol):
 
     def receive_response(self) -> AsyncIterator[Any]:
         """Yield messages until (and including) the turn's result."""
+        ...
+
+    async def interrupt(self) -> None:
+        """Abort the in-flight turn; safe to call from a concurrent task."""
+        ...
+
+    async def __aenter__(self) -> _AgentClient:
+        """Open the SDK session."""
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        """Close the SDK session."""
         ...
 
 
@@ -421,21 +448,163 @@ async def _drive_turn(client: _AgentClient, prompt: str) -> None:
             logger.info("agent: %s", text)
 
 
-async def _run_loop(
+async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
+    """Consume queued user turns and drive each to completion on ``client``.
+
+    Runs as a background task for one client lifecycle, blocking on the shared
+    ``turns`` queue so it idles silently between turns and resumes the moment the
+    poller enqueues inbound chatter or an operator injection. Each turn is marked
+    done so a stop-time :meth:`asyncio.Queue.join` can tell when the backlog is
+    fully drained.
+
+    Args:
+        client: The SDK client driving the conversation.
+        turns: Shared queue of user turns fed by :func:`_poll_inbound`.
+    """
+    while True:
+        prompt = await turns.get()
+        try:
+            await _drive_turn(client, prompt)
+        finally:
+            turns.task_done()
+
+
+async def _safe_interrupt(client: _AgentClient) -> None:
+    """Abort the client's current turn, tolerating "nothing to interrupt".
+
+    ``interrupt`` is fired from the poller while the driver may or may not be
+    mid-turn; with no turn in flight (or a transient transport error) the SDK may
+    raise, which is not actionable here — log at debug and carry on.
+
+    Args:
+        client: The SDK client whose in-flight turn should be aborted.
+    """
+    try:
+        await client.interrupt()
+    except Exception as exc:  # noqa: BLE001 - best-effort, not actionable
+        logger.debug("interrupt was a no-op or failed: %s", exc)
+
+
+async def _poll_inbound(
+    connector: HubConnector,
+    token: str,
     client: _AgentClient,
+    turns: asyncio.Queue[str],
+    poll_timeout: float,
+    stop: asyncio.Event,
+    reset: asyncio.Event,
+) -> None:
+    """Long-poll the hub and react: enqueue chatter, obey operator control.
+
+    Runs concurrently with :func:`_drive_turns` so operator commands land even
+    while the agent is mid-turn. Chatter and operator injections are pushed onto
+    ``turns`` for the driver; ``interrupt`` aborts the in-flight turn in place;
+    ``reset`` aborts it and signals the supervisor to rebuild the client with a
+    clean context; ``stop`` ends the session. Returns as soon as ``stop`` or
+    ``reset`` is set.
+
+    Args:
+        connector: The hub connector to long-poll on.
+        token: The agent's access token.
+        client: The live SDK client, so control commands can act on it.
+        turns: Shared queue the driver consumes.
+        poll_timeout: Per-poll long-poll ceiling in seconds.
+        stop: Set when the operator stops the room (ends the session).
+        reset: Set when the operator resets this agent (rebuild the client).
+    """
+    backoff = _BACKOFF_MIN
+    while True:
+        try:
+            inbound = await connector.receive(token, poll_timeout)
+        except httpx.HTTPError as exc:
+            # Transient hub error (restart, 5xx, dropped connection, read
+            # timeout): warn, back off, and retry rather than letting the
+            # exception escape the poller and end the session for good.
+            logger.warning("receive failed (%s); retrying in %.0fs", exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _BACKOFF_MAX)
+            continue
+        # A clean poll means the hub is healthy again — drop back to the floor.
+        backoff = _BACKOFF_MIN
+        # Enqueue chatter first, so a batch carrying both an injection and a
+        # reset still hands the new instruction to the freshly-rebuilt context.
+        if inbound.messages:
+            turns.put_nowait(format_inbound(inbound.messages))
+        if inbound.stop:
+            logger.warning("operator stopped the room; ending session")
+            stop.set()
+            return
+        for command in inbound.commands:
+            if command == "interrupt":
+                logger.warning("operator interrupt; aborting the current turn")
+                await _safe_interrupt(client)
+            elif command == "reset":
+                logger.warning("operator reset; rebuilding with a clean context")
+                await _safe_interrupt(client)
+                reset.set()
+                return
+            else:
+                logger.info("ignoring unknown operator command %r", command)
+
+
+async def _await_first(*events: asyncio.Event) -> None:
+    """Block until any of ``events`` is set, cancelling the other waiters.
+
+    Lets the supervisor wake on either a stop or a reset without busy-polling.
+
+    Args:
+        events: The events to race; returns when the first one is set.
+    """
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
+
+
+async def _drain_pending(
+    turns: asyncio.Queue[str], driver: asyncio.Future[None]
+) -> None:
+    """Let the driver finish the queued backlog before the session ends.
+
+    On stop we still want inbound that arrived before the stop to be answered, so
+    we wait on :meth:`asyncio.Queue.join`. The wait is raced against the driver
+    task itself to guard against a hang should the driver have already exited.
+
+    Args:
+        turns: The shared turn queue to drain.
+        driver: The running :func:`_drive_turns` task.
+    """
+    drain = asyncio.ensure_future(turns.join())
+    try:
+        await asyncio.wait({drain, driver}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        drain.cancel()
+        await asyncio.gather(drain, return_exceptions=True)
+
+
+async def _run_loop(
+    client_factory: Callable[[], _AgentClient],
     connector: HubConnector,
     token: str,
     *,
     poll_timeout: float,
     mission: str | None,
 ) -> None:
-    """Run the listen → inject → reply loop until the operator stops the room.
+    """Run the supervised listen → inject → reply loop until the operator stops.
 
-    With ``mission`` set, the agent opens proactively; otherwise it waits for a
-    peer to speak first. Each non-empty ``/receive`` batch is injected as a user
-    turn; quiet polls loop silently. An operator ``stop`` ends the loop. While
-    the agent is reasoning the loop is not polling, so concurrent inbound
-    messages simply buffer hub-side and are picked up on the next poll.
+    Per client lifecycle, runs a poller (:func:`_poll_inbound`, which owns the
+    hub long-poll and reacts to operator control) and a driver
+    (:func:`_drive_turns`, which turns queued inbound into conversation) side by
+    side. That split is what lets an ``interrupt``/``reset`` land while the agent
+    is mid-turn.
+
+    ``reset`` tears the SDK client down and rebuilds it from ``client_factory``
+    (a clean context window, system prompt and in-process tools re-applied),
+    while the shared turn queue survives so inbound that arrived around the reset
+    is still answered. ``stop`` drains the already-queued turns, then ends.
 
     Availability: a transient hub failure (restart, 5xx, dropped connection,
     read timeout) surfaces as :class:`httpx.HTTPError` from
@@ -447,37 +616,38 @@ async def _run_loop(
     ``KeyboardInterrupt`` is unaffected.
 
     Args:
-        client: The SDK client driving the conversation.
+        client_factory: Builds a fresh SDK client (an async context manager);
+            called once, and again after each operator reset.
         connector: The hub connector to poll and (implicitly, via tools) send on.
         token: The agent's access token.
         poll_timeout: Per-poll long-poll ceiling in seconds.
         mission: Optional opening instruction; when set the agent speaks first.
     """
+    turns: asyncio.Queue[str] = asyncio.Queue()
     if mission:
-        await _drive_turn(
-            client,
-            f"[caucus mission]\n{mission}\n\nOpen the exchange using the say tool.",
+        turns.put_nowait(
+            f"[caucus mission]\n{mission}\n\nOpen the exchange using the say tool."
         )
-    backoff = _BACKOFF_MIN
-    while True:
-        try:
-            inbound = await connector.receive(token, poll_timeout)
-        except httpx.HTTPError as exc:
-            # Transient hub error: warn, back off, and retry instead of letting
-            # the exception escape and end the session for good.
-            logger.warning(
-                "receive failed (%s); retrying in %.0fs", exc, backoff
+    stop = asyncio.Event()
+    while not stop.is_set():
+        reset = asyncio.Event()
+        async with client_factory() as client:
+            driver = asyncio.ensure_future(_drive_turns(client, turns))
+            poller = asyncio.ensure_future(
+                _poll_inbound(
+                    connector, token, client, turns, poll_timeout, stop, reset
+                )
             )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _BACKOFF_MAX)
-            continue
-        # A clean poll means the hub is healthy again — drop back to the floor.
-        backoff = _BACKOFF_MIN
-        if inbound.stop:
-            logger.warning("operator stopped the room; ending session")
-            return
-        if inbound.messages:
-            await _drive_turn(client, format_inbound(inbound.messages))
+            try:
+                await _await_first(stop, reset)
+                if stop.is_set():
+                    await _drain_pending(turns, driver)
+            finally:
+                driver.cancel()
+                poller.cancel()
+                await asyncio.gather(driver, poller, return_exceptions=True)
+        if reset.is_set() and not stop.is_set():
+            logger.info("rebuilding the agent with a fresh context")
 
 
 def _build_caucus_server(connector: HubConnector, token: str) -> Any:
@@ -740,15 +910,23 @@ async def run_session(
             model=model,
         )
 
+        def client_factory() -> _AgentClient:
+            """Build a fresh SDK client; called again after each operator reset.
+
+            Each call yields a brand-new :class:`ClaudeSDKClient` over the same
+            ``options``, so a reset re-applies the system prompt and re-initialises
+            the in-process caucus MCP server on a clean context window.
+            """
+            return ClaudeSDKClient(options=options)
+
         try:
-            async with ClaudeSDKClient(options=options) as client:
-                await _run_loop(
-                    client,
-                    connector,
-                    me.token,
-                    poll_timeout=poll_timeout,
-                    mission=mission,
-                )
+            await _run_loop(
+                client_factory,
+                connector,
+                me.token,
+                poll_timeout=poll_timeout,
+                mission=mission,
+            )
         finally:
             await connector.leave(me.token)
             logger.info("left caucus (was project=%s)", me.project)
