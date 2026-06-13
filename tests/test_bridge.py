@@ -277,6 +277,54 @@ def test_listen_returns_chatter(
     assert any("ping for you" in m["content"] for m in result["messages"])
 
 
+# --- talking stick -------------------------------------------------------
+
+
+def test_take_floor_then_status_reports_it(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "stick-holder")
+    bridge.join()
+    taken = bridge.take_floor("prod is down")
+    assert taken["ok"] is True
+    assert taken["holder"] == "stick-holder"
+    status = bridge.floor_status()
+    assert status["floors"]["all"]["holder"] == "stick-holder"
+    # Release so the module-scoped hub does not carry the stick into the next test.
+    assert bridge.drop_floor()["released"] is True
+
+
+def test_say_is_blocked_while_another_holds_the_floor(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    holder = _register_peer(live_hub, "floor-holder")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post(
+            "/floor",
+            json={"token": holder, "action": "take", "scope": "all", "reason": "fire"},
+        )
+    monkeypatch.setattr(bridge, "PROJECT", "barred")
+    bridge.join()
+    try:
+        result = bridge.say("let me in")
+        assert result["error"] == "floor_held"
+        assert result["held_by"] == "floor-holder"
+        # The barred peer can still queue for the next turn.
+        assert bridge.raise_hand()["ok"] is True
+    finally:
+        with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+            http.post("/floor", json={"token": holder, "action": "drop", "scope": "all"})
+
+
+def test_take_floor_without_join_errors(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert bridge.take_floor("x") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
+
+
 def test_listen_quiet_poll_is_empty(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
