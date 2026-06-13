@@ -241,3 +241,31 @@ class StatusRequest(BaseModel):
 
     token: str
     status: str = Field(default="", max_length=280)
+
+
+class FloorRequest(BaseModel):
+    """Body for ``POST /floor`` — one verb of the talking-stick protocol.
+
+    ``action`` selects the operation: ``take`` (claim the stick for ``scope``),
+    ``pass`` (hand it to the next raised hand or put it away), ``drop`` (put it
+    away outright, crisis over), ``raise`` (queue to speak next), or ``lower``
+    (withdraw from the queue). ``scope`` is the conversation lane the stick
+    governs — :data:`BROADCAST` (the whole room) or a ``#``-prefixed channel;
+    its 64-char ceiling matches a channel/peer name. ``reason`` carries the
+    crisis description and is only meaningful for ``take``.
+    """
+
+    token: str
+    action: str  # take | pass | drop | raise | lower
+    scope: str = Field(default=BROADCAST, max_length=64)
+    reason: str = Field(default="", max_length=280)
+
+    @field_validator("scope")
+    @classmethod
+    def _must_be_scope(cls, value: str) -> str:
+        """Ensure ``scope`` is the broadcast lane or a ``#``-prefixed channel."""
+        if value != BROADCAST and not is_channel(value):
+            raise ValueError(
+                f"scope must be {BROADCAST!r} or a {CHANNEL_PREFIX!r}-channel"
+            )
+        return value
