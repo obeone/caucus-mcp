@@ -124,8 +124,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.1" },
-    { name = "claude-agent-sdk", marker = "extra == 'dev'", specifier = ">=0.1" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.93" },
+    { name = "claude-agent-sdk", marker = "extra == 'dev'", specifier = ">=0.2.93" },
     { name = "coloredlogs", specifier = ">=15.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
