@@ -185,6 +185,13 @@ def compose_system_prompt(
         "messages, so announce it in broadcast first if you want peers to join. "
         "Give a channel a purpose with `set_channel_topic` so peers arriving "
         "later know what it is for.\n"
+        "- When something grave risks being drowned out, grab the talking stick "
+        "with `take_floor(reason, scope)` (scope ``\"all\"`` for the whole room or "
+        "a ``\"#channel\"`` name) so only you can speak in that scope; others "
+        "signal intent with `raise_hand`; call `pass_floor` to hand the stick to "
+        "the next queued peer, or `drop_floor` to release it once the crisis is "
+        "over. If your `say` returns ``floor_held``, someone else holds the stick "
+        "— use `raise_hand` instead of retrying.\n"
         "- If a turn does not warrant a reply, simply stay silent — do not call "
         "say.\n"
         "- When the operator stops the room, your session ends; do not try to "
@@ -327,6 +334,11 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
             text = f"rate_limited; back off for {result.retry_after}s before retrying"
         elif result.stopped:
             text = "stopped: the room is stopped; halt the exchange"
+        elif result.floor_held:
+            text = (
+                f"floor_held: {result.floor_holder} holds the talking stick for "
+                f"{result.floor_scope}; raise_hand to claim the next turn."
+            )
         else:
             text = f"delivered (id={result.message_id}) to {result.delivered_to}"
         return {"content": [{"type": "text", "text": text}]}
@@ -374,10 +386,82 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         text = f"topic set for {channel}" if ok else f"could not set topic for {channel}"
         return {"content": [{"type": "text", "text": text}]}
 
+    @tool(
+        "take_floor",
+        "Claim the talking stick for a scope so only you can speak there.",
+        {"reason": str, "scope": str},
+    )
+    async def take_floor(args: dict[str, Any]) -> dict[str, Any]:
+        result = await connector.take_floor(
+            token, args.get("scope") or "all", args["reason"]
+        )
+        if result.get("ok"):
+            text = f"took the stick for {result['scope']}"
+        elif result.get("error") == "floor_held":
+            text = (
+                f"{result.get('held_by')} already holds it — "
+                f"you're queued at position {result.get('position')}"
+            )
+        else:
+            text = str(result)
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "raise_hand",
+        "Join the talking-stick queue to signal you want the floor next.",
+        {"scope": str},
+    )
+    async def raise_hand(args: dict[str, Any]) -> dict[str, Any]:
+        result = await connector.raise_hand(token, args.get("scope") or "all")
+        if result.get("ok"):
+            text = f"hand raised; position {result.get('position')} in queue"
+        else:
+            text = str(result)
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "pass_floor",
+        "Pass the talking stick to the next queued peer, or release it if the queue is empty.",
+        {"scope": str},
+    )
+    async def pass_floor(args: dict[str, Any]) -> dict[str, Any]:
+        result = await connector.pass_floor(token, args.get("scope") or "all")
+        if result.get("ok"):
+            if result.get("passed_to"):
+                text = f"stick passed to {result['passed_to']}"
+            else:
+                text = "stick released (queue was empty)"
+        else:
+            text = str(result)
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
+        "drop_floor",
+        "Unconditionally release the talking stick and discard the queue.",
+        {"scope": str},
+    )
+    async def drop_floor(args: dict[str, Any]) -> dict[str, Any]:
+        result = await connector.drop_floor(token, args.get("scope") or "all")
+        if result.get("ok"):
+            text = "stick dropped; floor is open"
+        else:
+            text = str(result)
+        return {"content": [{"type": "text", "text": text}]}
+
     return create_sdk_mcp_server(
         name="caucus",
         version="1.0.0",
-        tools=[say, list_peers, join_channel, leave_channel, set_channel_topic],
+        tools=[
+            say,
+            list_peers,
+            join_channel,
+            leave_channel,
+            set_channel_topic,
+            take_floor,
+            raise_hand,
+            pass_floor,
+            drop_floor,
+        ],
     )
 
 
@@ -429,6 +513,10 @@ async def run_session(
                 "mcp__caucus__join_channel",
                 "mcp__caucus__leave_channel",
                 "mcp__caucus__set_channel_topic",
+                "mcp__caucus__take_floor",
+                "mcp__caucus__raise_hand",
+                "mcp__caucus__pass_floor",
+                "mcp__caucus__drop_floor",
             ],
             disallowed_tools=_BLOCKED_TOOLS,
             permission_mode="bypassPermissions",
