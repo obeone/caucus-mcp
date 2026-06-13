@@ -706,8 +706,18 @@
     return div;
   }
 
+  // ─── isPinnedToBottom — true when the feed is scrolled at (or near) the end ─
+  // A small slack absorbs sub-pixel rounding and lets "almost at the bottom"
+  // still count as pinned, so we never yank the operator away from messages
+  // they scrolled up to read.
+  function isPinnedToBottom() {
+    const slack = 24; // px
+    return feed.scrollHeight - feed.scrollTop - feed.clientHeight <= slack;
+  }
+
   // ─── renderFeed — re-render entire feed from allMessages + active filter ──
   function renderFeed() {
+    const pinned = isPinnedToBottom();
     const filter = filterEl.value;
     feed.innerHTML = "";
     for (const m of allMessages) {
@@ -718,7 +728,7 @@
         feed.appendChild(node);
       }
     }
-    feed.scrollTop = feed.scrollHeight;
+    if (pinned) feed.scrollTop = feed.scrollHeight;
   }
 
   // ─── addMessage — records to allMessages; appends live if filter passes ──
@@ -726,9 +736,12 @@
     allMessages.push(m);
     const filter = filterEl.value;
     if (!passesFilter(m, filter)) return;
+    // Capture pin state before the DOM grows, so a message arriving while the
+    // operator is reading scrollback doesn't drag them back to the bottom.
+    const pinned = isPinnedToBottom();
     const node = buildMessageNode(m);
     feed.appendChild(node);
-    feed.scrollTop = feed.scrollHeight;
+    if (pinned) feed.scrollTop = feed.scrollHeight;
   }
 
   // ─── setMode — unchanged ─────────────────────────────────────────────────
