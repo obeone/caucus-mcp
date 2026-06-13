@@ -308,6 +308,59 @@ async def test_control_signal_is_a_broadcast_control_message() -> None:
     assert sig.content == "stop"
 
 
+# --- per-agent operator control & the priority lane ----------------------
+
+
+async def test_operator_command_queues_on_priority_lane() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+
+    assert state.operator_command("alpha", "interrupt") is True
+
+    # Control commands ride the priority queue, not the gated chatter queue.
+    assert client.queue.empty()
+    msg = client.priority_queue.get_nowait()
+    assert msg.kind is MessageKind.CONTROL
+    assert msg.content == "interrupt"
+    assert msg.sender == "human"
+    assert msg.recipient == "alpha"
+
+
+async def test_operator_command_rejects_unknown_command() -> None:
+    state = HubState()
+    state.register("alpha")
+    assert state.operator_command("alpha", "explode") is False
+
+
+async def test_operator_command_unknown_agent_is_false() -> None:
+    state = HubState()
+    assert state.operator_command("ghost", "interrupt") is False
+
+
+async def test_operator_say_uses_priority_lane() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+
+    state.route(Message(sender="human", recipient="alpha", content="steer"))
+
+    assert client.queue.empty()
+    assert client.priority_queue.get_nowait().content == "steer"
+
+
+async def test_peer_chatter_stays_on_the_gated_queue() -> None:
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+
+    state.route(_msg("alpha", "beta", "yo"))
+
+    assert beta.priority_queue.empty()
+    assert beta.queue.get_nowait().content == "yo"
+
+
 async def test_add_ui_primes_a_snapshot() -> None:
     state = HubState()
     state.register("alpha")
@@ -987,9 +1040,10 @@ async def test_answer_form_routes_answer_to_broadcast_audience() -> None:
 
     assert resolved is not None
     assert resolved.status is FormStatus.ANSWERED
-    # sender="human", so even the asker receives the answer.
+    # sender="human", so even the asker receives the answer; and because it is
+    # operator-originated it rides the priority lane (delivered even when paused).
     for client in (asker, beta):
-        msg = client.queue.get_nowait()
+        msg = client.priority_queue.get_nowait()
         assert msg.kind is MessageKind.ANSWER
         assert msg.meta == {
             "form_id": form.id,
@@ -1014,10 +1068,11 @@ async def test_answer_form_for_channel_reaches_only_members() -> None:
 
     state.answer_form(form.id, {"ok": "no"})
 
-    # Members (asker + beta) get it; non-member gamma does not.
-    assert asker.queue.get_nowait().kind is MessageKind.ANSWER
-    assert beta.queue.get_nowait().kind is MessageKind.ANSWER
-    assert gamma.queue.empty()
+    # Members (asker + beta) get it on the operator priority lane; non-member
+    # gamma does not.
+    assert asker.priority_queue.get_nowait().kind is MessageKind.ANSWER
+    assert beta.priority_queue.get_nowait().kind is MessageKind.ANSWER
+    assert gamma.priority_queue.empty()
 
 
 async def test_answer_form_pushes_resolved_event() -> None:
@@ -1063,7 +1118,8 @@ async def test_cancel_form_routes_cancellation_and_keeps_answers_none() -> None:
     assert resolved is not None
     assert resolved.status is FormStatus.CANCELLED
     assert resolved.answers is None
-    msg = beta.queue.get_nowait()
+    # Cancellation is operator-originated (sender="human") → priority lane.
+    msg = beta.priority_queue.get_nowait()
     assert msg.kind is MessageKind.ANSWER
     assert msg.meta == {
         "form_id": form.id,

@@ -1181,6 +1181,26 @@ async def forms() -> dict[str, list[dict[str, object]]]:
     return {"forms": state.list_forms()}
 
 
+def _record_unacked(client: Client, messages: list[Message]) -> None:
+    """Buffer delivered messages for replay on reconnect, skipping control.
+
+    Ordinary chatter and operator steering messages are appended to the client's
+    unacked ring buffer so they can be re-injected if the client disconnects
+    before acknowledging them. :attr:`~caucus.models.MessageKind.CONTROL`
+    messages (the room ``stop`` and per-agent ``interrupt``/``reset`` commands)
+    are **deliberately not** buffered: they are point-in-time signals, and
+    replaying a stale ``interrupt`` onto a freshly reconnected agent would be
+    wrong.
+
+    Args:
+        client: The client the messages were delivered to.
+        messages: The batch returned by this ``/receive`` poll.
+    """
+    for msg in messages:
+        if msg.kind is not MessageKind.CONTROL:
+            client.unacked.append(msg)
+
+
 @app.get("/receive")
 async def receive(
     request: Request,
@@ -1245,7 +1265,20 @@ async def receive(
                 stop = state.control_signal("stop")
                 return {"messages": [stop.to_public()], "mode": state.mode.value}
 
-            # Pause gate: wait for resume (or stop) without draining the queue.
+            # Operator traffic on the priority queue pierces the pause gate, so
+            # the operator keeps a live grip (steer / interrupt / reset) on an
+            # agent even while the room is paused. Checked every iteration, ahead
+            # of the gate and the peer queue, so it always wins.
+            if not client.priority_queue.empty():
+                messages = [client.priority_queue.get_nowait()]
+                while not client.priority_queue.empty():
+                    messages.append(client.priority_queue.get_nowait())
+                _record_unacked(client, messages)
+                return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
+
+            # Pause gate: peer chatter is held back. Wait for resume (or stop);
+            # a priority message that lands during the wait is picked up on the
+            # next loop by the check above (≤1s later).
             if not state.transmit.is_set():
                 try:
                     await asyncio.wait_for(
@@ -1276,9 +1309,7 @@ async def receive(
             messages = [first]
             while not client.queue.empty():
                 messages.append(client.queue.get_nowait())
-            # Track delivered messages for potential replay on reconnect.
-            for msg in messages:
-                client.unacked.append(msg)
+            _record_unacked(client, messages)
             return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
     finally:
         client.active_polls -= 1
@@ -1440,6 +1471,7 @@ _MUTATING_COMMANDS = frozenset(
         "resume_peer",
         "heartbeat",
         "close_channel",
+        "command",
     }
 )
 
@@ -1553,6 +1585,11 @@ def _apply_ui_command(data: dict[str, object]) -> None:
             state.answer_form(form_id, answers)
     elif "cancel_form" in data:
         state.cancel_form(str(data["cancel_form"]))
+    elif "command" in data:
+        # Per-agent operator control (interrupt/reset) aimed at a single peer,
+        # distinct from the room-wide "action". Routes a CONTROL message to the
+        # target's priority queue so it reaches even a paused agent.
+        state.operator_command(str(data.get("to", "")), str(data["command"]))
 
 
 @app.websocket("/ui")
@@ -1571,8 +1608,10 @@ async def ui_socket(ws: WebSocket) -> None:
     ticks, heartbeat replies).
     Inbound (operator-only mutations unless noted):
 
-    * ``{"action": "pause"|"resume"|"stop"|"reset"}`` — control-mode change.
+    * ``{"action": "pause"|"resume"|"stop"|"reset"}`` — room-wide control mode.
     * ``{"say": "...", "to": "<project>|all"}`` — operator-authored message.
+    * ``{"command": "interrupt"|"reset", "to": "<project>"}`` — per-agent control
+      command (abort the current turn / wipe its context); pierces the pause gate.
     * ``{"kick": "<project>"}`` — evict the named peer from the roster.
     * ``{"pause_peer": "<name>"}`` / ``{"resume_peer": "<name>"}`` — withhold or
       release one peer's queue (delivery-side pause).
