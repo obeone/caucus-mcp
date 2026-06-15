@@ -37,7 +37,7 @@ import { useDashStore } from "../store/wsStore";
 import { colorFor, fmtTime, fmtTimeUTC } from "../lib/colors";
 import { cn } from "../lib/utils";
 import type { Message } from "../store/types";
-import { Search, X, Download } from "lucide-react";
+import { Search, X, Download, ArrowDown } from "lucide-react";
 
 // ── Badge helpers ─────────────────────────────────────────────────────────────
 
@@ -371,14 +371,39 @@ export default function FlowPanel() {
     overscan: 10,
   });
 
-  // Auto-scroll to bottom on new messages, unless the user has scrolled up.
-  useEffect(() => {
+  // Stick-to-bottom: follow new messages only while the viewport is pinned to
+  // the bottom. The instant the operator scrolls up (to read history) we detach
+  // and stop auto-scrolling; scrolling back down re-attaches. `stickToBottom` is
+  // a ref (not state) so updating it on every scroll frame never re-renders.
+  const stickToBottom = useRef(true);
+  const [detached, setDetached] = useState(false);
+
+  // Distance from the bottom (px) under which the view counts as "pinned" — a
+  // bit over one estimated row so a small upward scroll detaches cleanly.
+  const STICK_THRESHOLD = 80;
+
+  const handleScroll = useCallback(() => {
     const el = parentRef.current;
-    if (!el || filtered.length === 0) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    if (atBottom) {
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const pinned = distance <= STICK_THRESHOLD;
+    stickToBottom.current = pinned;
+    setDetached((prev) => (prev === !pinned ? prev : !pinned));
+  }, []);
+
+  const jumpToBottom = useCallback(() => {
+    stickToBottom.current = true;
+    setDetached(false);
+    if (filtered.length > 0) {
       virtualizer.scrollToIndex(filtered.length - 1, { align: "end" });
     }
+  }, [filtered.length, virtualizer]);
+
+  // Auto-scroll to the latest message whenever the list grows — but only while
+  // pinned to the bottom (see stickToBottom above).
+  useEffect(() => {
+    if (filtered.length === 0 || !stickToBottom.current) return;
+    virtualizer.scrollToIndex(filtered.length - 1, { align: "end" });
   }, [filtered.length, virtualizer]);
 
   // Clamp focusedIndex when the filtered list shrinks.
@@ -543,13 +568,15 @@ export default function FlowPanel() {
       )}
 
       {/* Virtualized message list */}
-      <div
-        ref={parentRef}
-        className="flex-1 overflow-y-auto"
-        role="log"
-        aria-live="polite"
-        aria-label="Message timeline"
-      >
+      <div className="relative flex-1 min-h-0">
+        <div
+          ref={parentRef}
+          onScroll={handleScroll}
+          className="h-full overflow-y-auto"
+          role="log"
+          aria-live="polite"
+          aria-label="Message timeline"
+        >
         {filtered.length === 0 ? (
           <div className="flex items-center justify-center h-32 text-dim font-mono text-sm">
             — no messages —
@@ -586,6 +613,18 @@ export default function FlowPanel() {
               );
             })}
           </div>
+        )}
+        </div>
+
+        {detached && (
+          <button
+            type="button"
+            onClick={jumpToBottom}
+            className="absolute bottom-3 right-4 z-10 flex items-center gap-1 px-2.5 py-1.5 rounded-full bg-cyan text-bg text-[11px] font-mono font-bold shadow-lg hover:brightness-110 transition-all"
+            aria-label="Scroll to latest message"
+          >
+            <ArrowDown size={13} /> latest
+          </button>
         )}
       </div>
     </div>
