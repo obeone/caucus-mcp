@@ -155,11 +155,12 @@ export interface FloorEvent {
 
 export interface MessageEvent {
   type: "message";
-  ts: number;
-  sender: string;
-  recipient: string;
-  content: string;
-  kind?: MessageKind;
+  /**
+   * The hub nests the message fields under `message` (mirrors the backend's
+   * `{"type":"message","message": to_public()}`). Reading them at the event
+   * root yields undefined — which previously crashed the Flow panel.
+   */
+  message: RawMessage;
 }
 
 export interface FormEvent {

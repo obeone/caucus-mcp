@@ -46,8 +46,8 @@ function rawToMessage(raw: RawMessage): Message {
     id: nextId(),
     ts: raw.ts,
     sender: raw.sender,
-    recipient: raw.recipient,
-    content: raw.content,
+    recipient: raw.recipient ?? "all",
+    content: raw.content ?? "",
     kind: raw.kind ?? "message",
   };
 }
@@ -171,13 +171,9 @@ export const useDashStore = create<InternalState>()((set, get) => ({
       }
 
       case "message": {
-        const msg = rawToMessage({
-          ts: evt.ts,
-          sender: evt.sender,
-          recipient: evt.recipient,
-          content: evt.content,
-          kind: evt.kind,
-        });
+        // The hub nests the payload under `message` (mirrors to_public());
+        // reading fields off the event root would yield undefined.
+        const msg = rawToMessage(evt.message);
         set((s) => ({
           messages:
             s.messages.length >= MAX_MESSAGES

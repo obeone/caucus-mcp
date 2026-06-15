@@ -32,7 +32,7 @@ import { Search, X, ChevronDown, ChevronRight, Download } from "lucide-react";
 // ── Badge helpers ────────────────────────────────────────────────────────────
 
 function routeBadge(msg: Message) {
-  const r = msg.recipient;
+  const r = msg.recipient ?? "";
   if (r === "all")
     return (
       <span className="text-[9px] font-chrome font-bold tracking-[2px] px-1.5 py-0.5 border border-cyan text-cyan opacity-75 rounded-sm uppercase">
@@ -173,7 +173,7 @@ function passesFilters(
 
   // Type filter
   if (typeFilter !== "all") {
-    const r = msg.recipient;
+    const r = msg.recipient ?? "";
     if (typeFilter === "broadcast" && r !== "all") return false;
     if (typeFilter === "direct" && (r === "all" || r.startsWith("#"))) return false;
     if (typeFilter === "channel" && !r.startsWith("#")) return false;
