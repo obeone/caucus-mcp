@@ -110,7 +110,9 @@ status_age?, reaped_age?}`.
 Existing (unchanged): `{"mode":"pause"|"resume"|"reset"|"stop"}`,
 `{"kick":"<name>"}`, `{"answer":{"id","answers"}}`, `{"cancel_form":"<id>"}`,
 `{"floor":{"action":"clear","scope":"<scope>"}}`, operator chat
-`{"to":"<scope>","content":"..."}` (current code reads `to`).
+`{"say":"<text>","to":"<scope>"}` (the legacy console format the hub
+dispatches on — the message text is under `say`, the audience under `to`,
+defaulting to `"all"`).
 
 ### NEW commands (all operator-only)
 - `{"pause_peer":"<name>"}` — withhold delivery of that peer's queue. The peer
