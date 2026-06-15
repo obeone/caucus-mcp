@@ -1,0 +1,15 @@
+# Node / Vite frontend workspace.
+# The BUILT bundle is committed under ../src/caucus/ui/ (package data); only
+# the local build workspace is ignored here.
+node_modules/
+dist/
+*.local
+*.log
+
+# Source maps must never be committed (keep the tracked bundle lean).
+*.map
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/

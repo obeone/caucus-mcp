@@ -1,0 +1,76 @@
+/* Google Fonts — must precede @tailwind directives to satisfy PostCSS @import ordering */
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Chakra+Petch:wght@700&family=JetBrains+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 30% 6%;
+    --foreground: 200 20% 82%;
+    --card: 210 25% 9%;
+    --card-foreground: 200 20% 82%;
+    --popover: 210 28% 11%;
+    --popover-foreground: 200 20% 82%;
+    --primary: 38 100% 59%;
+    --primary-foreground: 210 30% 6%;
+    --secondary: 210 20% 14%;
+    --secondary-foreground: 200 20% 82%;
+    --muted: 210 20% 14%;
+    --muted-foreground: 205 14% 48%;
+    --accent: 188 60% 55%;
+    --accent-foreground: 210 30% 6%;
+    --destructive: 355 100% 65%;
+    --destructive-foreground: 210 30% 6%;
+    --border: 207 26% 18%;
+    --input: 207 26% 18%;
+    --ring: 188 60% 55%;
+    --radius: 0.25rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border box-border;
+  }
+
+  html,
+  body {
+    @apply bg-bg text-ink h-full m-0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 14px;
+    background-image:
+      repeating-linear-gradient(
+        0deg,
+        rgba(255, 255, 255, 0.012) 0 1px,
+        transparent 1px 3px
+      ),
+      radial-gradient(
+        120% 80% at 50% -10%,
+        rgba(56, 198, 217, 0.07),
+        transparent 60%
+      );
+  }
+
+  #root {
+    @apply h-screen flex flex-col overflow-hidden;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0e12;
+}
+::-webkit-scrollbar-thumb {
+  background: #233039;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #38c6d9;
+}
+
