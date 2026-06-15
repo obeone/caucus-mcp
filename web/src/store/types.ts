@@ -244,6 +244,10 @@ export interface DashboardState {
   // UI cross-link
   selectedPeer: string | null;
 
+  /** Channel selected from the left-rail Channels list.
+   *  Drives Flow channel filter and OperatorComposer scope simultaneously. */
+  selectedChannel: string | null;
+
   // Timezone toggle (false = local, true = UTC)
   showUTC: boolean;
 
@@ -252,6 +256,7 @@ export interface DashboardState {
 
   // Actions
   setSelectedPeer: (name: string | null) => void;
+  setSelectedChannel: (name: string | null) => void;
   setShowUTC: (v: boolean) => void;
   setDarkMode: (v: boolean) => void;
 

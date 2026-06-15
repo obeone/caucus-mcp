@@ -135,7 +135,8 @@ function FieldInput({
   return null;
 }
 
-function FormModal({ form, open, onClose, onAnswer, onCancel, role }: FormModalProps) {
+/** Answer/reject modal for a single form. Exported for reuse in FormsAlert. */
+export function FormModal({ form, open, onClose, onAnswer, onCancel, role }: FormModalProps) {
   const [answers, setAnswers] = useState<AnswerValues>(() => {
     const init: AnswerValues = {};
     for (const f of form.fields) {
@@ -325,7 +326,8 @@ function FormModal({ form, open, onClose, onAnswer, onCancel, role }: FormModalP
 
 // ── Form row in the list ─────────────────────────────────────────────────────
 
-function FormRow({
+/** Single form row in the forms list. Exported for reuse in FormsAlert. */
+export function FormRow({
   form,
   onOpen,
 }: {
