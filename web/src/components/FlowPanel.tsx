@@ -1,14 +1,20 @@
 /**
- * FlowPanel — virtualized message timeline.
+ * FlowPanel — virtualized markdown message timeline.
  *
- * Displays up to 500 messages in a virtual list (via @tanstack/react-virtual).
- * Each row shows [timestamp] sender→recipient type channel payload.
- * Clicking a row expands it. Supports:
+ * Displays up to 500 messages in a virtual list (@tanstack/react-virtual v3,
+ * dynamic row heights via measureElement + data-index). Content is rendered
+ * as Markdown (react-markdown v10 + remark-gfm). Raw HTML in message content
+ * is NOT rendered — rehype-raw is intentionally absent; react-markdown's
+ * default pipeline escapes any HTML tags in agent-supplied content.
+ *
+ * Every row shows its full content — there is no expand/collapse toggle.
+ *
+ * Supports:
  * - Peer filter (cross-linked from HealthPanel selection)
- * - Channel filter
+ * - Channel filter (synced from left-rail selectedChannel)
  * - Type filter (broadcast / direct / channel)
  * - Client-side search (Cmd/Ctrl+F, Esc to close)
- * - Arrow-key row navigation (↑/↓ select, Enter expands, Esc clears focus)
+ * - Arrow-key row navigation (↑↓ select, Esc clears focus)
  * - Export transcript as JSON blob download
  * - Colour by peer
  * - UTC / local time toggle
@@ -21,16 +27,21 @@ import {
   useEffect,
   useMemo,
   KeyboardEvent,
+  ComponentPropsWithoutRef,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { Components } from "react-markdown";
 import { useDashStore } from "../store/wsStore";
 import { colorFor, fmtTime, fmtTimeUTC } from "../lib/colors";
 import { cn } from "../lib/utils";
 import type { Message } from "../store/types";
-import { Search, X, ChevronDown, ChevronRight, Download } from "lucide-react";
+import { Search, X, Download } from "lucide-react";
 
-// ── Badge helpers ────────────────────────────────────────────────────────────
+// ── Badge helpers ─────────────────────────────────────────────────────────────
 
+/** Coloured route badge shown next to recipient in each message header. */
 function routeBadge(msg: Message) {
   const r = msg.recipient ?? "";
   if (r === "all")
@@ -58,6 +69,7 @@ function routeBadge(msg: Message) {
   );
 }
 
+/** Left-border + background class based on message kind / recipient. */
 function kindClass(msg: Message): string {
   switch (msg.kind) {
     case "system":
@@ -73,17 +85,137 @@ function kindClass(msg: Message): string {
   }
 }
 
-// ── Message row ──────────────────────────────────────────────────────────────
+// ── Markdown component overrides (dark-theme) ─────────────────────────────────
+
+/**
+ * Custom react-markdown component map for the dark terminal theme.
+ *
+ * Security: rehype-raw is intentionally NOT included — any raw HTML tags in
+ * agent-supplied content are escaped to plain text by react-markdown's default
+ * pipeline. Links open in a new tab with rel="noopener noreferrer".
+ */
+const mdComponents: Components = {
+  a: ({ href, children, ...props }: ComponentPropsWithoutRef<"a">) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="text-cyan underline underline-offset-2 hover:text-cyan/70 transition-colors"
+      {...props}
+    >
+      {children}
+    </a>
+  ),
+
+  /**
+   * code — inline vs block distinguished by presence of a language className.
+   * Fenced blocks (```lang) get class="language-xxx" from remark-gfm.
+   */
+  code: ({ className, children, ...props }: ComponentPropsWithoutRef<"code">) =>
+    className ? (
+      <code className={cn("text-[11px] font-mono text-green/90", className)} {...props}>
+        {children}
+      </code>
+    ) : (
+      <code
+        className="bg-panel border border-line/60 rounded px-1 py-0.5 text-[11px] font-mono text-green/90"
+        {...props}
+      >
+        {children}
+      </code>
+    ),
+
+  pre: ({ children, ...props }: ComponentPropsWithoutRef<"pre">) => (
+    <pre
+      className="my-1.5 bg-bg border border-line/40 rounded-sm px-3 py-2 overflow-x-auto"
+      {...props}
+    >
+      {children}
+    </pre>
+  ),
+
+  p: ({ children, ...props }: ComponentPropsWithoutRef<"p">) => (
+    <p className="text-[12px] font-body text-ink leading-relaxed my-0.5" {...props}>
+      {children}
+    </p>
+  ),
+
+  ul: ({ children, ...props }: ComponentPropsWithoutRef<"ul">) => (
+    <ul className="list-disc pl-5 my-1 space-y-0.5" {...props}>{children}</ul>
+  ),
+
+  ol: ({ children, ...props }: ComponentPropsWithoutRef<"ol">) => (
+    <ol className="list-decimal pl-5 my-1 space-y-0.5" {...props}>{children}</ol>
+  ),
+
+  li: ({ children, ...props }: ComponentPropsWithoutRef<"li">) => (
+    <li className="text-[12px] font-body text-ink" {...props}>{children}</li>
+  ),
+
+  h1: ({ children, ...props }: ComponentPropsWithoutRef<"h1">) => (
+    <h1 className="text-sm font-bold text-ink mt-1.5 mb-0.5" {...props}>{children}</h1>
+  ),
+  h2: ({ children, ...props }: ComponentPropsWithoutRef<"h2">) => (
+    <h2 className="text-[13px] font-bold text-ink mt-1.5 mb-0.5" {...props}>{children}</h2>
+  ),
+  h3: ({ children, ...props }: ComponentPropsWithoutRef<"h3">) => (
+    <h3 className="text-[12px] font-semibold text-ink mt-1 mb-0.5" {...props}>{children}</h3>
+  ),
+  h4: ({ children, ...props }: ComponentPropsWithoutRef<"h4">) => (
+    <h4 className="text-[12px] font-semibold text-dim mt-1" {...props}>{children}</h4>
+  ),
+
+  strong: ({ children, ...props }: ComponentPropsWithoutRef<"strong">) => (
+    <strong className="font-bold text-ink" {...props}>{children}</strong>
+  ),
+
+  em: ({ children, ...props }: ComponentPropsWithoutRef<"em">) => (
+    <em className="italic text-ink/80" {...props}>{children}</em>
+  ),
+
+  blockquote: ({ children, ...props }: ComponentPropsWithoutRef<"blockquote">) => (
+    <blockquote className="border-l-2 border-dim/50 pl-3 my-1 text-dim italic" {...props}>
+      {children}
+    </blockquote>
+  ),
+
+  hr: () => <hr className="border-line/40 my-2" />,
+
+  table: ({ children, ...props }: ComponentPropsWithoutRef<"table">) => (
+    <div className="overflow-x-auto my-1.5">
+      <table className="text-[11px] font-mono border-collapse" {...props}>{children}</table>
+    </div>
+  ),
+  th: ({ children, ...props }: ComponentPropsWithoutRef<"th">) => (
+    <th className="border border-line px-2 py-0.5 text-left text-ink font-semibold" {...props}>
+      {children}
+    </th>
+  ),
+  td: ({ children, ...props }: ComponentPropsWithoutRef<"td">) => (
+    <td className="border border-line/60 px-2 py-0.5 text-dim" {...props}>{children}</td>
+  ),
+};
+
+// ── Message row ───────────────────────────────────────────────────────────────
 
 interface RowProps {
   msg: Message;
   showUTC: boolean;
-  expanded: boolean;
   focused: boolean;
-  onToggle: () => void;
+  onSelect: () => void;
 }
 
-function MessageRow({ msg, showUTC, expanded, focused, onToggle }: RowProps) {
+/**
+ * A single message row in the timeline.
+ *
+ * Always renders the full content as Markdown so the parent's measureElement
+ * ref can observe the true rendered height for dynamic virtual sizing.
+ * System/control messages are rendered as plain text.
+ *
+ * Exported so unit tests can render it in isolation (the virtualizer needs
+ * a real layout engine and cannot be exercised in jsdom).
+ */
+export function MessageRow({ msg, showUTC, focused, onSelect }: RowProps) {
   const senderColor = colorFor(msg.sender);
   const isSystem = msg.kind === "system" || msg.kind === "control";
 
@@ -92,15 +224,14 @@ function MessageRow({ msg, showUTC, expanded, focused, onToggle }: RowProps) {
       className={cn(
         "border-l-[3px] px-4 py-2 cursor-pointer hover:brightness-110 transition-all animate-slide-in",
         kindClass(msg),
-        msg.recipient === "human" && "border-l-[5px] shadow-[0_0_0_1px_rgba(192,139,255,0.3)]",
+        msg.recipient === "human" &&
+          "border-l-[5px] shadow-[0_0_0_1px_rgba(192,139,255,0.3)]",
         focused && "ring-1 ring-inset ring-cyan/40 brightness-110"
       )}
-      role="button"
       tabIndex={0}
-      aria-expanded={expanded}
       aria-current={focused ? "true" : undefined}
-      onClick={onToggle}
-      onKeyDown={(e: KeyboardEvent) => e.key === "Enter" && onToggle()}
+      onClick={onSelect}
+      onKeyDown={(e: KeyboardEvent) => e.key === "Enter" && onSelect()}
     >
       {/* Meta line */}
       <div className="flex items-center gap-2 text-[11px] font-mono text-dim flex-wrap">
@@ -117,46 +248,32 @@ function MessageRow({ msg, showUTC, expanded, focused, onToggle }: RowProps) {
             {routeBadge(msg)}
           </>
         )}
-        <span className="ml-auto flex items-center gap-1 text-dim/50">
-          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        </span>
       </div>
 
-      {/* Collapsed preview */}
-      {!expanded && (
-        <p
-          className={cn(
-            "mt-1 text-[12px] truncate",
-            msg.kind === "system" || msg.kind === "control"
-              ? "font-mono text-dim italic"
-              : "font-body text-ink"
-          )}
-        >
-          {msg.content}
-        </p>
-      )}
-
-      {/* Expanded content */}
-      {expanded && (
-        <div
-          className={cn(
-            "mt-2 text-sm whitespace-pre-wrap break-words",
-            msg.kind === "system" || msg.kind === "control"
-              ? "font-mono text-dim italic text-[11px]"
-              : "font-body text-ink leading-relaxed"
-          )}
-        >
-          {msg.content}
-        </div>
-      )}
+      {/* Full content — system messages as plain text, others as Markdown */}
+      <div
+        className={cn(
+          "mt-1.5 break-words",
+          isSystem && "font-mono text-[11px] text-dim italic"
+        )}
+      >
+        {isSystem ? (
+          <span>{msg.content}</span>
+        ) : (
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+            {msg.content}
+          </ReactMarkdown>
+        )}
+      </div>
     </div>
   );
 }
 
-// ── Filter bar ───────────────────────────────────────────────────────────────
+// ── Filters ───────────────────────────────────────────────────────────────────
 
 type TypeFilter = "all" | "broadcast" | "direct" | "channel";
 
+/** Returns true if the message passes all active filters. */
 function passesFilters(
   msg: Message,
   peerFilter: string | null,
@@ -164,22 +281,15 @@ function passesFilters(
   typeFilter: TypeFilter,
   searchQuery: string
 ): boolean {
-  // Peer cross-link filter
   if (peerFilter && msg.sender !== peerFilter && msg.recipient !== peerFilter)
     return false;
-
-  // Channel filter
   if (channelFilter !== "all" && msg.recipient !== channelFilter) return false;
-
-  // Type filter
   if (typeFilter !== "all") {
     const r = msg.recipient ?? "";
     if (typeFilter === "broadcast" && r !== "all") return false;
     if (typeFilter === "direct" && (r === "all" || r.startsWith("#"))) return false;
     if (typeFilter === "channel" && !r.startsWith("#")) return false;
   }
-
-  // Search
   if (searchQuery) {
     const q = searchQuery.toLowerCase();
     return (
@@ -188,14 +298,13 @@ function passesFilters(
       msg.recipient.toLowerCase().includes(q)
     );
   }
-
   return true;
 }
 
 // ── Export helper ─────────────────────────────────────────────────────────────
 
 /**
- * Download the provided messages as a JSON blob file.
+ * Download the provided messages as a prettified JSON blob.
  * Pure client-side — no server round-trip needed.
  */
 function exportMessages(msgs: Message[]) {
@@ -213,26 +322,32 @@ function exportMessages(msgs: Message[]) {
   URL.revokeObjectURL(url);
 }
 
-// ── Main component ───────────────────────────────────────────────────────────
+// ── Main component ────────────────────────────────────────────────────────────
 
+/** Virtualized, markdown-rendering message timeline for the operator dashboard. */
 export default function FlowPanel() {
   const messages = useDashStore((s) => s.messages);
   const showUTC = useDashStore((s) => s.showUTC);
   const selectedPeer = useDashStore((s) => s.selectedPeer);
+  const selectedChannel = useDashStore((s) => s.selectedChannel);
   const channels = useDashStore((s) => s.channels);
 
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [channelFilter, setChannelFilter] = useState("all");
+
+  // Sync channelFilter when the left-rail channel selection changes.
+  useEffect(() => {
+    setChannelFilter(selectedChannel ?? "all");
+  }, [selectedChannel]);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  // Arrow-key navigation: index into filtered[], -1 = none selected
+  // Arrow-key navigation index; -1 means nothing focused.
   const [focusedIndex, setFocusedIndex] = useState(-1);
 
   const searchRef = useRef<HTMLInputElement>(null);
   const parentRef = useRef<HTMLDivElement>(null);
 
-  // Filtered message list
   const filtered = useMemo(
     () =>
       messages.filter((m) =>
@@ -241,18 +356,25 @@ export default function FlowPanel() {
     [messages, selectedPeer, channelFilter, typeFilter, searchQuery]
   );
 
-  // Virtual list
+  /**
+   * Dynamic-height virtual list.
+   *
+   * Each item wrapper carries `ref={virtualizer.measureElement}` +
+   * `data-index={virtualItem.index}`. react-virtual observes the actual
+   * rendered height of each element via ResizeObserver and updates its
+   * internal size map, so variable-height markdown rows work correctly.
+   */
   const virtualizer = useVirtualizer({
     count: filtered.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => 56,
+    estimateSize: () => 72,
     overscan: 10,
   });
 
-  // Auto-scroll to bottom on new messages (unless user has scrolled up)
+  // Auto-scroll to bottom on new messages, unless the user has scrolled up.
   useEffect(() => {
     const el = parentRef.current;
-    if (!el) return;
+    if (!el || filtered.length === 0) return;
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
     if (atBottom) {
       virtualizer.scrollToIndex(filtered.length - 1, { align: "end" });
@@ -266,24 +388,13 @@ export default function FlowPanel() {
     }
   }, [filtered.length, focusedIndex]);
 
-  // toggleExpanded is declared before the keydown handler so the closure is stable.
-  const toggleExpanded = useCallback((id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const handleSelect = useCallback((index: number) => {
+    setFocusedIndex(index);
   }, []);
 
-  // Keyboard shortcuts:
-  //   Cmd/Ctrl+F   → open search
-  //   Escape        → close search (if open) / clear row focus (otherwise)
-  //   ArrowDown/Up  → move focus through rows (skips text inputs)
-  //   Enter         → toggle expand on the focused row
+  // Global keyboard shortcuts.
   useEffect(() => {
     function handler(e: globalThis.KeyboardEvent) {
-      // Don't steal keystrokes when the user is typing in an input.
       const tag = (e.target as HTMLElement).tagName;
       const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
 
@@ -320,15 +431,11 @@ export default function FlowPanel() {
           virtualizer.scrollToIndex(next, { align: "auto" });
           return next;
         });
-      } else if (e.key === "Enter" && focusedIndex >= 0) {
-        e.preventDefault();
-        const msg = filtered[focusedIndex];
-        if (msg) toggleExpanded(msg.id);
       }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [showSearch, filtered, focusedIndex, virtualizer, toggleExpanded]);
+  }, [showSearch, filtered, focusedIndex, virtualizer]);
 
   const channelNames = Object.keys(channels);
 
@@ -380,7 +487,7 @@ export default function FlowPanel() {
 
         {focusedIndex >= 0 && (
           <span className="text-[10px] font-mono text-dim/60">
-            row {focusedIndex + 1}/{filtered.length} · ↑↓ navigate · Enter expand · Esc clear
+            row {focusedIndex + 1}/{filtered.length} · ↑↓ navigate · Esc clear
           </span>
         )}
 
@@ -388,7 +495,6 @@ export default function FlowPanel() {
           {filtered.length} / {messages.length}
         </span>
 
-        {/* Export button */}
         <button
           onClick={() => exportMessages(messages)}
           className="text-dim hover:text-cyan transition-colors"
@@ -436,7 +542,7 @@ export default function FlowPanel() {
         </div>
       )}
 
-      {/* Virtual message list */}
+      {/* Virtualized message list */}
       <div
         ref={parentRef}
         className="flex-1 overflow-y-auto"
@@ -450,7 +556,10 @@ export default function FlowPanel() {
           </div>
         ) : (
           <div
-            style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              position: "relative",
+            }}
           >
             {virtualizer.getVirtualItems().map((virtualItem) => {
               const msg = filtered[virtualItem.index];
@@ -470,12 +579,8 @@ export default function FlowPanel() {
                   <MessageRow
                     msg={msg}
                     showUTC={showUTC}
-                    expanded={expandedIds.has(msg.id)}
                     focused={focusedIndex === virtualItem.index}
-                    onToggle={() => {
-                      setFocusedIndex(virtualItem.index);
-                      toggleExpanded(msg.id);
-                    }}
+                    onSelect={() => handleSelect(virtualItem.index)}
                   />
                 </div>
               );

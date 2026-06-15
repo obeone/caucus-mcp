@@ -4,15 +4,18 @@
  * Each test talks to a REAL hub (booted by global-setup.ts) serving the
  * built bundle. Fake peers are registered via the hub HTTP API where needed.
  *
+ * Layout note: the dashboard is now tab-free. Health and Channels panels are
+ * always visible in the left rail; Forms surface as a header badge when
+ * pending. Selectors below reflect this new structure.
+ *
  * Critical flows covered:
  *  1. Dashboard loads + shows snapshot (mode badge, peer count)
- *  2. Pause a peer via WS command → Health panel reflects "paused" state
- *  3. Fill a form created via POST /ask → modal appears; reject it (cancel_form)
- *  4. Close a channel after a peer joins one
- *  5. Reconnect: force-close WS → Disconnected banner → auto-reconnect clears it
- *
- * All tests use Playwright web-first assertions (toBeVisible with timeout)
- * rather than arbitrary sleeps, to be both fast and reliable.
+ *  2. Peer appears in the left-rail Health section after registration
+ *  3. Pause a peer via WS command → Health rail reflects "paused" state
+ *  4. Fill a form created via POST /ask → badge appears → modal → reject
+ *  5. Close a channel after a peer joins one (left-rail Channels section)
+ *  6. Reconnect: force-close WS → Disconnected banner → auto-reconnect
+ *  7. Accessibility: zero serious/critical WCAG violations on load
  */
 
 import { test, expect, Page } from "@playwright/test";
@@ -64,27 +67,29 @@ test.describe("Dashboard — basic load", () => {
     await expect(badge).toHaveText(/running|paused|stopped/i);
   });
 
-  test("shows peer in Health panel after registration", async ({ page }) => {
+  test("shows peer in left-rail Health section after registration", async ({
+    page,
+  }) => {
     // Register a real peer via the hub's /register endpoint to get a token.
     const peerName = `e2e-health-${Date.now()}`;
     await registerPeer(peerName);
 
     await page.goto(BASE);
     await waitConnected(page);
-    await page.getByRole("tab", { name: /Health/i }).click();
 
-    // The peer list region must be present.
+    // Health section is always visible in the left rail — no tab click needed.
+    // The peer list region must be present in the left rail.
     const peerList = page.getByRole("list", { name: "Connected peers" });
     await expect(peerList).toBeVisible({ timeout: 5_000 });
 
     // The peer card should show up (pushed via snapshot + health tick every 1.5s).
     // Scope inside the list to avoid strict-mode collision with the composer
-    // autocomplete <option> that also contains the peer name.
+    // autocomplete suggestions that also contain peer names.
     await expect(peerList.getByText(peerName)).toBeVisible({ timeout: 8_000 });
   });
 });
 
-test.describe("Dashboard — Health panel peer state", () => {
+test.describe("Dashboard — Health rail peer state", () => {
   test("paused peer shows paused state after pause_peer WS command", async ({
     page,
   }) => {
@@ -93,9 +98,8 @@ test.describe("Dashboard — Health panel peer state", () => {
 
     await page.goto(BASE);
     await waitConnected(page);
-    await page.getByRole("tab", { name: /Health/i }).click();
 
-    // Wait for peer to appear in the health grid (scoped to the peer list).
+    // Health is in the left rail — always visible, no tab click.
     const peerList = page.getByRole("list", { name: "Connected peers" });
     await expect(peerList.getByText(peerName)).toBeVisible({ timeout: 8_000 });
 
@@ -106,7 +110,7 @@ test.describe("Dashboard — Health panel peer state", () => {
       if (store) store.getState().sendPausePeer(name);
     }, peerName);
 
-    // Hub pushes a `peers` event with paused=true; the aria-label on the card
+    // Hub pushes a `peers` event with paused=true; the aria-label on the row
     // includes the state, so we wait for the "paused" variant.
     await expect(
       page.getByLabel(new RegExp(`Peer ${peerName} — paused`, "i"))
@@ -125,8 +129,8 @@ test.describe("Dashboard — Health panel peer state", () => {
   });
 });
 
-test.describe("Dashboard — Forms panel", () => {
-  test("form modal appears after POST /ask and can be rejected", async ({
+test.describe("Dashboard — Forms alert (header badge)", () => {
+  test("pending-form badge appears and form can be rejected via modal", async ({
     page,
   }) => {
     // Register a peer to obtain a valid token — /ask requires a bearer token.
@@ -134,9 +138,6 @@ test.describe("Dashboard — Forms panel", () => {
     const token = await registerPeer(peerName);
 
     // Create a form via POST /ask with a VALID payload.
-    // Rules from models.py FieldSpec:
-    //   - radio/checkbox require at least one option
-    //   - text/textarea must carry NO options
     const askRes = await fetch(`${BASE}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -145,7 +146,12 @@ test.describe("Dashboard — Forms panel", () => {
         to: "all",
         title: "E2E test form",
         fields: [
-          { key: "q1", label: "What is your name?", type: "text", required: false },
+          {
+            key: "q1",
+            label: "What is your name?",
+            type: "text",
+            required: false,
+          },
         ],
       }),
     });
@@ -157,17 +163,29 @@ test.describe("Dashboard — Forms panel", () => {
 
     await page.goto(BASE);
     await waitConnected(page);
-    await page.getByRole("tab", { name: /Forms/i }).click();
 
-    // The form title should appear in the forms list.
-    await expect(page.getByText("E2E test form")).toBeVisible({ timeout: 8_000 });
+    // Forms no longer have a tab — they surface as a badge in the header.
+    // The badge button appears when pendingForms.length > 0.
+    const formsBadge = page.getByRole("button", {
+      name: /open pending forms/i,
+    });
+    await expect(formsBadge).toBeVisible({ timeout: 8_000 });
 
-    // Click the form row to open the modal.
+    // Click the badge to open the pending-forms list dialog.
+    await formsBadge.click();
+
+    // The form title should appear in the forms list dialog.
+    // Scope to the dialog to avoid matching the hub log entry in FlowPanel.
+    await expect(
+      page.getByRole("dialog").getByText("E2E test form")
+    ).toBeVisible({ timeout: 5_000 });
+
+    // Click the form row button to open the answer/reject modal.
     await page
       .getByRole("button", { name: /Form: E2E test form — pending/i })
       .click();
 
-    // Modal should appear with the Reject button.
+    // The FormModal should open with a Reject button.
     await expect(page.getByRole("button", { name: /^Reject$/i })).toBeVisible({
       timeout: 5_000,
     });
@@ -186,7 +204,7 @@ test.describe("Dashboard — Forms panel", () => {
   });
 });
 
-test.describe("Dashboard — Channels panel", () => {
+test.describe("Dashboard — Channels rail", () => {
   test("close channel button appears after peer joins a channel", async ({
     page,
   }) => {
@@ -209,23 +227,24 @@ test.describe("Dashboard — Channels panel", () => {
 
     await page.goto(BASE);
     await waitConnected(page);
-    await page.getByRole("tab", { name: /Channels/i }).click();
 
-    // The channel card should appear in the Channels panel.
-    // Scope inside the list to avoid strict-mode collision with autocomplete
-    // <option> elements that also contain the channel name.
+    // Channels are in the left rail — always visible, no tab click needed.
     const channelList = page.getByRole("list", { name: "Active channels" });
     await expect(channelList.getByText(channelName)).toBeVisible({
       timeout: 8_000,
     });
 
-    // The close (X) button should be visible (aria-label set on the button).
+    // The close (X) button is visible on hover for operators.
+    // Hover over the channel row to reveal it.
+    // Use exact: true to avoid partial match on "Close channel #xxx" button's aria-label.
+    const channelRow = channelList.getByLabel(`Channel ${channelName}`, { exact: true });
+    await channelRow.hover();
+
     const closeBtn = page.getByLabel(`Close channel ${channelName}`);
     await expect(closeBtn).toBeVisible({ timeout: 5_000 });
 
     // Clicking the close button opens a confirmation dialog.
     await closeBtn.click();
-    // The dialog description includes "Force-unsubscribe all members from <name>".
     await expect(
       page.getByText(/Force-unsubscribe all members/i)
     ).toBeVisible({ timeout: 3_000 });
@@ -236,7 +255,7 @@ test.describe("Dashboard — Channels panel", () => {
       .last();
     await confirmBtn.click();
 
-    // After close the channel card should disappear from the list.
+    // After close the channel row should disappear from the list.
     await expect(channelList.getByText(channelName)).not.toBeVisible({
       timeout: 8_000,
     });
@@ -263,8 +282,6 @@ test.describe("Dashboard — reconnect banner", () => {
     await expect(page.getByRole("alert")).toBeVisible({ timeout: 3_000 });
 
     // The banner text: "Disconnected — reconnecting with backoff…" or "Connecting…".
-    // Use the alert container's text content rather than a strict getByText so
-    // we don't collide with the connection indicator span.
     await expect(page.getByRole("alert")).toContainText(
       /Disconnected|Connecting/i,
       { timeout: 3_000 }
@@ -289,9 +306,7 @@ test.describe("Dashboard — accessibility", () => {
       // Exclude color-contrast: the dashboard uses a deliberate dark terminal
       // palette ("text-dim" = #6b7d89) where reduced contrast on secondary/
       // decorative text is an intentional design choice. Primary interactive
-      // elements (active tabs, mode badge, alerts) meet WCAG 2 AA contrast.
-      // This exclusion is narrowed to color-contrast only; structural, ARIA,
-      // and keyboard rules remain enforced.
+      // elements (mode badge, alerts) meet WCAG 2 AA contrast.
       .disableRules(["color-contrast"])
       .analyze();
 

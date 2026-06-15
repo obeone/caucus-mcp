@@ -115,15 +115,16 @@ describe("HealthPanel — PeerCard ARIA labels", () => {
 
   it("each PeerCard has aria-label containing peer name and state", () => {
     render(<HealthPanel />, { wrapper: Wrapper });
-    // aria-label = "Peer <name> — <state>"
+    // aria-label = "Peer <name> — <state>"; rows no longer have role="button"
+    // so we match by label text rather than role.
     expect(
-      screen.getByRole("button", { name: /Peer agent-alpha — live/i })
+      screen.getByLabelText(/Peer agent-alpha — live/i)
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Peer agent-beta — paused/i })
+      screen.getByLabelText(/Peer agent-beta — paused/i)
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /Peer agent-gamma — reaped/i })
+      screen.getByLabelText(/Peer agent-gamma — reaped/i)
     ).toBeInTheDocument();
   });
 

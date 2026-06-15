@@ -1,9 +1,11 @@
 /**
  * HealthPanel — peer roster with live state indicators.
  *
- * Shows a grid of PeerInfo cards: name, state (live/idle/reaped) colour-coded,
- * status text, last_seen age, listening indicator. Hover tooltip shows uptime
- * and msg_count. Clicking a peer selects it for cross-panel linking.
+ * Two rendering modes:
+ *   - default (compact=false): grid of full PeerCards with all details.
+ *   - compact (compact=true):  dense list rows for the left-rail slot.
+ *     Each row keeps colour-coded state, listening indicator, hover tooltip
+ *     (uptime + msg_count), and operator action icons — but at reduced height.
  */
 
 import { useCallback } from "react";
@@ -22,6 +24,10 @@ import {
   Pause,
 } from "lucide-react";
 
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
 /** Colour class for a given peer state. */
 function stateColor(peer: PeerInfo): string {
   if (peer.state === "reaped") return "text-red";
@@ -38,6 +44,15 @@ function stateLabel(peer: PeerInfo): string {
   return "idle";
 }
 
+/** Shared tooltip text with uptime and message count. */
+function peerTooltip(peer: PeerInfo): string {
+  return `Uptime: ${fmtDuration(peer.uptime)} | Messages sent: ${peer.msg_count}`;
+}
+
+// ---------------------------------------------------------------------------
+// Full PeerCard (default mode)
+// ---------------------------------------------------------------------------
+
 interface PeerCardProps {
   peer: PeerInfo;
   selected: boolean;
@@ -50,7 +65,7 @@ interface PeerCardProps {
   onHeartbeat: (name: string) => void;
 }
 
-/** Single peer card in the health grid. */
+/** Single peer card in the health grid (default / non-compact mode). */
 function PeerCard({
   peer,
   selected,
@@ -66,9 +81,7 @@ function PeerCard({
 
   return (
     <div
-      role="button"
       tabIndex={0}
-      aria-pressed={selected}
       aria-label={`Peer ${peer.name} — ${stateLabel(peer)}`}
       onClick={() => onSelect(peer.name)}
       onKeyDown={(e) => e.key === "Enter" && onSelect(peer.name)}
@@ -78,7 +91,7 @@ function PeerCard({
         selected ? "border-cyan shadow-[0_0_12px_-4px_#38c6d9]" : "border-line"
       )}
       style={{ borderLeftColor: selected ? undefined : accent, borderLeftWidth: 3 }}
-      title={`Uptime: ${fmtDuration(peer.uptime)} | Messages sent: ${peer.msg_count}`}
+      title={peerTooltip(peer)}
     >
       {/* Name + state dot */}
       <div className="flex items-center gap-2 min-w-0">
@@ -188,7 +201,149 @@ function PeerCard({
   );
 }
 
-export default function HealthPanel() {
+// ---------------------------------------------------------------------------
+// Compact PeerRow (left-rail mode)
+// ---------------------------------------------------------------------------
+
+interface CompactPeerRowProps {
+  peer: PeerInfo;
+  selected: boolean;
+  onSelect: (name: string) => void;
+  role: "operator" | "observer";
+  onKick: (name: string) => void;
+  onPause: (name: string) => void;
+  onResume: (name: string) => void;
+  onHeartbeat: (name: string) => void;
+}
+
+/**
+ * Compact single-row peer entry for the left-rail Health slot.
+ *
+ * Keeps colour-coded state dot, listening indicator, hover tooltip, and
+ * operator action icons — but at about half the vertical footprint of PeerCard.
+ */
+function CompactPeerRow({
+  peer,
+  selected,
+  onSelect,
+  role,
+  onKick,
+  onPause,
+  onResume,
+  onHeartbeat,
+}: CompactPeerRowProps) {
+  const accent = colorFor(peer.name);
+  const isOperator = role === "operator";
+
+  return (
+    <div
+      tabIndex={0}
+      aria-label={`Peer ${peer.name} — ${stateLabel(peer)}`}
+      onClick={() => onSelect(peer.name)}
+      onKeyDown={(e) => e.key === "Enter" && onSelect(peer.name)}
+      title={peerTooltip(peer)}
+      className={cn(
+        "group flex items-center gap-1.5 px-3 py-1.5 cursor-pointer transition-all",
+        "border-l-[3px] border-b border-b-line/20",
+        selected
+          ? "bg-cyan/10 border-l-cyan"
+          : "bg-transparent hover:bg-panel border-l-transparent"
+      )}
+      style={selected ? undefined : { borderLeftColor: accent }}
+    >
+      {/* State dot */}
+      <span
+        className={cn(
+          "w-1.5 h-1.5 rounded-full flex-shrink-0",
+          peer.state === "reaped"
+            ? "bg-red"
+            : peer.paused
+            ? "bg-amber"
+            : peer.listening
+            ? "bg-green animate-pulse"
+            : "bg-dim"
+        )}
+        aria-hidden="true"
+      />
+
+      {/* Peer name */}
+      <span
+        className="font-mono text-[11px] font-semibold truncate flex-1 min-w-0"
+        style={{ color: accent }}
+      >
+        {peer.name}
+      </span>
+
+      {/* Listening indicator */}
+      {peer.listening && (
+        <span title="Listening" className="flex-shrink-0">
+          <Radio size={9} className="text-cyan opacity-70" aria-hidden="true" />
+        </span>
+      )}
+
+      {/* State label */}
+      <span className={cn("text-[9px] font-mono flex-shrink-0", stateColor(peer))}>
+        {stateLabel(peer)}
+      </span>
+
+      {/* Operator action icons — revealed on hover */}
+      {isOperator && peer.state !== "reaped" && (
+        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+          <button
+            onClick={(e) => { e.stopPropagation(); onHeartbeat(peer.name); }}
+            className="p-0.5 text-dim hover:text-cyan rounded-sm transition-colors"
+            aria-label={`Send heartbeat to ${peer.name}`}
+            title="Heartbeat ping"
+          >
+            <Heart size={9} />
+          </button>
+          {peer.paused ? (
+            <button
+              onClick={(e) => { e.stopPropagation(); onResume(peer.name); }}
+              className="p-0.5 text-green hover:bg-green/10 rounded-sm transition-colors"
+              aria-label={`Resume ${peer.name}`}
+              title="Resume"
+            >
+              <Play size={9} />
+            </button>
+          ) : (
+            <button
+              onClick={(e) => { e.stopPropagation(); onPause(peer.name); }}
+              className="p-0.5 text-amber hover:bg-amber/10 rounded-sm transition-colors"
+              aria-label={`Pause ${peer.name}`}
+              title="Pause"
+            >
+              <Pause size={9} />
+            </button>
+          )}
+          <button
+            onClick={(e) => { e.stopPropagation(); onKick(peer.name); }}
+            className="p-0.5 text-dim hover:text-red hover:bg-red/10 rounded-sm transition-colors"
+            aria-label={`Kick ${peer.name}`}
+            title="Kick"
+          >
+            <X size={9} />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HealthPanel
+// ---------------------------------------------------------------------------
+
+interface HealthPanelProps {
+  /**
+   * When true, renders compact single-row peers suitable for a narrow
+   * left-rail slot (~260 px wide) instead of the full card grid.
+   */
+  compact?: boolean;
+}
+
+/** Health panel — peer roster. Supports compact mode for the left rail. */
+export default function HealthPanel({ compact = false }: HealthPanelProps) {
   const peers = useDashStore((s) => s.peers);
   const selectedPeer = useDashStore((s) => s.selectedPeer);
   const showUTC = useDashStore((s) => s.showUTC);
@@ -244,6 +399,62 @@ export default function HealthPanel() {
   const live = peers.filter((p) => p.state === "live");
   const reaped = peers.filter((p) => p.state === "reaped");
 
+  // ── Compact mode (left rail) ─────────────────────────────────────────────
+  if (compact) {
+    return (
+      <div className="flex flex-col overflow-hidden h-full">
+        {/* Mini stats bar */}
+        <div className="flex items-center gap-3 px-3 py-1.5 border-b border-line/30 text-[10px] font-mono text-dim flex-shrink-0 bg-panel/40">
+          <span className="flex items-center gap-1">
+            <Activity size={9} className="text-cyan" />
+            {live.length} live
+          </span>
+          {reaped.length > 0 && (
+            <span className="text-red">{reaped.length} reaped</span>
+          )}
+          {peers.filter((p) => p.paused).length > 0 && (
+            <span className="flex items-center gap-0.5 text-amber">
+              <PauseCircle size={9} />
+              {peers.filter((p) => p.paused).length} paused
+            </span>
+          )}
+          {health && (
+            <span className="ml-auto">{health.msg_per_min}/min</span>
+          )}
+        </div>
+
+        {/* Compact peer list */}
+        <div
+          className="flex-1 overflow-y-auto"
+          role="list"
+          aria-label="Connected peers"
+        >
+          {peers.length === 0 ? (
+            <div className="flex items-center justify-center h-16 text-dim font-mono text-[11px]">
+              — no peers —
+            </div>
+          ) : (
+            peers.map((peer) => (
+              <div key={peer.name} role="listitem">
+                <CompactPeerRow
+                  peer={peer}
+                  selected={selectedPeer === peer.name}
+                  onSelect={handleSelect}
+                  role={role}
+                  onKick={handleKick}
+                  onPause={handlePause}
+                  onResume={handleResume}
+                  onHeartbeat={handleHeartbeat}
+                />
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Full mode (standalone panel) ─────────────────────────────────────────
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Stats bar */}

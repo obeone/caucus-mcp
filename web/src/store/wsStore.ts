@@ -108,6 +108,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   health: null as HealthInfo | null,
   messages: [],
   selectedPeer: null,
+  selectedChannel: null as string | null,
   showUTC: false,
   darkMode: (() => {
     const stored = localStorage.getItem("caucus_dark");
@@ -123,6 +124,8 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   // ---- UI setters ---------------------------------------------------------
 
   setSelectedPeer: (name) => set({ selectedPeer: name }),
+
+  setSelectedChannel: (name) => set({ selectedChannel: name }),
 
   setShowUTC: (v) => set({ showUTC: v }),
 
