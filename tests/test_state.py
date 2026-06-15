@@ -312,7 +312,9 @@ async def test_add_ui_primes_a_snapshot() -> None:
     snapshot = queue.get_nowait()
     assert snapshot["type"] == "snapshot"
     assert snapshot["mode"] == "running"
-    assert snapshot["peers"] == ["alpha"]
+    # Rich PeerInfo roster (dashboard protocol): list of dicts, not names.
+    assert [p["name"] for p in snapshot["peers"]] == ["alpha"]
+    assert "health" in snapshot
 
 
 async def test_ui_receives_message_and_mode_events() -> None:
