@@ -7,7 +7,9 @@
  * - Peer filter (cross-linked from HealthPanel selection)
  * - Channel filter
  * - Type filter (broadcast / direct / channel)
- * - Client-side search (Cmd/Ctrl+F)
+ * - Client-side search (Cmd/Ctrl+F, Esc to close)
+ * - Arrow-key row navigation (↑/↓ select, Enter expands, Esc clears focus)
+ * - Export transcript as JSON blob download
  * - Colour by peer
  * - UTC / local time toggle
  */
@@ -25,7 +27,7 @@ import { useDashStore } from "../store/wsStore";
 import { colorFor, fmtTime, fmtTimeUTC } from "../lib/colors";
 import { cn } from "../lib/utils";
 import type { Message } from "../store/types";
-import { Search, X, ChevronDown, ChevronRight } from "lucide-react";
+import { Search, X, ChevronDown, ChevronRight, Download } from "lucide-react";
 
 // ── Badge helpers ────────────────────────────────────────────────────────────
 
@@ -77,10 +79,11 @@ interface RowProps {
   msg: Message;
   showUTC: boolean;
   expanded: boolean;
+  focused: boolean;
   onToggle: () => void;
 }
 
-function MessageRow({ msg, showUTC, expanded, onToggle }: RowProps) {
+function MessageRow({ msg, showUTC, expanded, focused, onToggle }: RowProps) {
   const senderColor = colorFor(msg.sender);
   const isSystem = msg.kind === "system" || msg.kind === "control";
 
@@ -89,11 +92,13 @@ function MessageRow({ msg, showUTC, expanded, onToggle }: RowProps) {
       className={cn(
         "border-l-[3px] px-4 py-2 cursor-pointer hover:brightness-110 transition-all animate-slide-in",
         kindClass(msg),
-        msg.recipient === "human" && "border-l-[5px] shadow-[0_0_0_1px_rgba(192,139,255,0.3)]"
+        msg.recipient === "human" && "border-l-[5px] shadow-[0_0_0_1px_rgba(192,139,255,0.3)]",
+        focused && "ring-1 ring-inset ring-cyan/40 brightness-110"
       )}
       role="button"
       tabIndex={0}
       aria-expanded={expanded}
+      aria-current={focused ? "true" : undefined}
       onClick={onToggle}
       onKeyDown={(e: KeyboardEvent) => e.key === "Enter" && onToggle()}
     >
@@ -187,6 +192,27 @@ function passesFilters(
   return true;
 }
 
+// ── Export helper ─────────────────────────────────────────────────────────────
+
+/**
+ * Download the provided messages as a JSON blob file.
+ * Pure client-side — no server round-trip needed.
+ */
+function exportMessages(msgs: Message[]) {
+  const blob = new Blob([JSON.stringify(msgs, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `caucus-transcript-${new Date()
+    .toISOString()
+    .slice(0, 19)
+    .replace(/:/g, "-")}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // ── Main component ───────────────────────────────────────────────────────────
 
 export default function FlowPanel() {
@@ -200,6 +226,8 @@ export default function FlowPanel() {
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  // Arrow-key navigation: index into filtered[], -1 = none selected
+  const [focusedIndex, setFocusedIndex] = useState(-1);
 
   const searchRef = useRef<HTMLInputElement>(null);
   const parentRef = useRef<HTMLDivElement>(null);
@@ -231,23 +259,14 @@ export default function FlowPanel() {
     }
   }, [filtered.length, virtualizer]);
 
-  // Keyboard shortcut: Cmd/Ctrl+F to open search
+  // Clamp focusedIndex when the filtered list shrinks.
   useEffect(() => {
-    function handler(e: globalThis.KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
-        e.preventDefault();
-        setShowSearch(true);
-        setTimeout(() => searchRef.current?.focus(), 50);
-      }
-      if (e.key === "Escape") {
-        setShowSearch(false);
-        setSearchQuery("");
-      }
+    if (focusedIndex >= filtered.length) {
+      setFocusedIndex(filtered.length - 1);
     }
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, []);
+  }, [filtered.length, focusedIndex]);
 
+  // toggleExpanded is declared before the keydown handler so the closure is stable.
   const toggleExpanded = useCallback((id: string) => {
     setExpandedIds((prev) => {
       const next = new Set(prev);
@@ -256,6 +275,60 @@ export default function FlowPanel() {
       return next;
     });
   }, []);
+
+  // Keyboard shortcuts:
+  //   Cmd/Ctrl+F   → open search
+  //   Escape        → close search (if open) / clear row focus (otherwise)
+  //   ArrowDown/Up  → move focus through rows (skips text inputs)
+  //   Enter         → toggle expand on the focused row
+  useEffect(() => {
+    function handler(e: globalThis.KeyboardEvent) {
+      // Don't steal keystrokes when the user is typing in an input.
+      const tag = (e.target as HTMLElement).tagName;
+      const inInput = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        setShowSearch(true);
+        setTimeout(() => searchRef.current?.focus(), 50);
+        return;
+      }
+
+      if (e.key === "Escape") {
+        if (showSearch) {
+          setShowSearch(false);
+          setSearchQuery("");
+        } else {
+          setFocusedIndex(-1);
+        }
+        return;
+      }
+
+      if (inInput) return;
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setFocusedIndex((prev) => {
+          const next = Math.min(prev + 1, filtered.length - 1);
+          virtualizer.scrollToIndex(next, { align: "auto" });
+          return next;
+        });
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setFocusedIndex((prev) => {
+          const next = Math.max(prev - 1, 0);
+          virtualizer.scrollToIndex(next, { align: "auto" });
+          return next;
+        });
+      } else if (e.key === "Enter" && focusedIndex >= 0) {
+        e.preventDefault();
+        const msg = filtered[focusedIndex];
+        if (msg) toggleExpanded(msg.id);
+      }
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [showSearch, filtered, focusedIndex, virtualizer, toggleExpanded]);
 
   const channelNames = Object.keys(channels);
 
@@ -305,9 +378,25 @@ export default function FlowPanel() {
           </span>
         )}
 
+        {focusedIndex >= 0 && (
+          <span className="text-[10px] font-mono text-dim/60">
+            row {focusedIndex + 1}/{filtered.length} · ↑↓ navigate · Enter expand · Esc clear
+          </span>
+        )}
+
         <span className="text-[11px] font-mono text-dim ml-auto">
           {filtered.length} / {messages.length}
         </span>
+
+        {/* Export button */}
+        <button
+          onClick={() => exportMessages(messages)}
+          className="text-dim hover:text-cyan transition-colors"
+          aria-label="Export transcript as JSON"
+          title="Download transcript (all 500 messages) as JSON"
+        >
+          <Download size={14} />
+        </button>
 
         <button
           onClick={() => {
@@ -382,7 +471,11 @@ export default function FlowPanel() {
                     msg={msg}
                     showUTC={showUTC}
                     expanded={expandedIds.has(msg.id)}
-                    onToggle={() => toggleExpanded(msg.id)}
+                    focused={focusedIndex === virtualItem.index}
+                    onToggle={() => {
+                      setFocusedIndex(virtualItem.index);
+                      toggleExpanded(msg.id);
+                    }}
                   />
                 </div>
               );
