@@ -127,15 +127,38 @@ describe("wsStore — snapshot event", () => {
 describe("wsStore — message event (ring buffer cap)", () => {
   beforeEach(resetStore);
 
+  // Regression: the hub nests the payload under `message`. Reading the fields
+  // off the event root left recipient/sender/content undefined, and the Flow
+  // panel then crashed on `recipient.startsWith("#")`. Assert the nested
+  // fields are unpacked, not undefined.
+  it("unpacks the nested message payload (no undefined recipient)", () => {
+    handle({
+      type: "message",
+      message: {
+        ts: 1234,
+        sender: "architect",
+        recipient: "#design",
+        content: "hello",
+        kind: "message",
+      },
+    });
+    const [msg] = useDashStore.getState().messages;
+    expect(msg.recipient).toBe("#design");
+    expect(msg.sender).toBe("architect");
+    expect(msg.content).toBe("hello");
+  });
+
   it("appends messages up to MAX_MESSAGES (500)", () => {
     for (let i = 0; i < 500; i++) {
       handle({
         type: "message",
-        ts: 1000 + i,
-        sender: "agent-x",
-        recipient: "all",
-        content: `msg ${i}`,
-        kind: "message",
+        message: {
+          ts: 1000 + i,
+          sender: "agent-x",
+          recipient: "all",
+          content: `msg ${i}`,
+          kind: "message",
+        },
       });
     }
     expect(useDashStore.getState().messages).toHaveLength(500);
@@ -145,20 +168,24 @@ describe("wsStore — message event (ring buffer cap)", () => {
     for (let i = 0; i < 500; i++) {
       handle({
         type: "message",
-        ts: 1000 + i,
-        sender: "agent-x",
-        recipient: "all",
-        content: `msg ${i}`,
-        kind: "message",
+        message: {
+          ts: 1000 + i,
+          sender: "agent-x",
+          recipient: "all",
+          content: `msg ${i}`,
+          kind: "message",
+        },
       });
     }
     handle({
       type: "message",
-      ts: 2000,
-      sender: "agent-x",
-      recipient: "all",
-      content: "overflow",
-      kind: "message",
+      message: {
+        ts: 2000,
+        sender: "agent-x",
+        recipient: "all",
+        content: "overflow",
+        kind: "message",
+      },
     });
     const msgs = useDashStore.getState().messages;
     expect(msgs).toHaveLength(500);
