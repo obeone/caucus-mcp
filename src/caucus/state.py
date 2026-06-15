@@ -355,6 +355,17 @@ class HubState:
                 revived = self._revive(reaped)
                 if revived is not None:
                     return Registration(RegisterOutcome.REAFFIRMED, revived)
+        # The name is now being handed to a fresh identity. A reaped ghost may
+        # still hold this exact project name under a *different* token (it was
+        # idle-dropped, and the caller presented no token or one that did not
+        # match it). Evict that stale ghost from the revival graveyard: its name
+        # has been reassigned, so — exactly as :meth:`_revive` would decide — it
+        # can never come back. Leaving it parked would put the project in both
+        # ``_clients`` and ``_reaped_by_project``, breaking the "exactly one map"
+        # invariant and listing the peer twice in the dashboard roster.
+        ghost = self._reaped_by_project.pop(project, None)
+        if ghost is not None:
+            self._reaped.pop(ghost.token, None)
         client = Client(
             project=project,
             token=secrets.token_urlsafe(24),
