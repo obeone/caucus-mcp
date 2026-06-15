@@ -24,6 +24,7 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -33,6 +34,7 @@ from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__
 from .logging_setup import configure_logging
 
 logger = logging.getLogger("caucus.bridge")
@@ -935,7 +937,29 @@ def watch_command() -> dict[str, object]:
 
 
 def main() -> None:
-    """CLI entry point: serve the MCP stdio loop (no auto-join)."""
+    """CLI entry point: serve the MCP stdio loop (no auto-join).
+
+    A minimal parser handles ``--version`` only; all real config comes from
+    environment variables.  Normal MCP launches pass no extra args so
+    ``parse_args()`` is a no-op and the bridge falls straight through to
+    ``mcp.run()``.  stdout stays sacred for the MCP stdio transport — only
+    argparse's ``--version`` action ever writes to it, and only when the user
+    explicitly passes the flag (i.e. never during a real MCP session).
+    """
+    parser = argparse.ArgumentParser(
+        prog="caucus-bridge",
+        description="Caucus MCP bridge (stdio).",
+        add_help=False,  # keep --help off so MCP clients can't trigger it
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    # Unknown args (anything the MCP client might inject) are silently ignored
+    # so the bridge never rejects a valid MCP invocation.
+    parser.parse_known_args()
+
     # stderr keeps stdout clean for the MCP stdio transport; configure_logging
     # also silences httpx so the token never lands in the bridge log.
     configure_logging(sys.stderr)

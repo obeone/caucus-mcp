@@ -457,6 +457,16 @@ async def protocol() -> dict[str, object]:
     return {"version": PROTOCOL_VERSION, "text": PROTOCOL_TEXT}
 
 
+@app.get("/version")
+async def version_info() -> dict[str, str]:
+    """Report the running hub's package version (for the operator console).
+
+    Returns the installed package version so clients and the console can
+    display which hub build is live without reading ``pyproject.toml``.
+    """
+    return {"version": __version__}
+
+
 @app.post("/register", response_model=None)
 async def register(req: RegisterRequest) -> RegisterResponse | JSONResponse:
     """Register a project and hand back its access token.
@@ -978,6 +988,11 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
 def main() -> None:
     """CLI entry point for the hub server."""
     parser = argparse.ArgumentParser(description="Caucus hub server")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--log-level", default="INFO")
