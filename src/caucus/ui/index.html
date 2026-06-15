@@ -53,12 +53,18 @@
       repeating-linear-gradient(0deg, var(--grain) 0 1px, transparent 1px 3px),
       radial-gradient(120% 80% at 50% -10%, rgba(56, 198, 217, 0.07), transparent 60%);
     display: grid;
+    /* Explicit grid-row placement on the children below: #floor-strip is
+       hidden (display:none) when no floor is active, so without fixed rows the
+       remaining children (header, main) would collapse onto the first two rows
+       — main would land on the `auto` row and stop filling the viewport, un-
+       pinning the composer. Pinning each child to its row keeps main on `1fr`. */
     grid-template-rows: auto auto 1fr;
     height: 100vh;
   }
 
   /* ─── Header chrome — unchanged ─── */
   header {
+    grid-row: 1;
     display: flex; align-items: center; gap: 18px;
     padding: 12px 20px;
     border-bottom: 1px solid var(--line);
@@ -110,6 +116,7 @@
 
   /* ─── Layout ─── */
   main {
+    grid-row: 3; /* the body's 1fr row — fills the viewport so the composer stays pinned */
     display: grid;
     grid-template-columns: 220px 1fr;
     min-height: 0;
@@ -154,7 +161,9 @@
 
   /* ─── Feed ─── */
   #feed {
+    grid-row: 3;
     overflow-y: auto;
+    min-height: 0;
     padding: 24px 28px;
     display: flex; flex-direction: column;
     gap: 0; /* gaps handled by msg margin-bottom */
@@ -406,7 +415,13 @@
 
   /* ─── Feed filter bar ─── */
   .feed-wrap { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 0; }
+  /*
+   * Explicit grid-row placement: #forms-area is hidden (display:none) when empty,
+   * which removes it from grid flow and shifts later items into the wrong rows.
+   * Pinning each child to its row keeps .composer in row 4 regardless.
+   */
   .filter-bar {
+    grid-row: 1;
     display: flex; align-items: center; gap: 10px;
     padding: 7px 20px;
     border-bottom: 1px solid var(--line);
@@ -427,6 +442,7 @@
 
   /* ─── Pending forms area ─── */
   #forms-area {
+    grid-row: 2;
     display: none; /* hidden when empty */
     flex-direction: column;
     gap: 0;
@@ -508,6 +524,7 @@
 
   /* ─── Composer — unchanged chrome ─── */
   .composer {
+    grid-row: 4;
     border-top: 1px solid var(--line);
     background: var(--panel-2);
     padding: 12px 20px; display: flex; gap: 10px; align-items: flex-end;
@@ -529,6 +546,7 @@
 
   /* ─── Talking-stick floor strip ─── */
   #floor-strip {
+    grid-row: 2; /* explicit so main stays on row 3 even while this is hidden */
     display: none; /* hidden when no active floors */
     flex-direction: column; gap: 8px;
     padding: 10px 20px;
