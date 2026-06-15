@@ -11,6 +11,7 @@
  */
 
 import { create } from "zustand";
+import { fireToast } from "../components/ToastProvider";
 import type {
   DashboardState,
   HubEvent,
@@ -51,12 +52,26 @@ function rawToMessage(raw: RawMessage): Message {
   };
 }
 
-/** Read the auth token from ?token= URL param or localStorage. */
+/**
+ * Read the auth token from ?token= URL param or localStorage.
+ *
+ * Security: when the token is supplied in the URL we immediately strip it from
+ * the address bar (via replaceState) before returning so it does not linger in
+ * browser history, Referer headers, or server access logs.  localStorage is the
+ * durable store; the ?token= param is only the one-time bootstrap path.
+ */
 function getToken(): string | null {
   const params = new URLSearchParams(window.location.search);
   const fromUrl = params.get("token");
   if (fromUrl) {
     localStorage.setItem("caucus_token", fromUrl);
+    // Strip the token from the URL immediately to prevent leakage via browser
+    // history, server access logs, and Referer headers.
+    window.history.replaceState(
+      {},
+      "",
+      window.location.pathname + window.location.hash,
+    );
     return fromUrl;
   }
   return localStorage.getItem("caucus_token");
@@ -215,12 +230,21 @@ export const useDashStore = create<InternalState>()((set, get) => ({
         });
         break;
 
-      case "heartbeat_result":
-        // Surfaced via toast — handled at component level via subscription.
-        // Store result in a transient field so components can react.
-        // For now just log; toast subscription is in HeartbeatButton.
-        console.info("[caucus] heartbeat_result", evt.result);
+      case "heartbeat_result": {
+        // Fire a toast with the ping result so the operator sees liveness inline.
+        const r = evt.result;
+        const latency =
+          r.last_seen_age !== null && r.last_seen_age !== undefined
+            ? ` (seen ${r.last_seen_age.toFixed(1)}s ago)`
+            : "";
+        const status = r.status ? ` — ${r.status}` : "";
+        fireToast({
+          title: `Heartbeat: ${r.peer} is ${r.present ? "present" : "absent"}`,
+          description: `state: ${r.state}${latency}${status}`,
+          variant: r.present ? "success" : "error",
+        });
         break;
+      }
 
       case "error":
         console.warn("[caucus] server error", evt);
@@ -302,7 +326,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   sendFloorClear: (scope) =>
     get()._send({ floor: { action: "clear", scope } }),
 
-  sendChat: (to, content) => get()._send({ to, content }),
+  // Wire format: {"say":"<text>","to":"<scope>"} — hub dispatches on the "say"
+  // key (legacy console format, hub.py line ~1062); a {to,content} payload is
+  // silently ignored.
+  sendChat: (to, content) => get()._send({ say: content, to }),
 }));
 
 // ---------------------------------------------------------------------------

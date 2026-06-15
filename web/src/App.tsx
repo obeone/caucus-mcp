@@ -1,8 +1,9 @@
 /**
  * Root application component.
  *
- * Renders the fixed header chrome (brand, mode badge, controls, health stats)
- * and the four-panel dashboard grid below it.
+ * Renders the fixed header chrome (brand, mode badge, controls, health stats),
+ * the floor strip (active talking-stick floors), the four-panel tab bar, the
+ * active panel content, and the operator composer pinned at the bottom.
  */
 
 import { useState, useCallback } from "react";
@@ -14,10 +15,20 @@ import FlowPanel from "./components/FlowPanel";
 import ChannelsPanel from "./components/ChannelsPanel";
 import FormsPanel from "./components/FormsPanel";
 import DisconnectedBanner from "./components/DisconnectedBanner";
+import FloorStrip from "./components/FloorStrip";
+import OperatorComposer from "./components/OperatorComposer";
 import ToastProvider from "./components/ToastProvider";
-import { Moon, Sun, Wifi, WifiOff } from "lucide-react";
+import { Moon, Sun, Wifi, WifiOff, HelpCircle, BookOpen } from "lucide-react";
 
 type ActivePanel = "health" | "flow" | "channels" | "forms";
+
+/** Tooltip hint shown when the user hovers the ? button on a panel tab. */
+const PANEL_HELP: Record<ActivePanel, string> = {
+  health: "Health: live peer roster, pause/resume/kick individual agents, send heartbeat pings.",
+  flow: "Flow: real-time message timeline. ↑↓ navigate rows, Enter expand, Ctrl+F search, ⬇ export JSON.",
+  channels: "Channels: active hub channels. Operator can force-close a channel (non-sticky).",
+  forms: "Forms: pending operator questionnaires from agents. Fill or reject each form.",
+};
 
 export default function App() {
   const mode = useDashStore((s) => s.mode);
@@ -32,6 +43,7 @@ export default function App() {
   const setShowUTC = useDashStore((s) => s.setShowUTC);
 
   const [activePanel, setActivePanel] = useState<ActivePanel>("flow");
+  const [helpTooltip, setHelpTooltip] = useState<string | null>(null);
 
   const pendingForms = forms.filter((f) => f.status === "pending");
 
@@ -106,6 +118,19 @@ export default function App() {
 
           <div className="flex-1" />
 
+          {/* Help / Runbook link */}
+          <a
+            href="/docs/operator-runbook.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 text-[10px] font-mono text-dim hover:text-cyan transition-colors"
+            aria-label="Open operator runbook"
+            title="Operator runbook"
+          >
+            <BookOpen size={13} aria-hidden="true" />
+            <span className="hidden sm:inline">Runbook</span>
+          </a>
+
           {/* UTC toggle */}
           <button
             onClick={() => setShowUTC(!showUTC)}
@@ -168,6 +193,9 @@ export default function App() {
         {/* Disconnected banner */}
         <DisconnectedBanner />
 
+        {/* Floor strip — amber band showing active talking-stick floors */}
+        <FloorStrip />
+
         {/* ── Panel tabs ───────────────────────────────────────────────── */}
         <nav
           className="flex gap-0 border-b border-line bg-panel flex-shrink-0"
@@ -184,40 +212,67 @@ export default function App() {
               },
             ] as { id: ActivePanel; label: string }[]
           ).map(({ id, label }) => (
-            <button
-              key={id}
-              role="tab"
-              aria-selected={activePanel === id}
-              onClick={() => setActivePanel(id)}
-              className={cn(
-                "font-chrome font-bold tracking-[2px] text-[11px] px-5 py-2.5 uppercase border-b-2 transition-all",
-                activePanel === id
-                  ? "text-cyan border-cyan"
-                  : "text-dim border-transparent hover:text-ink hover:border-line",
-                id === "forms" && pendingForms.length > 0 && activePanel !== id
-                  ? "text-amber"
-                  : ""
-              )}
-            >
-              {label}
-            </button>
+            <div key={id} className="flex items-center relative">
+              <button
+                role="tab"
+                aria-selected={activePanel === id}
+                onClick={() => setActivePanel(id)}
+                className={cn(
+                  "font-chrome font-bold tracking-[2px] text-[11px] px-5 py-2.5 uppercase border-b-2 transition-all",
+                  activePanel === id
+                    ? "text-cyan border-cyan"
+                    : "text-dim border-transparent hover:text-ink hover:border-line",
+                  id === "forms" && pendingForms.length > 0 && activePanel !== id
+                    ? "text-amber"
+                    : ""
+                )}
+              >
+                {label}
+              </button>
+
+              {/* Context-help "?" affordance */}
+              <button
+                onMouseEnter={() => setHelpTooltip(PANEL_HELP[id])}
+                onMouseLeave={() => setHelpTooltip(null)}
+                onFocus={() => setHelpTooltip(PANEL_HELP[id])}
+                onBlur={() => setHelpTooltip(null)}
+                className="mr-1 text-dim/40 hover:text-dim transition-colors"
+                aria-label={`Help for ${id} panel`}
+                tabIndex={0}
+              >
+                <HelpCircle size={11} aria-hidden="true" />
+              </button>
+            </div>
           ))}
+
+          {/* Help tooltip */}
+          {helpTooltip && (
+            <div
+              role="tooltip"
+              className="absolute top-full left-0 mt-1 ml-2 z-50 max-w-xs bg-panel-2 border border-line rounded-sm px-3 py-2 text-[11px] font-mono text-dim shadow-lg pointer-events-none"
+            >
+              {helpTooltip}
+            </div>
+          )}
         </nav>
 
         {/* ── Panel content ───────────────────────────────────────────── */}
-        <main className="flex-1 min-h-0 overflow-hidden">
-          <div className={cn("h-full", activePanel !== "health" && "hidden")}>
+        <main className="flex-1 min-h-0 overflow-hidden flex flex-col">
+          <div className={cn("flex-1 min-h-0", activePanel !== "health" && "hidden")}>
             <HealthPanel />
           </div>
-          <div className={cn("h-full", activePanel !== "flow" && "hidden")}>
+          <div className={cn("flex-1 min-h-0", activePanel !== "flow" && "hidden")}>
             <FlowPanel />
           </div>
-          <div className={cn("h-full", activePanel !== "channels" && "hidden")}>
+          <div className={cn("flex-1 min-h-0", activePanel !== "channels" && "hidden")}>
             <ChannelsPanel />
           </div>
-          <div className={cn("h-full", activePanel !== "forms" && "hidden")}>
+          <div className={cn("flex-1 min-h-0", activePanel !== "forms" && "hidden")}>
             <FormsPanel />
           </div>
+
+          {/* Operator composer — pinned to panel bottom, operator-only */}
+          <OperatorComposer />
         </main>
       </div>
     </ToastProvider>

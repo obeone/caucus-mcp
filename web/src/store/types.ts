@@ -264,5 +264,6 @@ export interface DashboardState {
   sendAnswer: (id: string, answers: Record<string, string | string[]>) => void;
   sendCancelForm: (id: string, reason?: string) => void;
   sendFloorClear: (scope: string) => void;
+  /** Send operator message. Wire format: {"say":"<text>","to":"<scope>"}. */
   sendChat: (to: string, content: string) => void;
 }

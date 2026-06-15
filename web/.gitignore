@@ -6,6 +6,11 @@ dist/
 *.local
 *.log
 
+# Playwright run outputs (regenerated per run, never committed)
+playwright-report/
+test-results/
+.playwright/
+
 # Source maps must never be committed (keep the tracked bundle lean).
 *.map
 
