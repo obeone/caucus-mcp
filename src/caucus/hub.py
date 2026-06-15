@@ -14,9 +14,12 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
+import secrets
 import threading
 import webbrowser
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import coloredlogs
@@ -31,6 +34,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from . import export as export_mod
@@ -55,6 +59,7 @@ from .models import (
     StatusRequest,
     is_channel,
 )
+from .disklog import DiskLog
 from .state import Client, HubState, RegisterOutcome
 
 logger = logging.getLogger("caucus.hub")
@@ -66,6 +71,59 @@ LONG_POLL_SECONDS = 25.0
 # How often the background reaper sweeps the roster for idle peers. Kept well
 # under the client TTL so a gone peer is detected within a couple of sweeps.
 REAP_INTERVAL_SECONDS = 15.0
+
+# How often the dashboard health tick fans a fresh ``health`` event (with the
+# rich peer roster) out to every connected UI listener.
+HEALTH_INTERVAL_SECONDS = 1.5
+
+
+@dataclass
+class AuthConfig:
+    """Opt-in operator/observer token configuration for the ``/ui`` socket.
+
+    Both tokens default to ``None`` (auth disabled — every connection is an
+    operator, preserving the localhost default). When ``operator`` is set, the
+    ``/ui`` socket demands a first-frame ``{"auth": "<token>"}`` handshake and
+    grades the connection ``operator`` (read-write), ``observer`` (read-only) or
+    rejected.
+    """
+
+    operator: str | None = None
+    observer: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether an operator token is configured (auth required)."""
+        return self.operator is not None
+
+    def role_for(self, token: str | None) -> str | None:
+        """Return the role a ``token`` grants, or ``None`` if it grants none.
+
+        Uses :func:`secrets.compare_digest` for constant-time comparison so a
+        token is never leaked through timing. When auth is disabled every caller
+        is an ``operator``. The operator token is checked first, so a token
+        configured for both roles grants the higher one.
+
+        Args:
+            token: The token presented in the first frame, if any.
+
+        Returns:
+            ``"operator"``, ``"observer"``, or ``None`` when the token matches
+            no configured role.
+        """
+        if not self.enabled:
+            return "operator"
+        if token is None:
+            return None
+        if self.operator is not None and secrets.compare_digest(token, self.operator):
+            return "operator"
+        if self.observer is not None and secrets.compare_digest(token, self.observer):
+            return "observer"
+        return None
+
+
+auth_config = AuthConfig()
+"""Module-level auth config; populated from CLI/env in :func:`main`."""
 
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
@@ -294,26 +352,70 @@ async def _reaper_loop() -> None:
             logger.info("reaped idle peer project=%s", name)
 
 
+async def _health_loop() -> None:
+    """Periodically fan a ``health`` event (plus the rich roster) to the UI.
+
+    Drives the dashboard's Health panel and keeps the continuously-drifting peer
+    counters/ages fresh without a roster change. Resolves the module global
+    ``state`` each tick so a swapped-in instance (e.g. in tests) is honored. The
+    event is only built when at least one UI listener is connected, so an idle
+    hub does no needless work.
+    """
+    while True:
+        await asyncio.sleep(HEALTH_INTERVAL_SECONDS)
+        try:
+            state.push_health()
+        except Exception:  # pragma: no cover - never let the tick die
+            logger.exception("health tick failed")
+
+
+# Disk-log writer, created in the lifespan when --log-file/CAUCUS_LOG_FILE is set.
+disk_log: DiskLog | None = None
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Run the background idle-peer reaper for the lifetime of the app."""
-    task = asyncio.create_task(_reaper_loop())
+    """Run the reaper, the health tick, and (opt-in) the disk-log writer.
+
+    The disk log is wired here, not at import time, so the ``state`` global it
+    feeds is the live one and tests that swap a fresh state are unaffected.
+    """
+    tasks = [
+        asyncio.create_task(_reaper_loop()),
+        asyncio.create_task(_health_loop()),
+    ]
+    if disk_log is not None:
+        state.set_log_sink(disk_log.enqueue)
+        tasks.append(asyncio.create_task(disk_log.run()))
+        tasks.append(asyncio.create_task(disk_log.retention_loop()))
     try:
         yield
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
 
-_UI_INDEX = Path(__file__).resolve().parent / "ui" / "index.html"
+_UI_DIR = Path(__file__).resolve().parent / "ui"
+_UI_INDEX = _UI_DIR / "index.html"
+_UI_ASSETS = _UI_DIR / "assets"
+
+# The operator dashboard is a Vite-built SPA: ``index.html`` references hashed
+# bundles under ``assets/`` with relative URLs (Vite ``base: "./"``). Mount that
+# directory so ``/assets/<hash>.js|css`` resolve. Mounted only when the build is
+# present (it is shipped as package data); absent in a source checkout that has
+# not run ``npm run build``, in which case dev uses the Vite dev server instead.
+if _UI_ASSETS.is_dir():
+    app.mount("/assets", StaticFiles(directory=_UI_ASSETS), name="assets")
 
 
 @app.get("/")
 async def index() -> FileResponse:
-    """Serve the operator control UI."""
+    """Serve the operator dashboard entry point (the built SPA shell)."""
     if not _UI_INDEX.is_file():
         raise HTTPException(status_code=404, detail="UI not found")
     return FileResponse(_UI_INDEX)
@@ -755,6 +857,17 @@ async def receive(
                     pass
                 continue
 
+            # Per-peer pause gate: hold this peer's queue while the operator has
+            # it paused, the same way the global gate above holds the room. We
+            # poll the flag rather than block on an event so the loop keeps
+            # spinning to its deadline and returns normally — the watcher then
+            # re-polls, refreshing ``last_seen`` so a paused peer is NOT reaped.
+            # Queued messages stay in the queue (undrained) and are released the
+            # instant the operator resumes the peer.
+            if client.paused:
+                await asyncio.sleep(min(remaining, 1.0))
+                continue
+
             try:
                 first = await asyncio.wait_for(
                     client.queue.get(), timeout=min(remaining, 1.0)
@@ -871,16 +984,140 @@ async def control(req: ControlRequest) -> dict[str, str]:
     return {"mode": mode.value}
 
 
+# Inbound ``/ui`` command keys that mutate hub state. An observer connection
+# may read the live feed but never apply any of these — each is refused with a
+# ``{"type":"error","reason":"forbidden"}`` and left unapplied.
+_MUTATING_COMMANDS = frozenset(
+    {
+        "action",
+        "say",
+        "kick",
+        "floor",
+        "answer",
+        "cancel_form",
+        "pause_peer",
+        "resume_peer",
+        "heartbeat",
+        "close_channel",
+    }
+)
+
+
+async def _ui_authenticate(ws: WebSocket) -> str | None:
+    """Run the first-frame ``/ui`` auth handshake; return the granted role.
+
+    When auth is disabled, replies ``auth_ok`` with ``role="operator"`` and
+    ``auth=false`` immediately and returns ``"operator"`` without reading a
+    frame. When an operator token is configured, reads the first frame, expects
+    ``{"auth": "<token>"}``, and grades it: a matching operator/observer token
+    gets ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
+    anything else gets ``{"type":"auth_error"}``, the socket is closed (1008),
+    and ``None`` is returned.
+
+    Args:
+        ws: The accepted WebSocket.
+
+    Returns:
+        The granted role (``"operator"`` / ``"observer"``), or ``None`` when the
+        handshake failed and the socket was closed.
+    """
+    if not auth_config.enabled:
+        await ws.send_json({"type": "auth_ok", "role": "operator", "auth": False})
+        return "operator"
+    try:
+        first = await ws.receive_json()
+    except (WebSocketDisconnect, ValueError):
+        with contextlib.suppress(Exception):
+            await ws.close(code=1008)
+        return None
+    token = first.get("auth") if isinstance(first, dict) else None
+    role = auth_config.role_for(str(token) if token is not None else None)
+    if role is None:
+        await ws.send_json({"type": "auth_error"})
+        await ws.close(code=1008)
+        return None
+    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
+    return role
+
+
+def _apply_ui_command(data: dict[str, object]) -> None:
+    """Apply one mutating ``/ui`` command to hub state (operator-authorised).
+
+    Dispatches on the command key; unknown or malformed commands are ignored.
+    The caller is responsible for the RBAC check — this only runs for an
+    operator connection.
+
+    Args:
+        data: The decoded inbound frame.
+    """
+    if "action" in data:
+        mode = {
+            "pause": ControlMode.PAUSED,
+            "resume": ControlMode.RUNNING,
+            "reset": ControlMode.RUNNING,
+            "stop": ControlMode.STOPPED,
+        }.get(str(data["action"]))
+        if mode is not None:
+            state.set_mode(mode)
+    elif "say" in data:
+        state.route(
+            Message(
+                sender="human",
+                recipient=str(data.get("to", "all")),
+                content=str(data["say"]),
+                kind=MessageKind.MESSAGE,
+            )
+        )
+    elif "kick" in data:
+        state.kick(str(data["kick"]))
+    elif "pause_peer" in data:
+        state.pause_peer(str(data["pause_peer"]))
+    elif "resume_peer" in data:
+        state.resume_peer(str(data["resume_peer"]))
+    elif "close_channel" in data:
+        state.close_channel(str(data["close_channel"]))
+    elif "floor" in data:
+        floor_cmd = data["floor"]
+        if (
+            isinstance(floor_cmd, dict)
+            and floor_cmd.get("action") == "clear"
+            and isinstance(floor_cmd.get("scope"), str)
+        ):
+            state.clear_floor(floor_cmd["scope"])
+    elif "answer" in data:
+        answer = data["answer"]
+        if isinstance(answer, dict):
+            form_id = str(answer.get("id", ""))
+            raw = answer.get("answers")
+            answers = raw if isinstance(raw, dict) else {}
+            state.answer_form(form_id, answers)
+    elif "cancel_form" in data:
+        state.cancel_form(str(data["cancel_form"]))
+
+
 @app.websocket("/ui")
 async def ui_socket(ws: WebSocket) -> None:
     """Bidirectional channel for the operator UI.
 
-    Outbound: live feed events (messages, mode changes, peer lists).
-    Inbound:
+    The first frame is an auth handshake (see :func:`_ui_authenticate`): when an
+    operator token is configured the client must send ``{"auth": "<token>"}``;
+    otherwise auth is disabled and every connection is an operator. The granted
+    role is enforced per-command — an ``observer`` may read the live feed but any
+    mutating command is refused with ``{"type":"error","reason":"forbidden",
+    "command":...}`` and left unapplied. There is no single-writer lock: multiple
+    operators may all act, last write wins.
+
+    Outbound: live feed events (messages, mode changes, rich peer lists, health
+    ticks, heartbeat replies).
+    Inbound (operator-only mutations unless noted):
 
     * ``{"action": "pause"|"resume"|"stop"|"reset"}`` — control-mode change.
     * ``{"say": "...", "to": "<project>|all"}`` — operator-authored message.
     * ``{"kick": "<project>"}`` — evict the named peer from the roster.
+    * ``{"pause_peer": "<name>"}`` / ``{"resume_peer": "<name>"}`` — withhold or
+      release one peer's queue (delivery-side pause).
+    * ``{"heartbeat": "<name>"}`` — probe one peer; replies ``heartbeat_result``.
+    * ``{"close_channel": "<name>"}`` — force-close a channel (non-sticky).
     * ``{"floor": {"action": "clear", "scope": "<scope>"}}`` — force a talking
       stick closed regardless of who holds it (operator override).
     * ``{"answer": {"id": "<form_id>", "answers": {...}}}`` — submit a form's
@@ -888,6 +1125,9 @@ async def ui_socket(ws: WebSocket) -> None:
     * ``{"cancel_form": "<form_id>"}`` — cancel a pending form.
     """
     await ws.accept()
+    role = await _ui_authenticate(ws)
+    if role is None:
+        return  # handshake failed; socket already closed
     queue = state.add_ui()
 
     async def pump() -> None:
@@ -899,42 +1139,21 @@ async def ui_socket(ws: WebSocket) -> None:
     try:
         while True:
             data = await ws.receive_json()
-            if "action" in data:
-                mode = {
-                    "pause": ControlMode.PAUSED,
-                    "resume": ControlMode.RUNNING,
-                    "reset": ControlMode.RUNNING,
-                    "stop": ControlMode.STOPPED,
-                }.get(str(data["action"]))
-                if mode is not None:
-                    state.set_mode(mode)
-            elif "say" in data:
-                msg = Message(
-                    sender="human",
-                    recipient=str(data.get("to", "all")),
-                    content=str(data["say"]),
-                    kind=MessageKind.MESSAGE,
+            if not isinstance(data, dict):
+                continue
+            # ``heartbeat`` is the one mutating-keyed command that produces a
+            # direct reply; handle it explicitly so observers are still refused.
+            command = next((k for k in _MUTATING_COMMANDS if k in data), None)
+            if command is not None and role != "operator":
+                await ws.send_json(
+                    {"type": "error", "reason": "forbidden", "command": command}
                 )
-                state.route(msg)
-            elif "kick" in data:
-                state.kick(str(data["kick"]))
-            elif "floor" in data:
-                floor_cmd = data["floor"]
-                if (
-                    isinstance(floor_cmd, dict)
-                    and floor_cmd.get("action") == "clear"
-                    and isinstance(floor_cmd.get("scope"), str)
-                ):
-                    state.clear_floor(floor_cmd["scope"])
-            elif "answer" in data:
-                answer = data["answer"]
-                if isinstance(answer, dict):
-                    form_id = str(answer.get("id", ""))
-                    raw = answer.get("answers")
-                    answers = raw if isinstance(raw, dict) else {}
-                    state.answer_form(form_id, answers)
-            elif "cancel_form" in data:
-                state.cancel_form(str(data["cancel_form"]))
+                continue
+            if "heartbeat" in data:
+                result = state.ping(str(data["heartbeat"]))
+                await ws.send_json({"type": "heartbeat_result", "result": result})
+                continue
+            _apply_ui_command(data)
     except WebSocketDisconnect:
         pass
     finally:
@@ -1010,8 +1229,49 @@ def main() -> None:
         action="store_true",
         help="do not open the operator console in a browser on startup",
     )
+    parser.add_argument(
+        "--operator-token",
+        default=os.environ.get("CAUCUS_OPERATOR_TOKEN"),
+        help=(
+            "require this token (first /ui frame {\"auth\":...}) for read-write "
+            "operator access; unset (default) leaves /ui open as operator. "
+            "Env: CAUCUS_OPERATOR_TOKEN"
+        ),
+    )
+    parser.add_argument(
+        "--observer-token",
+        default=os.environ.get("CAUCUS_OBSERVER_TOKEN"),
+        help=(
+            "token granting read-only observer access to /ui (only meaningful "
+            "with --operator-token). Env: CAUCUS_OBSERVER_TOKEN"
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        default=os.environ.get("CAUCUS_LOG_FILE"),
+        help=(
+            "append every routed message as JSONL to this file; unset (default) "
+            "disables disk logging. Env: CAUCUS_LOG_FILE"
+        ),
+    )
+    parser.add_argument(
+        "--log-retention-hours",
+        type=float,
+        default=float(os.environ.get("CAUCUS_LOG_RETENTION_HOURS", "24")),
+        help=(
+            "drop disk-log lines older than this many hours (default: "
+            "%(default)s). Env: CAUCUS_LOG_RETENTION_HOURS"
+        ),
+    )
     args = parser.parse_args()
 
+    global disk_log
+    auth_config.operator = args.operator_token
+    auth_config.observer = args.observer_token
+    if args.log_file:
+        disk_log = DiskLog(
+            Path(args.log_file), retention_hours=args.log_retention_hours
+        )
     state.client_ttl = args.client_ttl
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
