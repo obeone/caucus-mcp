@@ -77,6 +77,11 @@ export interface FormField {
   type: FieldType;
   options?: string[];
   required?: boolean;
+  /**
+   * For `radio`/`checkbox` fields, whether the operator may supply a value
+   * outside `options` via an "Other…" affordance. Ignored for free-text fields.
+   */
+  allow_other?: boolean;
 }
 
 export interface FormObj {

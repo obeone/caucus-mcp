@@ -30,15 +30,190 @@ interface FormModalProps {
   role: "operator" | "observer";
 }
 
-function FieldInput({
-  field,
-  value,
-  onChange,
-}: {
+interface FieldInputProps {
   field: FormField;
   value: string | string[];
   onChange: (v: string | string[]) => void;
-}) {
+}
+
+/** Shared option-row chrome for radio/checkbox choices and their "Other" row. */
+const OPTION_ROW =
+  "flex items-center gap-2.5 px-3 py-2 rounded-sm border cursor-pointer transition-all bg-panel-2";
+
+/**
+ * Single-choice field. When `allow_other` is set the asker explicitly permits a
+ * value outside `options`, so we render an extra "Other…" radio that reveals a
+ * free-text input; the typed string becomes the answer. `otherMode` is local
+ * state (not derivable from `value` alone) so picking "Other" stays sticky even
+ * before any text is typed — required validation then sees the empty value.
+ */
+function RadioField({ field, value, onChange }: FieldInputProps) {
+  const opts = field.options ?? [];
+  const valueStr = typeof value === "string" ? value : "";
+  const [otherMode, setOtherMode] = useState(
+    field.allow_other === true && valueStr !== "" && !opts.includes(valueStr)
+  );
+
+  return (
+    <div className="flex flex-col gap-2" role="radiogroup" aria-label={field.label}>
+      {opts.map((opt) => {
+        const checked = !otherMode && valueStr === opt;
+        return (
+          <label
+            key={opt}
+            className={cn(
+              OPTION_ROW,
+              checked ? "border-amber bg-amber/8" : "border-line hover:border-amber/50"
+            )}
+          >
+            <input
+              type="radio"
+              name={field.key}
+              value={opt}
+              checked={checked}
+              onChange={() => {
+                setOtherMode(false);
+                onChange(opt);
+              }}
+              className="accent-amber w-3.5 h-3.5"
+            />
+            <span className="text-xs font-mono text-ink">{opt}</span>
+          </label>
+        );
+      })}
+      {field.allow_other && (
+        <>
+          <label
+            className={cn(
+              OPTION_ROW,
+              otherMode ? "border-amber bg-amber/8" : "border-line hover:border-amber/50"
+            )}
+          >
+            <input
+              type="radio"
+              name={field.key}
+              checked={otherMode}
+              onChange={() => {
+                setOtherMode(true);
+                onChange("");
+              }}
+              className="accent-amber w-3.5 h-3.5"
+              aria-label={`${field.label} — other`}
+            />
+            <span className="text-xs font-mono text-dim italic">Other…</span>
+          </label>
+          {otherMode && (
+            <input
+              type="text"
+              value={valueStr}
+              onChange={(e) => onChange(e.target.value)}
+              placeholder="Type a custom value…"
+              className="ml-6 w-[calc(100%-1.5rem)] bg-bg text-ink border border-line rounded-sm px-3 py-2 text-xs font-mono focus:outline-none focus:border-cyan"
+              aria-label={`${field.label} — custom value`}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Multi-choice field. Listed selections live in `value`; when `allow_other` is
+ * set, an "Other…" checkbox reveals a free-text input whose trimmed value is
+ * appended as one extra entry. `listed` is derived from `value` each render so
+ * checkbox state never desyncs; the custom entry is tracked in local state.
+ */
+function CheckboxField({ field, value, onChange }: FieldInputProps) {
+  const opts = field.options ?? [];
+  const selected = Array.isArray(value) ? value : [];
+  const listed = selected.filter((v) => opts.includes(v));
+  const customExisting = selected.find((v) => !opts.includes(v)) ?? "";
+  const [otherMode, setOtherMode] = useState(
+    field.allow_other === true && customExisting !== ""
+  );
+  const [otherText, setOtherText] = useState(customExisting);
+
+  // Re-emit the full answer array: listed selections plus the custom entry when
+  // "Other" is active and non-blank.
+  const emit = (nextListed: string[], on: boolean, text: string) => {
+    const arr = [...nextListed];
+    if (on && text.trim()) arr.push(text.trim());
+    onChange(arr);
+  };
+
+  return (
+    <div className="flex flex-col gap-2" role="group" aria-label={field.label}>
+      {opts.map((opt) => {
+        const checked = listed.includes(opt);
+        return (
+          <label
+            key={opt}
+            className={cn(
+              OPTION_ROW,
+              checked ? "border-amber bg-amber/8" : "border-line hover:border-amber/50"
+            )}
+          >
+            <input
+              type="checkbox"
+              value={opt}
+              checked={checked}
+              onChange={(e) =>
+                emit(
+                  e.target.checked
+                    ? [...listed, opt]
+                    : listed.filter((v) => v !== opt),
+                  otherMode,
+                  otherText
+                )
+              }
+              className="accent-amber w-3.5 h-3.5"
+            />
+            <span className="text-xs font-mono text-ink">{opt}</span>
+          </label>
+        );
+      })}
+      {field.allow_other && (
+        <>
+          <label
+            className={cn(
+              OPTION_ROW,
+              otherMode ? "border-amber bg-amber/8" : "border-line hover:border-amber/50"
+            )}
+          >
+            <input
+              type="checkbox"
+              checked={otherMode}
+              onChange={(e) => {
+                setOtherMode(e.target.checked);
+                emit(listed, e.target.checked, otherText);
+              }}
+              className="accent-amber w-3.5 h-3.5"
+              aria-label={`${field.label} — other`}
+            />
+            <span className="text-xs font-mono text-dim italic">Other…</span>
+          </label>
+          {otherMode && (
+            <input
+              type="text"
+              value={otherText}
+              onChange={(e) => {
+                setOtherText(e.target.value);
+                emit(listed, true, e.target.value);
+              }}
+              placeholder="Type a custom value…"
+              className="ml-6 w-[calc(100%-1.5rem)] bg-bg text-ink border border-line rounded-sm px-3 py-2 text-xs font-mono focus:outline-none focus:border-cyan"
+              aria-label={`${field.label} — custom value`}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Dispatch a form field to its input widget by type. */
+function FieldInput({ field, value, onChange }: FieldInputProps) {
   if (field.type === "text") {
     return (
       <input
@@ -66,70 +241,11 @@ function FieldInput({
   }
 
   if (field.type === "radio") {
-    return (
-      <div className="flex flex-col gap-2" role="radiogroup" aria-label={field.label}>
-        {(field.options ?? []).map((opt) => (
-          <label
-            key={opt}
-            className={cn(
-              "flex items-center gap-2.5 px-3 py-2 rounded-sm border cursor-pointer transition-all",
-              "bg-panel-2",
-              value === opt
-                ? "border-amber bg-amber/8"
-                : "border-line hover:border-amber/50"
-            )}
-          >
-            <input
-              type="radio"
-              name={field.key}
-              value={opt}
-              checked={value === opt}
-              onChange={() => onChange(opt)}
-              className="accent-amber w-3.5 h-3.5"
-            />
-            <span className="text-xs font-mono text-ink">{opt}</span>
-          </label>
-        ))}
-      </div>
-    );
+    return <RadioField field={field} value={value} onChange={onChange} />;
   }
 
   if (field.type === "checkbox") {
-    const selected = Array.isArray(value) ? value : [];
-    return (
-      <div className="flex flex-col gap-2" role="group" aria-label={field.label}>
-        {(field.options ?? []).map((opt) => {
-          const checked = selected.includes(opt);
-          return (
-            <label
-              key={opt}
-              className={cn(
-                "flex items-center gap-2.5 px-3 py-2 rounded-sm border cursor-pointer transition-all",
-                "bg-panel-2",
-                checked
-                  ? "border-amber bg-amber/8"
-                  : "border-line hover:border-amber/50"
-              )}
-            >
-              <input
-                type="checkbox"
-                value={opt}
-                checked={checked}
-                onChange={(e) => {
-                  if (e.target.checked) {
-                    onChange([...selected, opt]);
-                  } else {
-                    onChange(selected.filter((v) => v !== opt));
-                  }
-                }}
-                className="accent-amber w-3.5 h-3.5"
-              />
-              <span className="text-xs font-mono text-ink">{opt}</span>
-            </label>
-          );
-        })}
-      </div>
-    );
+    return <CheckboxField field={field} value={value} onChange={onChange} />;
   }
 
   return null;

@@ -5,11 +5,11 @@
  * ARIA roles/labels.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { useDashStore } from "../../store/wsStore";
 import type { FormObj } from "../../store/types";
-import FormsPanel from "../FormsPanel";
+import FormsPanel, { FormModal } from "../FormsPanel";
 import ToastProvider from "../ToastProvider";
 import { ReactNode } from "react";
 
@@ -124,6 +124,108 @@ describe("FormsPanel — pending forms", () => {
     expect(matches.length).toBeGreaterThan(0);
     const heading = matches.find((el) => el.textContent?.trim() === "Resolved");
     expect(heading).toBeTruthy();
+  });
+});
+
+describe("FormModal — allow_other affordance", () => {
+  const radioOtherForm: FormObj = {
+    id: "form-other-radio",
+    title: "Custom radio form",
+    fields: [
+      {
+        key: "channel",
+        label: "Rollout channel",
+        type: "radio",
+        options: ["stable", "beta"],
+        required: true,
+        allow_other: true,
+      },
+    ],
+    audience: "all",
+    asker: "agent-alpha",
+    status: "pending",
+  };
+
+  const checkboxOtherForm: FormObj = {
+    id: "form-other-check",
+    title: "Custom checkbox form",
+    fields: [
+      {
+        key: "surfaces",
+        label: "Surfaces",
+        type: "checkbox",
+        options: ["dashboard", "docs"],
+        required: true,
+        allow_other: true,
+      },
+    ],
+    audience: "all",
+    asker: "agent-alpha",
+    status: "pending",
+  };
+
+  function renderModal(form: FormObj) {
+    const onAnswer = vi.fn();
+    render(
+      <FormModal
+        form={form}
+        open
+        onClose={() => {}}
+        onAnswer={onAnswer}
+        onCancel={() => {}}
+        role="operator"
+      />,
+      { wrapper: Wrapper }
+    );
+    return onAnswer;
+  }
+
+  it("radio: reveals a custom input on 'Other' and submits the typed value", () => {
+    const onAnswer = renderModal(radioOtherForm);
+
+    // The custom input is hidden until "Other" is chosen.
+    expect(
+      screen.queryByLabelText("Rollout channel — custom value")
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Rollout channel — other"));
+    const custom = screen.getByLabelText("Rollout channel — custom value");
+    fireEvent.change(custom, { target: { value: "canary" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /submit answer/i }));
+    expect(onAnswer).toHaveBeenCalledWith("form-other-radio", {
+      channel: "canary",
+    });
+  });
+
+  it("checkbox: appends the custom value alongside listed selections", () => {
+    const onAnswer = renderModal(checkboxOtherForm);
+
+    fireEvent.click(screen.getByLabelText("dashboard"));
+    fireEvent.click(screen.getByLabelText("Surfaces — other"));
+    fireEvent.change(screen.getByLabelText("Surfaces — custom value"), {
+      target: { value: "cli" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /submit answer/i }));
+    expect(onAnswer).toHaveBeenCalledWith("form-other-check", {
+      surfaces: ["dashboard", "cli"],
+    });
+  });
+
+  it("radio without allow_other shows no 'Other' option", () => {
+    render(
+      <FormModal
+        form={pendingForm}
+        open
+        onClose={() => {}}
+        onAnswer={() => {}}
+        onCancel={() => {}}
+        role="operator"
+      />,
+      { wrapper: Wrapper }
+    );
+    expect(screen.queryByLabelText("Decision — other")).not.toBeInTheDocument();
   });
 });
 
