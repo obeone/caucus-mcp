@@ -494,6 +494,35 @@ async def test_revival_refused_when_name_reclaimed() -> None:
     assert state.client_for(new.token) is new
 
 
+async def test_fresh_reregister_evicts_same_name_reaped_ghost() -> None:
+    """Re-registering a reaped name fresh must not list the peer twice.
+
+    Regression: a peer that was idle-reaped sits in the revival graveyard
+    keyed by its name. When the same name re-registers *without* the reaped
+    token (a brand-new identity), the old ghost used to linger in
+    ``_reaped_by_project`` while the new client sat in ``_clients`` — so the
+    project appeared twice in :meth:`peers_info`, doubling it in the dashboard
+    roster. The fresh registration must evict the now-unreachable ghost.
+    """
+    state = HubState()
+    old = state.register("alpha").client
+    assert old is not None
+    old_token = old.token
+    state.reap_stale(ttl=30.0, now=old.last_seen + 1000.0)
+
+    # Brand-new identity grabs the freed name (no token presented).
+    new = state.register("alpha").client
+    assert new is not None
+    assert new.token != old_token
+
+    # The roster lists "alpha" exactly once — no reaped ghost lingering.
+    names = [p["name"] for p in state.peers_info()]
+    assert names.count("alpha") == 1
+    assert state.peers() == ["alpha"]
+    # The ghost is gone from both revival indices.
+    assert state.client_for(old_token) is None
+
+
 async def test_reaped_token_forgotten_after_grace() -> None:
     """Past the grace window the reaped token is purged and cannot revive."""
     state = HubState(reaped_grace=100.0)
