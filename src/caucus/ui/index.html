@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CAUCUS // operator console</title>
+<title>Caucus // operator console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <!--
@@ -528,6 +528,39 @@
     border-top: 1px solid var(--line);
     background: var(--panel-2);
     padding: 12px 20px; display: flex; gap: 10px; align-items: flex-end;
+    position: relative; /* anchor for #ac-menu absolute positioning */
+  }
+
+  /* ─── Autocomplete dropdown — anchored upward from the textarea ─── */
+  #ac-menu {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    left: 20px; right: 20px;
+    z-index: 50;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-bottom: none;
+    border-radius: 2px 2px 0 0;
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 12px;
+  }
+  #ac-menu.open { display: block; }
+  .ac-item {
+    padding: 6px 10px;
+    cursor: pointer;
+    color: var(--ink);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    border-left: 2px solid transparent;
+    transition: background .08s;
+  }
+  .ac-item:hover { background: rgba(56, 198, 217, 0.07); }
+  .ac-item.ac-active {
+    border-left-color: var(--cyan);
+    background: rgba(56, 198, 217, 0.12);
+    color: var(--cyan);
   }
   select, textarea {
     font-family: "IBM Plex Mono", monospace; font-size: 13px;
@@ -543,6 +576,8 @@
   .conn { font-size: 11px; letter-spacing: 2px; color: var(--dim); }
   .conn.live { color: var(--green); }
   .conn.dead { color: var(--red); }
+
+  .version { font-family: "IBM Plex Mono", monospace; font-size: 10px; letter-spacing: 2px; color: var(--dim); }
 
   /* ─── Talking-stick floor strip ─── */
   #floor-strip {
@@ -816,7 +851,8 @@
 </head>
 <body>
   <header>
-    <div class="brand">WAR&nbsp;<b>ROOM</b></div>
+    <div class="brand">CAU<b>CUS</b></div>
+    <span id="version" class="version"></span>
     <div id="mode" class="mode-badge mode-running">running</div>
     <span id="conn" class="conn">connecting…</span>
     <div class="spacer"></div>
@@ -870,6 +906,8 @@
 
       <div id="feed"></div>
       <div class="composer">
+        <!-- Autocomplete dropdown — opens upward, populated by acUpdate() -->
+        <div id="ac-menu"></div>
         <div>
           <label class="target-label">target</label>
           <select id="target"><option value="all">all (broadcast)</option></select>
@@ -1424,9 +1462,199 @@
     input.value = "";
   }
 
-  document.getElementById("input").addEventListener("keydown", (e) => {
+  // ─── Autocomplete — inline dropdown for @peers, #channels, /commands ────
+  //
+  // Trigger regex: matches an active token at the caret position.
+  // Group 1 = leading whitespace (or start of text), group 2 = trigger char
+  // (@, #, /), group 3 = query typed after the trigger (may be empty).
+  // We test against the substring of the textarea value up to the caret so
+  // that the token must be at a word boundary (start or after whitespace).
+  const AC_TOKEN_RE = /(^|\s)([/@#])(\S*)$/;
+
+  // Operator commands: each has a display name and a run() that executes the
+  // control action. Selecting one runs it immediately (no text insertion).
+  const AC_COMMANDS = [
+    { name: "/pause",  run: () => ctl("pause") },
+    { name: "/resume", run: () => ctl("resume") },
+    { name: "/stop",   run: () => ctl("stop") },
+    { name: "/reset",  run: () => ctl("reset") },
+    { name: "/export", run: () => exportChat() },
+  ];
+
+  // Autocomplete state
+  let acOpen = false;       // whether the menu is visible
+  let acItems = [];         // current suggestion list: { label, run? }
+  let acIdx = 0;            // highlighted row index
+  let acTrigger = "";       // trigger char of active token ("@", "#", "/")
+  let acTokenStart = 0;     // caret offset where the trigger char begins
+
+  const acMenu = document.getElementById("ac-menu");
+  const acInput = document.getElementById("input");
+
+  /** Close the dropdown and reset all autocomplete state. */
+  function acClose() {
+    acOpen = false;
+    acItems = [];
+    acIdx = 0;
+    acMenu.classList.remove("open");
+    acMenu.innerHTML = "";
+  }
+
+  /** Render menu rows from acItems, marking acIdx as active. */
+  function acRender() {
+    acMenu.innerHTML = "";
+    for (let i = 0; i < acItems.length; i++) {
+      const row = document.createElement("div");
+      row.className = "ac-item" + (i === acIdx ? " ac-active" : "");
+      row.textContent = acItems[i].label;
+      // mousedown (not click) so we fire before blur loses textarea focus
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault(); // keep textarea focus
+        acAccept(i);
+      });
+      acMenu.appendChild(row);
+    }
+    acMenu.classList.add("open");
+    acOpen = true;
+    // Scroll highlighted item into view
+    const active = acMenu.querySelector(".ac-active");
+    if (active) active.scrollIntoView({ block: "nearest" });
+  }
+
+  /**
+   * Accept the suggestion at index i.
+   * - /command items: run their action, clear the textarea.
+   * - @peer / #channel items: replace the active token with the label + space.
+   */
+  function acAccept(i) {
+    const item = acItems[i];
+    if (!item) { acClose(); return; }
+
+    if (item.run) {
+      // /command: execute, clear input, close
+      item.run();
+      acInput.value = "";
+      acClose();
+      return;
+    }
+
+    // Text insertion: replace the active token (trigger + query) with label + space
+    const val = acInput.value;
+    const caret = acInput.selectionStart;
+    // Before the trigger char
+    const before = val.slice(0, acTokenStart);
+    // After the caret (rest of the text)
+    const after = val.slice(caret);
+    const inserted = item.label + " ";
+    const newVal = before + inserted + after;
+    acInput.value = newVal;
+    // Place caret right after the inserted text
+    const newCaret = before.length + inserted.length;
+    acInput.setSelectionRange(newCaret, newCaret);
+    acClose();
+  }
+
+  /**
+   * On every input event, inspect the text before the caret for an active
+   * autocomplete token and rebuild the dropdown accordingly.
+   */
+  function acUpdate() {
+    const val = acInput.value;
+    const caret = acInput.selectionStart;
+    const before = val.slice(0, caret);
+
+    const m = AC_TOKEN_RE.exec(before);
+    if (!m) { acClose(); return; }
+
+    const trigger = m[2];          // "@", "#", or "/"
+    const query = m[3].toLowerCase(); // text typed after trigger
+    // Start offset of the trigger char in the full textarea value
+    // = (length of substring before match) + (length of group 1)
+    acTokenStart = before.length - m[0].length + m[1].length;
+    acTrigger = trigger;
+
+    let candidates = [];
+    if (trigger === "@") {
+      // Filter peer names by query (prefix first, then substring)
+      candidates = currentPeers
+        .filter(p => p.toLowerCase().startsWith(query) || p.toLowerCase().includes(query))
+        .sort((a, b) => {
+          const al = a.toLowerCase(), bl = b.toLowerCase();
+          return (al.startsWith(query) ? 0 : 1) - (bl.startsWith(query) ? 0 : 1) || al.localeCompare(bl);
+        })
+        .map(p => ({ label: "@" + p }));
+    } else if (trigger === "#") {
+      // Channel keys already include the "#" prefix (e.g. "#design")
+      // Query is matched against the part after "#"
+      candidates = Object.keys(channels)
+        .filter(ch => {
+          const name = ch.slice(1).toLowerCase(); // strip leading "#"
+          return name.startsWith(query) || name.includes(query);
+        })
+        .sort((a, b) => {
+          const an = a.slice(1).toLowerCase(), bn = b.slice(1).toLowerCase();
+          return (an.startsWith(query) ? 0 : 1) - (bn.startsWith(query) ? 0 : 1) || an.localeCompare(bn);
+        })
+        .map(ch => {
+          const entry = channels[ch] || {};
+          const memberCount = Array.isArray(entry.members) ? entry.members.length : null;
+          const label = memberCount !== null ? ch + "  (" + memberCount + ")" : ch;
+          return { label, insertLabel: ch }; // insertLabel = what we actually insert
+        });
+      // Normalise so acAccept can use item.label directly for slash but needs
+      // the bare channel name for #. We store it in label cleanly instead.
+      candidates = candidates.map(c => ({ label: c.insertLabel || c.label }));
+    } else if (trigger === "/") {
+      // Filter operator commands
+      candidates = AC_COMMANDS
+        .filter(cmd => cmd.name.startsWith("/" + query) || cmd.name.includes(query))
+        .map(cmd => ({ label: cmd.name, run: cmd.run }));
+    }
+
+    if (!candidates.length) { acClose(); return; }
+
+    acItems = candidates;
+    acIdx = 0;
+    acRender();
+  }
+
+  // Input event: rebuild dropdown on every keystroke
+  acInput.addEventListener("input", acUpdate);
+
+  // Keydown: when menu is open, intercept navigation/accept/escape keys
+  // BEFORE the sendHuman() Enter binding fires.
+  acInput.addEventListener("keydown", (e) => {
+    if (acOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        acIdx = (acIdx + 1) % acItems.length;
+        acRender();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        acIdx = (acIdx - 1 + acItems.length) % acItems.length;
+        acRender();
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault(); // must not send message or change focus
+        acAccept(acIdx);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        acClose();
+        return;
+      }
+    }
+    // Default behaviour: send on Enter (no shift)
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendHuman(); }
   });
+
+  // Close the menu when the textarea loses focus (small delay so mousedown
+  // on a menu row can fire first and register the click).
+  acInput.addEventListener("blur", () => setTimeout(acClose, 120));
 
   // ─── filter change — re-render feed from allMessages ─────────────────────
   filterEl.addEventListener("change", renderFeed);
@@ -2035,6 +2263,17 @@
       }
     };
   }
+  // ─── Version badge — fetch hub version and display in header ────────────
+  (async () => {
+    try {
+      const r = await fetch("/version");
+      if (r.ok) {
+        const { version } = await r.json();
+        document.getElementById("version").textContent = "v" + version;
+      }
+    } catch (_) { /* failed fetch is non-fatal — badge stays empty */ }
+  })();
+
   connect();
 
   // ─── Non-blocking Google Fonts injection ──────────────────────────────────
