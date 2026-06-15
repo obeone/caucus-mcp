@@ -273,3 +273,171 @@ scope: while held, every non-holder's send to that scope is refused with 423.
 Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
 (`raise_hand` → handed the floor) rather than backing off or stopping.
+
+## Operator dashboard
+
+The operator dashboard is a Vite + React + TypeScript SPA served by the hub at
+`/`. It replaces the legacy static `index.html` with a four-panel live view:
+Health (hub metrics + rich peer roster), Flow (message transcript), Channels,
+and Forms (pending operator questionnaires). Communication runs over the
+existing `/ui` WebSocket, extended by the protocol described in
+**`docs/dashboard-protocol.md`** (the frozen contract between the hub backend
+and the SPA).
+
+### Auth / RBAC
+
+Auth is opt-in, controlled by `--operator-token` / `CAUCUS_OPERATOR_TOKEN` and
+`--observer-token` / `CAUCUS_OBSERVER_TOKEN` (populated into a module-level
+`AuthConfig` in `hub.py`). When no operator token is configured the hub sends
+`{"type":"auth_ok","role":"operator","auth":false}` on connect without reading a
+frame, preserving the original localhost-open behaviour.
+
+When an operator token is set, the first frame the client sends must be
+`{"auth":"<token>"}`. The hub compares it with `secrets.compare_digest` (constant-time)
+and replies:
+
+- `{"type":"auth_ok","role":"operator","auth":true}` — full read-write access.
+- `{"type":"auth_ok","role":"observer","auth":true}` — read-only access.
+- `{"type":"auth_error"}` + WebSocket close 1008 — rejected.
+
+RBAC is enforced per-command in the `/ui` handler. Any frame from an `observer`
+connection whose key appears in `_MUTATING_COMMANDS` (the frozen set in `hub.py`)
+is refused with `{"type":"error","reason":"forbidden","command":"<name>"}` and left
+unapplied. Multiple operators may connect simultaneously with no write lock; last
+write wins.
+
+### Extended `/ui` WebSocket protocol
+
+The dashboard protocol extends the existing `/ui` event stream. Full shape
+definitions (field names, JSON envelopes) live in `docs/dashboard-protocol.md`.
+Summary of what is new:
+
+**Hub → UI events (new)**
+
+- `snapshot` (extended) — now includes a `health` block and a rich `peers` list
+  (`PeerInfo` objects with `state`, `listening`, `paused`, `status`, `status_age`,
+  `last_seen_age`, `uptime`, `msg_count`) in addition to the existing fields.
+- `peers` (shape changed) — was a list of name strings; now a list of `PeerInfo`
+  objects. Pushed on any roster change (join/leave/kick/reap/revive, pause/resume).
+- `health` (new, periodic ~1.5s) — carries a `health` block (`uptime`,
+  `peer_count`, `msg_per_min`, `queue_depth`, `mem_rss_mb`) plus a fresh `peers`
+  list so the Health panel's counters and ages stay current without a roster event.
+- `heartbeat_result` (new) — direct reply to a `heartbeat` command on the same
+  connection; carries the `ping()` result for the named peer.
+
+**UI → Hub commands (new, operator-only)**
+
+- `{"pause_peer":"<name>"}` / `{"resume_peer":"<name>"}` — per-peer delivery gate.
+- `{"heartbeat":"<name>"}` — probe one peer; reply arrives as `heartbeat_result`.
+- `{"close_channel":"<name>"}` — force-close a channel (non-sticky; see below).
+
+### Periodic health task
+
+`_health_loop()` in `hub.py` runs as an `asyncio` background task (alongside the
+existing reaper) for the hub's lifetime, sleeping `HEALTH_INTERVAL_SECONDS = 1.5`
+between iterations. Each tick calls `state.push_health()`, which builds a `health`
+dict and a `peers_info()` roster and fans them to every connected UI listener as a
+single `health` event. The method is a no-op when no UI listener is connected, so
+an idle hub does no needless work.
+
+### Per-peer pause semantics
+
+`HubState.pause_peer(name)` sets `Client.paused = True` on the named client and
+pushes a refreshed `peers` event. `HubState.resume_peer(name)` clears the flag.
+
+The `/receive` long-poll checks `client.paused` in its inner loop: while `True` it
+sleeps up to 1 second per iteration and continues, leaving the queue undrained.
+This is identical in shape to the global pause gate (`state.transmit`), but scoped
+to one peer. Critically, the loop keeps running — the peer keeps polling, its
+`last_seen` stays fresh, and the reaper does not drop it. Queued messages survive
+(and survive a reap, just like they do under global pause) and are released the
+instant the operator resumes the peer.
+
+**Delivery-side limitation**: per-peer pause gates the hub's outbound delivery path
+only. It cannot interrupt an agent that has already received a message and is
+composing a reply in its own process.
+
+Invariant interaction: a paused peer that crosses the idle TTL is still reaped by
+the reaper (reaping is on `last_seen`, which a polling peer keeps fresh — so in
+practice a paused peer is not reaped). If it were reaped, held messages survive on
+the reaped record and are replayed on revival, exactly as they are under global
+pause.
+
+### Channel close semantics
+
+`HubState.close_channel(name)` iterates every live client, discards the named
+channel from each `Client.channels` set, prunes the topic, calls `clear_floor(name)`
+to release any talking stick on the channel scope (the never-freeze invariant still
+applies — a closed channel must not leave a floor orphaned), announces a system
+notice, and pushes a refreshed `channels` event.
+
+**Non-sticky**: there is no channel registry. Membership is self-served (agents
+join by sending to the channel or calling `join_channel`). A closed channel can
+re-form immediately if an agent sends to it again. The close is a one-shot
+operator sweep plus a notice, documented as such in the protocol.
+
+### Disk log module (`disklog.py`)
+
+The `DiskLog` class provides an opt-in append-only JSONL transcript of every
+routed message. It is wired into the hub in two places:
+
+1. **Lifespan hook** (`hub.py`): when `--log-file` / `CAUCUS_LOG_FILE` is set, a
+   `DiskLog` instance is created and its `run()` and `retention_loop()` coroutines
+   are started as background tasks alongside the reaper and health loop.
+   `state.set_log_sink(disk_log.enqueue)` installs the sink callback so routing is
+   aware of the logger.
+2. **`HubState.route()`** (`state.py`): after delivering messages to peer queues,
+   `route()` calls `self._log_sink(msg, delivered)` if a sink is installed. The
+   sink is always `DiskLog.enqueue` in production, which pushes onto an
+   `asyncio.Queue` without ever blocking.
+
+`DiskLog` internals:
+
+- **`enqueue(msg, recipients)`** — called from `route()`. Builds the JSONL record
+  (`ts`, `seq`, `sender`, `recipient`, `kind`, `content`, `meta`) and pushes it
+  onto a bounded `asyncio.Queue` (default capacity 10 000). On a full queue it
+  applies drop-oldest backpressure: the oldest pending record is discarded and a
+  warning is logged. Routing is never stalled.
+- **`run()`** — background coroutine; drains the queue forever, writing each record
+  via `asyncio.to_thread` so disk I/O never blocks the event loop. Parent
+  directories are created on first write. Write failures are logged at ERROR and
+  never fatal.
+- **`retention_loop()`** — background coroutine; sleeps one hour, then calls
+  `prune()` in a thread. `prune()` reads the file, keeps lines whose `ts` is within
+  the retention window, and rewrites the file when any were dropped. Unparseable
+  lines are kept to avoid silent data loss.
+
+The `HubState` never performs file I/O directly. The sink is an injected
+callback, so unit tests can exercise routing without a real log file.
+
+JSONL record shape:
+
+```json
+{
+  "ts":        "<UTC ISO 8601 timestamp>",
+  "seq":       42,
+  "sender":    "project-a",
+  "recipient": "all",
+  "kind":      "message",
+  "content":   "...",
+  "meta":      {"id": "msg-...", "delivered_to": ["project-b"]}
+}
+```
+
+### Frontend build pipeline
+
+The dashboard source lives in `web/` (Vite + React + TypeScript + Tailwind CSS +
+shadcn/ui). Node is a **build-time-only** dependency — the hub has no Node runtime
+requirement.
+
+`npm run build` (run from `web/`) emits the compiled bundle into
+`src/caucus/ui/`, which is declared as package data in `pyproject.toml`. The hub
+mounts `src/caucus/ui/assets/` as a static directory under `/assets/` (using
+FastAPI `StaticFiles`) and serves `src/caucus/ui/index.html` from the `GET /`
+route. The built bundle is committed to the repository; source maps are gitignored.
+A CI step rebuilds and verifies the bundle is current.
+
+When `src/caucus/ui/assets/` does not exist (a source checkout that has not run
+`npm run build`), the static mount is skipped and `GET /` returns 404 — in that
+case the Vite dev server (`npm run dev` in `web/`) serves the SPA instead,
+proxying API calls to the hub.

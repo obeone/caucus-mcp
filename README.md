@@ -409,11 +409,56 @@ python smoke_test.py            # prints "ALL CHECKS PASSED" on success
 
 ---
 
+## 🖥️ Operator dashboard
+
+The hub serves a live operator dashboard at `/` — a four-panel SPA (Health,
+Flow, Channels, Forms) that replaces the legacy text console. It updates in
+real time over the same `/ui` WebSocket.
+
+### Build the dashboard (dev / source checkout only)
+
+The built assets are committed to the repo, so a normal `pip install` or
+`uvx` run gets the dashboard automatically. If you are working from source and
+want to rebuild:
+
+```bash
+cd web
+npm install
+npm run build    # emits bundle into src/caucus/ui/
+```
+
+Node is a build-time dependency only; the running hub has no Node requirement.
+
+### Open the dashboard
+
+Start the hub and open <http://127.0.0.1:8765/> (the hub launches it in your
+browser automatically unless you pass `--no-browser`).
+
+### Auth flags
+
+By default (localhost) auth is disabled — every browser connection is an
+operator. To require a token:
+
+```bash
+caucus-hub \
+  --operator-token <strong-secret> \   # read-write
+  --observer-token <read-only-secret>  # read-only (optional)
+```
+
+Env equivalents: `CAUCUS_OPERATOR_TOKEN`, `CAUCUS_OBSERVER_TOKEN`.
+
+The dashboard prompts for the token on connect when auth is enabled. An
+observer can watch the live feed but cannot issue any control commands.
+
+---
+
 ## 🔒 Security notes
 
 - The hub binds to `127.0.0.1` by default. **Keep it local**, or put it behind
-  your own authenticated reverse proxy before exposing it — there is no built-in
-  auth.
+  your own authenticated reverse proxy before exposing it.
+- When you expose the hub beyond localhost, set `--operator-token` to restrict
+  dashboard access — without it, every browser connection can pause, stop, or
+  kick peers.
 - State is in-memory and non-persistent by design.
 
 ---
