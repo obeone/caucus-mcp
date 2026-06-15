@@ -23,6 +23,19 @@ def _register(client: TestClient, project: str) -> str:
     return str(resp.json()["token"])
 
 
+def _drain_ui_until(ws: object, event_type: str) -> dict[str, object]:
+    """Read ``/ui`` events until one of ``event_type`` arrives (bounded).
+
+    Tolerates the periodic ``health`` tick (and any other interleaved event)
+    that the hub fans out while a UI socket is connected.
+    """
+    for _ in range(30):
+        event = ws.receive_json()  # type: ignore[attr-defined]
+        if event.get("type") == event_type:
+            return dict(event)
+    raise AssertionError(f"no {event_type!r} event arrived")
+
+
 # --- registration & peers ------------------------------------------------
 
 
@@ -420,6 +433,7 @@ def test_operator_can_speak_into_a_channel(client: TestClient) -> None:
     client.post("/channels/join", json={"token": token, "channel": "#ops"})
 
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"say": "operator here", "to": "#ops"})
 
@@ -503,6 +517,7 @@ def test_reset_returns_to_running(client: TestClient, state: HubState) -> None:
 
 def test_ui_socket_primes_snapshot(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         snap = ws.receive_json()
     assert snap["type"] == "snapshot"
     assert snap["mode"] == "running"
@@ -511,15 +526,16 @@ def test_ui_socket_primes_snapshot(client: TestClient) -> None:
 
 def test_ui_socket_receives_mode_change(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"action": "pause"})
-        events = [ws.receive_json(), ws.receive_json()]
-    modes = [e for e in events if e["type"] == "mode"]
-    assert modes and modes[0]["mode"] == "paused"
+        mode_event = _drain_ui_until(ws, "mode")
+    assert mode_event["mode"] == "paused"
 
 
 def test_ui_socket_operator_say_is_broadcast(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"say": "stand down", "to": "all"})
         event = ws.receive_json()
@@ -530,15 +546,16 @@ def test_ui_socket_operator_say_is_broadcast(client: TestClient) -> None:
 
 def test_ui_socket_sees_peer_join(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         client.post("/register", json={"project": "alpha"})
-        events = [ws.receive_json(), ws.receive_json()]
-    types = {e["type"] for e in events}
-    assert "peers" in types
+        peers_event = _drain_ui_until(ws, "peers")
+    assert any(p["name"] == "alpha" for p in peers_event["peers"])
 
 
 def test_ui_socket_snapshot_includes_channels(client: TestClient) -> None:
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         snap = ws.receive_json()
     assert snap["channels"] == {}
 
@@ -546,12 +563,12 @@ def test_ui_socket_snapshot_includes_channels(client: TestClient) -> None:
 def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
     token = _register(client, "alpha")
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         client.post("/channels/join", json={"token": token, "channel": "#x"})
         # subscribe announces a system message and pushes the channel map.
-        events = [ws.receive_json(), ws.receive_json()]
-    channels_events = [e for e in events if e["type"] == "channels"]
-    assert channels_events and channels_events[0]["channels"] == {
+        channels_event = _drain_ui_until(ws, "channels")
+    assert channels_event["channels"] == {
         "#x": {"topic": None, "members": ["alpha"]}
     }
 
@@ -693,6 +710,7 @@ def test_ui_answer_round_trip_reaches_asker(client: TestClient) -> None:
     ).json()["form_id"]
 
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
 
@@ -713,6 +731,7 @@ def test_ui_cancel_form_notifies_asker(client: TestClient) -> None:
     ).json()["form_id"]
 
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"cancel_form": form_id})
 
