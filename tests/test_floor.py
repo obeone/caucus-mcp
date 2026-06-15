@@ -251,6 +251,7 @@ def test_floor_endpoint_validates_scope(client: TestClient) -> None:
 def test_floor_event_and_operator_clear_over_ui(client: TestClient) -> None:
     holder = _register(client, "alice")
     with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
         # Taking the floor emits a floor event carrying the active stick.
         client.post(

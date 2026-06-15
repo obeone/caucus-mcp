@@ -8,9 +8,12 @@ All mutation goes through this object so the FastAPI layer stays thin.
 from __future__ import annotations
 
 import asyncio
+import resource
 import secrets
+import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -63,6 +66,17 @@ class Client:
         status_ts: When :attr:`status` was last set, or ``None`` while unset.
             Lets a pinging peer judge how fresh the status is (a stale line is a
             hint the agent may be heads-down and not updating it).
+        first_seen: When this client record was first created. Basis for the
+            dashboard's ``uptime`` figure; unlike :attr:`last_seen` it never
+            moves, so it survives revival (the same record is reused).
+        msg_count: How many messages this client has *sent* — incremented in
+            :meth:`HubState.route` when the client is the sender. Surfaced as
+            ``msg_count`` in the dashboard's ``PeerInfo``.
+        paused: Operator pause flag. While ``True`` the peer's ``/receive``
+            long-poll holds its queue (a per-peer analogue of the global
+            transmit gate) so delivery is withheld until the operator resumes
+            it. The peer keeps polling, so it is not reaped and its queued
+            messages survive a reap and are replayed on revival.
     """
 
     project: str
@@ -77,6 +91,9 @@ class Client:
     unacked: deque[Message] = field(default_factory=lambda: deque(maxlen=200))
     status: str | None = None
     status_ts: float | None = None
+    first_seen: float = field(default_factory=time.time)
+    msg_count: int = 0
+    paused: bool = False
 
 
 class RegisterOutcome(str, Enum):
@@ -172,6 +189,16 @@ class HubState:
         self._forms: dict[str, Form] = {}  # form id -> pending Form
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
+        # Hub start time — basis for the dashboard's hub-uptime figure.
+        self._started_at: float = time.time()
+        # Rolling window of send timestamps (one per routed agent/operator
+        # message) used to compute msg_per_min over the last 60 seconds. Old
+        # entries are evicted lazily in :meth:`health`.
+        self._send_times: deque[float] = deque()
+        # Optional sink invoked once per routed message, set by the hub when
+        # disk logging is enabled. Kept as a plain callback so this in-memory
+        # state never performs file I/O and unit tests stay pure.
+        self._log_sink: Callable[[Message, list[str]], None] | None = None
         self._mode: ControlMode = ControlMode.RUNNING
         self._transmit = asyncio.Event()
         self._transmit.set()
@@ -201,6 +228,25 @@ class HubState:
     def transmit(self) -> asyncio.Event:
         """Event that is set while transmission is allowed (i.e. not paused)."""
         return self._transmit
+
+    @property
+    def started_at(self) -> float:
+        """Unix timestamp when this hub state was created (uptime basis)."""
+        return self._started_at
+
+    def set_log_sink(
+        self, sink: Callable[[Message, list[str]], None] | None
+    ) -> None:
+        """Install (or clear) the per-message disk-log sink.
+
+        The sink is invoked from :meth:`route` with the routed message and the
+        list of recipient project names. It must never block (the hub feeds an
+        ``asyncio.Queue`` and drains it on a background writer), so the routing
+        path stays non-blocking. Passing ``None`` disables logging. Keeping the
+        sink as an injected callback means this in-memory state performs no file
+        I/O of its own, so unit tests can exercise routing without a log file.
+        """
+        self._log_sink = sink
 
     def peers(self) -> list[str]:
         """Return the names of all connected projects."""
@@ -317,7 +363,7 @@ class HubState:
         self._clients[project] = client
         self._by_token[client.token] = client
         self._announce_system(f"{project} joined")
-        self._push_ui({"type": "peers", "peers": self.peers()})
+        self._push_ui({"type": "peers", "peers": self.peers_info()})
         return Registration(RegisterOutcome.FRESH, client)
 
     def kick(self, project: str) -> bool:
@@ -391,7 +437,7 @@ class HubState:
         else:
             self._reaped_by_project.pop(client.project, None)
         self._announce_system(f"{client.project} {reason}")
-        self._push_ui({"type": "peers", "peers": self.peers()})
+        self._push_ui({"type": "peers", "peers": self.peers_info()})
         if had_channels:
             self._prune_topics()  # forget topics of any channel this emptied
             self._push_ui({"type": "channels", "channels": self.channels()})
@@ -479,7 +525,7 @@ class HubState:
         # receives the notice, which is harmless and informative.
         self.route(notice)
 
-        self._push_ui({"type": "peers", "peers": self.peers()})
+        self._push_ui({"type": "peers", "peers": self.peers_info()})
         if client.channels:
             self._push_ui({"type": "channels", "channels": self.channels()})
         return client
@@ -650,6 +696,197 @@ class HubState:
             }
         return {"peer": name, "state": "absent", "present": False}
 
+    # --- dashboard: rich roster, pause, health ---------------------------
+
+    def peer_info(self, name: str, *, now: float | None = None) -> dict[str, object] | None:
+        """Build the dashboard ``PeerInfo`` for one peer, or ``None`` if absent.
+
+        Extends the liveness probe :meth:`ping` with the dashboard-only fields
+        (``uptime``, ``msg_count``, ``paused``) so the operator console gets a
+        single rich record per peer. The shared liveness shape is reused so the
+        two never drift: ``state``, ``listening``, ``status``, ``status_age``
+        and ``last_seen_age`` all come straight from :meth:`ping`. A peer that
+        is neither live nor reaped yields ``None`` (it is simply not listed).
+
+        Args:
+            name: The project name to describe.
+            now: Reference timestamp (defaults to :func:`time.time`); injectable
+                for deterministic tests.
+
+        Returns:
+            A JSON-friendly ``PeerInfo`` dict, or ``None`` when ``name`` has no
+            live or reaped record.
+        """
+        ref = time.time() if now is None else now
+        probe = self.ping(name, now=ref)
+        if probe["state"] == "absent":
+            return None
+        client = self._clients.get(name) or self._reaped_by_project.get(name)
+        assert client is not None  # state is live or reaped, so a record exists
+        return {
+            "name": name,
+            "state": probe["state"],
+            "listening": probe["listening"],
+            "paused": client.paused,
+            "status": probe["status"],
+            "status_age": probe["status_age"],
+            "last_seen_age": probe["last_seen_age"],
+            "uptime": round(ref - client.first_seen, 1),
+            "msg_count": client.msg_count,
+        }
+
+    def peers_info(self, *, now: float | None = None) -> list[dict[str, object]]:
+        """Return rich ``PeerInfo`` for every live and reaped peer, sorted by name.
+
+        Live peers are listed first by name, then reaped-but-revivable ones, so
+        the dashboard roster shows the active room above the graveyard. Each
+        entry is the :meth:`peer_info` shape.
+
+        Args:
+            now: Reference timestamp (defaults to :func:`time.time`); injectable
+                for deterministic tests.
+
+        Returns:
+            A list of ``PeerInfo`` dicts, live peers first then reaped, each
+            group sorted by project name.
+        """
+        ref = time.time() if now is None else now
+        names = sorted(self._clients) + sorted(self._reaped_by_project)
+        infos: list[dict[str, object]] = []
+        for name in names:
+            info = self.peer_info(name, now=ref)
+            if info is not None:
+                infos.append(info)
+        return infos
+
+    def pause_peer(self, name: str) -> bool:
+        """Withhold delivery of one peer's queue until it is resumed.
+
+        Sets the per-peer pause flag so the peer's ``/receive`` long-poll holds
+        its queue (a scoped analogue of the global transmit gate). The peer
+        stays connected and keeps polling, so its ``last_seen`` stays fresh and
+        it is not reaped; any messages routed to it queue up and are released on
+        :meth:`resume_peer`. Pushes a refreshed ``peers`` event. A redundant
+        pause is a no-op success.
+
+        Args:
+            name: The project name of the peer to pause.
+
+        Returns:
+            ``True`` if a live peer with that name was found, ``False`` otherwise.
+        """
+        client = self._clients.get(name)
+        if client is None:
+            return False
+        if not client.paused:
+            client.paused = True
+            self._announce_system(f"⏸ {name} paused by operator")
+            self._push_ui({"type": "peers", "peers": self.peers_info()})
+        return True
+
+    def resume_peer(self, name: str) -> bool:
+        """Release a paused peer's held queue.
+
+        Clears the per-peer pause flag set by :meth:`pause_peer`; the peer's
+        next ``/receive`` poll drains whatever queued while it was held. Pushes
+        a refreshed ``peers`` event. A redundant resume is a no-op success.
+
+        Args:
+            name: The project name of the peer to resume.
+
+        Returns:
+            ``True`` if a live peer with that name was found, ``False`` otherwise.
+        """
+        client = self._clients.get(name)
+        if client is None:
+            return False
+        if client.paused:
+            client.paused = False
+            self._announce_system(f"▶ {name} resumed by operator")
+            self._push_ui({"type": "peers", "peers": self.peers_info()})
+        return True
+
+    def close_channel(self, name: str) -> bool:
+        """Force a channel closed: unsubscribe all members and announce it.
+
+        The operator's channel sweep. Every member is force-unsubscribed, the
+        channel's topic is pruned, and any talking stick held on the channel
+        scope is relinquished via the normal :meth:`_relinquish_floor` path (the
+        floor is never frozen — it is passed on or put away). A system notice is
+        announced and a refreshed ``channels`` event is pushed.
+
+        **Non-sticky:** there is no registry and membership is self-served, so a
+        closed channel may immediately re-form if an agent sends to it or joins
+        it again. This is a one-shot sweep plus a notice, not a permanent ban.
+
+        Args:
+            name: The ``#``-prefixed channel name to close.
+
+        Returns:
+            ``True`` if the channel had at least one member (it was closed),
+            ``False`` if no such channel was open.
+        """
+        members = [c for c in self._clients.values() if name in c.channels]
+        if not members:
+            return False
+        for client in members:
+            client.channels.discard(name)
+        self._prune_topics()  # the channel is now empty: forget its topic
+        # No member is left to hold a stick on this scope, so release any floor
+        # on it outright via the operator force-close path — never freeze it.
+        self.clear_floor(name)
+        self._announce_system(f"🚪 channel {name} closed by operator")
+        self._push_ui({"type": "channels", "channels": self.channels()})
+        return True
+
+    def health(self, *, now: float | None = None) -> dict[str, object]:
+        """Build the dashboard ``Health`` dict from in-memory bookkeeping.
+
+        Composes hub uptime, the live peer count, the rolling messages-per-
+        minute rate (routed messages whose timestamp falls in the last 60s),
+        the aggregate pending queue depth across every live and reaped peer, and
+        a best-effort resident-set size via :func:`resource.getrusage`. Old
+        entries in the rolling send-timestamp window are evicted here.
+
+        Args:
+            now: Reference timestamp (defaults to :func:`time.time`); injectable
+                for deterministic tests.
+
+        Returns:
+            A JSON-friendly ``Health`` dict with ``uptime``, ``peer_count``,
+            ``msg_per_min``, ``queue_depth`` and ``mem_rss_mb``.
+        """
+        ref = time.time() if now is None else now
+        cutoff = ref - 60.0
+        while self._send_times and self._send_times[0] < cutoff:
+            self._send_times.popleft()
+        queue_depth = sum(c.queue.qsize() for c in self._recipients())
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # ru_maxrss is kilobytes on Linux, bytes on macOS/BSD. Normalise to MB
+        # by sniffing the platform so the figure is comparable across hosts.
+        rss_bytes = usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
+        return {
+            "uptime": round(ref - self._started_at, 1),
+            "peer_count": len(self._clients),
+            "msg_per_min": len(self._send_times),
+            "queue_depth": queue_depth,
+            "mem_rss_mb": round(rss_bytes / (1024 * 1024), 1),
+        }
+
+    def push_health(self) -> None:
+        """Fan a fresh ``health`` event (with the rich roster) to UI listeners.
+
+        Builds one :meth:`health` block and one :meth:`peers_info` roster and
+        pushes them as a single ``health`` event. A no-op when no UI listener is
+        connected, so an idle hub's periodic tick does no needless work. Called
+        by the hub's background health loop.
+        """
+        if not self._ui:
+            return
+        self._push_ui(
+            {"type": "health", "health": self.health(), "peers": self.peers_info()}
+        )
+
     # --- messaging -------------------------------------------------------
 
     def _recipients(self) -> list[Client]:
@@ -703,6 +940,14 @@ class HubState:
         self._log.append(msg)
         self._push_ui({"type": "message", "message": msg.to_public()})
 
+        # Per-sender send counter and the rolling msg/min window. Both track
+        # *every* routed message (agent chatter, operator input, system
+        # notices); the sender counter only advances for a known live client.
+        self._send_times.append(msg.ts)
+        sender_client = self._clients.get(msg.sender)
+        if sender_client is not None:
+            sender_client.msg_count += 1
+
         if msg.recipient == BROADCAST:
             targets = [
                 c for c in self._recipients() if c.project != msg.sender
@@ -723,7 +968,12 @@ class HubState:
 
         for client in targets:
             client.queue.put_nowait(msg)
-        return [c.project for c in targets]
+        delivered = [c.project for c in targets]
+        # Feed the optional disk-log sink last, once routing is settled. The
+        # sink only enqueues onto an asyncio.Queue, so this never blocks.
+        if self._log_sink is not None:
+            self._log_sink(msg, delivered)
+        return delivered
 
     def subscribe(self, token: str, channel: str) -> bool:
         """Subscribe the token holder to ``channel`` (idempotent self-join).
@@ -1309,13 +1559,20 @@ class HubState:
     # --- UI fan-out ------------------------------------------------------
 
     def add_ui(self) -> asyncio.Queue[dict[str, object]]:
-        """Register a UI listener queue and prime it with current state."""
+        """Register a UI listener queue and prime it with current state.
+
+        The priming ``snapshot`` carries the rich ``peers`` roster
+        (:meth:`peers_info`) and the current ``health`` block in addition to the
+        mode, channels, floors, forms and recent log, matching the dashboard
+        protocol's extended snapshot.
+        """
         q: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self._ui.add(q)
         q.put_nowait({"type": "snapshot", "mode": self._mode.value,
-                      "peers": self.peers(), "channels": self.channels(),
+                      "peers": self.peers_info(), "channels": self.channels(),
                       "floors": self.floors_public(),
-                      "forms": self.list_forms(), "log": self.recent()})
+                      "forms": self.list_forms(), "log": self.recent(),
+                      "health": self.health()})
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:
