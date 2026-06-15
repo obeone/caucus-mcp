@@ -197,23 +197,31 @@ export default function App() {
         <FloorStrip />
 
         {/* ── Panel tabs ───────────────────────────────────────────────── */}
+        {/*
+          ARIA structure: the outer <nav> is the landmark; the inner <div
+          role="tablist"> contains ONLY the <button role="tab"> children so
+          aria-required-children is satisfied.  The help-icon buttons are
+          siblings of the tablist (inside the nav) so they don't pollute the
+          tablist's allowed-children set.
+        */}
         <nav
-          className="flex gap-0 border-b border-line bg-panel flex-shrink-0"
+          className="flex gap-0 border-b border-line bg-panel flex-shrink-0 relative"
           aria-label="Dashboard panels"
         >
-          {(
-            [
-              { id: "health", label: "Health" },
-              { id: "flow", label: "Flow" },
-              { id: "channels", label: "Channels" },
-              {
-                id: "forms",
-                label: `Forms${pendingForms.length > 0 ? ` (${pendingForms.length})` : ""}`,
-              },
-            ] as { id: ActivePanel; label: string }[]
-          ).map(({ id, label }) => (
-            <div key={id} className="flex items-center relative">
+          <div role="tablist" className="flex">
+            {(
+              [
+                { id: "health", label: "Health" },
+                { id: "flow", label: "Flow" },
+                { id: "channels", label: "Channels" },
+                {
+                  id: "forms",
+                  label: `Forms${pendingForms.length > 0 ? ` (${pendingForms.length})` : ""}`,
+                },
+              ] as { id: ActivePanel; label: string }[]
+            ).map(({ id, label }) => (
               <button
+                key={id}
                 role="tab"
                 aria-selected={activePanel === id}
                 onClick={() => setActivePanel(id)}
@@ -229,21 +237,26 @@ export default function App() {
               >
                 {label}
               </button>
+            ))}
+          </div>
 
-              {/* Context-help "?" affordance */}
+          {/* Context-help "?" affordances — outside tablist so ARIA is satisfied */}
+          <div className="flex items-center">
+            {(["health", "flow", "channels", "forms"] as ActivePanel[]).map((id) => (
               <button
+                key={id}
                 onMouseEnter={() => setHelpTooltip(PANEL_HELP[id])}
                 onMouseLeave={() => setHelpTooltip(null)}
                 onFocus={() => setHelpTooltip(PANEL_HELP[id])}
                 onBlur={() => setHelpTooltip(null)}
-                className="mr-1 text-dim/40 hover:text-dim transition-colors"
+                className="px-1 text-dim/40 hover:text-dim transition-colors"
                 aria-label={`Help for ${id} panel`}
                 tabIndex={0}
               >
                 <HelpCircle size={11} aria-hidden="true" />
               </button>
-            </div>
-          ))}
+            ))}
+          </div>
 
           {/* Help tooltip */}
           {helpTooltip && (
