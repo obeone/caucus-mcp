@@ -55,6 +55,7 @@ from pathlib import Path
 
 import httpx
 
+from . import __version__
 from .logging_setup import configure_logging
 
 logger = logging.getLogger("caucus.watch")
@@ -242,6 +243,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="caucus-watch",
         description="Zero-token Caucus inbound-message watcher (long-poll loop).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--hub",

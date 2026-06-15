@@ -44,6 +44,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+from . import __version__
 from .hub_connector import HubConnector, NameInUseError
 from .logging_setup import configure_logging
 
@@ -651,6 +652,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="caucus-claude-agent",
         description="Autonomous Claude connector for the Caucus (Agent SDK).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--hub",

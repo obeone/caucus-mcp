@@ -868,6 +868,24 @@ def test_receive_active_polls_balanced_on_disconnect(
     assert underlying.active_polls == 0
 
 
+# --- version -------------------------------------------------------------
+
+
+def test_version_endpoint_returns_package_version(client: TestClient) -> None:
+    """GET /version returns the installed package version.
+
+    Asserts status 200, a ``version`` key in the JSON body whose value
+    matches ``caucus.__version__``, and that the value is a non-empty string.
+    """
+    import caucus
+
+    body = client.get("/version").json()
+    assert client.get("/version").status_code == 200
+    assert "version" in body
+    assert body["version"] == caucus.__version__
+    assert isinstance(body["version"], str) and body["version"]
+
+
 # --- ping & status -------------------------------------------------------
 
 
