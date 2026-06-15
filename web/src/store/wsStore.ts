@@ -262,6 +262,9 @@ export const useDashStore = create<InternalState>()((set, get) => ({
     const url = wsUrl();
     const ws = new WebSocket(url);
     set({ _ws: ws, connectionState: "connecting" });
+    // Expose for E2E tests so Playwright can force-close the socket.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__CAUCUS_WS__ = ws;
 
     ws.onopen = () => {
       // Send auth frame if a token is configured.
@@ -342,5 +345,9 @@ if (useDashStore.getState().darkMode) {
 } else {
   document.documentElement.classList.remove("dark");
 }
+
+// Expose the store on window so E2E tests can reach store actions directly.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(window as any).__CAUCUS_STORE__ = useDashStore;
 
 useDashStore.getState()._initWs();
