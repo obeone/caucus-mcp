@@ -1,6 +1,6 @@
 [project]
 name = "caucus-mcp"
-version = "0.20.0"
+version = "1.0.0"
 description = "Central hub + MCP bridge letting multiple agents (any MCP client) talk to each other under human supervision."
 readme = "README.md"
 requires-python = ">=3.10"
