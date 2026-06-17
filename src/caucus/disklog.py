@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +59,13 @@ class DiskLog:
             periodic retention sweep.
         dropped: Running count of records dropped under backpressure, surfaced in
             the warning logged on each drop.
+
+    Notes:
+        Both :meth:`_append` and :meth:`prune` mutate :attr:`path` from worker
+        threads (dispatched via :func:`asyncio.to_thread`). A ``threading.Lock``
+        — not an ``asyncio.Lock`` — serialises those two operations so an append
+        can never interleave with the prune rewrite (which would otherwise lose
+        the appended line, a classic lost-update race).
     """
 
     def __init__(
@@ -80,6 +90,11 @@ class DiskLog:
         self.dropped = 0
         self._queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=max_queue)
         self._retention_interval = retention_interval
+        # Guards the file against concurrent mutation. _append (background
+        # writer) and prune (retention sweep) both run in worker threads, so a
+        # threading.Lock — held only across the actual file I/O — keeps an
+        # append from landing between prune's read and its atomic replace.
+        self._file_lock = threading.Lock()
 
     def enqueue(self, msg: Message, recipients: list[str]) -> None:
         """Queue one routed message for the background writer (never blocks).
@@ -114,11 +129,18 @@ class DiskLog:
                 pass
 
     def _append(self, record: dict[str, object]) -> None:
-        """Append one record as a JSON line; log (never raise) on failure."""
+        """Append one record as a JSON line; log (never raise) on failure.
+
+        Held under :attr:`_file_lock` so the append cannot interleave with a
+        concurrent :meth:`prune` rewrite (which would otherwise drop this line).
+        """
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # Serialise against prune's read-modify-replace; the critical
+            # section is just the single append write.
+            with self._file_lock:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:  # pragma: no cover - disk error path
             logger.exception("failed to append to disk log %s", self.path)
 
@@ -141,6 +163,19 @@ class DiskLog:
         silent data loss), and rewrites the file when anything was dropped. A
         missing file is a no-op. Failures are logged, never raised.
 
+        Durability: the rewrite is performed via a write-temp-then-atomic-replace
+        sequence rather than truncating the live file in place. The pruned
+        content is written to a sibling temp file in the same directory (so the
+        final :func:`os.replace` is atomic on one filesystem), fsynced, and only
+        then swapped over the original. A crash, OOM-kill, or ``ENOSPC`` mid-write
+        therefore leaves the existing transcript fully intact — the original is
+        never observed empty or half-written. On any failure the temp file is
+        removed and the original is left untouched.
+
+        Concurrency: the whole read-modify-replace runs under
+        :attr:`_file_lock`, so a concurrent :meth:`_append` cannot land between
+        the read and the replace (which would silently lose the appended line).
+
         Args:
             now: Reference Unix timestamp (defaults to the current time);
                 injectable for deterministic tests.
@@ -152,37 +187,76 @@ class DiskLog:
             now, tz=timezone.utc
         )
         cutoff = ref.timestamp() - self.retention_hours * 3600.0
-        try:
-            if not self.path.is_file():
-                return 0
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:  # pragma: no cover - disk error path
-            logger.exception("failed to read disk log %s for pruning", self.path)
-            return 0
-        kept: list[str] = []
-        dropped = 0
-        for line in lines:
-            if not line.strip():
-                continue
+        # Hold the lock across read -> filter -> atomic replace so no append can
+        # slip in between the read and the swap and be dropped on the floor.
+        with self._file_lock:
             try:
-                ts_raw = json.loads(line)["ts"]
-                ts = datetime.fromisoformat(str(ts_raw)).timestamp()
-            except (ValueError, KeyError, TypeError):
-                kept.append(line)  # keep anything we cannot date
-                continue
-            if ts >= cutoff:
-                kept.append(line)
-            else:
-                dropped += 1
-        if dropped:
-            try:
-                self.path.write_text(
-                    "\n".join(kept) + ("\n" if kept else ""), encoding="utf-8"
-                )
+                if not self.path.is_file():
+                    return 0
+                lines = self.path.read_text(encoding="utf-8").splitlines()
             except OSError:  # pragma: no cover - disk error path
-                logger.exception("failed to rewrite disk log %s after pruning", self.path)
+                logger.exception("failed to read disk log %s for pruning", self.path)
                 return 0
+            kept: list[str] = []
+            dropped = 0
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    ts_raw = json.loads(line)["ts"]
+                    ts = datetime.fromisoformat(str(ts_raw)).timestamp()
+                except (ValueError, KeyError, TypeError):
+                    kept.append(line)  # keep anything we cannot date
+                    continue
+                if ts >= cutoff:
+                    kept.append(line)
+                else:
+                    dropped += 1
+            if dropped:
+                self._atomic_rewrite(
+                    "\n".join(kept) + ("\n" if kept else "")
+                )
         return dropped
+
+    def _atomic_rewrite(self, content: str) -> None:
+        """Replace :attr:`path` with ``content`` durably and atomically.
+
+        Writes ``content`` to a sibling temp file in the same directory, flushes
+        and ``fsync``s it to disk, then :func:`os.replace`s it over the original
+        in a single atomic rename. The original is only swapped at that final
+        step, so any failure before it leaves the existing log intact; the temp
+        file is always cleaned up on error. Logged, never raised (preserves the
+        non-fatal contract of the caller).
+
+        Args:
+            content: The full file contents to atomically install in place.
+        """
+        try:
+            # Same directory as the target so os.replace stays on one
+            # filesystem and is therefore atomic.
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.path.parent), prefix=self.path.name + ".", suffix=".tmp"
+            )
+        except OSError:  # pragma: no cover - disk error path
+            logger.exception("failed to create temp file for disk log %s", self.path)
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                # Force the data to stable storage before the swap so a crash
+                # right after os.replace can't surface an empty/partial file.
+                os.fsync(handle.fileno())
+            # Atomic on the same filesystem: readers see either the old file or
+            # the fully-written new one, never an intermediate truncated state.
+            os.replace(tmp_name, self.path)
+        except OSError:  # pragma: no cover - disk error path
+            logger.exception("failed to rewrite disk log %s after pruning", self.path)
+            # The original was never touched; drop the half-written temp file.
+            try:
+                os.unlink(tmp_name)
+            except OSError:  # pragma: no cover - best-effort cleanup
+                pass
 
     async def retention_loop(self) -> None:
         """Periodically prune old lines (sibling to the hub's reaper loop)."""
