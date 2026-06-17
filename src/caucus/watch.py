@@ -57,6 +57,7 @@ import httpx
 
 from . import __version__
 from .logging_setup import configure_logging
+from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.watch")
 
@@ -190,7 +191,16 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 continue
 
             backoff = _BACKOFF_MIN
-            payload = resp.json()
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                # A proxy or misbehaving hub can return an HTML/empty 200; treat
+                # a decode failure like any other transient error so the loop
+                # retries rather than crashing the watcher with a traceback.
+                logger.warning("non-JSON response body (%s); retrying in %.0fs", exc, backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _BACKOFF_MAX)
+                continue
             emitted, stop = _drain(payload)
             if emitted:
                 # ACK the highest seq we just emitted so the hub does not
@@ -271,6 +281,11 @@ def main() -> None:
         help="Per-poll long-poll ceiling in seconds (default: %(default)s).",
     )
     args = parser.parse_args()
+
+    try:
+        validate_hub_url(args.hub)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # stderr keeps stdout clean (the agent's signal channel); configure_logging
     # also silences httpx so the token in the /receive URL never hits stderr.
