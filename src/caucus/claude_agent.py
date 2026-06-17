@@ -45,9 +45,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+import httpx
+
 from . import __version__
 from .hub_connector import HubConnector, NameInUseError
 from .logging_setup import configure_logging
+from .urlguard import validate_hub_url
 
 try:
     from claude_agent_sdk import (
@@ -66,6 +69,12 @@ logger = logging.getLogger("caucus.claude")
 
 # Default per-poll long-poll ceiling, kept under the connector's HTTP timeout.
 DEFAULT_POLL_TIMEOUT = 25.0
+
+# Backoff bounds (seconds) for transient hub errors in the receive loop, so a
+# flapping or restarting hub does not spin the loop hot nor kill the agent
+# permanently (mirrors the watcher's bounds in :mod:`caucus.watch`).
+_BACKOFF_MIN = 1.0
+_BACKOFF_MAX = 15.0
 
 # The in-process caucus MCP tools — the room-facing surface every agent type
 # keeps, whatever else it is allowed to do.
@@ -428,6 +437,15 @@ async def _run_loop(
     the agent is reasoning the loop is not polling, so concurrent inbound
     messages simply buffer hub-side and are picked up on the next poll.
 
+    Availability: a transient hub failure (restart, 5xx, dropped connection,
+    read timeout) surfaces as :class:`httpx.HTTPError` from
+    :meth:`HubConnector.receive`. Left unguarded it would propagate out of
+    ``asyncio.run`` and kill the agent permanently. Instead we catch it and
+    retry with bounded exponential backoff (``_BACKOFF_MIN`` floor, doubling up
+    to ``_BACKOFF_MAX``, reset on a successful poll), so the agent rides out a
+    hub hiccup rather than dying on it. Non-``httpx`` errors still propagate, and
+    ``KeyboardInterrupt`` is unaffected.
+
     Args:
         client: The SDK client driving the conversation.
         connector: The hub connector to poll and (implicitly, via tools) send on.
@@ -440,8 +458,21 @@ async def _run_loop(
             client,
             f"[caucus mission]\n{mission}\n\nOpen the exchange using the say tool.",
         )
+    backoff = _BACKOFF_MIN
     while True:
-        inbound = await connector.receive(token, poll_timeout)
+        try:
+            inbound = await connector.receive(token, poll_timeout)
+        except httpx.HTTPError as exc:
+            # Transient hub error: warn, back off, and retry instead of letting
+            # the exception escape and end the session for good.
+            logger.warning(
+                "receive failed (%s); retrying in %.0fs", exc, backoff
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, _BACKOFF_MAX)
+            continue
+        # A clean poll means the hub is healthy again — drop back to the floor.
+        backoff = _BACKOFF_MIN
         if inbound.stop:
             logger.warning("operator stopped the room; ending session")
             return
@@ -810,6 +841,16 @@ def main() -> None:
             "worker agents may not run with bypassPermissions/dontAsk: these "
             "remove the only guardrail against peer-injected tool use"
         )
+
+    # Fail closed on the destination too. The hub URL (from --hub or the
+    # CAUCUS_HUB_URL default) is where the access token and every message body
+    # are POSTed, so a plain-http URL to a non-loopback host would leak both in
+    # cleartext. validate_hub_url refuses that unless CAUCUS_ALLOW_REMOTE_HUB is
+    # set; surface the rejection as a clean argparse error rather than a traceback.
+    try:
+        validate_hub_url(args.hub)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # configure_logging silences httpx too, keeping the token out of stderr.
     configure_logging(sys.stderr)
