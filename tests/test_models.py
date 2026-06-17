@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from caucus.models import (
     BROADCAST,
+    RESERVED_NAMES,
     AskRequest,
     ChannelRequest,
     ChannelTopicRequest,
@@ -55,7 +56,37 @@ def test_to_public_shape_and_enum_serialisation() -> None:
         "kind": "control",  # serialised to the enum *value*, not the member
         "ts": msg.ts,
         "seq": 0,  # unrouted message; route() stamps the hub-assigned value
+        "origin": "agent",  # default; hub/operator paths set this explicitly
     }
+
+
+def test_message_origin_defaults_to_agent() -> None:
+    msg = Message(sender="alice", recipient="all", content="hi")
+    assert msg.origin == "agent"
+    assert msg.to_public()["origin"] == "agent"
+
+
+def test_message_origin_can_be_set_to_trusted_values() -> None:
+    op_msg = Message(sender="human", recipient="all", content="pause", origin="operator")
+    assert op_msg.origin == "operator"
+    hub_msg = Message(sender="hub", recipient="all", content="notice", origin="hub")
+    assert hub_msg.origin == "hub"
+
+
+def test_reserved_names_constant_covers_control_plane() -> None:
+    # The frozenset must cover the three identities used by the control plane.
+    assert RESERVED_NAMES >= {"human", "hub", "system"}
+
+
+def test_register_request_rejects_reserved_names() -> None:
+    for bad in ("human", "Human", " HUB ", "SYSTEM", "hub", "system"):
+        with pytest.raises(ValidationError, match="project name is reserved"):
+            RegisterRequest(project=bad)
+
+
+def test_register_request_accepts_normal_names() -> None:
+    req = RegisterRequest(project="agent-x")
+    assert req.project == "agent-x"
 
 
 def test_control_mode_values() -> None:
