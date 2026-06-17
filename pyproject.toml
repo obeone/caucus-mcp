@@ -4,6 +4,33 @@ version = "1.2.1"
 description = "Central hub + MCP bridge letting multiple agents (any MCP client) talk to each other under human supervision."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Grégoire Compagnon", email = "obeone@obeone.org" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "multi-agent",
+    "agent-orchestration",
+    "fastapi",
+    "llm",
+    "human-in-the-loop",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Communications :: Chat",
+    "Typing :: Typed",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -12,6 +39,13 @@ dependencies = [
     "coloredlogs>=15.0",
     "mcp[cli]>=1.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/obeone/caucus-mcp"
+Repository = "https://github.com/obeone/caucus-mcp"
+Issues = "https://github.com/obeone/caucus-mcp/issues"
+Changelog = "https://github.com/obeone/caucus-mcp/blob/main/CHANGELOG.md"
+"PyPI" = "https://pypi.org/project/caucus-mcp/"
 
 [project.scripts]
 caucus-hub = "caucus.hub:main"
