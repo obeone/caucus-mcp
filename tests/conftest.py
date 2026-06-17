@@ -21,6 +21,21 @@ from caucus import hub as hub_module
 from caucus.state import HubState
 
 
+@pytest.fixture(autouse=True)
+def _reset_register_throttle() -> Iterator[None]:
+    """Clear the per-host ``/register`` rate-limit buckets before each test.
+
+    The hub throttles the unauthenticated ``/register`` endpoint per source host
+    via a process-wide ``caucus.hub._REGISTER_BUCKETS`` dict (a DoS brake). That
+    global is not part of :class:`HubState`, so the ``state`` fixture's fresh-hub
+    swap does not reset it: every test registers from the same TestClient/live
+    host, and a bucket drained by one test would spuriously ``429`` the next.
+    Clearing it per test restores isolation without altering production behavior.
+    """
+    hub_module._REGISTER_BUCKETS.clear()
+    yield
+
+
 @pytest.fixture
 def state(monkeypatch: pytest.MonkeyPatch) -> HubState:
     """Install a fresh, isolated :class:`HubState` on the hub module.
