@@ -25,10 +25,13 @@ Configuration via environment variables:
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import logging
 import os
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -36,6 +39,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import __version__
 from .logging_setup import configure_logging
+from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.bridge")
 
@@ -70,7 +74,8 @@ _token: str | None = None
 _joined_as: str | None = None
 
 # Path of the 0600 token file written by :func:`watch_command` for the
-# background watcher, cleaned up by :func:`leave`. ``None`` when none is live.
+# background watcher (an unpredictable mkstemp name), cleaned up by
+# :func:`leave`. ``None`` when none is live.
 _token_file: str | None = None
 
 # Flipped by :func:`setup`. The active tools refuse until then, so the agent
@@ -93,6 +98,47 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=HUB_URL, timeout=35.0)
 
 
+# Type of an MCP tool body: takes any args, returns the result dict.
+_ToolFn = Callable[..., dict[str, object]]
+
+
+def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
+    """Wrap a tool so a hub blip yields a structured error instead of crashing.
+
+    Every active tool talks to the hub through a short ``with _client() as
+    http:`` block and finishes with ``resp.raise_for_status()`` /
+    ``resp.json()``. Those two calls raise — a transient hub outage surfaces as
+    an :class:`httpx.HTTPError` and a non-JSON / truncated body as a
+    :class:`json.JSONDecodeError` — and an unhandled raise aborts the agent's
+    whole tool turn. This decorator catches both and returns the same
+    ``{"error": "hub_unreachable", "detail": ..., "hub": HUB_URL}`` contract the
+    hand-written handlers in :func:`setup` / :func:`join` already use.
+
+    The success path is untouched: on no error the wrapped function's return
+    value is passed straight through. Only the failure path changes — a network
+    hiccup becomes a tidy error dict the agent can read and retry, never an
+    exception. The hub's own JSON error bodies (the ``429`` / ``409`` / ``422``
+    branches) are well-formed JSON, so they never trip the decode guard.
+
+    Args:
+        func: The tool body to protect.
+
+    Returns:
+        The wrapped tool, identical on success and returning a structured
+        ``hub_unreachable`` dict on a transport or JSON-decode failure.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: object, **kwargs: object) -> dict[str, object]:
+        try:
+            return func(*args, **kwargs)
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            logger.error("%s failed: %s", func.__name__, exc)
+            return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
+
+    return wrapper
+
+
 def _require_setup() -> dict[str, object] | None:
     """Return a gate error if :func:`setup` has not run, else ``None``."""
     if not _setup_done:
@@ -105,8 +151,14 @@ def _write_token_file(token: str) -> str:
 
     Used by :func:`watch_command` so the access token reaches the background
     watcher by path rather than on the command line, keeping it out of the
-    process argv and the launching transcript. One file per bridge process
-    (keyed by PID); re-writing overwrites it in place.
+    process argv and the launching transcript.
+
+    The file is created with :func:`tempfile.mkstemp`, which atomically opens a
+    brand-new file (``O_EXCL | O_CREAT``) at mode ``0600`` under an
+    *unpredictable* name. That closes the predictable-path/symlink window a
+    fixed PID-based path left open: an attacker cannot pre-create or symlink the
+    target to redirect or read the token. Any previous token file from this
+    bridge is removed first so each call yields a single live file.
 
     Args:
         token: The access token to persist.
@@ -114,15 +166,15 @@ def _write_token_file(token: str) -> str:
     Returns:
         The absolute path to the token file.
     """
-    path = Path(tempfile.gettempdir()) / f"caucus-watch-{os.getpid()}.token"
-    # Open with restrictive perms from the start, never widening a pre-existing
-    # file's mode (O_TRUNC keeps it owner-only).
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Drop any token file from a prior watch_command() call so we never leak a
+    # stale one when a fresh, unpredictable path replaces it.
+    _cleanup_token_file()
+    fd, path = tempfile.mkstemp(prefix="caucus-watch-", suffix=".token")
     try:
         os.write(fd, token.encode("utf-8"))
     finally:
         os.close(fd)
-    return str(path)
+    return path
 
 
 def _cleanup_token_file() -> None:
@@ -313,6 +365,7 @@ def whoami() -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def list_peers() -> dict[str, object]:
     """List the project names currently connected to the Caucus.
 
@@ -333,6 +386,7 @@ def list_peers() -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def ping(peer: str) -> dict[str, object]:
     """Check whether a peer is still around and what it is working on.
 
@@ -368,6 +422,7 @@ def ping(peer: str) -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def say(content: str, to: str = "all") -> dict[str, object]:
     """Send a message to a peer, a private channel, or broadcast to everyone.
 
@@ -414,6 +469,7 @@ def say(content: str, to: str = "all") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def set_status(status: str = "") -> dict[str, object]:
     """Publish a one-line "what I'm working on" so peers can ``ping`` you.
 
@@ -448,6 +504,7 @@ def set_status(status: str = "") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def join_channel(channel: str) -> dict[str, object]:
     """Subscribe to a private channel to start receiving its messages.
 
@@ -487,6 +544,7 @@ def join_channel(channel: str) -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def leave_channel(channel: str) -> dict[str, object]:
     """Unsubscribe from a private channel once the sub-topic is resolved.
 
@@ -519,6 +577,7 @@ def leave_channel(channel: str) -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def list_channels() -> dict[str, object]:
     """List the active private channels and their members.
 
@@ -539,6 +598,7 @@ def list_channels() -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
     """Set or change a private channel's topic so late joiners know its purpose.
 
@@ -582,6 +642,7 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def take_floor(reason: str, scope: str = "all") -> dict[str, object]:
     """Grab the talking stick to cut through noise when something grave is getting drowned.
 
@@ -627,6 +688,7 @@ def take_floor(reason: str, scope: str = "all") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def raise_hand(scope: str = "all") -> dict[str, object]:
     """Signal interest in speaking without seizing the floor outright.
 
@@ -664,6 +726,7 @@ def raise_hand(scope: str = "all") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def pass_floor(scope: str = "all") -> dict[str, object]:
     """Hand the talking stick to the next peer waiting in the queue.
 
@@ -702,6 +765,7 @@ def pass_floor(scope: str = "all") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def drop_floor(scope: str = "all") -> dict[str, object]:
     """Relinquish the talking stick outright — crisis over, room unblocked.
 
@@ -740,6 +804,7 @@ def drop_floor(scope: str = "all") -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def floor_status() -> dict[str, object]:
     """Report the current floor-control state for all active scopes.
 
@@ -762,6 +827,7 @@ def floor_status() -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def ask_operator(
     title: str, fields: list[dict[str, object]], to: str = "all"
 ) -> dict[str, object]:
@@ -817,6 +883,7 @@ def ask_operator(
 
 
 @mcp.tool()
+@_resilient_hub_call
 def list_forms() -> dict[str, object]:
     """List the operator forms currently awaiting an answer.
 
@@ -837,6 +904,7 @@ def list_forms() -> dict[str, object]:
 
 
 @mcp.tool()
+@_resilient_hub_call
 def listen(timeout: float = 30.0) -> dict[str, object]:
     """Wait for messages addressed to this agent (or broadcast).
 
@@ -963,6 +1031,14 @@ def main() -> None:
     # stderr keeps stdout clean for the MCP stdio transport; configure_logging
     # also silences httpx so the token never lands in the bridge log.
     configure_logging(sys.stderr)
+    # Fail closed on an unsafe hub URL (plain http to a non-loopback host would
+    # leak the access token and message content in cleartext). The check runs
+    # after logging is wired so the refusal lands on stderr, never stdout.
+    try:
+        validate_hub_url(HUB_URL)
+    except ValueError as exc:
+        logger.error("refusing to start: %s", exc)
+        sys.exit(2)
     logger.info("caucus bridge ready (default project=%s); call join() to enter", PROJECT)
     mcp.run()
 
