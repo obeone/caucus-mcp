@@ -10,6 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ValidationInfo, field_validator
 from pydantic import Field as PydField
@@ -20,6 +21,15 @@ BROADCAST = "all"
 CHANNEL_PREFIX = "#"
 """Recipient prefix marking a private channel — a named side room whose traffic
 reaches only its members (plus the always-watching operator)."""
+
+RESERVED_NAMES: frozenset[str] = frozenset({"human", "hub", "system"})
+"""Project names that are permanently reserved for the operator and hub itself.
+
+Agents may not register under these identities: "human" is the operator's
+canonical sender label, "hub" is used for system-level routing, and "system"
+is used for authoritative hub announcements. Allowing any peer to claim one of
+these names would let it impersonate the trusted control plane to other agents.
+"""
 
 
 def is_channel(recipient: str) -> bool:
@@ -105,6 +115,16 @@ class Message:
     id: str = field(default_factory=_new_id)
     ts: float = field(default_factory=time.time)
     seq: int = 0
+    origin: Literal["agent", "operator", "hub"] = "agent"
+    """Server-set trust/provenance flag — never supplied by clients.
+
+    Distinguishes ordinary agent traffic (``"agent"``) from operator-issued
+    messages (``"operator"``) and authoritative hub/system notices (``"hub"``).
+    Downstream consumers must use this field — not the free-text ``sender``
+    string — to determine whether a message carries operator or hub authority.
+    The hub sets this explicitly on trusted paths; all other messages default
+    to ``"agent"``.
+    """
 
     def to_public(self) -> dict[str, object]:
         """Serialise to a JSON-friendly dict for clients and the UI.
@@ -120,6 +140,7 @@ class Message:
             "kind": self.kind.value,
             "ts": self.ts,
             "seq": self.seq,
+            "origin": self.origin,
         }
         if self.meta is not None:
             public["meta"] = self.meta
@@ -219,6 +240,20 @@ class RegisterRequest(BaseModel):
     token: str | None = None
     """The token previously issued for this project, if the caller still holds
     it; lets the hub tell a genuine re-join from a colliding duplicate."""
+
+    @field_validator("project")
+    @classmethod
+    def _reject_reserved_names(cls, value: str) -> str:
+        """Reject project names that impersonate the operator or hub.
+
+        The names in :data:`RESERVED_NAMES` are permanently reserved for the
+        control plane. Registering under one of them would let a peer fabricate
+        operator or hub authority in the ``sender`` field, so the hub returns
+        422 before the peer ever obtains a token.
+        """
+        if value.strip().lower() in RESERVED_NAMES:
+            raise ValueError("project name is reserved")
+        return value
 
 
 class RegisterResponse(BaseModel):
