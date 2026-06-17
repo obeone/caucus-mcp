@@ -8,6 +8,7 @@ All mutation goes through this object so the FastAPI layer stays thin.
 from __future__ import annotations
 
 import asyncio
+import logging
 import resource
 import secrets
 import sys
@@ -28,6 +29,68 @@ from .models import (
     is_channel,
 )
 from .ratelimit import TokenBucket
+
+logger = logging.getLogger("caucus.state")
+
+
+class CapExceeded(Exception):
+    """Raised when a HubState resource limit would be exceeded.
+
+    The hub HTTP layer catches this and maps it to HTTP 409 so a buggy or
+    adversarial peer cannot grow in-memory state without bound.
+    """
+
+
+# --- resource caps ------------------------------------------------------
+#
+# All hub state is in-memory only, so an adversarial or buggy peer that keeps
+# registering identities, joining channels, opening forms, raising hands, or
+# flooding a paused peer's queue could grow the process without bound. These
+# module-level caps put a hard ceiling on every such collection. They are tuned
+# comfortably above any legitimate multi-agent workload — a real caucus is a
+# handful of agents, not hundreds — so honest peers never trip them, while a
+# runaway one is rejected with :class:`CapExceeded` (mapped to HTTP 409 by the
+# hub) before it can exhaust memory.
+
+MAX_CLIENTS = 512
+"""Maximum number of client records (live + reaped) that may coexist.
+
+Counts both the active roster and the revival graveyard, since both pin a
+:class:`Client` (with its queue and unacked buffer) in memory. A fresh
+registration past this ceiling is refused; reusing an existing identity
+(reaffirm/replace/revive) is always allowed so honest reconnects never trip it.
+"""
+
+MAX_CHANNELS_PER_CLIENT = 64
+"""Maximum number of channels a single client may be subscribed to at once.
+
+Each membership is a string in :attr:`Client.channels` and a delivery target in
+:meth:`route`; capping per client bounds both the set and the fan-out work one
+peer can impose.
+"""
+
+MAX_FORMS = 256
+"""Maximum number of pending operator forms held at once.
+
+Forms live in :attr:`HubState._forms` until answered or cancelled; without a cap
+a peer could open forms indefinitely and never resolve them.
+"""
+
+MAX_HANDS_PER_FLOOR = 128
+"""Maximum number of raised hands queued behind a single floor.
+
+Bounds :attr:`Floor.hands`. A peer already in the queue re-raising its hand is
+idempotent and never counts against the cap.
+"""
+
+MAX_QUEUE_SIZE = 1000
+"""Maximum number of undelivered messages buffered per client.
+
+Bounds :attr:`Client.queue`. A paused or reaped peer accumulates messages it has
+not yet drained; rather than reject sends (which would penalise the *sender* for
+a slow *recipient*), :meth:`route` drops the oldest queued message to make room,
+so the queue behaves like a ring buffer once full.
+"""
 
 
 @dataclass(slots=True)
@@ -81,7 +144,12 @@ class Client:
 
     project: str
     token: str
-    queue: asyncio.Queue[Message] = field(default_factory=asyncio.Queue)
+    # Bounded so a paused/reaped peer cannot accumulate messages without limit;
+    # :meth:`HubState.route` drops the oldest entry (ring-buffer style) when full
+    # rather than blocking the sender — see :data:`MAX_QUEUE_SIZE`.
+    queue: asyncio.Queue[Message] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+    )
     bucket: TokenBucket | None = None
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
@@ -366,6 +434,14 @@ class HubState:
         ghost = self._reaped_by_project.pop(project, None)
         if ghost is not None:
             self._reaped.pop(ghost.token, None)
+        # Cap the total number of client records (live + reaped) before minting
+        # a brand-new identity. Reaffirm/replace/revive reuse an existing record
+        # and are checked out above, so this only gates genuinely new peers — a
+        # runaway registrant cannot grow in-memory state without bound. We
+        # checked above for a ghost under this exact name and evicted it, so it
+        # is not double-counted here.
+        if len(self._clients) + len(self._reaped) >= MAX_CLIENTS:
+            raise CapExceeded("client limit reached")
         client = Client(
             project=project,
             token=secrets.token_urlsafe(24),
@@ -508,10 +584,12 @@ class HubState:
             m for m in client.unacked if m.seq > client.last_acked_seq
         ]
         replayed.sort(key=lambda m: m.seq)
+        # Re-enqueue via the ring-buffer-safe path: the queue is bounded, so a
+        # large replay must not overflow and crash the revival.
         for msg in replayed:
-            client.queue.put_nowait(msg)
+            self._safe_put(client, msg)
         for msg in pending_during_absence:
-            client.queue.put_nowait(msg)
+            self._safe_put(client, msg)
 
         # Build and broadcast the reconnect notice to all peers.
         if downtime is not None:
@@ -530,6 +608,9 @@ class HubState:
             recipient="all",
             content=content,
             kind=MessageKind.SYSTEM,
+            # Hub-generated provenance: consumers must trust this flag, not the
+            # free-text sender, to know the hub itself emitted the notice.
+            origin="hub",
         )
         # Use route() so the notice gets a seq, lands in peer queues, and is
         # logged — at this point client is already in _clients so it also
@@ -915,6 +996,36 @@ class HubState:
         """
         return [*self._clients.values(), *self._reaped.values()]
 
+    @staticmethod
+    def _safe_put(client: Client, msg: Message) -> None:
+        """Enqueue ``msg`` on ``client.queue``, dropping the oldest if full.
+
+        The queue is bounded to :data:`MAX_QUEUE_SIZE`, so a paused or reaped
+        peer that never drains its queue would otherwise make ``put_nowait``
+        raise :class:`asyncio.QueueFull` and crash the routing path. Instead we
+        treat the queue as a ring buffer: on overflow we discard the *oldest*
+        undelivered message and retry, so the newest traffic always lands and a
+        single stuck recipient cannot break delivery for everyone. Both
+        ``get_nowait`` and ``put_nowait`` are non-blocking, preserving the
+        single-event-loop atomicity invariant of every mutator here.
+        """
+        try:
+            client.queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            # Drop the oldest queued message to make room, then retry. The queue
+            # is at capacity, so exactly one get is enough; log so the operator
+            # can see a peer is falling behind.
+            try:
+                client.queue.get_nowait()
+            except asyncio.QueueEmpty:  # pragma: no cover - racey, defensive
+                pass
+            logger.warning(
+                "queue full for %s (cap=%d) — dropped oldest message",
+                client.project,
+                MAX_QUEUE_SIZE,
+            )
+            client.queue.put_nowait(msg)
+
     def route(self, msg: Message) -> list[str]:
         """Deliver ``msg`` to the right queue(s) and the UI feed.
 
@@ -978,7 +1089,9 @@ class HubState:
             targets = [target] if target is not None else []
 
         for client in targets:
-            client.queue.put_nowait(msg)
+            # Drop-oldest on overflow (ring buffer) so a stuck recipient can
+            # never crash routing or exhaust memory — see :meth:`_safe_put`.
+            self._safe_put(client, msg)
         delivered = [c.project for c in targets]
         # Feed the optional disk-log sink last, once routing is settled. The
         # sink only enqueues onto an asyncio.Queue, so this never blocks.
@@ -1006,6 +1119,11 @@ class HubState:
         if client is None:
             return False
         if channel not in client.channels:
+            # Cap the per-client channel set on genuine joins only (re-joining a
+            # channel already subscribed is idempotent and never trips this), so
+            # one peer cannot pin an unbounded membership set / fan-out cost.
+            if len(client.channels) >= MAX_CHANNELS_PER_CLIENT:
+                raise CapExceeded("channel subscription limit reached")
             client.channels.add(channel)
             self._announce_system(f"{client.project} joined {channel}")
             self._push_ui({"type": "channels", "channels": self.channels()})
@@ -1107,13 +1225,30 @@ class HubState:
         send bounces.
         """
         notice = Message(
-            sender="hub", recipient=scope, content=content, kind=MessageKind.SYSTEM
+            sender="hub",
+            recipient=scope,
+            content=content,
+            kind=MessageKind.SYSTEM,
+            # Hub-generated floor notice: mark provenance so consumers trust the
+            # flag rather than the free-text sender.
+            origin="hub",
         )
         self.route(notice)
 
     def _add_hand(self, floor: Floor, project: str) -> int:
-        """Append ``project`` to ``floor``'s hand queue (idempotent); return its 1-based position."""
+        """Append ``project`` to ``floor``'s hand queue (idempotent); return its 1-based position.
+
+        Raises:
+            CapExceeded: When the hand queue is already at
+                :data:`MAX_HANDS_PER_FLOOR` and ``project`` is not already in it.
+                A peer re-raising a hand it already holds is idempotent and never
+                trips the cap (it does not grow the queue).
+        """
         if project not in floor.hands:
+            # Only a genuine new hand can grow the queue, so the cap is checked
+            # on that path only — idempotent re-raises pass through untouched.
+            if len(floor.hands) >= MAX_HANDS_PER_FLOOR:
+                raise CapExceeded("hand-queue limit reached")
             floor.hands.append(project)
         return floor.hands.index(project) + 1
 
@@ -1388,6 +1523,9 @@ class HubState:
             recipient=BROADCAST,
             content=action,
             kind=MessageKind.CONTROL,
+            # Hub-generated control plane: provenance flag so a peer cannot forge
+            # a control signal by spoofing the "hub" sender string.
+            origin="hub",
         )
 
     # --- operator forms --------------------------------------------------
@@ -1412,6 +1550,10 @@ class HubState:
         Returns:
             The newly created (pending) :class:`Form`.
         """
+        # Cap pending forms before storing a new one: forms linger until the
+        # operator answers or cancels, so an unbounded opener could pile them up.
+        if len(self._forms) >= MAX_FORMS:
+            raise CapExceeded("pending form limit reached")
         form = Form(title=title, asker=asker, to=to, fields=fields)
         self._forms[form.id] = form
         self._push_ui({"type": "form", "form": form.to_public()})
@@ -1449,6 +1591,11 @@ class HubState:
                 recipient=form.to,
                 content=recap,
                 kind=MessageKind.ANSWER,
+                # Server-attested operator provenance: the hub constructs this
+                # message and the answers come from the human operator, so the
+                # flag is "operator" (not "agent"). Consumers trust this flag,
+                # not the free-text "human" sender, to know it is genuine.
+                origin="operator",
                 meta={
                     "form_id": form.id,
                     "title": form.title,
@@ -1492,6 +1639,9 @@ class HubState:
                 recipient=form.to,
                 content=f"form “{form.title}” cancelled by operator",
                 kind=MessageKind.ANSWER,
+                # Operator-sourced cancellation, server-attested — see
+                # :meth:`answer_form` for why this is "operator", not "agent".
+                origin="operator",
                 meta={
                     "form_id": form.id,
                     "title": form.title,
@@ -1553,7 +1703,8 @@ class HubState:
         elif mode is ControlMode.STOPPED:
             stop = self.control_signal("stop")
             for client in self._clients.values():
-                client.queue.put_nowait(stop)
+                # Ring-buffer-safe so a backed-up peer still receives the stop.
+                self._safe_put(client, stop)
             self._transmit.set()  # unblock waiters so they see STOPPED
             self._log.append(stop)
             self._push_ui({"type": "message", "message": stop.to_public()})
@@ -1597,7 +1748,9 @@ class HubState:
 
     def _announce_system(self, text: str) -> None:
         """Log and broadcast a system notice to the UI feed only."""
+        # Hub-generated provenance: every system notice the hub emits is flagged
+        # so consumers trust this field, not the spoofable free-text sender.
         msg = Message(sender="hub", recipient=BROADCAST, content=text,
-                      kind=MessageKind.SYSTEM)
+                      kind=MessageKind.SYSTEM, origin="hub")
         self._log.append(msg)
         self._push_ui({"type": "message", "message": msg.to_public()})
