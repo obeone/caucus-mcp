@@ -60,7 +60,8 @@ from .models import (
     is_channel,
 )
 from .disklog import DiskLog
-from .state import Client, HubState, RegisterOutcome
+from .ratelimit import TokenBucket
+from .state import CapExceeded, Client, HubState, RegisterOutcome
 
 logger = logging.getLogger("caucus.hub")
 
@@ -124,6 +125,116 @@ class AuthConfig:
 
 auth_config = AuthConfig()
 """Module-level auth config; populated from CLI/env in :func:`main`."""
+
+
+@dataclass
+class ServerConfig:
+    """Bind address and Origin allowlist for browser-handshake gating.
+
+    Populated from CLI/env in :func:`main`. ``host``/``port`` reproduce the
+    origin the hub serves itself on so the operator console's own ``/ui``
+    handshake is always allowed; ``allowed_origins`` carries any extra
+    operator-approved origins (for a reverse proxy, an alternate hostname, …).
+    """
+
+    host: str = "127.0.0.1"
+    port: int = 8765
+    allowed_origins: frozenset[str] = frozenset()
+
+
+server_config = ServerConfig()
+"""Module-level server config; populated from CLI/env in :func:`main`."""
+
+
+def _origin_allowed(
+    origin: str | None, host: str, port: int, extra: set[str] | frozenset[str]
+) -> bool:
+    """Decide whether a WebSocket handshake ``Origin`` may be trusted.
+
+    Cross-Site WebSocket Hijacking (CSWSH) defense. A browser ALWAYS attaches an
+    ``Origin`` header to a WS handshake, identifying the page that opened the
+    socket; a raw (non-browser) client — the native connector, the bridge —
+    sends none. We therefore treat a missing/empty ``Origin`` as a trusted
+    non-browser caller and gate only browser-originated handshakes against an
+    allowlist. Without this, any web page the operator happens to visit could
+    silently open ``ws://127.0.0.1:<port>/ui`` and read the full transcript
+    (including private channels) and drive operator commands.
+
+    Args:
+        origin: The handshake ``Origin`` header value, if any.
+        host: The address the hub binds to (its own served origin).
+        port: The port the hub listens on.
+        extra: Additional operator-approved origins to allow verbatim.
+
+    Returns:
+        ``True`` when the handshake may proceed (no Origin, or an allowlisted
+        one), ``False`` when a browser presented a disallowed cross-site Origin.
+    """
+    # No Origin => not a browser (raw clients send none); the CSWSH threat model
+    # only covers browser-driven cross-site handshakes, so allow it.
+    if not origin:
+        return True
+    allowed = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+    }
+    # Honor the configured bind host too when it is a real hostname/IP (a
+    # bind-all address like 0.0.0.0/:: is not a connectable browser origin).
+    if host and host not in ("0.0.0.0", "::"):
+        allowed.add(f"http://{host}:{port}")
+    allowed.update(extra)
+    return origin in allowed
+
+
+# Per-source-host token buckets throttling the unauthenticated /register flood
+# surface. /register mints client records (each pinning a queue + unacked
+# buffer), so an unthrottled registration storm is a cheap memory-exhaustion DoS
+# even with the MAX_CLIENTS cap (it churns reaped slots). Keyed on the caller's
+# client.host; generous params so honest multi-agent startup never trips it.
+_REGISTER_BUCKETS: dict[str, TokenBucket] = {}
+_REGISTER_BUCKET_CAPACITY = 20.0
+_REGISTER_BUCKET_REFILL = 1.0
+
+
+def _register_rate_limited(host: str) -> float | None:
+    """Charge one ``/register`` token to ``host``'s bucket; return retry hint.
+
+    Lazily creates a :class:`TokenBucket` per source host on first contact.
+
+    Args:
+        host: The remote client host (``request.client.host``) the registration
+            arrived from; an empty/unknown host shares a single bucket.
+
+    Returns:
+        ``None`` when the registration is permitted, or the rounded seconds to
+        wait before retrying when the source's bucket is empty.
+    """
+    bucket = _REGISTER_BUCKETS.get(host)
+    if bucket is None:
+        bucket = TokenBucket(
+            capacity=_REGISTER_BUCKET_CAPACITY, refill_rate=_REGISTER_BUCKET_REFILL
+        )
+        _REGISTER_BUCKETS[host] = bucket
+    if bucket.allow():
+        return None
+    return round(bucket.retry_after(), 2)
+
+
+def _prune_register_buckets() -> None:
+    """Drop fully-refilled (idle) per-host ``/register`` buckets.
+
+    The per-host bucket map (:data:`_REGISTER_BUCKETS`) would otherwise grow
+    without bound when a caller rotates source addresses — the DoS brake must not
+    itself become a slow memory leak. A freshly minted bucket starts full, so a
+    host whose bucket has refilled back to capacity is indistinguishable from one
+    we have never seen: evicting it is free (the next request lazily recreates an
+    identical full bucket) and bounds the map to recently-active sources. Called
+    from the reaper sweep alongside :meth:`HubState.reap_stale`.
+    """
+    idle = [h for h, b in _REGISTER_BUCKETS.items() if b.available() >= b.capacity]
+    for host in idle:
+        del _REGISTER_BUCKETS[host]
 
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
@@ -345,6 +456,9 @@ async def _reaper_loop() -> None:
         await asyncio.sleep(REAP_INTERVAL_SECONDS)
         try:
             reaped = state.reap_stale(state.client_ttl)
+            # Evict fully-refilled /register buckets so the per-host throttle map
+            # cannot grow without bound under source-address rotation.
+            _prune_register_buckets()
         except Exception:  # pragma: no cover - never let the sweep die
             logger.exception("reaper sweep failed")
             continue
@@ -570,7 +684,9 @@ async def version_info() -> dict[str, str]:
 
 
 @app.post("/register", response_model=None)
-async def register(req: RegisterRequest) -> RegisterResponse | JSONResponse:
+async def register(
+    req: RegisterRequest, request: Request
+) -> RegisterResponse | JSONResponse:
     """Register a project and hand back its access token.
 
     Compares the caller's ``protocol_version`` against :data:`PROTOCOL_VERSION`.
@@ -587,8 +703,29 @@ async def register(req: RegisterRequest) -> RegisterResponse | JSONResponse:
     registration is silently re-affirmed (REAFFIRMED outcome). When the prior
     listener is gone (dead process / timed-out watcher), the slot is taken over
     (REPLACED outcome) and a human-readable ``note`` advises the caller.
+
+    The endpoint is unauthenticated by design (a peer has no token yet), so it
+    is throttled per source host (429) to deny a registration flood — a cheap
+    memory-exhaustion DoS — and any :class:`CapExceeded` from the client cap is
+    surfaced as 409.
     """
-    reg = state.register(req.project, req.token)
+    # DoS brake: /register is the one mutating endpoint with no token, so the
+    # only attacker handle is the source host. A token bucket per host lets a
+    # whole fleet boot at once but caps a flood.
+    host = request.client.host if request.client else ""
+    retry = _register_rate_limited(host)
+    if retry is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limited", "retry_after": retry},
+        )
+    try:
+        reg = state.register(req.project, req.token)
+    except CapExceeded as exc:
+        # Client cap hit: refuse rather than grow the in-memory roster without
+        # bound (DoS defense). 409 mirrors the duplicate-name refusal below.
+        logger.warning("register refused (cap) project=%s: %s", req.project, exc)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if reg.outcome is RegisterOutcome.CONTESTED:
         logger.warning(
             "duplicate join refused project=%s outcome=%s",
@@ -689,7 +826,12 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     # Sending to a channel makes the sender a member, so it receives replies
     # without a separate join_channel call (no "I spoke but hear nothing").
     if is_channel(req.to):
-        state.subscribe(client.token, req.to)
+        try:
+            state.subscribe(client.token, req.to)
+        except CapExceeded as exc:
+            # Per-client channel cap hit: refuse before the membership set grows
+            # without bound (DoS defense).
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     msg = Message(
         sender=client.project,
@@ -752,22 +894,27 @@ async def ask(req: AskRequest) -> AskResponse | JSONResponse:
         raise HTTPException(
             status_code=422, detail="form target must be 'all' or a #channel"
         )
-    if is_channel(req.to):
-        state.subscribe(client.token, req.to)
-    fields = [
-        Field(
-            key=spec.key,
-            label=spec.label,
-            type=spec.type,
-            options=list(spec.options),
-            required=spec.required,
-            allow_other=spec.allow_other,
+    try:
+        if is_channel(req.to):
+            state.subscribe(client.token, req.to)
+        fields = [
+            Field(
+                key=spec.key,
+                label=spec.label,
+                type=spec.type,
+                options=list(spec.options),
+                required=spec.required,
+                allow_other=spec.allow_other,
+            )
+            for spec in req.fields
+        ]
+        form = state.create_form(
+            asker=client.project, to=req.to, title=req.title, fields=fields
         )
-        for spec in req.fields
-    ]
-    form = state.create_form(
-        asker=client.project, to=req.to, title=req.title, fields=fields
-    )
+    except CapExceeded as exc:
+        # Pending-form (or channel-membership) cap hit: refuse before unbounded
+        # growth (DoS defense).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     logger.info("form %s %s -> %s (%d fields)", form.id, client.project, req.to, len(fields))
     return AskResponse(form_id=form.id, to=form.to)
 
@@ -958,7 +1105,12 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     handler = handlers.get(req.action)
     if handler is None:
         raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
-    result = handler()
+    try:
+        result = handler()
+    except CapExceeded as exc:
+        # Raised-hands (or floor) cap hit: refuse before the waiting queue grows
+        # without bound (DoS defense).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result.get("error") == "unknown_token":
         raise HTTPException(status_code=401, detail="unknown token")
     logger.info(
@@ -968,8 +1120,45 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
 
 
 @app.post("/control")
-async def control(req: ControlRequest) -> dict[str, str]:
-    """Apply an operator control action: pause | resume | stop | reset."""
+async def control(
+    req: ControlRequest,
+    authorization: str | None = Header(default=None),
+    origin: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Apply an operator control action: pause | resume | stop | reset.
+
+    ``/control`` is the operator kill-switch: it pauses, stops, or resets the
+    whole room. When auth is enabled it MUST require the operator token —
+    otherwise an unauthenticated party (or a cross-site CSRF POST from a page in
+    the operator's browser) could silently disarm the stop/pause that the human
+    relies on. The bearer token is parsed the same way as ``/receive`` (see
+    :func:`_resolve_receive_token`) and must resolve to the ``operator`` role;
+    when auth is disabled the endpoint stays open (the documented localhost
+    default). As defense-in-depth, a present-but-disallowed browser ``Origin`` is
+    also refused (blocks a simple cross-site form/fetch POST).
+
+    Args:
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator) only when :attr:`AuthConfig.enabled`.
+        origin: Optional handshake-style ``Origin`` header; if a browser sends a
+            disallowed one, the request is rejected before any state change.
+
+    Returns:
+        ``{"mode": "<mode>"}`` for the applied control action.
+    """
+    # CSRF defense-in-depth: a browser always tags a cross-site POST with an
+    # Origin; a disallowed one means the request came from a page we don't
+    # trust, so refuse before mutating room state. (A raw client sends none.)
+    if origin and not _origin_allowed(
+        origin, server_config.host, server_config.port, server_config.allowed_origins
+    ):
+        raise HTTPException(status_code=403, detail="origin not allowed")
+    # Kill-switch must not be bypassable when auth is on: require the operator
+    # token. _resolve_receive_token reuses the existing bearer-parsing rule.
+    if auth_config.enabled:
+        token = _resolve_receive_token(authorization, None)
+        if auth_config.role_for(token) != "operator":
+            raise HTTPException(status_code=401, detail="operator token required")
     mapping = {
         "pause": ControlMode.PAUSED,
         "resume": ControlMode.RUNNING,
@@ -1066,6 +1255,10 @@ def _apply_ui_command(data: dict[str, object]) -> None:
                 recipient=str(data.get("to", "all")),
                 content=str(data["say"]),
                 kind=MessageKind.MESSAGE,
+                # Server-set provenance: this message originates from the human
+                # operator console, not a peer agent. Recipients can trust the
+                # tag because the hub stamps it, not the sender.
+                origin="operator",
             )
         )
     elif "kick" in data:
@@ -1123,8 +1316,25 @@ async def ui_socket(ws: WebSocket) -> None:
     * ``{"answer": {"id": "<form_id>", "answers": {...}}}`` — submit a form's
       answers; routed to the form's audience as an ``answer`` message.
     * ``{"cancel_form": "<form_id>"}`` — cancel a pending form.
+
+    Before any role is granted or feed streamed, the handshake ``Origin`` is
+    checked (CSWSH defense): a browser always attaches its page origin to a WS
+    handshake, so a cross-site page trying to hijack this socket — to read the
+    full transcript or drive operator commands — is rejected here. A raw client
+    sends no Origin and passes (see :func:`_origin_allowed`).
     """
+    # CSWSH gate FIRST — before granting a role or streaming any data. Starlette
+    # requires accept() before close(), so we accept then immediately close 1008
+    # (policy violation) on a disallowed browser Origin, sending no feed.
     await ws.accept()
+    origin = ws.headers.get("origin")
+    if not _origin_allowed(
+        origin, server_config.host, server_config.port, server_config.allowed_origins
+    ):
+        logger.warning("rejected /ui handshake from disallowed origin=%s", origin)
+        with contextlib.suppress(Exception):
+            await ws.close(code=1008)
+        return  # cross-site origin; no role granted, no feed streamed
     role = await _ui_authenticate(ws)
     if role is None:
         return  # handshake failed; socket already closed
@@ -1263,11 +1473,33 @@ def main() -> None:
             "%(default)s). Env: CAUCUS_LOG_RETENTION_HOURS"
         ),
     )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=None,
+        metavar="ORIGIN",
+        help=(
+            "extra browser Origin allowed to open the /ui WebSocket (repeatable; "
+            "CSWSH allowlist). Loopback origins on the served port are always "
+            "allowed. Env: CAUCUS_ALLOWED_ORIGINS (comma-separated)"
+        ),
+    )
     args = parser.parse_args()
 
     global disk_log
     auth_config.operator = args.operator_token
     auth_config.observer = args.observer_token
+
+    # CSWSH allowlist: merge CLI --allowed-origin entries with the comma-split
+    # CAUCUS_ALLOWED_ORIGINS env var. Loopback origins are always allowed by
+    # _origin_allowed, so the default (empty) extra set is the safe localhost
+    # posture; operators add origins only for a proxy/alternate hostname.
+    extra_origins: set[str] = set(args.allowed_origin or [])
+    env_origins = os.environ.get("CAUCUS_ALLOWED_ORIGINS", "")
+    extra_origins.update(o.strip() for o in env_origins.split(",") if o.strip())
+    server_config.host = args.host
+    server_config.port = args.port
+    server_config.allowed_origins = frozenset(extra_origins)
     if args.log_file:
         disk_log = DiskLog(
             Path(args.log_file), retention_hours=args.log_retention_hours
