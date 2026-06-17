@@ -35,6 +35,8 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import Message as ASGIMessage
 
 from . import __version__
 from . import export as export_mod
@@ -76,6 +78,41 @@ REAP_INTERVAL_SECONDS = 15.0
 # How often the dashboard health tick fans a fresh ``health`` event (with the
 # rich peer roster) out to every connected UI listener.
 HEALTH_INTERVAL_SECONDS = 1.5
+
+# Hard ceiling on an inbound HTTP request body, in bytes. FastAPI/Starlette
+# buffers and parses the whole body before our handlers (and their Pydantic
+# validation) run, so an oversized POST — e.g. to the unauthenticated
+# ``/register`` — is a cheap memory-pressure DoS. 64 KiB sits comfortably above
+# the 8 KiB content cap plus the JSON envelope of any real request, while still
+# slamming the door on a multi-megabyte flood. Enforced by
+# :class:`BodySizeLimitMiddleware`. Exposed as a module constant so tests can
+# reference it directly.
+MAX_BODY_BYTES = 64 * 1024
+
+# Content-Security-Policy for the operator console. The served ``index.html`` is
+# a Vite build that loads exactly: an external same-origin module bundle and
+# stylesheet under ``/assets/``, webfonts from the Google Fonts CDN
+# (``fonts.googleapis.com`` stylesheet + ``fonts.gstatic.com`` font files), and
+# a same-origin WebSocket to ``/ui``. The policy below allows precisely those
+# sources and nothing else: ``object-src 'none'`` / ``base-uri 'none'`` /
+# ``frame-ancestors 'none'`` shut down plugin, base-tag, and clickjacking
+# vectors. ``style-src`` keeps ``'unsafe-inline'`` because the Vite/React build
+# injects inline styles at runtime; no inline ``<script>`` is present, so
+# ``script-src 'self'`` stays strict (no ``'unsafe-inline'``). NOTE: the Google
+# Fonts CDN allowance is intentional and a separately tracked item — the console
+# pulls its webfonts from there today; CSP must permit it to avoid breaking the
+# UI.
+CONSOLE_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
+)
 
 
 @dataclass
@@ -514,6 +551,140 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
 
+
+class BodySizeLimitMiddleware:
+    """Reject oversized HTTP request bodies before they are buffered or parsed.
+
+    DoS brake, implemented as a pure ASGI middleware (not
+    :class:`~starlette.middleware.base.BaseHTTPMiddleware`). Starlette reads and
+    (for JSON endpoints) parses the entire request body before our route
+    handlers run, so a large POST — most cheaply against the unauthenticated
+    ``/register`` — pins memory with no token required. This middleware fails
+    such requests fast with a ``413`` JSON response, capping the body at
+    :data:`MAX_BODY_BYTES`.
+
+    A pure ASGI wrapper is used deliberately:
+    :class:`BaseHTTPMiddleware` consumes and re-streams the request body through
+    an internal queue, so reassigning ``request._receive`` from a ``dispatch``
+    override corrupts that stream (the downstream parser then fails). Wrapping
+    the raw ASGI ``receive`` callable instead leaves Starlette's own body
+    handling untouched.
+
+    Two checks, cheapest first:
+
+    * A ``Content-Length`` header over the cap is rejected outright, without
+      reading a single body byte.
+    * For a chunked / length-less body, the ``receive`` channel is wrapped so the
+      running byte total is tallied as the app consumes it; the moment it crosses
+      the cap a ``413`` is sent and the body is reported complete, so a streamed
+      flood cannot sneak past the header check.
+
+    Only HTTP scopes are gated. The ``/ui`` WebSocket handshake (``websocket``
+    scope) and the ASGI ``lifespan`` scope pass straight through, and a bodyless
+    GET — like the ``/receive`` long-poll — trivially clears both checks.
+    """
+
+    def __init__(self, app: ASGIApp, max_body_bytes: int = MAX_BODY_BYTES) -> None:
+        """Wrap ``app`` with a per-request body-size ceiling.
+
+        Args:
+            app: The downstream ASGI application to guard.
+            max_body_bytes: Maximum accepted request-body size, in bytes.
+        """
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        """Gate one ASGI event; enforce the body cap for HTTP requests only.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive callable (the inbound event channel).
+            send: The ASGI send callable (the outbound event channel).
+        """
+        # Only HTTP requests carry a body worth gating; WebSocket and lifespan
+        # scopes pass through untouched.
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Cheap path: trust a declared Content-Length and reject early so an
+        # oversized body is never buffered. A malformed header just falls
+        # through to the streamed check below.
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    if int(value) > self.max_body_bytes:
+                        await _send_body_too_large(scope, receive, send)
+                        return
+                except ValueError:
+                    pass
+                break
+
+        # Defensive path: a chunked / length-less body has no header to trust,
+        # so wrap the receive channel and tally bytes as they stream in. Crossing
+        # the cap mid-stream short-circuits the body so the app sees a clean end
+        # rather than the flood.
+        total = 0
+        exceeded = False
+
+        async def limited_receive() -> ASGIMessage:
+            nonlocal total, exceeded
+            message = await receive()
+            if message["type"] == "http.request":
+                total += len(message.get("body", b""))
+                if total > self.max_body_bytes:
+                    exceeded = True
+                    # Truncate the stream: hand the app an empty, final chunk so
+                    # it stops reading instead of consuming the rest of the flood.
+                    return {"type": "http.request", "body": b"", "more_body": False}
+            return message
+
+        # When the cap is breached mid-stream the app may still emit a normal
+        # response; we intercept the response start to force a 413 instead.
+        response_started = False
+
+        async def guarded_send(message: ASGIMessage) -> None:
+            nonlocal response_started
+            if exceeded and not response_started:
+                # Replace whatever the app was about to send with the 413.
+                response_started = True
+                await _send_body_too_large(scope, receive, send)
+                return
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        await self.app(scope, limited_receive, guarded_send)
+
+
+async def _send_body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+    """Emit the uniform ``413`` ASGI response for an over-cap request body.
+
+    Args:
+        scope: The ASGI connection scope of the rejected request.
+        receive: The ASGI receive callable (unused; present for symmetry).
+        send: The ASGI send callable used to write the response.
+    """
+    response = _body_too_large_response()
+    await response(scope, receive, send)
+
+
+def _body_too_large_response() -> JSONResponse:
+    """Build the uniform ``413`` response for an over-cap request body."""
+    return JSONResponse(
+        status_code=413,
+        content={"detail": "request body too large", "max_bytes": MAX_BODY_BYTES},
+    )
+
+
+# Register the body-size brake on the app. Applies to every HTTP request; the
+# /ui WebSocket handshake bypasses HTTP middleware and the bodyless GETs clear
+# the cap trivially, so nothing legitimate is affected.
+app.add_middleware(BodySizeLimitMiddleware)
+
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 _UI_INDEX = _UI_DIR / "index.html"
 _UI_ASSETS = _UI_DIR / "assets"
@@ -529,10 +700,17 @@ if _UI_ASSETS.is_dir():
 
 @app.get("/")
 async def index() -> FileResponse:
-    """Serve the operator dashboard entry point (the built SPA shell)."""
+    """Serve the operator dashboard entry point (the built SPA shell).
+
+    The response carries a restrictive Content-Security-Policy
+    (:data:`CONSOLE_CSP`) scoped to exactly what the console loads — same-origin
+    assets, the Google Fonts CDN, and a same-origin ``/ui`` WebSocket — so a
+    content-injection bug cannot pull in arbitrary scripts or exfiltrate to a
+    third-party origin.
+    """
     if not _UI_INDEX.is_file():
         raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(_UI_INDEX)
+    return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
 
 
 @app.get("/peers")
@@ -567,8 +745,11 @@ async def channels() -> dict[str, dict[str, dict[str, object]]]:
     return {"channels": state.channels()}
 
 
-@app.get("/export")
-async def export(format: str = "json") -> Response:
+@app.get("/export", response_model=None)
+async def export(
+    format: str = "json",
+    authorization: str | None = Header(default=None),
+) -> Response:
     """Download the recent message log as a transcript file.
 
     A read-only operator convenience: serialises the same bounded log the UI
@@ -578,7 +759,25 @@ async def export(format: str = "json") -> Response:
     ``text`` (alias ``txt``, one flat line per message). Unknown values fall back
     to JSON. The bounded log holds at most the last few hundred messages, so this
     is a live snapshot, not a permanent archive.
+
+    The transcript includes private-channel traffic, so when auth is enabled this
+    endpoint is gated exactly like ``/ui``: it requires an ``Authorization:
+    Bearer <token>`` resolving to the ``operator`` or ``observer`` role (reading
+    is allowed for observers). A missing or unrecognised token is refused with
+    401. When auth is disabled (the localhost default) the endpoint stays open.
+
+    Args:
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator/observer) only when :attr:`AuthConfig.enabled`.
     """
+    # Token parity with /ui: the export carries the full transcript (private
+    # channels included), so reading it must demand the same operator/observer
+    # token the live feed does — otherwise auth on /ui is trivially bypassed by
+    # downloading the same data here.
+    if auth_config.enabled:
+        token = _resolve_receive_token(authorization, None)
+        if auth_config.role_for(token) not in ("operator", "observer"):
+            raise HTTPException(status_code=401, detail="operator/observer token required")
     body, media_type, filename = export_mod.render(state.recent(), format)
     return Response(
         content=body,
