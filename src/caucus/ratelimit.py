@@ -53,3 +53,13 @@ class TokenBucket:
         if self.refill_rate <= 0:
             return float("inf")
         return (cost - self.tokens) / self.refill_rate
+
+    def available(self) -> float:
+        """Return the tokens available right now without consuming any.
+
+        Performs the same lazy refill as :meth:`allow` but read-only, so callers
+        can probe a bucket's fill level (e.g. to evict fully-refilled, idle
+        buckets from a per-key map) without disturbing its state.
+        """
+        now = time.monotonic()
+        return min(self.capacity, self.tokens + (now - self.updated) * self.refill_rate)
