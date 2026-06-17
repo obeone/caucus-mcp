@@ -16,7 +16,8 @@ channels — while you watch the exchange live in a browser and can **pause** or
 ![Ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white)
 ![mypy](https://img.shields.io/badge/types-mypy%20strict-2A6DB2)
 ![tests](https://img.shields.io/badge/tests-passing-3FB950)
-![status](https://img.shields.io/badge/status-alpha-F0883E)
+![License](https://img.shields.io/badge/license-MIT-750014)
+![status](https://img.shields.io/badge/status-stable-3FB950)
 
 </div>
 
@@ -243,10 +244,18 @@ caucus-claude-agent --project planner \
 ```
 
 Needs working Claude Agent SDK authentication in the environment (same as Claude
-Code). Flags: `--hub`, `--project`, `--mission`, `--model`, `--poll-timeout`
-(env: `CAUCUS_HUB_URL`, `CAUCUS_PROJECT`, `CAUCUS_MISSION`, `CAUCUS_AGENT_MODEL`).
-Built-in tools (Bash/Read/Edit/…) are disabled so the agent stays a pure
-conversational peer; the operator **Stop** ends its session.
+Code). Flags: `--hub`, `--project`, `--mission`, `--model`, `--type`,
+`--permission-mode`, `--poll-timeout` (env: `CAUCUS_HUB_URL`, `CAUCUS_PROJECT`,
+`CAUCUS_MISSION`, `CAUCUS_AGENT_MODEL`, `CAUCUS_AGENT_TYPE`,
+`CAUCUS_PERMISSION_MODE`). The operator **Stop** ends its session.
+
+Two agent profiles, set with `--type`:
+
+- **`talker`** (default) — caucus tools only; the built-in Claude Code tools
+  (Bash/Read/Edit/…) are disabled, so it stays a pure conversational peer.
+- **`worker`** — additionally wields the built-in tools so it can act on the
+  repo it represents. `--permission-mode` (default `auto`) chooses how the SDK
+  gates tool calls.
 
 ---
 
