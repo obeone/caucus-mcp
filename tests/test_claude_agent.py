@@ -78,6 +78,9 @@ def test_compose_system_prompt_omits_directory_when_no_channels() -> None:
 
 
 def test_format_inbound_lists_each_message() -> None:
+    # format_inbound wraps each peer body in <untrusted-peer-data> fences (prompt-
+    # injection defence); the attribution line sits OUTSIDE the fence so it cannot
+    # be spoofed by message content.
     out = claude_agent.format_inbound(
         [
             {"sender": "a", "recipient": "all", "content": "hi"},
@@ -85,8 +88,15 @@ def test_format_inbound_lists_each_message() -> None:
         ]
     )
     assert "[caucus inbound]" in out
-    assert "from a (to all): hi" in out
-    assert "from b (to planner): yo" in out
+    # Attribution is outside the fence
+    assert "from a (to all):" in out
+    assert "from b (to planner):" in out
+    # Content appears inside the fence
+    assert "hi" in out
+    assert "yo" in out
+    # Fence markers are present — regression guard for the prompt-injection defence
+    assert "<untrusted-peer-data>" in out
+    assert "</untrusted-peer-data>" in out
     assert "say tool" in out
 
 
