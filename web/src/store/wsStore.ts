@@ -308,7 +308,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
 
   // ---- Public command senders --------------------------------------------
 
-  sendMode: (action) => get()._send({ mode: action }),
+  // Wire format: {"action":"<pause|resume|reset|stop>"} — the hub dispatches
+  // control-mode on the "action" key (hub.py `_apply_ui_command` and
+  // `_MUTATING_COMMANDS`). A {mode:...} payload matches no command key, so it is
+  // silently dropped and operator pause/resume/stop/reset never reach the hub.
+  sendMode: (action) => get()._send({ action }),
 
   sendKick: (name) => get()._send({ kick: name }),
 

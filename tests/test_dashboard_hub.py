@@ -108,6 +108,29 @@ def test_operator_mutating_command_is_applied(
     assert client.get("/peers").json()["peers"] == []
 
 
+# --- control mode over /ui -----------------------------------------------
+
+
+def test_operator_action_pause_over_ui_flips_mode(
+    client: TestClient, state: HubState
+) -> None:
+    """An operator ``{action:"pause"}`` over ``/ui`` actually pauses the room.
+
+    Coverage for the control-mode wire path the dashboard depends on: the
+    console sends ``{action:...}`` and the hub flips :class:`ControlMode`. The
+    legacy ``{mode:...}`` frame matched no command key and was silently dropped
+    (operator pause/resume/stop were dead over the socket), so this path had no
+    test guarding it.
+    """
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"action": "pause"})
+        evt = _drain_until(ws, "mode")
+    assert evt["mode"] == "paused"
+    assert state.mode.value == "paused"
+
+
 # --- new operator commands -----------------------------------------------
 
 

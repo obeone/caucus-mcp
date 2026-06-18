@@ -58,6 +58,28 @@ describe("wsStore — auth events", () => {
   });
 });
 
+describe("wsStore — command senders", () => {
+  beforeEach(resetStore);
+
+  it("sendMode emits {action} so the hub dispatches it (regression: was {mode})", () => {
+    // The hub gates and dispatches control-mode on the "action" key
+    // (hub.py _MUTATING_COMMANDS / _apply_ui_command). A {mode:...} frame
+    // matched no command key and was silently dropped, leaving operator
+    // pause/resume/stop dead over /ui. Pin the corrected wire format.
+    const send = vi.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useDashStore.setState({ _send: send } as any);
+    useDashStore.getState().sendMode("pause");
+    expect(send).toHaveBeenCalledWith({ action: "pause" });
+    useDashStore.getState().sendMode("resume");
+    expect(send).toHaveBeenCalledWith({ action: "resume" });
+    useDashStore.getState().sendMode("stop");
+    expect(send).toHaveBeenCalledWith({ action: "stop" });
+    useDashStore.getState().sendMode("reset");
+    expect(send).toHaveBeenCalledWith({ action: "reset" });
+  });
+});
+
 describe("wsStore — snapshot event", () => {
   beforeEach(resetStore);
 
