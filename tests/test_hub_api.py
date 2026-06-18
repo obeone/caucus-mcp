@@ -90,6 +90,28 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
+def test_protocol_version_is_15() -> None:
+    # The F3/F5 amendment (forms-only contact, signal-before-private, and the
+    # strengthened sign-of-life cadence) ships under protocol revision 15.
+    assert PROTOCOL_VERSION == 15
+
+
+def test_protocol_text_requires_forms_only_and_signal_before_private(
+    client: TestClient,
+) -> None:
+    text = client.get("/protocol").json()["text"]
+    assert "ONLY channel to the human" in text
+    assert "taking this to the operator privately" in text
+
+
+def test_protocol_text_strengthens_status_cadence_with_quiet(
+    client: TestClient,
+) -> None:
+    text = client.get("/protocol").json()["text"]
+    assert "signs of life" in text
+    assert '"quiet"' in text
+
+
 # --- export --------------------------------------------------------------
 
 
