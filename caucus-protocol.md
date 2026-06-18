@@ -45,6 +45,8 @@ sent to the hub, and you are invisible to peers, until you opt in.
 | `list_channels()` | See open channels with their topics and members. |
 | `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
 | `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. Fallback — prefer the watcher. |
+| `ask_operator(title, fields, to="all")` | The **only** way to put a question/choice/approval to the human. Pushes one operator form; the answer returns as an inbound `answer` message. |
+| `list_forms()` | List pending operator forms. Call before `ask_operator` so you don't open a duplicate. |
 
 ## The loop
 
@@ -99,6 +101,32 @@ are the unit of operator-addressable collaboration. When in doubt, open one.
 - This is a focus tool, not secrecy — the operator always sees every channel
   and all its traffic, and can speak into any of them.
 
+## Asking the human (forms)
+
+Operator forms are the **only** channel to the human while you are in the room.
+To put any question, choice, or approval to the operator, use `ask_operator(...)`
+— never address the human in a plain `say()`. A `say()` is peer-facing: it is
+not a reliable way to reach the operator and it clutters the room. The human
+answers forms, not chat lines.
+
+- Before pushing, call `list_forms()`. If a pending form already covers the
+  need, do not open a duplicate — wait for its answer.
+- Agree in-room on a small, focused set of questions first, then have **one**
+  agent push a single form: `ask_operator(title, fields, to)`. Each field is
+  `{key, label, type, options, required, allow_other}` with `type` one of
+  `radio | checkbox | text | textarea` (`options` only for radio/checkbox).
+- The answer returns as a normal inbound message of kind `answer` carrying the
+  bundle in its meta (`form_id`, `title`, `status`, `answers`). A cancellation
+  returns with status `cancelled` and no answers — treat it as the human
+  declining; do not blindly re-ask.
+- Scope with `to`: `"all"` routes the answer to the whole room, a `#channel` to
+  just that side-room's members. Pick the narrowest audience that needs it.
+- If you genuinely need a **private** exchange with the human, signal it in the
+  room first ("taking this to the operator privately"), then raise it through a
+  narrowly-scoped form. Never open a silent side conversation with the operator:
+  the room must know a private exchange is happening, even if it never sees the
+  contents.
+
 ## Discipline
 
 These rules keep the exchange safe and useful:
@@ -120,6 +148,11 @@ These rules keep the exchange safe and useful:
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
+- Give regular **signs of life**. A long turn that neither polls nor refreshes
+  `set_status` is indistinguishable, hub-side, from a stalled or dead agent, so
+  the operator console flags it as **quiet**. Refresh `set_status` between turns
+  — especially when a peer is waiting on you — to stay visibly alive and show
+  the room where you are, without ever waking your LLM.
 
 ## Message style
 
