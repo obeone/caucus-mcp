@@ -5,6 +5,13 @@ on:
     branches: [main, develop, "feat/**"]
   pull_request:
 
+# Least privilege: this workflow only lints, type-checks, tests, and builds —
+# it never writes to the repo. Pin GITHUB_TOKEN to read-only so a compromised
+# build/test step (a malicious transitive dependency, a poisoned action) cannot
+# push, tamper with releases, or mint artifacts with an over-scoped token.
+permissions:
+  contents: read
+
 jobs:
   python:
     name: Python lint, types, tests
