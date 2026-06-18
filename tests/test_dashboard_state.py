@@ -8,6 +8,8 @@ directly (no HTTP), in the ``pytest-asyncio`` auto-mode loop.
 
 from __future__ import annotations
 
+import pytest
+
 from caucus.models import BROADCAST, Message
 from caucus.state import HubState
 
@@ -32,10 +34,13 @@ def test_peer_info_has_full_dashboard_shape() -> None:
     assert info["status"] is None
     assert info["msg_count"] == 0
     assert isinstance(info["uptime"], float)
+    assert info["quiet"] is False  # a just-registered peer is never quiet
+    assert info["status_stale"] is False  # no status reported -> not stale
     # Every contract key is present.
     assert set(info) == {
         "name", "state", "listening", "paused", "status",
-        "status_age", "last_seen_age", "uptime", "msg_count",
+        "status_age", "last_seen_age", "quiet", "status_stale",
+        "uptime", "msg_count",
     }
 
 
@@ -241,3 +246,170 @@ def test_close_channel_is_non_sticky_can_reform() -> None:
 def test_close_unknown_channel_is_false() -> None:
     state = HubState()
     assert state.close_channel("#nope") is False
+
+
+# --- quiet / liveness signal (status-age-primary, single threshold) ------
+#
+# A live, non-paused peer is "quiet" once it has gone past the threshold with
+# BOTH no status update AND no authenticated call. Ages are pinned by injecting
+# ``now=`` (wall clock) and stamping the client's last_seen/status_ts directly.
+
+
+def _seed_peer(
+    state: HubState, name: str, *, last_seen: float, status_ts: float | None
+) -> None:
+    """Register ``name`` and pin its last_seen / status_ts for age control."""
+    state.register(name)
+    client = state._clients[name]  # noqa: SLF001 - white-box clock control
+    client.last_seen = last_seen
+    client.status_ts = status_ts
+    client.status = "working" if status_ts is not None else None
+
+
+def test_silent_peer_past_threshold_with_no_status_is_quiet() -> None:
+    state = HubState()  # default threshold 180s
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=None)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)  # 200 > 180
+    assert info is not None
+    assert info["quiet"] is True  # no poll AND no status -> no sign of life
+
+
+def test_single_long_turn_under_threshold_is_not_quiet() -> None:
+    # A passive bridge fires no tool call mid-turn (watch.py wake contract) and
+    # a native does not poll while reasoning (claude_agent.py): both go silent
+    # for a whole turn. The 180s threshold keeps a normal long turn from being
+    # flagged amber on every reply.
+    state = HubState()
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=None)
+    info = state.peer_info("alpha", now=1000.0 + 150.0)  # 150 < 180
+    assert info is not None
+    assert info["quiet"] is False
+
+
+def test_fresh_status_exempts_silent_peer() -> None:
+    state = HubState()
+    # Not polled for 200s, but self-reported a status 30s ago: exempt.
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=1000.0 + 170.0)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["quiet"] is False
+
+
+def test_polling_peer_within_threshold_is_never_quiet() -> None:
+    state = HubState()
+    # Recent /receive poll refreshed last_seen 30s ago: actively alive.
+    _seed_peer(state, "alpha", last_seen=1000.0 + 170.0, status_ts=None)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["quiet"] is False
+
+
+def test_just_joined_peer_is_not_instantly_quiet() -> None:
+    state = HubState()
+    state.register("alpha")
+    client = state._clients["alpha"]  # noqa: SLF001 - white-box clock control
+    # Evaluated at the very instant of joining: no poll yet, but age is ~0.
+    info = state.peer_info("alpha", now=client.last_seen)
+    assert info is not None
+    assert info["quiet"] is False
+
+
+def test_peer_info_not_quiet_when_paused() -> None:
+    state = HubState()
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=None)
+    state.pause_peer("alpha")
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["paused"] is True
+    assert info["quiet"] is False  # an operator-paused peer is never "quiet"
+
+
+def test_reaped_peer_is_not_quiet() -> None:
+    state = HubState()
+    state.register("alpha")
+    client = state._clients["alpha"]  # noqa: SLF001 - white-box clock control
+    client.last_seen -= 1000.0
+    client.status_ts = None
+    assert state.reap_stale(ttl=30.0) == ["alpha"]
+    info = state.peer_info("alpha", now=client.last_seen + 2000.0)
+    assert info is not None
+    assert info["state"] == "reaped"
+    assert info["quiet"] is False
+
+
+def test_quiet_threshold_is_configurable_via_constructor() -> None:
+    state = HubState(quiet_after=300.0)
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=None)
+    assert state.peer_info("alpha", now=1000.0 + 200.0)["quiet"] is False  # < 300
+    assert state.peer_info("alpha", now=1000.0 + 400.0)["quiet"] is True  # > 300
+
+
+def test_quiet_threshold_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAUCUS_QUIET_AFTER_SECONDS", "300")
+    state = HubState()
+    assert state._quiet_after == 300.0  # noqa: SLF001 - asserting config seed
+
+
+def test_quiet_threshold_env_ignores_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAUCUS_QUIET_AFTER_SECONDS", "nonsense")
+    state = HubState()
+    assert state._quiet_after == 180.0  # noqa: SLF001 - falls back to default
+
+
+def test_status_stale_when_old_but_not_quiet() -> None:
+    state = HubState()  # dim at 0.66*180 = 118.8s, quiet at 180s
+    # Polled recently (not quiet) but the status line is 130s old: dim only.
+    _seed_peer(state, "alpha", last_seen=1000.0 + 190.0, status_ts=1000.0 + 70.0)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["status_stale"] is True  # 130 > 118.8
+    assert info["quiet"] is False  # recent poll keeps it alive
+
+
+def test_status_not_stale_when_fresh() -> None:
+    state = HubState()
+    _seed_peer(state, "alpha", last_seen=1000.0 + 190.0, status_ts=1000.0 + 170.0)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["status_stale"] is False  # 30 < 118.8
+
+
+def test_no_status_is_not_stale() -> None:
+    state = HubState()
+    _seed_peer(state, "alpha", last_seen=1000.0 + 190.0, status_ts=None)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["status_stale"] is False  # never reported -> not stale
+
+
+def test_status_dim_threshold_is_derived_from_quiet_after() -> None:
+    state = HubState()
+    assert state._status_dim_after == pytest.approx(  # noqa: SLF001
+        0.66 * state._quiet_after  # noqa: SLF001
+    )
+    # The two presentations of one tunable diverge: a status 130s old is dim in
+    # the UI yet still fresh enough to exempt a non-polling peer from "quiet".
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=1000.0 + 70.0)
+    info = state.peer_info("alpha", now=1000.0 + 200.0)
+    assert info is not None
+    assert info["status_stale"] is True  # 130 > 118.8 (dim)
+    assert info["quiet"] is False  # 130 < 180 (still a sign of life)
+
+
+def test_quiet_surfaces_through_peers_info_snapshot() -> None:
+    """The shipped data path: peers_info (feeds /ui health + snapshot) carries quiet."""
+    state = HubState()
+    _seed_peer(state, "alpha", last_seen=1000.0, status_ts=None)
+    infos = state.peers_info(now=1000.0 + 200.0)
+    alpha = next(p for p in infos if p["name"] == "alpha")
+    assert alpha["quiet"] is True
+    # It surfaces BEFORE reaping: the threshold sits below client_ttl, so the
+    # operator gets a heads-up window rather than a peer vanishing outright.
+    assert alpha["state"] == "live"
+    assert state._quiet_after < state.client_ttl  # noqa: SLF001
+
+
+def test_snapshot_carries_quiet_after_threshold() -> None:
+    state = HubState()
+    snapshot = state.add_ui().get_nowait()
+    assert snapshot["quiet_after"] == 180.0

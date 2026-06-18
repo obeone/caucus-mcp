@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import resource
 import secrets
 import sys
@@ -226,6 +227,38 @@ class Floor:
     since: float = field(default_factory=time.time)
 
 
+# --- liveness thresholds ------------------------------------------------
+
+QUIET_AFTER_SECONDS = 180.0
+"""Seconds of combined silence after which a live peer is flagged ``quiet``.
+
+A peer is "quiet" once it has gone this long with *neither* a ``/receive`` poll
+(refreshing ``last_seen``) *nor* a self-reported ``set_status`` update. The
+default sits deliberately between a realistic single long agent turn and the
+300s reaper ``client_ttl``: a passive bridge fires no tool call mid-turn and a
+native does not poll while reasoning, so a normal turn must not cross it, yet a
+genuinely silent peer surfaces to the operator *before* it is reaped. Override
+per deployment with the ``CAUCUS_QUIET_AFTER_SECONDS`` environment variable.
+"""
+
+
+def _quiet_after_from_env() -> float:
+    """Read ``CAUCUS_QUIET_AFTER_SECONDS`` (positive float) or fall back.
+
+    A missing, malformed, or non-positive value yields the
+    :data:`QUIET_AFTER_SECONDS` default, so a bad env var can never silently
+    disable the liveness signal.
+    """
+    raw = os.environ.get("CAUCUS_QUIET_AFTER_SECONDS")
+    if raw is None:
+        return QUIET_AFTER_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return QUIET_AFTER_SECONDS
+    return value if value > 0.0 else QUIET_AFTER_SECONDS
+
+
 class HubState:
     """Central, mutable state shared by all hub endpoints."""
 
@@ -237,6 +270,7 @@ class HubState:
         log_size: int = 500,
         client_ttl: float = 300.0,
         reaped_grace: float = 1800.0,
+        quiet_after: float | None = None,
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
@@ -284,6 +318,14 @@ class HubState:
         # Generous on purpose: a peer that goes quiet for a while should still
         # be able to pick its identity back up rather than re-join from scratch.
         self.reaped_grace = reaped_grace
+        # Liveness threshold (see QUIET_AFTER_SECONDS). A live, non-paused peer
+        # that goes this long without either polling or self-reporting a status
+        # surfaces as ``quiet`` to the operator. The UI status line dims at a
+        # derived, looser fraction so the operator holds a single tunable.
+        self._quiet_after = (
+            quiet_after if quiet_after is not None else _quiet_after_from_env()
+        )
+        self._status_dim_after = 0.66 * self._quiet_after
 
     # --- properties ------------------------------------------------------
 
@@ -815,6 +857,26 @@ class HubState:
             return None
         client = self._clients.get(name) or self._reaped_by_project.get(name)
         assert client is not None  # state is live or reaped, so a record exists
+        # Derive the liveness signals from the client's own timestamps (floats),
+        # not the probe's JSON-typed copies. A peer is "quiet" when it is live,
+        # not operator-paused, and has gone past the threshold with BOTH no
+        # status update AND no authenticated call — the last_seen guard keeps an
+        # actively polling peer from ever being flagged. A passive bridge cannot
+        # set_status mid-turn (it fires no tool call until the turn ends), so the
+        # status exemption is earned across turns; the threshold (default 180s,
+        # below the 300s reaper) is what keeps a single long turn from tripping
+        # it. ``status_stale`` is a looser, cosmetic dim off the same threshold.
+        status_age = None if client.status_ts is None else ref - client.status_ts
+        last_seen_age = ref - client.last_seen
+        quiet = (
+            probe["state"] == "live"
+            and not client.paused
+            and (status_age is None or status_age > self._quiet_after)
+            and last_seen_age > self._quiet_after
+        )
+        status_stale = (
+            status_age is not None and status_age > self._status_dim_after
+        )
         return {
             "name": name,
             "state": probe["state"],
@@ -823,6 +885,8 @@ class HubState:
             "status": probe["status"],
             "status_age": probe["status_age"],
             "last_seen_age": probe["last_seen_age"],
+            "quiet": quiet,
+            "status_stale": status_stale,
             "uptime": round(ref - client.first_seen, 1),
             "msg_count": client.msg_count,
         }
@@ -1792,7 +1856,8 @@ class HubState:
                       "peers": self.peers_info(), "channels": self.channels(),
                       "floors": self.floors_public(),
                       "forms": self.list_forms(), "log": self.recent(),
-                      "health": self.health(), "rate": self.rate_limit()})
+                      "health": self.health(), "rate": self.rate_limit(),
+                      "quiet_after": self._quiet_after})
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:
