@@ -181,6 +181,52 @@ def test_observer_heartbeat_is_forbidden(client: TestClient, with_auth: None) ->
     assert err["command"] == "heartbeat"
 
 
+# --- rate limit over /ui -------------------------------------------------
+
+
+def test_set_rate_command_over_ui_applies(
+    client: TestClient, state: HubState
+) -> None:
+    """An operator {set_rate} retunes the global limit and echoes a rate event."""
+    _register(client, "alpha")
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"set_rate": {"refill_rate": 2.0, "capacity": 8.0}})
+        evt = _drain_until(ws, "rate")
+    assert evt["rate"] == {"refill_rate": 2.0, "capacity": 8.0}
+    assert state.rate_limit() == {"refill_rate": 2.0, "capacity": 8.0}
+
+
+def test_set_rate_with_reserved_peer_key_is_noop(
+    client: TestClient, state: HubState
+) -> None:
+    """A {set_rate} carrying the reserved 'peer' key is a no-op (not yet wired)."""
+    _register(client, "alpha")
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json(
+            {"set_rate": {"refill_rate": 9.0, "capacity": 9.0, "peer": "alpha"}}
+        )
+        # Sync point: a follow-up command we can observe guarantees the reserved
+        # frame was processed first (FIFO) before we assert it changed nothing.
+        ws.send_json({"heartbeat": "alpha"})
+        _drain_until(ws, "heartbeat_result")
+    assert state.rate_limit() == {"refill_rate": 0.5, "capacity": 5.0}
+
+
+def test_observer_set_rate_is_forbidden(client: TestClient, with_auth: None) -> None:
+    with client.websocket_connect("/ui") as ws:
+        ws.send_json({"auth": "ob-tok"})
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"set_rate": {"refill_rate": 2.0, "capacity": 8.0}})
+        err = _drain_until(ws, "error")
+    assert err["reason"] == "forbidden"
+    assert err["command"] == "set_rate"
+
+
 # --- per-peer pause over the real /receive long-poll ---------------------
 
 

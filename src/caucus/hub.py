@@ -1378,6 +1378,7 @@ async def control(
 _MUTATING_COMMANDS = frozenset(
     {
         "action",
+        "set_rate",
         "say",
         "kick",
         "floor",
@@ -1447,6 +1448,21 @@ def _apply_ui_command(data: dict[str, object]) -> None:
         }.get(str(data["action"]))
         if mode is not None:
             state.set_mode(mode)
+    elif "set_rate" in data:
+        # {"set_rate": {"refill_rate": <msg/s>, "capacity": <burst>}} retunes the
+        # global send limit. A "peer" key is reserved for a future per-peer
+        # override: reject it as a no-op today so that follow-up extends the wire
+        # contract rather than breaking it. Malformed payloads are ignored;
+        # set_rate_limit itself validates the numbers and is a no-op on reject.
+        spec = data.get("set_rate")
+        if isinstance(spec, dict) and "peer" not in spec:
+            try:
+                refill_rate = float(spec["refill_rate"])
+                capacity = float(spec["capacity"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                state.set_rate_limit(refill_rate=refill_rate, capacity=capacity)
     elif "say" in data:
         state.route(
             Message(
