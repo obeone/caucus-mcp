@@ -1,0 +1,46 @@
+# Automatic changelog + version management.
+#
+# release-please watches Conventional Commits landing on `main` and keeps a
+# single "release PR" permanently open. That PR accumulates the next
+# CHANGELOG.md section (grouped per `release-please-config.json`) and bumps
+# `[project].version` in pyproject.toml — the project's single source of truth.
+# Merging the release PR is the release act: it tags `vX.Y.Z` and publishes a
+# GitHub Release, which in turn triggers `publish.yml` to ship to PyPI.
+#
+# This honors the repo rule "every release bumps the version in a dedicated
+# commit": the bump lives in release-please's `chore(main): release X.Y.Z`
+# commit, and the CHANGELOG entry rides along with it.
+name: Changelog & Release PR
+
+on:
+  push:
+    branches: [main]
+  # Lets an operator force a re-evaluation of the release PR from the Actions
+  # tab without pushing a new commit.
+  workflow_dispatch:
+
+# The action needs to write the release PR (and create the release/tag on
+# merge) and to comment on PRs/issues it links. Nothing else.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Only one release PR should ever be in flight; cancel stale runs so a burst
+# of merges collapses into a single up-to-date release PR.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Maintain release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # Default GITHUB_TOKEN is sufficient for same-repo release PRs. To
+          # have the created tag/release retrigger other workflows, swap this
+          # for a PAT or GitHub App token stored as a secret.
+          token: ${{ secrets.GITHUB_TOKEN }}
