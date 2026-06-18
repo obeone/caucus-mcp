@@ -10,6 +10,24 @@
 # This honors the repo rule "every release bumps the version in a dedicated
 # commit": the bump lives in release-please's `chore(main): release X.Y.Z`
 # commit, and the CHANGELOG entry rides along with it.
+#
+# Authentication uses a short-lived GitHub App installation token rather than
+# the default GITHUB_TOKEN. This is deliberate: a tag/Release created with the
+# default token does NOT, by GitHub design, retrigger other workflows, so
+# `publish.yml` would never fire. An App token sidesteps that anti-recursion
+# rule, is ephemeral, and isn't tied to a personal account.
+#
+# One-time setup:
+#   1. Create a GitHub App (org or personal) with repository permissions:
+#        Contents: Read and write   (commits, tags, releases)
+#        Pull requests: Read and write
+#        Issues: Read and write     (release-please manages labels)
+#      Add Workflows: Read and write only if a release PR ever edits files
+#      under .github/workflows/.
+#   2. Install it on obeone/caucus-mcp.
+#   3. Expose its credentials to this repo:
+#        vars.RELEASE_APP_ID            -> the App's numeric ID
+#        secrets.RELEASE_APP_PRIVATE_KEY -> the App's generated private key (PEM)
 name: Changelog & Release PR
 
 on:
@@ -36,11 +54,18 @@ jobs:
     name: Maintain release PR
     runs-on: ubuntu-latest
     steps:
+      # Mint a short-lived installation token for the release App. Its outputs
+      # are scoped to this repo and expire at the end of the run.
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          # Default GITHUB_TOKEN is sufficient for same-repo release PRs. To
-          # have the created tag/release retrigger other workflows, swap this
-          # for a PAT or GitHub App token stored as a secret.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # App token (not the default GITHUB_TOKEN) so the tag/Release it
+          # creates can retrigger publish.yml.
+          token: ${{ steps.app-token.outputs.token }}
