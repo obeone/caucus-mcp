@@ -12,12 +12,10 @@
 #     Workflow:     publish.yml
 #     Environment:  pypi
 #
-# Note on auto-chaining: a Release created by release-please's default
-# GITHUB_TOKEN does NOT, by GitHub design, trigger this workflow. To chain
-# them automatically, give release-please a PAT or GitHub App token (the
-# `token:` input in changelog.yml). Otherwise publish manually from the
-# Actions tab, or let the `release: published` event fire when a maintainer
-# publishes the release by hand.
+# Auto-chaining: changelog.yml runs release-please under a GitHub App token,
+# so the Release it publishes DOES trigger this workflow (the default
+# GITHUB_TOKEN would not, by GitHub design). `workflow_dispatch` remains as a
+# manual fallback for re-runs.
 name: Publish to PyPI
 
 on:
