@@ -117,6 +117,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
     if (stored !== null) return stored === "true";
     return window.matchMedia("(prefers-color-scheme: dark)").matches;
   })(),
+  pauseOnType: (() => {
+    const stored = localStorage.getItem("caucus_pause_on_type");
+    return stored === "true";
+  })(),
 
   // ---- internal state -----------------------------------------------------
   _ws: null,
@@ -139,6 +143,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
       document.documentElement.classList.remove("dark");
     }
     set({ darkMode: v });
+  },
+
+  setPauseOnType: (v) => {
+    localStorage.setItem("caucus_pause_on_type", String(v));
+    set({ pauseOnType: v });
   },
 
   // ---- WebSocket internals ------------------------------------------------

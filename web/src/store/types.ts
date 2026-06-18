@@ -285,11 +285,15 @@ export interface DashboardState {
   // Dark mode (persisted in localStorage)
   darkMode: boolean;
 
+  // Pause-while-typing toggle (persisted in localStorage)
+  pauseOnType: boolean;
+
   // Actions
   setSelectedPeer: (name: string | null) => void;
   setSelectedChannel: (name: string | null) => void;
   setShowUTC: (v: boolean) => void;
   setDarkMode: (v: boolean) => void;
+  setPauseOnType: (v: boolean) => void;
 
   // WS commands
   sendMode: (action: "pause" | "resume" | "reset" | "stop") => void;
