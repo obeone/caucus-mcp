@@ -30,6 +30,7 @@ import FormsAlert from "./components/FormsAlert";
 import DisconnectedBanner from "./components/DisconnectedBanner";
 import FloorStrip from "./components/FloorStrip";
 import OperatorComposer from "./components/OperatorComposer";
+import RateControl from "./components/RateControl";
 import ToastProvider from "./components/ToastProvider";
 import { Moon, Sun, Wifi, WifiOff, HelpCircle, BookOpen } from "lucide-react";
 
@@ -251,6 +252,13 @@ export default function App() {
             <div className="flex-1 min-h-0 overflow-hidden">
               <FlowPanel />
             </div>
+
+            {/* Rate control panel — operator-only, self-guards internally */}
+            {role === "operator" && (
+              <div className="flex-shrink-0 px-4 pt-2 pb-1 border-t border-line/40 bg-panel/20">
+                <RateControl />
+              </div>
+            )}
 
             {/* Operator composer — pinned to bottom, operator-only */}
             <OperatorComposer />
