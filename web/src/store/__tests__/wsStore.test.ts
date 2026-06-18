@@ -93,6 +93,8 @@ describe("wsStore — snapshot event", () => {
     last_seen_age: 0.5,
     uptime: 120,
     msg_count: 3,
+    quiet: false,
+    status_stale: false,
   };
 
   const snapshot: SnapshotEvent = {
@@ -224,6 +226,7 @@ describe("wsStore — peers event", () => {
       peers: [{
         name: "old", state: "live", listening: false, paused: false,
         status: null, status_age: null, last_seen_age: 0, uptime: 0, msg_count: 0,
+        quiet: false, status_stale: false,
       }],
     });
     handle({
@@ -231,6 +234,7 @@ describe("wsStore — peers event", () => {
       peers: [{
         name: "new", state: "live", listening: true, paused: false,
         status: null, status_age: null, last_seen_age: 0, uptime: 0, msg_count: 0,
+        quiet: false, status_stale: false,
       }],
     });
     const peers = useDashStore.getState().peers;
@@ -246,6 +250,7 @@ describe("wsStore — health event", () => {
     const peer: PeerInfo = {
       name: "p", state: "live", listening: true, paused: false,
       status: null, status_age: null, last_seen_age: 0.1, uptime: 60, msg_count: 1,
+      quiet: false, status_stale: false,
     };
     handle({
       type: "health",

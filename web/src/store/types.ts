@@ -21,6 +21,17 @@ export interface PeerInfo {
   last_seen_age: number | null;
   uptime: number;
   msg_count: number;
+  /**
+   * Advisory liveness flag: true when a live, non-paused peer has gone past
+   * the hub's quiet threshold with neither a /receive poll nor a status update.
+   * A peer can legitimately be quiet mid-long-turn — render amber, not red.
+   */
+  quiet: boolean;
+  /**
+   * True when the peer's self-reported status line is older than the hub's
+   * status-stale threshold. Dims the status text; purely advisory.
+   */
+  status_stale: boolean;
 }
 
 // ---------------------------------------------------------------------------

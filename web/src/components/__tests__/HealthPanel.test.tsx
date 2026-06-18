@@ -36,6 +36,8 @@ const livePeer: PeerInfo = {
   last_seen_age: 0.3,
   uptime: 240,
   msg_count: 12,
+  quiet: false,
+  status_stale: false,
 };
 
 const pausedPeer: PeerInfo = {
@@ -48,6 +50,8 @@ const pausedPeer: PeerInfo = {
   last_seen_age: 1.1,
   uptime: 60,
   msg_count: 3,
+  quiet: false,
+  status_stale: false,
 };
 
 const reapedPeer: PeerInfo = {
@@ -60,6 +64,8 @@ const reapedPeer: PeerInfo = {
   last_seen_age: 90,
   uptime: 400,
   msg_count: 8,
+  quiet: false,
+  status_stale: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -179,5 +185,132 @@ describe("HealthPanel — observer role", () => {
     expect(
       screen.queryByRole("button", { name: /Kick agent-alpha/i })
     ).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Liveness: quiet badge and status staleness
+// ---------------------------------------------------------------------------
+
+describe("HealthPanel — quiet badge", () => {
+  it("renders_quiet_amber_badge_when_peer_quiet", () => {
+    const quietPeer: PeerInfo = {
+      ...livePeer,
+      name: "agent-quiet",
+      quiet: true,
+      last_seen_age: 42.5,
+    };
+    useDashStore.setState({
+      peers: [quietPeer],
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+
+    // The peer card renders a badge with the advisory tooltip title
+    const peerBadge = screen.getByTitle(
+      /no poll and no status update for a while/i
+    );
+    expect(peerBadge).toBeInTheDocument();
+
+    // Must use amber, not red/error class
+    expect(peerBadge.className).toMatch(/text-amber/);
+    expect(peerBadge.className).not.toMatch(/text-red/);
+  });
+
+  it("does_not_render_quiet_badge_when_not_quiet", () => {
+    useDashStore.setState({
+      peers: [livePeer], // livePeer.quiet === false
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+    expect(screen.queryByText(/quiet/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("HealthPanel — status age and staleness", () => {
+  it("shows_status_age_and_dims_when_stale", () => {
+    const stalePeer: PeerInfo = {
+      ...livePeer,
+      name: "agent-stale",
+      status: "processing data",
+      status_age: 120,
+      status_stale: true,
+      quiet: false,
+    };
+    useDashStore.setState({
+      peers: [stalePeer],
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+
+    // Status age text is rendered
+    expect(screen.getByText(/120s ago/i)).toBeInTheDocument();
+
+    // Status paragraph carries the dim/muted class when stale
+    const statusEl = screen.getByText(/processing data/i).closest("p");
+    expect(statusEl?.className).toMatch(/text-dim\/50/);
+  });
+
+  it("does_not_dim_status_when_not_stale", () => {
+    // livePeer has status_stale: false
+    useDashStore.setState({
+      peers: [livePeer],
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+
+    const statusEl = screen.getByText(/building the API/i).closest("p");
+    // Should not carry the stale dim class
+    expect(statusEl?.className).not.toMatch(/text-dim\/50/);
+  });
+});
+
+describe("HealthPanel — quiet count in stats bar", () => {
+  it("quiet_count_in_stats: shows quiet tally when at least one peer is quiet", () => {
+    const quietPeer: PeerInfo = {
+      ...livePeer,
+      name: "agent-q",
+      quiet: true,
+    };
+    const normalPeer: PeerInfo = {
+      ...pausedPeer,
+      name: "agent-n",
+      quiet: false,
+    };
+    useDashStore.setState({
+      peers: [quietPeer, normalPeer],
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+
+    // Stats bar should show "1 quiet"
+    expect(screen.getByText(/1 quiet/i)).toBeInTheDocument();
+  });
+
+  it("does not show quiet count when no peers are quiet", () => {
+    useDashStore.setState({
+      peers: [livePeer, pausedPeer],
+      selectedPeer: null,
+      role: "operator",
+      health: null,
+      showUTC: false,
+    });
+    render(<HealthPanel />, { wrapper: Wrapper });
+    expect(screen.queryByText(/quiet/i)).not.toBeInTheDocument();
   });
 });
