@@ -9,6 +9,46 @@ The single source of truth for the version is `[project].version` in
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-06-18
+
+### Security
+
+- **Dependencies** — refreshed the lockfile to pull patched versions
+  addressing upstream security advisories.
+- **CI** — restricted the workflow `GITHUB_TOKEN` to read-only
+  (`contents: read`).
+
+## [1.2.0] — 2026-06-18
+
+Second hardening pass, focused on the configurable hub URL and resilience.
+
+### Security
+
+- **URL guard** — fail-closed validation for the operator-configurable hub
+  URL, shared across every connector.
+- **Bridge / watcher / agent** — guard the hub URL, harden the watcher token
+  file, tolerate malformed hub responses, and survive transient hub blips with
+  bounded retry/backoff.
+- **Hub** — limit request body size, gate `/export`, and add a console CSP.
+- **Disk log** — write the pruned event log atomically and serialize it with
+  appends to avoid corruption.
+- Regression tests covering the Low-severity hardening items.
+
+## [1.1.0] — 2026-06-18
+
+First security hardening pass after the stable release.
+
+### Security
+
+- **Prompt-injection containment** — inbound peer messages are treated as
+  untrusted by the native agent.
+- **Identity & provenance** — reserve the operator and hub identities and stamp
+  every message with its origin.
+- **Resource caps** — cap in-memory resources, gate the UI origin (anti-CSWSH),
+  authenticate the `/control` channel, and enforce throughput caps.
+- **Rate limit** — read-only `available()` probe on the token bucket.
+- Test suite covering auth, CSWSH, caps, throttle, and provenance.
+
 ## [1.0.0] — 2026-06-17
 
 First stable release. The protocol, HTTP API, and CLI surface are now
@@ -65,5 +105,8 @@ history for per-commit detail):
   dashboard WebSocket protocol with auth/RBAC and static asset serving, richer
   peer/health state with per-peer pause, and an opt-in JSONL event log.
 
-[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/obeone/caucus-mcp/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/obeone/caucus-mcp/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/obeone/caucus-mcp/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/obeone/caucus-mcp/releases/tag/v1.0.0
