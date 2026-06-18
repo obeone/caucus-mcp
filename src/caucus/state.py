@@ -1718,6 +1718,64 @@ class HubState:
         self._push_ui({"type": "mode", "mode": mode.value})
         self._announce_system(f"control: {mode.value}")
 
+    # --- rate limit ------------------------------------------------------
+
+    def rate_limit(self) -> dict[str, float]:
+        """Return the current global send rate-limit parameters.
+
+        Returns:
+            ``{"refill_rate": tokens/sec, "capacity": burst}`` — the defaults
+            new peers are minted with and the values every live bucket currently
+            enforces (kept in lock-step by :meth:`set_rate_limit`).
+        """
+        return {"refill_rate": self._bucket_refill,
+                "capacity": self._bucket_capacity}
+
+    def set_rate_limit(
+        self, *, refill_rate: float, capacity: float
+    ) -> dict[str, float] | None:
+        """Retune the global send rate limit at runtime and re-apply it live.
+
+        Validates first and is a strict no-op on rejection: an invalid request
+        leaves ``_bucket_refill``/``_bucket_capacity`` and every existing bucket
+        byte-identical. On accept, updates the defaults (so newly registered and
+        revived peers inherit them) and reconfigures every live *and* reaped
+        peer's bucket in place — never reconstructing it, which would reseed
+        tokens to a full burst (see :meth:`TokenBucket.reconfigure`). Tightening
+        takes effect immediately for all peers (a room-wide clamp); loosening
+        recovers at the new rate.
+
+        Args:
+            refill_rate: New sustained rate in messages per second; must be
+                strictly positive (a zero rate would wedge the room — buckets
+                would never refill).
+            capacity: New burst size; must be at least 1.0.
+
+        Returns:
+            The applied ``{"refill_rate", "capacity"}`` on success, or ``None``
+            if the request was rejected and the state left unchanged.
+        """
+        # Validate BEFORE mutating anything. /ui frames are attacker-shaped, and
+        # a partial application could wedge the room (refill_rate <= 0 never
+        # refills). Reject is a strict no-op so callers can ignore None safely.
+        if not (refill_rate > 0.0 and capacity >= 1.0):
+            return None
+        self._bucket_refill = refill_rate
+        self._bucket_capacity = capacity
+        # Re-apply to every existing bucket — live and reaped — so already-joined
+        # peers are retuned too, not only future registrations. Mutate in place;
+        # reconstructing would reseed tokens to a full burst (see reconfigure).
+        for client in (*self._clients.values(), *self._reaped.values()):
+            if client.bucket is not None:
+                client.bucket.reconfigure(
+                    capacity=capacity, refill_rate=refill_rate
+                )
+        self._push_ui({"type": "rate", "rate": self.rate_limit()})
+        self._announce_system(
+            f"rate limit: {refill_rate:g} msg/s, burst {capacity:g}"
+        )
+        return self.rate_limit()
+
     # --- UI fan-out ------------------------------------------------------
 
     def add_ui(self) -> asyncio.Queue[dict[str, object]]:
@@ -1734,7 +1792,7 @@ class HubState:
                       "peers": self.peers_info(), "channels": self.channels(),
                       "floors": self.floors_public(),
                       "forms": self.list_forms(), "log": self.recent(),
-                      "health": self.health()})
+                      "health": self.health(), "rate": self.rate_limit()})
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:

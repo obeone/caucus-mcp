@@ -63,3 +63,28 @@ class TokenBucket:
         """
         now = time.monotonic()
         return min(self.capacity, self.tokens + (now - self.updated) * self.refill_rate)
+
+    def reconfigure(self, *, capacity: float, refill_rate: float) -> None:
+        """Retune this bucket in place to a new capacity and refill rate.
+
+        Credits elapsed idle time under the *old* rate first (the same lazy
+        refill as :meth:`allow`), then adopts the new parameters and clamps the
+        live token count down to the new capacity. Tightening therefore takes
+        effect immediately (tokens are clamped); loosening recovers gradually at
+        the new rate.
+
+        Mutating in place is deliberate. Reconstructing the bucket would re-run
+        :meth:`__post_init__`, which seeds ``tokens`` to ``capacity`` whenever
+        ``tokens == 0.0`` — silently handing the sender a full fresh burst on
+        every retune. Always reconfigure; never replace.
+
+        Args:
+            capacity: New maximum token count (burst size).
+            refill_rate: New tokens added per second.
+        """
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.refill_rate)
+        self.updated = now
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.tokens = min(self.tokens, capacity)
