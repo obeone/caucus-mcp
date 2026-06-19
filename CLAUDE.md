@@ -110,11 +110,23 @@ contract) lives in **`docs/ARCHITECTURE.md`**.
 
 ## Versioning
 
-The version follows SemVer and has **a single source of truth**:
-`[project].version` in `pyproject.toml`. `caucus.__version__` reads it back from
-the installed package metadata (`importlib.metadata.version`), and the FastAPI
-app title in `hub.py` uses `caucus.__version__` — neither hardcodes a number.
-Bump `pyproject.toml` and the rest follows.
+The version follows SemVer and is **derived from git tags** — it is *not*
+written anywhere in the source. `hatch-vcs` reads the latest `vX.Y.Z` tag at
+build time (`[tool.hatch.version] source = "vcs"` in `pyproject.toml`) and
+stamps the build accordingly. `caucus.__version__` reads it back from the
+generated `src/caucus/_version.py` (falling back to installed package
+metadata), and the FastAPI app title in `hub.py` uses `caucus.__version__`.
+
+**Releasing = tagging.** Merge as many PRs into `main` as you want with no
+version bump; nothing in the tree changes. When you decide to ship, create a
+GitHub Release `vX.Y.Z` (which pushes the tag) — that tag *becomes* version
+`X.Y.Z`, and the `Release` workflow builds and publishes it. Cut one release
+after five PRs, or five releases in an afternoon: it is one tag per version,
+your call. There is no more `chore(release): bump version` commit.
+
+> Builds between tags get a dev version like `1.4.1.dev3+g<sha>` (3 commits
+> past `v1.4.0`). `src/caucus/_version.py` is a build artifact — git-ignored,
+> never committed.
 
 > Note: `PROTOCOL_VERSION` in `hub.py` is **not** the package version — it is an
 > independent counter for the operating-protocol revision. This bump *is*
