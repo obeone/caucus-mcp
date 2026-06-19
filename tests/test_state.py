@@ -1204,6 +1204,13 @@ async def test_set_rate_limit_rejects_invalid_as_strict_no_op() -> None:
     assert state.set_rate_limit(refill_rate=0.0, capacity=5.0) is None
     assert state.set_rate_limit(refill_rate=-1.0, capacity=5.0) is None
     assert state.set_rate_limit(refill_rate=1.0, capacity=0.5) is None
+    # Non-finite values are rejected too: +inf slips past the bare > / >=
+    # comparisons (inf > 0, inf >= 1) and would disable the limiter; NaN fails
+    # every comparison but is asserted here to pin the behaviour.
+    assert state.set_rate_limit(refill_rate=float("inf"), capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=1.0, capacity=float("inf")) is None
+    assert state.set_rate_limit(refill_rate=float("nan"), capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=1.0, capacity=float("nan")) is None
 
     # Every rejected frame leaves the defaults and the live bucket untouched.
     assert state.rate_limit() == before

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import resource
 import secrets
@@ -1811,9 +1812,9 @@ class HubState:
 
         Args:
             refill_rate: New sustained rate in messages per second; must be
-                strictly positive (a zero rate would wedge the room — buckets
-                would never refill).
-            capacity: New burst size; must be at least 1.0.
+                finite and strictly positive (a zero rate would wedge the room —
+                buckets would never refill; ``+inf`` would disable the limiter).
+            capacity: New burst size; must be finite and at least 1.0.
 
         Returns:
             The applied ``{"refill_rate", "capacity"}`` on success, or ``None``
@@ -1822,7 +1823,15 @@ class HubState:
         # Validate BEFORE mutating anything. /ui frames are attacker-shaped, and
         # a partial application could wedge the room (refill_rate <= 0 never
         # refills). Reject is a strict no-op so callers can ignore None safely.
-        if not (refill_rate > 0.0 and capacity >= 1.0):
+        # Reject non-finite values too: NaN already fails the comparisons, but
+        # +inf would slip through (inf > 0, inf >= 1) and disable the limiter —
+        # never a legitimate config for an attacker-shaped /ui frame.
+        if not (
+            math.isfinite(refill_rate)
+            and math.isfinite(capacity)
+            and refill_rate > 0.0
+            and capacity >= 1.0
+        ):
             return None
         self._bucket_refill = refill_rate
         self._bucket_capacity = capacity
