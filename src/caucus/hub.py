@@ -276,6 +276,8 @@ def _prune_register_buckets() -> None:
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
+# When PROTOCOL_TEXT changes, also update the human-readable mirror
+# caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
 PROTOCOL_VERSION = 15
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
@@ -418,15 +420,24 @@ The talking stick (when something grave is getting drowned):
     and can force a stick closed at any time — their word is final.
 
 Asking the human (operator forms):
-  - ask_operator is the ONLY way to put a question to the human while you are in
-    the room. NEVER use your host's own interactive prompt (e.g. the
-    AskUserQuestion tool, or any "ask the user" / blocking dialog the runtime
-    offers): it freezes your turn, and a frozen turn cannot run the watcher — so
-    every inbound message, peer reply, and the operator stop is silently dropped
-    while you sit and wait, and the exchange dies in a timeout. This generalizes:
-    once you are in the room, NO tool that blocks the turn is allowed. The
-    watcher must always be free to wake you. Route every human question through
-    ask_operator instead.
+  - Operator forms are the ONLY channel to the human while you are in the room.
+    To put any question, choice, or approval to the operator, use
+    ask_operator(...) — do NOT address the human in a plain say(). A say() is
+    peer-facing: it is not a reliable way to reach the operator and it clutters
+    the room. The human answers forms, not chat lines.
+  - NEVER use your host's own interactive prompt (e.g. the AskUserQuestion tool,
+    or any "ask the user" / blocking dialog the runtime offers): it freezes your
+    turn, and a frozen turn cannot run the watcher — so every inbound message,
+    peer reply, and the operator stop is silently dropped while you sit and wait,
+    and the exchange dies in a timeout. This generalizes: once you are in the
+    room, NO tool that blocks the turn is allowed. The watcher must always be
+    free to wake you. Route every human question through ask_operator instead.
+  - If you genuinely need a PRIVATE exchange with the human — something that
+    should not go to the whole room — signal it in the room first
+    ("taking this to the operator privately"), then raise it through a form
+    scoped narrowly. Never open a silent side conversation with the operator:
+    the room must know a private exchange is happening, even if it never sees
+    the contents.
   - When the work needs a HUMAN decision (a choice, an approval, a value only
     the operator can give), do NOT each ask separately and do NOT scatter the
     question across several say()s. Agree in-room on a small, restricted set of
@@ -483,6 +494,13 @@ Checking on a peer (ping & status):
     doing: set_status("implementing the /items endpoint") when you pick up
     work, and refresh it as the work moves. Keep it to one line; clear it with
     set_status("") when idle. This is a heartbeat for your peers, not a log.
+  - Give regular signs of life — especially when peers are waiting on you. To
+    the hub a long turn that neither polls nor reports a status is
+    indistinguishable from a stalled or dead agent, and after a while the
+    operator console flags you as "quiet" (no poll AND no status update for a
+    while). A fresh set_status between turns is what keeps you visibly alive and
+    tells the room where you are, without ever waking your LLM. Before you go
+    heads-down on a slow piece of work, say so with set_status.
 """
 
 state = HubState()
@@ -1387,6 +1405,7 @@ async def control(
 _MUTATING_COMMANDS = frozenset(
     {
         "action",
+        "set_rate",
         "say",
         "kick",
         "floor",
@@ -1456,6 +1475,21 @@ def _apply_ui_command(data: dict[str, object]) -> None:
         }.get(str(data["action"]))
         if mode is not None:
             state.set_mode(mode)
+    elif "set_rate" in data:
+        # {"set_rate": {"refill_rate": <msg/s>, "capacity": <burst>}} retunes the
+        # global send limit. A "peer" key is reserved for a future per-peer
+        # override: reject it as a no-op today so that follow-up extends the wire
+        # contract rather than breaking it. Malformed payloads are ignored;
+        # set_rate_limit itself validates the numbers and is a no-op on reject.
+        spec = data.get("set_rate")
+        if isinstance(spec, dict) and "peer" not in spec:
+            try:
+                refill_rate = float(spec["refill_rate"])
+                capacity = float(spec["capacity"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                state.set_rate_limit(refill_rate=refill_rate, capacity=capacity)
     elif "say" in data:
         state.route(
             Message(

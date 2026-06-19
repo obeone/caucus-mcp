@@ -21,6 +21,17 @@ export interface PeerInfo {
   last_seen_age: number | null;
   uptime: number;
   msg_count: number;
+  /**
+   * Advisory liveness flag: true when a live, non-paused peer has gone past
+   * the hub's quiet threshold with neither a /receive poll nor a status update.
+   * A peer can legitimately be quiet mid-long-turn — render amber, not red.
+   */
+  quiet: boolean;
+  /**
+   * True when the peer's self-reported status line is older than the hub's
+   * status-stale threshold. Dims the status text; purely advisory.
+   */
+  status_stale: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +105,22 @@ export interface FormObj {
 }
 
 // ---------------------------------------------------------------------------
+// Rate limit
+// ---------------------------------------------------------------------------
+
+/**
+ * Token-bucket rate-limit parameters as reported by the hub.
+ *
+ * `refill_rate` is the sustained rate in messages per second (may be
+ * fractional, e.g. 0.5 = 30 msg/min).  `capacity` is the burst size
+ * (maximum tokens in the bucket; always >= 1).
+ */
+export interface RateInfo {
+  refill_rate: number;
+  capacity: number;
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 
@@ -128,6 +155,8 @@ export interface SnapshotEvent {
   forms: FormObj[];
   log: RawMessage[];
   health: HealthInfo;
+  /** Current rate-limit config; present when the hub has one configured. */
+  rate?: RateInfo;
 }
 
 export interface RawMessage {
@@ -199,6 +228,11 @@ export interface HeartbeatResultEvent {
   };
 }
 
+export interface RateEvent {
+  type: "rate";
+  rate: RateInfo;
+}
+
 export interface ErrorEvent {
   type: "error";
   reason: string;
@@ -218,6 +252,7 @@ export type HubEvent =
   | FormResolvedEvent
   | HealthEvent
   | HeartbeatResultEvent
+  | RateEvent
   | ErrorEvent;
 
 // ---------------------------------------------------------------------------
@@ -244,6 +279,8 @@ export interface DashboardState {
   floors: FloorsMap;
   forms: FormObj[];
   health: HealthInfo | null;
+  /** Current token-bucket rate-limit config; null until hub sends one. */
+  rate: RateInfo | null;
   messages: Message[];
 
   // UI cross-link
@@ -259,11 +296,15 @@ export interface DashboardState {
   // Dark mode (persisted in localStorage)
   darkMode: boolean;
 
+  // Pause-while-typing toggle (persisted in localStorage)
+  pauseOnType: boolean;
+
   // Actions
   setSelectedPeer: (name: string | null) => void;
   setSelectedChannel: (name: string | null) => void;
   setShowUTC: (v: boolean) => void;
   setDarkMode: (v: boolean) => void;
+  setPauseOnType: (v: boolean) => void;
 
   // WS commands
   sendMode: (action: "pause" | "resume" | "reset" | "stop") => void;
@@ -277,4 +318,11 @@ export interface DashboardState {
   sendFloorClear: (scope: string) => void;
   /** Send operator message. Wire format: {"say":"<text>","to":"<scope>"}. */
   sendChat: (to: string, content: string) => void;
+  /**
+   * Set the global token-bucket rate limit at runtime.
+   *
+   * @param refillRate - Sustained rate in messages per second (e.g. 0.5 = 30/min).
+   * @param capacity   - Burst size; must be >= 1.
+   */
+  sendSetRate: (refillRate: number, capacity: number) => void;
 }

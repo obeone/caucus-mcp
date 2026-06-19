@@ -21,6 +21,7 @@ import type {
   FloorsMap,
   FormObj,
   HealthInfo,
+  RateInfo,
   RawMessage,
   ConnectionState,
   UserRole,
@@ -106,6 +107,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   floors: {},
   forms: [],
   health: null as HealthInfo | null,
+  rate: null as RateInfo | null,
   messages: [],
   selectedPeer: null,
   selectedChannel: null as string | null,
@@ -114,6 +116,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
     const stored = localStorage.getItem("caucus_dark");
     if (stored !== null) return stored === "true";
     return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  })(),
+  pauseOnType: (() => {
+    const stored = localStorage.getItem("caucus_pause_on_type");
+    return stored === "true";
   })(),
 
   // ---- internal state -----------------------------------------------------
@@ -137,6 +143,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
       document.documentElement.classList.remove("dark");
     }
     set({ darkMode: v });
+  },
+
+  setPauseOnType: (v) => {
+    localStorage.setItem("caucus_pause_on_type", String(v));
+    set({ pauseOnType: v });
   },
 
   // ---- WebSocket internals ------------------------------------------------
@@ -168,6 +179,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
           floors: (evt.floors ?? {}) as FloorsMap,
           forms: (evt.forms ?? []) as FormObj[],
           health: evt.health ?? null,
+          rate: evt.rate ?? null,
           messages: msgs.slice(-MAX_MESSAGES),
         });
         break;
@@ -245,6 +257,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
         break;
       }
 
+      case "rate":
+        set({ rate: evt.rate });
+        break;
+
       case "error":
         console.warn("[caucus] server error", evt);
         break;
@@ -308,7 +324,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
 
   // ---- Public command senders --------------------------------------------
 
-  sendMode: (action) => get()._send({ mode: action }),
+  // Wire format: {"action":"<pause|resume|reset|stop>"} — the hub dispatches
+  // control-mode on the "action" key (hub.py `_apply_ui_command` and
+  // `_MUTATING_COMMANDS`). A {mode:...} payload matches no command key, so it is
+  // silently dropped and operator pause/resume/stop/reset never reach the hub.
+  sendMode: (action) => get()._send({ action }),
 
   sendKick: (name) => get()._send({ kick: name }),
 
@@ -332,6 +352,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   // key (legacy console format, hub.py line ~1062); a {to,content} payload is
   // silently ignored.
   sendChat: (to, content) => get()._send({ say: content, to }),
+
+  // Wire format: {"set_rate":{"refill_rate":<number>,"capacity":<number>}}
+  sendSetRate: (refillRate, capacity) =>
+    get()._send({ set_rate: { refill_rate: refillRate, capacity } }),
 }));
 
 // ---------------------------------------------------------------------------

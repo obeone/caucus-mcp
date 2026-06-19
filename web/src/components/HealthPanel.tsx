@@ -22,6 +22,7 @@ import {
   X,
   Play,
   Pause,
+  Clock,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -119,10 +120,20 @@ function PeerCard({
         </span>
       </div>
 
-      {/* Status text */}
+      {/* Status text with optional age */}
       {peer.status && (
-        <p className="text-[11px] font-mono text-dim italic truncate pl-4">
+        <p
+          className={cn(
+            "text-[11px] font-mono italic truncate pl-4",
+            peer.status_stale ? "text-dim/50" : "text-dim"
+          )}
+        >
           {peer.status}
+          {peer.status_age !== null && (
+            <span className="not-italic ml-1">
+              · {peer.status_age.toFixed(0)}s ago
+            </span>
+          )}
         </p>
       )}
 
@@ -134,7 +145,16 @@ function PeerCard({
             listening
           </span>
         )}
-        {peer.last_seen_age !== null && (
+        {peer.quiet && (
+          <span
+            className="flex items-center gap-1 text-amber"
+            title="no poll and no status update for a while — may be mid-long-turn or stuck; check its status or ping it"
+          >
+            <Clock size={10} />
+            quiet · {peer.last_seen_age !== null ? `${peer.last_seen_age.toFixed(1)}s` : "?"}
+          </span>
+        )}
+        {!peer.quiet && peer.last_seen_age !== null && (
           <span title="Last seen">
             seen {peer.last_seen_age.toFixed(1)}s ago
           </span>
@@ -398,6 +418,7 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
 
   const live = peers.filter((p) => p.state === "live");
   const reaped = peers.filter((p) => p.state === "reaped");
+  const quiet = peers.filter((p) => p.quiet);
 
   // ── Compact mode (left rail) ─────────────────────────────────────────────
   if (compact) {
@@ -416,6 +437,12 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
             <span className="flex items-center gap-0.5 text-amber">
               <PauseCircle size={9} />
               {peers.filter((p) => p.paused).length} paused
+            </span>
+          )}
+          {quiet.length > 0 && (
+            <span className="flex items-center gap-0.5 text-amber">
+              <Clock size={9} />
+              {quiet.length} quiet
             </span>
           )}
           {health && (
@@ -470,6 +497,12 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
           <span className="flex items-center gap-1 text-amber">
             <PauseCircle size={11} />
             {peers.filter((p) => p.paused).length} paused
+          </span>
+        )}
+        {quiet.length > 0 && (
+          <span className="flex items-center gap-1 text-amber">
+            <Clock size={11} />
+            {quiet.length} quiet
           </span>
         )}
         {health && (

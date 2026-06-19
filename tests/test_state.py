@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from caucus import ratelimit
 from caucus.models import (
     BROADCAST,
     ControlMode,
@@ -1107,3 +1110,143 @@ async def test_snapshot_includes_forms() -> None:
     snapshot = state.add_ui().get_nowait()
     assert len(snapshot["forms"]) == 1
     assert snapshot["forms"][0]["title"] == "Deploy?"
+
+
+# --- runtime rate-limit control --------------------------------------
+
+
+async def test_set_rate_limit_updates_defaults_and_live_buckets() -> None:
+    state = HubState()
+    alpha = state.register("alpha").client
+    assert alpha is not None
+
+    applied = state.set_rate_limit(refill_rate=10.0, capacity=20.0)
+
+    assert applied == {"refill_rate": 10.0, "capacity": 20.0}
+    assert state.rate_limit() == {"refill_rate": 10.0, "capacity": 20.0}
+    # The already-joined peer's live bucket is retuned in place...
+    assert alpha.bucket is not None
+    assert alpha.bucket.capacity == 20.0
+    assert alpha.bucket.refill_rate == 10.0
+    # ...and a peer registering afterwards inherits the new defaults.
+    beta = state.register("beta").client
+    assert beta is not None and beta.bucket is not None
+    assert beta.bucket.capacity == 20.0
+    assert beta.bucket.refill_rate == 10.0
+
+
+async def test_set_rate_limit_tightening_clamps_live_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: 100.0)
+    state = HubState()
+    alpha = state.register("alpha").client
+    assert alpha is not None and alpha.bucket is not None
+    assert alpha.bucket.tokens == 5.0  # default burst
+    # The bucket's ``updated`` was stamped with the real monotonic clock at
+    # mint time (the field's default_factory captured the unpatched function);
+    # realign it with our frozen clock so ``reconfigure`` credits zero elapsed.
+    alpha.bucket.updated = 100.0
+
+    state.set_rate_limit(refill_rate=0.1, capacity=1.0)
+
+    # Tightening bites immediately: the in-flight burst is clamped to the new
+    # capacity rather than left at the old, larger value.
+    assert alpha.bucket.capacity == 1.0
+    assert alpha.bucket.tokens == 1.0
+
+
+async def test_set_rate_limit_loosening_does_not_reseed_live_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: 100.0)
+    state = HubState()
+    alpha = state.register("alpha").client
+    assert alpha is not None and alpha.bucket is not None
+    alpha.bucket.updated = 100.0  # realign with the frozen clock (see above)
+    # Drain the bucket dry (clock frozen, so no refill between sends).
+    assert all(alpha.bucket.allow() for _ in range(5))
+    assert alpha.bucket.allow() is False
+
+    state.set_rate_limit(refill_rate=10.0, capacity=20.0)  # loosen hard
+
+    # The drained count must survive — reconstructing the bucket would reseed it
+    # to 20 and hand the flooder a free burst the instant the operator relaxes.
+    assert alpha.bucket.capacity == 20.0
+    assert alpha.bucket.tokens < 1.0
+
+
+async def test_set_rate_limit_low_rate_capacity_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: 100.0)
+    state = HubState()
+    state.set_rate_limit(refill_rate=1.0 / 60.0, capacity=1.0)  # ~1 msg/min
+    peer = state.register("z").client
+    assert peer is not None and peer.bucket is not None
+    peer.bucket.updated = 100.0  # realign with the frozen clock (see above)
+    # Burst of exactly one, then limited until the slow refill catches up.
+    assert peer.bucket.allow() is True
+    assert peer.bucket.allow() is False
+
+
+async def test_set_rate_limit_rejects_invalid_as_strict_no_op() -> None:
+    state = HubState()
+    alpha = state.register("alpha").client
+    assert alpha is not None and alpha.bucket is not None
+    before = state.rate_limit()
+    bucket_before = (
+        alpha.bucket.capacity,
+        alpha.bucket.refill_rate,
+        alpha.bucket.tokens,
+    )
+
+    assert state.set_rate_limit(refill_rate=0.0, capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=-1.0, capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=1.0, capacity=0.5) is None
+    # Non-finite values are rejected too: +inf slips past the bare > / >=
+    # comparisons (inf > 0, inf >= 1) and would disable the limiter; NaN fails
+    # every comparison but is asserted here to pin the behaviour.
+    assert state.set_rate_limit(refill_rate=float("inf"), capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=1.0, capacity=float("inf")) is None
+    assert state.set_rate_limit(refill_rate=float("nan"), capacity=5.0) is None
+    assert state.set_rate_limit(refill_rate=1.0, capacity=float("nan")) is None
+
+    # Every rejected frame leaves the defaults and the live bucket untouched.
+    assert state.rate_limit() == before
+    assert (
+        alpha.bucket.capacity,
+        alpha.bucket.refill_rate,
+        alpha.bucket.tokens,
+    ) == bucket_before
+
+
+async def test_set_rate_limit_retunes_reaped_then_revivable_bucket() -> None:
+    state = HubState()
+    stale = state.register("stale").client
+    assert stale is not None and stale.bucket is not None
+    stale.last_seen -= 120.0
+    assert state.reap_stale(ttl=30.0) == ["stale"]  # now parked in _reaped
+
+    state.set_rate_limit(refill_rate=3.0, capacity=7.0)
+
+    # A reaped-but-revivable peer is retuned too, so it does not reconnect with
+    # a stale limit.
+    assert stale.bucket.capacity == 7.0
+    assert stale.bucket.refill_rate == 3.0
+
+
+async def test_add_ui_snapshot_carries_rate_and_set_rate_pushes_event() -> None:
+    state = HubState()
+    snapshot = state.add_ui().get_nowait()
+    assert snapshot["rate"] == {"refill_rate": 0.5, "capacity": 5.0}
+
+    q = state.add_ui()
+    q.get_nowait()  # discard this listener's priming snapshot
+    state.set_rate_limit(refill_rate=2.0, capacity=8.0)
+    events = []
+    while not q.empty():
+        events.append(q.get_nowait())
+    rate_events = [e for e in events if e.get("type") == "rate"]
+    assert rate_events
+    assert rate_events[-1]["rate"] == {"refill_rate": 2.0, "capacity": 8.0}

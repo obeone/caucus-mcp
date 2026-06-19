@@ -58,6 +58,28 @@ describe("wsStore — auth events", () => {
   });
 });
 
+describe("wsStore — command senders", () => {
+  beforeEach(resetStore);
+
+  it("sendMode emits {action} so the hub dispatches it (regression: was {mode})", () => {
+    // The hub gates and dispatches control-mode on the "action" key
+    // (hub.py _MUTATING_COMMANDS / _apply_ui_command). A {mode:...} frame
+    // matched no command key and was silently dropped, leaving operator
+    // pause/resume/stop dead over /ui. Pin the corrected wire format.
+    const send = vi.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useDashStore.setState({ _send: send } as any);
+    useDashStore.getState().sendMode("pause");
+    expect(send).toHaveBeenCalledWith({ action: "pause" });
+    useDashStore.getState().sendMode("resume");
+    expect(send).toHaveBeenCalledWith({ action: "resume" });
+    useDashStore.getState().sendMode("stop");
+    expect(send).toHaveBeenCalledWith({ action: "stop" });
+    useDashStore.getState().sendMode("reset");
+    expect(send).toHaveBeenCalledWith({ action: "reset" });
+  });
+});
+
 describe("wsStore — snapshot event", () => {
   beforeEach(resetStore);
 
@@ -71,6 +93,8 @@ describe("wsStore — snapshot event", () => {
     last_seen_age: 0.5,
     uptime: 120,
     msg_count: 3,
+    quiet: false,
+    status_stale: false,
   };
 
   const snapshot: SnapshotEvent = {
@@ -202,6 +226,7 @@ describe("wsStore — peers event", () => {
       peers: [{
         name: "old", state: "live", listening: false, paused: false,
         status: null, status_age: null, last_seen_age: 0, uptime: 0, msg_count: 0,
+        quiet: false, status_stale: false,
       }],
     });
     handle({
@@ -209,6 +234,7 @@ describe("wsStore — peers event", () => {
       peers: [{
         name: "new", state: "live", listening: true, paused: false,
         status: null, status_age: null, last_seen_age: 0, uptime: 0, msg_count: 0,
+        quiet: false, status_stale: false,
       }],
     });
     const peers = useDashStore.getState().peers;
@@ -224,6 +250,7 @@ describe("wsStore — health event", () => {
     const peer: PeerInfo = {
       name: "p", state: "live", listening: true, paused: false,
       status: null, status_age: null, last_seen_age: 0.1, uptime: 60, msg_count: 1,
+      quiet: false, status_stale: false,
     };
     handle({
       type: "health",
