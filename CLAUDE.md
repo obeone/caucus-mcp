@@ -117,8 +117,11 @@ app title in `hub.py` uses `caucus.__version__` — neither hardcodes a number.
 Bump `pyproject.toml` and the rest follows.
 
 > Note: `PROTOCOL_VERSION` in `hub.py` is **not** the package version — it is an
-> independent counter for the operating-protocol revision (bump it only when
-> `PROTOCOL_TEXT` changes).
+> independent counter for the operating-protocol revision. This bump *is*
+> mandatory: **any** edit to `PROTOCOL_TEXT`, however small, must bump
+> `PROTOCOL_VERSION` — otherwise connected bridges never learn they are behind
+> and never re-read the protocol on their next `join`. Conversely, only a
+> `PROTOCOL_TEXT` change warrants bumping it.
 
 ## Peer protocol doc
 
