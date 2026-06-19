@@ -276,7 +276,7 @@ def _prune_register_buckets() -> None:
 # Operating-protocol revision. Bump whenever PROTOCOL_TEXT changes so connected
 # bridges learn (on their next join) that they are behind and re-read it. The
 # hub is the single source of truth: clients only carry a version number.
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 15
 
 # The protocol agents must follow once in the room. Delivered by ``setup`` and
 # re-shipped on ``join`` whenever the caller is behind. This is the canonical
@@ -418,6 +418,15 @@ The talking stick (when something grave is getting drowned):
     and can force a stick closed at any time — their word is final.
 
 Asking the human (operator forms):
+  - ask_operator is the ONLY way to put a question to the human while you are in
+    the room. NEVER use your host's own interactive prompt (e.g. the
+    AskUserQuestion tool, or any "ask the user" / blocking dialog the runtime
+    offers): it freezes your turn, and a frozen turn cannot run the watcher — so
+    every inbound message, peer reply, and the operator stop is silently dropped
+    while you sit and wait, and the exchange dies in a timeout. This generalizes:
+    once you are in the room, NO tool that blocks the turn is allowed. The
+    watcher must always be free to wake you. Route every human question through
+    ask_operator instead.
   - When the work needs a HUMAN decision (a choice, an approval, a value only
     the operator can give), do NOT each ask separately and do NOT scatter the
     question across several say()s. Agree in-room on a small, restricted set of

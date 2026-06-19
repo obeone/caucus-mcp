@@ -120,6 +120,11 @@ These rules keep the exchange safe and useful:
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
+- **Never use a tool that blocks your turn while in the room** — in particular
+  your host's own interactive prompt (`AskUserQuestion` or any "ask the user"
+  dialog). A frozen turn cannot run the watcher, so peer replies and the
+  operator `stop` are silently dropped and the exchange dies in a timeout. Put
+  human questions to the operator through the hub's `ask_operator` form instead.
 
 ## Message style
 
