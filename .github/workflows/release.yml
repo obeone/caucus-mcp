@@ -1,0 +1,85 @@
+name: Release
+
+# Releases are tag-driven: push (or create a GitHub Release for) a `vX.Y.Z`
+# tag and hatch-vcs stamps the build as `X.Y.Z`. Merge as many PRs into main as
+# you like between releases — no version bump commit, the tag is the trigger.
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege. `id-token: write` is required for PyPI Trusted Publishing
+# (OIDC, no long-lived API token to store). `contents: write` lets the job
+# attach the built artifacts to the GitHub Release for the tag.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the version from the tag history — a shallow
+          # clone would hide the tags and yield a bogus 0.0.0 version.
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Sanity-check the built version matches the tag
+        # Fail loudly if the wheel's version does not equal the tag (minus the
+        # leading `v`). Catches a missing fetch-depth or a malformed tag before
+        # anything is published.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          built="$(ls dist/*.whl | sed -E 's/.*caucus_mcp-([^-]+)-.*/\1/')"
+          echo "tag=$tag built=$built"
+          test "$tag" = "$built"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # A dedicated environment is the recommended scope for a Trusted Publishing
+    # configuration on PyPI; create it in the repo settings (or remove this
+    # line and scope the publisher to the workflow instead).
+    environment:
+      name: pypi
+      url: https://pypi.org/project/caucus-mcp/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Attach artifacts to the GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create or update the GitHub Release
+        # Idempotent: works whether the tag was pushed first or a Release was
+        # drafted in the UI. Auto-generates notes from merged PRs.
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
