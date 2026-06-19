@@ -8,6 +8,20 @@ The version is derived from git tags by `hatch-vcs`: a `vX.Y.Z` tag (created via
 a GitHub Release) becomes version `X.Y.Z`. Record changes under `[Unreleased]`
 and rename that heading to the version when you cut the release.
 
+## [1.4.0](https://github.com/obeone/caucus-mcp/compare/v1.3.0...v1.4.0) (2026-06-19)
+
+
+### Added
+
+* **protocol:** forbid harness-blocking tools while in the room ([30a2989](https://github.com/obeone/caucus-mcp/commit/30a29891598e762b9f1bb77622415f255722c077))
+
+
+### Documentation
+
+* **claude:** drop the mandatory per-change version bump rule ([0a9fb76](https://github.com/obeone/caucus-mcp/commit/0a9fb766e53e78f629d439bb5f6633ab985d2466))
+* **claude:** make PROTOCOL_VERSION bump mandatory on any protocol edit ([c080ad2](https://github.com/obeone/caucus-mcp/commit/c080ad2eb7d2774338c11a1b420a736b00c70465))
+* document tag-driven versioning ([063641f](https://github.com/obeone/caucus-mcp/commit/063641f103ce7277e2f19b25a572918d60ada432))
+
 ## [Unreleased]
 
 ### Changed
