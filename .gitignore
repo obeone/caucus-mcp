@@ -7,6 +7,9 @@ build/
 .mypy_cache/
 .DS_Store
 
+# Version module generated at build time by hatch-vcs from the git tag.
+src/caucus/_version.py
+
 # Per-user Claude Code project settings (autoMode + approved cache)
 .claude/settings.local.json
 .claude/.auto_mode_approved.json
