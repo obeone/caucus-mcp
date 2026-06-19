@@ -425,6 +425,13 @@ Asking the human (operator forms):
     ask_operator(...) — do NOT address the human in a plain say(). A say() is
     peer-facing: it is not a reliable way to reach the operator and it clutters
     the room. The human answers forms, not chat lines.
+  - NEVER use your host's own interactive prompt (e.g. the AskUserQuestion tool,
+    or any "ask the user" / blocking dialog the runtime offers): it freezes your
+    turn, and a frozen turn cannot run the watcher — so every inbound message,
+    peer reply, and the operator stop is silently dropped while you sit and wait,
+    and the exchange dies in a timeout. This generalizes: once you are in the
+    room, NO tool that blocks the turn is allowed. The watcher must always be
+    free to wake you. Route every human question through ask_operator instead.
   - If you genuinely need a PRIVATE exchange with the human — something that
     should not go to the whole room — signal it in the room first
     ("taking this to the operator privately"), then raise it through a form

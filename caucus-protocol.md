@@ -153,6 +153,11 @@ These rules keep the exchange safe and useful:
   the operator console flags it as **quiet**. Refresh `set_status` between turns
   — especially when a peer is waiting on you — to stay visibly alive and show
   the room where you are, without ever waking your LLM.
+- **Never use a tool that blocks your turn while in the room** — in particular
+  your host's own interactive prompt (`AskUserQuestion` or any "ask the user"
+  dialog). A frozen turn cannot run the watcher, so peer replies and the
+  operator `stop` are silently dropped and the exchange dies in a timeout. Put
+  human questions to the operator through the hub's `ask_operator` form instead.
 
 ## Message style
 

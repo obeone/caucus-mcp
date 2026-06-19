@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## What this is
 
@@ -72,9 +72,9 @@ wired by `[project.scripts]` in `pyproject.toml`:
 - **`hub.py`** (`caucus-hub`) — FastAPI app, the only stateful process; HTTP
   endpoints + `/control` + `/ui` WebSocket, serves the operator console at `/`.
   Single source of truth for the protocol; a background reaper drops idle peers.
-  Also hosts **operator forms** (`/ask` + `/forms`): one agent pushes a small
-  questionnaire, the operator answers once in a console wizard, and the bundle
-  routes back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
+  Also hosts **operator forms** (`/ask` + `/forms`) — one agent pushes a
+  questionnaire, the operator answers in a console wizard, and the reply routes
+  back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
 - **`mcp_bridge.py`** (`caucus-bridge`) — FastMCP stdio server, one per agent
   session. Passive until `join`; `setup` is the mandatory entry point.
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
@@ -105,27 +105,38 @@ contract) lives in **`docs/ARCHITECTURE.md`**.
   the existing density).
 - `from __future__ import annotations` at the top of every module; PEP 604
   unions (`X | None`).
-- `coloredlogs` for logging; the bridge logs to **stderr** (see above).
+- `coloredlogs` for logging (the bridge to **stderr** — see invariants above).
 - Python ≥3.10, line length 88, `mypy` strict.
 
 ## Versioning
 
-**Every new release must bump the version — no exceptions.** Whenever a change
-ships (a merged feature, fix, or any user-visible behavior change), the version
-moves accordingly (SemVer) in a dedicated `chore(release): bump version to X.Y.Z`
-commit.
+The package version (SemVer) is **derived from git tags** by `hatch-vcs` — it
+is never written in the source. At build time `hatch-vcs`
+(`[tool.hatch.version] source = "vcs"`) reads the latest `vX.Y.Z` tag and
+writes `src/caucus/_version.py` (git-ignored build artifact). `caucus.__version__`
+reads that module, falling back to installed package metadata, and `hub.py`'s
+FastAPI title uses it. Builds between tags get a dev version like
+`1.4.1.dev3+g<sha>`.
 
-The version has **a single source of truth**: `[project].version` in
-`pyproject.toml`. `caucus.__version__` reads it back from the installed package
-metadata (`importlib.metadata.version`), and the FastAPI app title in `hub.py`
-uses `caucus.__version__` — neither hardcodes a number. Bump `pyproject.toml`
-and the rest follows.
+**A release is a tag.** Merge any number of PRs into `main` with no version
+bump — there is no version field to edit and no `chore(release)` commit. To
+ship, create a GitHub Release `vX.Y.Z`; the `Release` workflow
+(`.github/workflows/release.yml`) builds, asserts the built version matches the
+tag, publishes to PyPI (Trusted Publishing, environment `pypi`), and attaches
+the artifacts. A PR template plus a `PreToolUse` hook
+(`.claude/hooks/pr-version-reminder.sh`) remind humans and Claude not to bump
+the version in a PR.
 
-Never merge a release to a protected branch without the `pyproject.toml` bump.
+> One-time setup before the first tag: configure PyPI Trusted Publishing for
+> `caucus-mcp` (workflow `release.yml`, environment `pypi`) and create the
+> `pypi` GitHub environment — otherwise the publish step fails.
 
 > Note: `PROTOCOL_VERSION` in `hub.py` is **not** the package version — it is an
-> independent counter for the operating-protocol revision (bump it only when
-> `PROTOCOL_TEXT` changes).
+> independent counter for the operating-protocol revision. This bump *is*
+> mandatory: **any** edit to `PROTOCOL_TEXT`, however small, must bump
+> `PROTOCOL_VERSION` — otherwise connected bridges never learn they are behind
+> and never re-read the protocol on their next `join`. Conversely, only a
+> `PROTOCOL_TEXT` change warrants bumping it.
 
 ## Peer protocol doc
 
