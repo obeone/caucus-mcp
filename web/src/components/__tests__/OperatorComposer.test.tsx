@@ -243,6 +243,54 @@ describe("OperatorComposer — pause while typing", () => {
 
   // -------------------------------------------------------------------------
 
+  it("slash_export_via_dropdown_releases_auto_pause", () => {
+    // Regression: picking a slash-command from the autocomplete clears the box
+    // through executeCommand, NOT handleChange — so the typing-pause it armed
+    // must be released here or /export leaves the room paused forever.
+    const { sendMode } = seedStore("running", true);
+    render(<OperatorComposer />, { wrapper: Wrapper });
+
+    const textarea = screen.getByLabelText("Compose operator message");
+    // Typing "/export" goes empty → non-empty (arms the auto-pause) and opens
+    // the "/" autocomplete with "/export" highlighted.
+    typeInto(textarea, "/export");
+    expect(sendMode).toHaveBeenCalledWith("pause");
+    expect(screen.getByTestId("auto-paused-hint")).toBeInTheDocument();
+
+    // Accept the highlighted command via Enter → executeCommand("/export").
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    // The transient typing-pause must be released and the machine reset.
+    expect(sendMode).toHaveBeenCalledWith("resume");
+    expect(screen.queryByTestId("auto-paused-hint")).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+
+  it("slash_pause_via_dropdown_does_not_leak_state_machine", () => {
+    // /pause sets its own terminal mode — the auto-pause must be forgotten
+    // (no stray resume undoing the explicit pause, no lingering hint), but we
+    // must NOT issue a resume that would cancel what the operator asked for.
+    const { sendMode } = seedStore("running", true);
+    render(<OperatorComposer />, { wrapper: Wrapper });
+
+    const textarea = screen.getByLabelText("Compose operator message");
+    typeInto(textarea, "/pause");
+    expect(sendMode).toHaveBeenCalledWith("pause");
+
+    sendMode.mockClear();
+    // Accept "/pause" → executeCommand("/pause").
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    // The command's own pause fires; no spurious resume undoes it.
+    expect(sendMode).toHaveBeenCalledWith("pause");
+    expect(sendMode).not.toHaveBeenCalledWith("resume");
+    // Machine reset → hint gone, so the next send can't emit a stale resume.
+    expect(screen.queryByTestId("auto-paused-hint")).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+
   it("shows_auto_paused_hint_while_auto_paused", () => {
     seedStore("running", true);
     render(<OperatorComposer />, { wrapper: Wrapper });

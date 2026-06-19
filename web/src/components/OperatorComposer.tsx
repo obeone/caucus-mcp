@@ -248,6 +248,16 @@ export default function OperatorComposer() {
 
   /** Execute a slash-command and clear the input. */
   function executeCommand(cmd: string) {
+    // Typing the leading "/" goes empty → non-empty, so with pauseOnType ON the
+    // composer has already armed an auto-pause (phase waiting/confirmed). Picking
+    // a command from the dropdown clears the box here WITHOUT going through
+    // handleChange's clear-box-resume branch, so we must release that auto-pause
+    // ourselves or the machine leaks (stale phase, lingering hint, a spurious
+    // resume on the next send — and for /export, the room stays paused forever).
+    const autoPaused =
+      autoPausePhaseRef.current === "waiting" ||
+      autoPausePhaseRef.current === "confirmed";
+
     switch (cmd) {
       case "/pause":
         sendMode("pause");
@@ -266,10 +276,17 @@ export default function OperatorComposer() {
         toast({ title: "Hub reset", variant: "default" });
         break;
       case "/export":
+        // /export sets no mode of its own, so the only pause in effect is the
+        // transient typing-pause we caused — actively release it.
+        if (autoPaused) sendMode("resume");
         exportMessages(messages);
         toast({ title: "Transcript exported", variant: "success" });
         break;
     }
+    // The other commands (pause/resume/stop/reset) set their own terminal mode,
+    // which is authoritative — don't fight it with a resume; just forget the
+    // transient auto-pause so it can't trigger a stray resume later.
+    if (autoPaused) setAutoPausePhase("idle");
     setContent("");
     setAcToken(null);
     setAcCandidates([]);
