@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## What this is
 
@@ -72,9 +72,9 @@ wired by `[project.scripts]` in `pyproject.toml`:
 - **`hub.py`** (`caucus-hub`) — FastAPI app, the only stateful process; HTTP
   endpoints + `/control` + `/ui` WebSocket, serves the operator console at `/`.
   Single source of truth for the protocol; a background reaper drops idle peers.
-  Also hosts **operator forms** (`/ask` + `/forms`): one agent pushes a small
-  questionnaire, the operator answers once in a console wizard, and the bundle
-  routes back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
+  Also hosts **operator forms** (`/ask` + `/forms`) — one agent pushes a
+  questionnaire, the operator answers in a console wizard, and the reply routes
+  back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
 - **`mcp_bridge.py`** (`caucus-bridge`) — FastMCP stdio server, one per agent
   session. Passive until `join`; `setup` is the mandatory entry point.
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
@@ -105,7 +105,7 @@ contract) lives in **`docs/ARCHITECTURE.md`**.
   the existing density).
 - `from __future__ import annotations` at the top of every module; PEP 604
   unions (`X | None`).
-- `coloredlogs` for logging; the bridge logs to **stderr** (see above).
+- `coloredlogs` for logging (the bridge to **stderr** — see invariants above).
 - Python ≥3.10, line length 88, `mypy` strict.
 
 ## Versioning
