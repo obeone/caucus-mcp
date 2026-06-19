@@ -110,18 +110,11 @@ contract) lives in **`docs/ARCHITECTURE.md`**.
 
 ## Versioning
 
-**Every new release must bump the version — no exceptions.** Whenever a change
-ships (a merged feature, fix, or any user-visible behavior change), the version
-moves accordingly (SemVer) in a dedicated `chore(release): bump version to X.Y.Z`
-commit.
-
-The version has **a single source of truth**: `[project].version` in
-`pyproject.toml`. `caucus.__version__` reads it back from the installed package
-metadata (`importlib.metadata.version`), and the FastAPI app title in `hub.py`
-uses `caucus.__version__` — neither hardcodes a number. Bump `pyproject.toml`
-and the rest follows.
-
-Never merge a release to a protected branch without the `pyproject.toml` bump.
+The version follows SemVer and has **a single source of truth**:
+`[project].version` in `pyproject.toml`. `caucus.__version__` reads it back from
+the installed package metadata (`importlib.metadata.version`), and the FastAPI
+app title in `hub.py` uses `caucus.__version__` — neither hardcodes a number.
+Bump `pyproject.toml` and the rest follows.
 
 > Note: `PROTOCOL_VERSION` in `hub.py` is **not** the package version — it is an
 > independent counter for the operating-protocol revision (bump it only when
