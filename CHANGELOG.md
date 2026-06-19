@@ -4,8 +4,18 @@ All notable changes to this project are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-The single source of truth for the version is `[project].version` in
-`pyproject.toml`.
+The version is derived from git tags by `hatch-vcs`: a `vX.Y.Z` tag (created via
+a GitHub Release) becomes version `X.Y.Z`. Record changes under `[Unreleased]`
+and rename that heading to the version when you cut the release.
+
+## [Unreleased]
+
+### Changed
+
+- **Versioning** — the package version is now derived from git tags via
+  `hatch-vcs` instead of a hardcoded `[project].version`. Releases are cut by
+  tagging `vX.Y.Z` (a GitHub Release); a new `Release` workflow builds and
+  publishes to PyPI on tag push. No more `chore(release): bump version` commits.
 
 ## [1.3.0](https://github.com/obeone/caucus-mcp/compare/v1.2.1...v1.3.0) (2026-06-18)
 

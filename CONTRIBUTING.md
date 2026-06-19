@@ -69,12 +69,14 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
 
 ## Versioning
 
-Every user-visible change bumps the version (SemVer) in a dedicated
-`chore(release): bump version to X.Y.Z` commit. The version lives only in
-`[project].version` of `pyproject.toml`; `caucus.__version__` reads it back from
-package metadata. `PROTOCOL_VERSION` in `hub.py` is a separate counter — bump it
-only when `PROTOCOL_TEXT` changes. Add a matching entry to
-[`CHANGELOG.md`](CHANGELOG.md).
+The version (SemVer) is derived from git tags by `hatch-vcs` — there is no
+version field to bump and no `chore(release)` commit. To cut a release, create
+a GitHub Release `vX.Y.Z`; that tag becomes the version and the `Release`
+workflow builds and publishes it. Several PRs can land on `main` between
+releases. `caucus.__version__` reads the build-time `_version.py` back.
+`PROTOCOL_VERSION` in `hub.py` is a separate counter — bump it only when
+`PROTOCOL_TEXT` changes. Record user-visible changes under `## [Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md); rename that heading to the version on release.
 
 ## License
 
