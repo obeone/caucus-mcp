@@ -104,7 +104,6 @@ wheels = [
 
 [[package]]
 name = "caucus-mcp"
-version = "1.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "coloredlogs" },
