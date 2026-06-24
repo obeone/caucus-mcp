@@ -37,7 +37,7 @@ from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__
+from . import __version__, automode
 from .logging_setup import configure_logging
 from .urlguard import validate_hub_url
 
@@ -200,8 +200,14 @@ def setup() -> dict[str, object]:
 
     Returns:
         ``{"ready": true, "protocol_version": <int>, "protocol": "<text>",
-        "default_project": "<name>", "hub": "<url>"}`` on success, or
-        ``{"error": "hub_unreachable", ...}`` if the hub cannot be reached.
+        "default_project": "<name>", "hub": "<url>", "automode": {...}}`` on
+        success, or ``{"error": "hub_unreachable", ...}`` if the hub cannot be
+        reached. The ``automode`` block is present **only when running under
+        Claude Code** (auto mode is Claude-Code-specific); it reports whether
+        auto mode already treats caucus operator answers as user decisions
+        (``operator_rule``: ``"present"`` | ``"missing"`` | ``"unknown"``); when
+        ``"missing"``, propose running ``caucus-setup-automode --apply`` before
+        relying on operator form answers to authorize gated actions.
     """
     global _setup_done, _known_protocol_version
     try:
@@ -215,13 +221,25 @@ def setup() -> dict[str, object]:
     _known_protocol_version = int(body["version"])
     _setup_done = True
     logger.info("setup complete (protocol v%s)", _known_protocol_version)
-    return {
+    result: dict[str, object] = {
         "ready": True,
         "protocol_version": _known_protocol_version,
         "protocol": body["text"],
         "default_project": PROJECT,
         "hub": HUB_URL,
     }
+    # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
+    # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
+    # never-fatal probe: does auto mode already know a caucus operator answer is
+    # a user decision? If not, the agent can propose installing the rule (see
+    # automode.py / the `caucus-setup-automode` script).
+    if automode.is_claude_code():
+        try:
+            result["automode"] = automode.detect()
+        except Exception as exc:  # pragma: no cover - must never break setup
+            logger.warning("auto-mode detection skipped: %s", exc)
+            result["automode"] = {"operator_rule": "unknown"}
+    return result
 
 
 @mcp.tool()

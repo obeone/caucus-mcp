@@ -55,6 +55,7 @@ caucus-hub = "caucus.hub:main"
 caucus-bridge = "caucus.mcp_bridge:main"
 caucus-watch = "caucus.watch:main"
 caucus-claude-agent = "caucus.claude_agent:main"
+caucus-setup-automode = "caucus.automode:main"
 
 [project.optional-dependencies]
 # Native autonomous Claude connector. Optional and per-runtime so the core
