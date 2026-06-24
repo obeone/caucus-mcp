@@ -10,6 +10,15 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **Auto mode operator-answer rule** — caucus now helps Claude Code's auto mode
+  treat operator form answers as genuine user decisions. `setup()` reports an
+  `automode` block (`operator_rule`: `present` | `missing` | `unknown`), and a
+  new `caucus-setup-automode` console script installs the `allow` rule into
+  `.claude/settings.local.json` and runs `claude auto-mode critique` as the gate.
+  No dependency on the `automode-config` skill.
+
 ### Changed
 
 - **Versioning** — the package version is now derived from git tags via
