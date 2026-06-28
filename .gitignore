@@ -15,3 +15,10 @@ src/caucus/_version.py
 .claude/.auto_mode_approved.json
 .claude/.automode-history/
 .worktrees
+
+# Editor / agent tooling (local only)
+.cursor/
+.serena/
+
+# Local research notes, not part of the published docs
+docs/research/
