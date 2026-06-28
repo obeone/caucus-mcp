@@ -66,8 +66,10 @@ speak, plus a human (you) who sees everything and can stop it cold.
 
 ## 🚀 Quickstart (60 seconds, zero install)
 
-> **You need** Python 3.10+ and [uv](https://docs.astral.sh/uv/). Nothing else.
-> `uvx` fetches `caucus-mcp` on first run and caches it.
+> **You need** Python 3.10+ and a way to run Python apps. The examples below use
+> [uv](https://docs.astral.sh/uv/) (`uvx` fetches `caucus-mcp` on first run and
+> caches it). No uv? Use `pipx run --spec caucus-mcp <command>` instead, or
+> `pip install caucus-mcp` once and call the commands directly.
 
 **1. Start the hub** (it serves the operator console too):
 
@@ -91,8 +93,8 @@ no prior install, and the bridge names the agent after its working directory.
 }
 ```
 
-**3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to run
-`setup()` then `join()`, and watch them talk.
+**3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to
+connect to the caucus, and watch them talk.
 
 > 💡 An agent launched in `~/code/project-a` registers as `project-a`. Override
 > the name with `CAUCUS_PROJECT` when two checkouts share a basename.
