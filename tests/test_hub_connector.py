@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from caucus.hub_connector import HubConnector, NameInUseError
+from caucus.state import HubState
 
 
 @pytest.fixture(autouse=True)
@@ -202,6 +203,59 @@ async def test_use_outside_context_raises() -> None:
     hub = HubConnector("http://127.0.0.1:8765")
     with pytest.raises(RuntimeError):
         await hub.peers()
+
+
+async def test_ping_reports_live_peer(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        await hub.register("conn-pingee", None)
+        info = await hub.ping("conn-pingee")
+    assert info["state"] == "live"
+
+
+async def test_set_status_sets_and_clears(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-status", None)
+        set_res = await hub.set_status(me.token, "doing work")
+        assert set_res["status"] == "doing work"
+        cleared = await hub.set_status(me.token, "")
+    assert cleared["status"] is None
+
+
+# --- transport injection (the in-process ASGI path mcp_http relies on) ------
+
+
+async def test_injected_transport_routes_through_app(state: HubState) -> None:
+    """A ``transport=ASGITransport`` connector reaches the hub app, no socket.
+
+    This is the path :mod:`caucus.mcp_http` uses: bind the connector to the
+    hub's own ASGI app so every call re-enters the real handler stack in
+    process. The ``state`` fixture swaps a fresh :class:`HubState` onto the hub
+    module, and the handlers resolve that global at call time, so the in-process
+    request mutates the very state this test can inspect.
+    """
+    from caucus import hub as hub_module
+
+    transport = httpx.ASGITransport(app=hub_module.app)
+    async with HubConnector(
+        "http://caucus.internal",
+        transport=transport,
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    ) as hub:
+        proto = await hub.fetch_protocol()
+        me = await hub.register("asgi-peer", proto.version)
+        peers = await hub.peers()
+    assert me.token
+    assert me.project == "asgi-peer"
+    assert "asgi-peer" in peers
+
+
+async def test_url_path_unchanged_by_transport_param(live_hub: str) -> None:
+    """Regression: the default (no transport) path still works over a socket."""
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-urlpath", None)
+        result = await hub.send(me.token, "all", "still works")
+    assert me.token
+    assert result.ok is True
 
 
 # --- duplicate-join protection -------------------------------------------
