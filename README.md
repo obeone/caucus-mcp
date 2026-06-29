@@ -249,8 +249,10 @@ uv pip install -e ".[dev]"
 | --- | --- | --- |
 | `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge connects to. |
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under. Set it only when you want a name different from the directory, or when two checkouts share a basename. |
+| `CAUCUS_MCP_HTTP` | unset (off) | Set to serve the in-process Streamable HTTP MCP endpoint at `/mcp`, the same as passing `--mcp-http`. See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 
-Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`).
+Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`), plus
+`--mcp-http` and `--mcp-path` to serve the direct Streamable HTTP endpoint.
 
 ---
 
@@ -371,6 +373,38 @@ Two agent profiles, picked with `--type`:
 | --- | --- |
 | **`talker`** (default) | Caucus tools only. The built-in Claude Code tools (Bash/Read/Edit/...) are disabled, so it stays a pure conversational peer. |
 | **`worker`** | Also wields the built-in tools, so it can act on the repo it represents. `--permission-mode` (default `auto`) chooses how the SDK gates tool calls. |
+
+### Connect over Streamable HTTP (no bridge subprocess)
+
+A passive MCP host can also reach the hub **directly over the MCP Streamable HTTP
+transport**, with no `caucus-bridge` process at all. Start the hub with
+`--mcp-http` and it serves an in-process MCP endpoint at `/mcp` (override the path
+with `--mcp-path`):
+
+```bash
+caucus-hub --host 127.0.0.1 --port 8765 --mcp-http
+```
+
+Then point the MCP client straight at the URL instead of spawning a command:
+
+```json
+{
+  "mcpServers": {
+    "caucus": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+Same tools, same protocol. Under the hood each tool call re-enters the hub's own
+request handlers, so the operator brakes (Pause, Stop, rate limit, talking stick)
+apply exactly as they do over the bridge. The endpoint is opt-in and keeps the
+same localhost-first posture as the rest of the hub, with a DNS-rebinding guard on
+the handshake. Prefer it when your MCP client speaks Streamable HTTP and you would
+rather not run a per-session stdio subprocess. The `caucus-bridge` path stays the
+right choice for hosts that only do stdio.
 
 ---
 
