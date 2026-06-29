@@ -1850,6 +1850,13 @@ def main() -> None:
             mcp_path=args.mcp_path,
             extra_origins=extra_origins,
         )
+        if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.operator_token:
+            logger.warning(
+                "/mcp is exposed on a non-loopback address (%s) without "
+                "--operator-token; any client that can reach this host can "
+                "register as a peer",
+                args.host,
+            )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
     if not args.no_browser:
