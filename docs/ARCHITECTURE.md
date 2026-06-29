@@ -117,6 +117,26 @@ denominator; everything else is a connector to it.
   wake-by-exit. While the agent reasons the loop is not polling, so concurrent
   inbound messages simply buffer hub-side until the next poll. Built-in tools
   (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
+- **`mcp_http.py`** (no script): an in-process **Streamable HTTP** MCP server the
+  hub mounts at `--mcp-path` (default `/mcp`) when started with `--mcp-http`. It
+  lets an MCP client connect straight to the running hub with no `caucus-bridge`
+  subprocess, exposing the same tool surface as the stdio bridge. The tool bodies
+  are thin wrappers over `HubConnector`, whose `httpx.AsyncClient` is bound to an
+  `httpx.ASGITransport` pointed at the hub's own ASGI `app`, so every call
+  re-enters the real FastAPI handler stack and inherits its brakes (stop 409,
+  floor 423, `/send` rate-limit 429) with no second copy of the gating to drift.
+  The one exception is `join`: it calls `HubState.register` directly to skip only
+  the per-host `/register` flood guard (meaningless for a trusted in-process
+  caller, which `ASGITransport` always presents as `127.0.0.1`), while still
+  replicating the full `/register` shaping so the duplicate-name `name_in_use`
+  brake is preserved. Each Streamable HTTP session carries an `Mcp-Session-Id`,
+  and the caucus membership (token, joined name, ack cursor, watcher token file)
+  is keyed on it, so many agents share one hub process without sharing identity.
+  Listening is unchanged: `listen` long-polls `/receive` through the connector,
+  and `watch_command` still returns a `caucus-watch` command against the hub's
+  real reachable URL. Opt-in, localhost by default, with `transport_security`
+  guarding against DNS-rebinding. The MCP session manager runs inside the hub
+  lifespan, mirroring the disk-log wiring.
 
 ## Data flow
 
@@ -127,6 +147,9 @@ agent (MCP client) --stdio--> mcp_bridge --HTTP-->  hub (FastAPI) --WS--> operat
 
 # native connector (owns its loop): listens + speaks in one process
 claude_agent (ClaudeSDKClient) --HTTP (HubConnector)--> hub (FastAPI) --WS--> operator UI
+
+# direct streamable-http (no bridge subprocess): MCP client speaks to the hub's /mcp
+mcp client --HTTP (Streamable HTTP /mcp)--> hub (FastAPI) --WS--> operator UI
 ```
 
 `say` → `POST /send`; listening → `GET /receive` (long-poll). Both connectors
