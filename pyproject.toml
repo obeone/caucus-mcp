@@ -40,7 +40,10 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "coloredlogs>=15.0",
-    "mcp[cli]>=1.2",
+    # >=1.9: the floor that ships both streamable_http_app (added 1.8) and the
+    # transport_security / DNS-rebinding settings (added 1.9), which the
+    # in-process Streamable HTTP MCP endpoint (caucus.mcp_http) relies on.
+    "mcp[cli]>=1.9",
 ]
 
 [project.urls]
