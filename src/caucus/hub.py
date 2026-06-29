@@ -21,6 +21,7 @@ import webbrowser
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import coloredlogs
 import uvicorn
@@ -64,6 +65,9 @@ from .models import (
 from .disklog import DiskLog
 from .ratelimit import TokenBucket
 from .state import CapExceeded, Client, HubState, RegisterOutcome
+
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("caucus.hub")
 
@@ -550,13 +554,22 @@ async def _health_loop() -> None:
 # Disk-log writer, created in the lifespan when --log-file/CAUCUS_LOG_FILE is set.
 disk_log: DiskLog | None = None
 
+# In-process Streamable HTTP MCP server, built and mounted in main() when
+# --mcp-http is on, else None. Set as a module global (mirroring disk_log) so
+# the lifespan below can run its session manager without rebuilding the
+# import-time app. See caucus.mcp_http and the plan's amendment A4.
+_mcp_server: FastMCP | None = None
+
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Run the reaper, the health tick, and (opt-in) the disk-log writer.
+    """Run the reaper, the health tick, and (opt-in) the disk-log + MCP manager.
 
-    The disk log is wired here, not at import time, so the ``state`` global it
-    feeds is the live one and tests that swap a fresh state are unaffected.
+    The disk log and the Streamable HTTP MCP session manager are wired here, not
+    at import time, so the ``state`` global the disk log feeds is the live one
+    and tests that swap a fresh state are unaffected. A mounted MCP sub-app's own
+    lifespan is not run by the parent app, so when ``_mcp_server`` is set its
+    session manager must be entered here for the ``/mcp`` endpoint to serve.
     """
     tasks = [
         asyncio.create_task(_reaper_loop()),
@@ -567,7 +580,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         tasks.append(asyncio.create_task(disk_log.run()))
         tasks.append(asyncio.create_task(disk_log.retention_loop()))
     try:
-        yield
+        async with contextlib.AsyncExitStack() as stack:
+            # Run the MCP session manager (created lazily by streamable_http_app()
+            # at mount time) for the lifetime of the hub when the endpoint is on.
+            if _mcp_server is not None:
+                await stack.enter_async_context(_mcp_server.session_manager.run())
+            yield
     finally:
         for task in tasks:
             task.cancel()
@@ -1656,6 +1674,55 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
     threading.Timer(delay, _launch).start()
 
 
+def _env_flag(name: str) -> bool:
+    """Read a boolean toggle from the environment (truthy values are ``True``)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[str]) -> None:
+    """Build the Streamable HTTP MCP server and attach its route to the hub app.
+
+    Mirrors the ``disk_log`` pattern (amendment A4): sets the module global
+    :data:`_mcp_server` and registers the endpoint's route(s) on the import-time
+    ``app`` before ``uvicorn.run``, so the existing :func:`lifespan` runs the
+    session manager. The route is attached directly rather than via
+    ``app.mount`` because a Starlette ``Mount`` on ``/mcp`` 307-redirects to
+    ``/mcp/`` (then 404s); a direct route serves at exactly ``mcp_path``. The
+    DNS-rebinding allowlist mirrors :func:`_origin_allowed`: loopback (the
+    defaults in :mod:`caucus.mcp_http`) plus the served host:port and any
+    operator-approved extra origins.
+
+    Args:
+        host: The address the hub binds to (its served host).
+        port: The port the hub listens on.
+        mcp_path: The path the endpoint serves at (e.g. ``/mcp``).
+        extra_origins: Operator-approved extra browser origins (the CSWSH set).
+    """
+    global _mcp_server
+    from . import mcp_http
+
+    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    self_url = f"http://{browse_host}:{port}"
+    allowed_hosts: list[str] = []
+    allowed_origins: list[str] = list(extra_origins)
+    # A bind-all address is not a connectable origin; only add a concrete host.
+    if host not in ("0.0.0.0", "::"):
+        allowed_hosts.append(f"{host}:{port}")
+        allowed_origins.append(f"http://{host}:{port}")
+    _mcp_server = mcp_http.build_mcp_server(
+        app,
+        self_url=self_url,
+        mcp_path=mcp_path,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+    # streamable_http_app() lazily creates the session manager (run by lifespan)
+    # and registers the endpoint route; attach that route to the hub app.
+    sub_app = _mcp_server.streamable_http_app()
+    app.router.routes.extend(sub_app.routes)
+    logger.info("streamable-http MCP mounted at %s", mcp_path)
+
+
 def main() -> None:
     """CLI entry point for the hub server."""
     parser = argparse.ArgumentParser(description="Caucus hub server")
@@ -1726,6 +1793,24 @@ def main() -> None:
             "allowed. Env: CAUCUS_ALLOWED_ORIGINS (comma-separated)"
         ),
     )
+    parser.add_argument(
+        "--mcp-http",
+        action="store_true",
+        default=_env_flag("CAUCUS_MCP_HTTP"),
+        help=(
+            "serve an in-process MCP Streamable HTTP endpoint at --mcp-path so an "
+            "MCP client can connect to the hub with no caucus-bridge subprocess "
+            "(opt-in; localhost, DNS-rebinding guarded). Env: CAUCUS_MCP_HTTP"
+        ),
+    )
+    parser.add_argument(
+        "--mcp-path",
+        default=os.environ.get("CAUCUS_MCP_PATH", "/mcp"),
+        help=(
+            "path the in-process MCP endpoint serves at (default: %(default)s). "
+            "Env: CAUCUS_MCP_PATH"
+        ),
+    )
     args = parser.parse_args()
 
     global disk_log
@@ -1747,6 +1832,15 @@ def main() -> None:
             Path(args.log_file), retention_hours=args.log_retention_hours
         )
     state.client_ttl = args.client_ttl
+    # Opt-in: build and attach the in-process Streamable HTTP MCP endpoint before
+    # uvicorn binds, so the existing lifespan runs its session manager (A4).
+    if args.mcp_http:
+        _mount_mcp_http(
+            host=args.host,
+            port=args.port,
+            mcp_path=args.mcp_path,
+            extra_origins=extra_origins,
+        )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
     if not args.no_browser:
