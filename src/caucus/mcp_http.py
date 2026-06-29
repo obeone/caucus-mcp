@@ -198,6 +198,12 @@ def _remove_token_file(path: str | None) -> None:
             pass
 
 
+# Callback set by build_mcp_server() so hub._reaper_loop() can sweep dead
+# sessions without importing mcp_http in the hot loop.  None until the first
+# build_mcp_server() call.
+_session_reaper_fn: Callable[[], None] | None = None
+
+
 def _transport_security(
     allowed_hosts: list[str] | None, allowed_origins: list[str] | None
 ) -> TransportSecuritySettings:
@@ -260,6 +266,25 @@ def build_mcp_server(
 
     # Per-session caucus membership, keyed on the Mcp-Session-Id.
     sessions: dict[str, _Membership] = {}
+
+    def _sweep_dead_sessions() -> None:
+        """Remove per-session state and token files for sessions whose hub client has died.
+
+        Called by the hub reaper on every sweep tick.  Only joined sessions
+        (``member.token is not None``) are inspected; a setup-only session is
+        left in place so it can still complete its join without being evicted
+        prematurely.
+        """
+        dead = [
+            sid
+            for sid, m in list(sessions.items())
+            if m.token is not None and _hub.state.client_for(m.token) is None
+        ]
+        for sid in dead:
+            member = sessions.pop(sid, None)
+            if member is not None:
+                _remove_token_file(member.token_file)
+                logger.debug("swept dead mcp-http session sid=%s", sid)
 
     # The connector is process-lived: created and entered lazily on first use
     # (inside the running loop) and never closed (process lifetime, like the
@@ -1048,5 +1073,10 @@ def build_mcp_server(
                 "leave the room."
             ),
         }
+
+    # Expose the sweep callback so hub._reaper_loop() can call it without a
+    # circular back-import (hub imports mcp_http, not the other way round).
+    global _session_reaper_fn
+    _session_reaper_fn = _sweep_dead_sessions
 
     return mcp

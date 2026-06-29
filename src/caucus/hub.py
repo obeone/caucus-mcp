@@ -18,7 +18,7 @@ import os
 import secrets
 import threading
 import webbrowser
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -527,6 +527,8 @@ async def _reaper_loop() -> None:
             # Evict fully-refilled /register buckets so the per-host throttle map
             # cannot grow without bound under source-address rotation.
             _prune_register_buckets()
+            if _session_reaper_fn is not None:
+                _session_reaper_fn()
         except Exception:  # pragma: no cover - never let the sweep die
             logger.exception("reaper sweep failed")
             continue
@@ -559,6 +561,11 @@ disk_log: DiskLog | None = None
 # the lifespan below can run its session manager without rebuilding the
 # import-time app. See caucus.mcp_http and the plan's amendment A4.
 _mcp_server: FastMCP | None = None
+
+# Session-sweep callback set by _mount_mcp_http() from build_mcp_server().
+# Called each reaper tick to reclaim per-session state and token files for
+# sessions whose hub client has died.  None when --mcp-http is not active.
+_session_reaper_fn: Callable[[], None] | None = None
 
 
 @contextlib.asynccontextmanager
@@ -1721,6 +1728,8 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
     sub_app = _mcp_server.streamable_http_app()
     app.router.routes.extend(sub_app.routes)
     logger.info("streamable-http MCP mounted at %s", mcp_path)
+    global _session_reaper_fn
+    _session_reaper_fn = mcp_http._session_reaper_fn
 
 
 def main() -> None:

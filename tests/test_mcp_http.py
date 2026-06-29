@@ -220,3 +220,42 @@ async def test_tool_surface_matches_bridge(state: HubState) -> None:
         http_sig = _schema_signature(http_tools[name].inputSchema)
         bridge_sig = _schema_signature(bridge_tools[name].inputSchema)
         assert http_sig == bridge_sig, f"schema drift on tool {name!r}"
+
+
+async def test_session_reaper_sweeps_dead_sessions(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reaper sweeps joined sessions whose hub client has died, unlinking token files.
+
+    A setup-only session (token=None, never joined) must NOT be swept: it has
+    not registered a hub client yet and must remain eligible to complete join.
+    """
+    import os
+
+    from caucus import mcp_http
+
+    server = _build()
+    ctx_joined = _ctx("joined")
+    ctx_setup_only = _ctx("setup-only")
+
+    await _tool(server, "setup")(ctx_joined)
+    await _tool(server, "setup")(ctx_setup_only)
+    await _tool(server, "join")(ctx_joined, project="alpha")
+
+    # Obtain the token-file path written by watch_command.
+    res = await _tool(server, "watch_command")(ctx_joined)
+    token_path = str(res["command"]).split("--token-file ", 1)[1]
+    assert os.path.exists(token_path)
+
+    # Simulate the joined session's hub client dying.
+    monkeypatch.setattr(state, "client_for", lambda _tok: None)
+
+    assert mcp_http._session_reaper_fn is not None
+    mcp_http._session_reaper_fn()
+
+    # The joined session's token file must have been unlinked.
+    assert not os.path.exists(token_path)
+
+    # The setup-only session (token=None) must NOT have been swept.
+    who = await _tool(server, "whoami")(ctx_setup_only)
+    assert who["joined"] is False
