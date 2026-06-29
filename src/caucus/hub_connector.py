@@ -173,16 +173,38 @@ class HubConnector:
     :class:`SendResult` flags rather than raised, so the agent can react.
     """
 
-    def __init__(self, hub_url: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        hub_url: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        transport: httpx.AsyncBaseTransport | None = None,
+        limits: httpx.Limits | None = None,
+    ) -> None:
         """Initialize the connector.
 
         Args:
-            hub_url: Base URL of the hub (a trailing slash is tolerated).
+            hub_url: Base URL of the hub. With the default URL transport it is
+                the address requests are sent to (a trailing slash is
+                tolerated). When ``transport`` is supplied it routes requests
+                instead, so ``hub_url`` is only a placeholder ``base_url`` httpx
+                still needs to build request URLs (its host is ignored by an
+                ASGI transport).
             timeout: Per-request HTTP timeout in seconds; keep it above the
                 hub's long-poll ceiling.
+            transport: Optional async HTTP transport to route requests through.
+                The in-process Streamable HTTP MCP server (:mod:`caucus.mcp_http`)
+                passes an :class:`httpx.ASGITransport` bound to the hub's own
+                ASGI app, so every call re-enters the real handler stack (and
+                its brakes) without a socket. ``None`` keeps the default
+                URL/socket transport, untouched.
+            limits: Optional explicit connection-pool bounds. ``None`` uses
+                httpx's defaults.
         """
         self._base = hub_url.rstrip("/")
         self._timeout = timeout
+        self._transport = transport
+        self._limits = limits
         self._http: httpx.AsyncClient | None = None
 
     @property
@@ -191,8 +213,19 @@ class HubConnector:
         return self._base
 
     async def __aenter__(self) -> HubConnector:
-        """Open the underlying HTTP client."""
-        self._http = httpx.AsyncClient(base_url=self._base, timeout=self._timeout)
+        """Open the underlying HTTP client.
+
+        When an injected ``transport`` was supplied it is bound here so requests
+        route through it instead of a socket; ``limits`` (when given) caps the
+        connection pool. With both ``None`` (the default) the client behaves
+        exactly as before: a plain URL/socket transport with httpx defaults.
+        """
+        self._http = httpx.AsyncClient(
+            base_url=self._base,
+            timeout=self._timeout,
+            transport=self._transport,
+            limits=self._limits if self._limits is not None else httpx.Limits(),
+        )
         return self
 
     async def __aexit__(
@@ -420,6 +453,58 @@ class HubConnector:
         resp = await http.get("/peers")
         resp.raise_for_status()
         return list(resp.json().get("peers", []))
+
+    async def ping(self, peer: str) -> dict[str, object]:
+        """Probe a peer's liveness and self-reported status from the hub.
+
+        Answered entirely from the hub's in-memory bookkeeping, so the target
+        agent's turn is never consumed. Open endpoint (no token), like
+        :meth:`peers`.
+
+        Args:
+            peer: The project name to check.
+
+        Returns:
+            The hub's ``/ping`` payload: ``state`` is ``live`` / ``reaped`` /
+            ``absent``, plus ``last_seen_age`` / ``listening`` / ``status`` when
+            the peer is known.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error.
+        """
+        http = self._require_http()
+        resp = await http.get("/ping", params={"peer": peer})
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def set_status(self, token: str, status: str) -> dict[str, object]:
+        """Set (or clear) the caller's one-line activity status.
+
+        A blank ``status`` clears it. The status is what a peer's :meth:`ping`
+        surfaces, so an agent publishes "what I'm working on" here and refreshes
+        it as the work moves. The per-sender rate-limit brake is surfaced as a
+        flag rather than raised, mirroring :meth:`send`.
+
+        Args:
+            token: The caller's access token.
+            status: The one-line activity description; empty clears it.
+
+        Returns:
+            The hub's response (``{"status": str | None}``) on success, or
+            ``{"error": "rate_limited", "retry_after": <float>}`` when the
+            sender's bucket is empty (HTTP 429).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes
+                (e.g. 401 unknown token).
+        """
+        http = self._require_http()
+        resp = await http.post("/status", json={"token": token, "status": status})
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+        resp.raise_for_status()
+        return dict(resp.json())
 
     async def ask_operator(
         self,
