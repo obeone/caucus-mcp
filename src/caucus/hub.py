@@ -1681,9 +1681,35 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
     threading.Timer(delay, _launch).start()
 
 
-def _env_flag(name: str) -> bool:
-    """Read a boolean toggle from the environment (truthy values are ``True``)."""
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
+    """Decide whether to serve the in-process Streamable HTTP MCP endpoint.
+
+    The ``--mcp-http`` / ``--no-mcp-http`` flag is tri-state: ``True`` and
+    ``False`` are explicit operator choices that win outright, while ``None``
+    (neither flag given) defers to a default. The default is ON for a loopback
+    bind, where the endpoint adds no attack surface beyond the agent HTTP API the
+    hub already serves unauthenticated on localhost (and it is DNS-rebinding
+    guarded), and OFF for a non-loopback bind, where exposing tool execution must
+    be an explicit opt-in. The ``CAUCUS_MCP_HTTP`` environment variable overrides
+    the default when no flag is passed.
+
+    Args:
+        explicit: The parsed ``--mcp-http`` tri-state (``True`` / ``False`` /
+            ``None`` when neither flag was given).
+        host: The address the hub binds to.
+
+    Returns:
+        ``True`` when the MCP endpoint should be mounted.
+    """
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("CAUCUS_MCP_HTTP")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    return host in _LOOPBACK_HOSTS
 
 
 def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[str]) -> None:
@@ -1804,12 +1830,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--mcp-http",
-        action="store_true",
-        default=_env_flag("CAUCUS_MCP_HTTP"),
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "serve an in-process MCP Streamable HTTP endpoint at --mcp-path so an "
-            "MCP client can connect to the hub with no caucus-bridge subprocess "
-            "(opt-in; localhost, DNS-rebinding guarded). Env: CAUCUS_MCP_HTTP"
+            "MCP client can connect to the hub with no caucus-bridge subprocess. "
+            "On by default for a loopback bind (DNS-rebinding guarded, and no "
+            "surface beyond the agent API the hub already serves there); use "
+            "--no-mcp-http to disable it. Off by default on a non-loopback bind; "
+            "pass --mcp-http to force it on (a warning fires without "
+            "--operator-token). Env: CAUCUS_MCP_HTTP overrides the default."
         ),
     )
     parser.add_argument(
@@ -1841,9 +1871,9 @@ def main() -> None:
             Path(args.log_file), retention_hours=args.log_retention_hours
         )
     state.client_ttl = args.client_ttl
-    # Opt-in: build and attach the in-process Streamable HTTP MCP endpoint before
-    # uvicorn binds, so the existing lifespan runs its session manager (A4).
-    if args.mcp_http:
+    # Build and attach the in-process Streamable HTTP MCP endpoint before uvicorn
+    # binds, so the existing lifespan runs its session manager (A4).
+    if _resolve_mcp_http(args.mcp_http, args.host):
         _mount_mcp_http(
             host=args.host,
             port=args.port,
