@@ -1865,4 +1865,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Re-enter via the canonical module so `python -m caucus.hub` and the
+    # caucus-hub console script share one module object (one HubState, one
+    # app).  Running main() here would execute hub.py as __main__, a second
+    # module distinct from the caucus.hub that mcp_http imports, splitting
+    # state and breaking the in-process MCP endpoint.
+    from caucus.hub import main as _main
+
+    _main()
