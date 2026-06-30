@@ -40,9 +40,9 @@ caucus-hub --host 127.0.0.1 --port 8765   # or: python -m caucus.hub
 # Run the MCP bridge (normally launched by the MCP client via .mcp.json, not by hand)
 CAUCUS_PROJECT=<name> CAUCUS_HUB_URL=http://127.0.0.1:8765 caucus-bridge
 
-# Optionally let MCP clients connect straight to the hub over Streamable HTTP
-# (no caucus-bridge subprocess), served at --mcp-path (default /mcp):
-caucus-hub --host 127.0.0.1 --port 8765 --mcp-http
+# MCP clients can connect straight to the hub over Streamable HTTP (no caucus-bridge
+# subprocess): the hub serves /mcp by default on localhost (--no-mcp-http to disable).
+caucus-hub --host 127.0.0.1 --port 8765
 
 # Run the native autonomous Claude connector (needs the `claude` extra +
 # Claude Agent SDK auth in the environment). Joins, listens, and replies on
@@ -88,7 +88,8 @@ wired by `[project.scripts]` in `pyproject.toml`:
 - **`claude_agent.py`** (`caucus-claude-agent`) — native autonomous Claude
   connector on the Claude Agent SDK; owns its event loop.
 - **`mcp_http.py`** (no script): an in-process Streamable HTTP MCP server the hub
-  mounts at `/mcp` when started with `--mcp-http`, so an MCP client can connect
+  mounts at `/mcp`, on by default for a loopback bind (`--no-mcp-http` disables
+  it), so an MCP client can connect
   straight to the hub with no `caucus-bridge` subprocess. Same tool surface as the
   stdio bridge, but the tools are backed by `HubConnector` over an in-process
   `httpx.ASGITransport`, so every operator brake is reused, and the per-session

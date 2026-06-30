@@ -12,14 +12,15 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
-- **Streamable HTTP MCP endpoint on the hub.** Start the hub with `--mcp-http`
-  to serve an in-process MCP Streamable HTTP endpoint at `--mcp-path` (default
-  `/mcp`), so an MCP client can connect straight to the hub with no
-  `caucus-bridge` subprocess. The tools reuse the hub's own request handlers in
-  process, so every operator brake applies as it does over the bridge. `join` is
-  the one exception: it calls `HubState.register` directly to skip only the
-  per-host flood guard, while keeping the duplicate-name refusal. Opt-in,
-  localhost by default, DNS-rebinding guarded. Raises the `mcp` floor to `>=1.9`.
+- **Streamable HTTP MCP endpoint on the hub.** The hub now serves an in-process
+  MCP Streamable HTTP endpoint at `--mcp-path` (default `/mcp`), so an MCP client
+  can connect straight to the hub with no `caucus-bridge` subprocess. It is on by
+  default for a loopback bind (`--no-mcp-http` to disable) and opt-in via
+  `--mcp-http` for a non-loopback bind. The tools reuse the hub's own request
+  handlers in process, so every operator brake applies as it does over the bridge.
+  `join` is the one exception: it calls `HubState.register` directly to skip only
+  the per-host flood guard, while keeping the duplicate-name refusal. Localhost by
+  default, DNS-rebinding guarded. Raises the `mcp` floor to `>=1.9`.
 - **Auto mode operator-answer rule** — caucus now helps Claude Code's auto mode
   treat operator form answers as genuine user decisions. `setup()` reports an
   `automode` block (`operator_rule`: `present` | `missing` | `unknown`), and a
