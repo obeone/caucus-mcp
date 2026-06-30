@@ -118,7 +118,8 @@ denominator; everything else is a connector to it.
   inbound messages simply buffer hub-side until the next poll. Built-in tools
   (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
 - **`mcp_http.py`** (no script): an in-process **Streamable HTTP** MCP server the
-  hub mounts at `--mcp-path` (default `/mcp`) when started with `--mcp-http`. It
+  hub mounts at `--mcp-path` (default `/mcp`), on by default for a loopback bind
+  and opt-in (`--mcp-http`) for a non-loopback one. It
   lets an MCP client connect straight to the running hub with no `caucus-bridge`
   subprocess, exposing the same tool surface as the stdio bridge. The tool bodies
   are thin wrappers over `HubConnector`, whose `httpx.AsyncClient` is bound to an

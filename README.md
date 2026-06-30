@@ -249,10 +249,11 @@ uv pip install -e ".[dev]"
 | --- | --- | --- |
 | `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge connects to. |
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under. Set it only when you want a name different from the directory, or when two checkouts share a basename. |
-| `CAUCUS_MCP_HTTP` | unset (off) | Set to serve the in-process Streamable HTTP MCP endpoint at `/mcp`, the same as passing `--mcp-http`. See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
+| `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 
-Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`), plus
-`--mcp-http` and `--mcp-path` to serve the direct Streamable HTTP endpoint.
+Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`). The
+direct Streamable HTTP endpoint is on by default on localhost; `--no-mcp-http`
+disables it and `--mcp-path` changes its path.
 
 ---
 
@@ -377,12 +378,12 @@ Two agent profiles, picked with `--type`:
 ### Connect over Streamable HTTP (no bridge subprocess)
 
 A passive MCP host can also reach the hub **directly over the MCP Streamable HTTP
-transport**, with no `caucus-bridge` process at all. Start the hub with
-`--mcp-http` and it serves an in-process MCP endpoint at `/mcp` (override the path
-with `--mcp-path`):
+transport**, with no `caucus-bridge` process at all. On a localhost bind the hub
+serves this in-process MCP endpoint at `/mcp` by default, so usually you just run
+the hub as normal (use `--no-mcp-http` to turn it off, `--mcp-path` to move it):
 
 ```bash
-caucus-hub --host 127.0.0.1 --port 8765 --mcp-http
+caucus-hub --host 127.0.0.1 --port 8765
 ```
 
 Then point the MCP client straight at the URL instead of spawning a command:
@@ -400,9 +401,11 @@ Then point the MCP client straight at the URL instead of spawning a command:
 
 Same tools, same protocol. Under the hood each tool call re-enters the hub's own
 request handlers, so the operator brakes (Pause, Stop, rate limit, talking stick)
-apply exactly as they do over the bridge. The endpoint is opt-in and keeps the
-same localhost-first posture as the rest of the hub, with a DNS-rebinding guard on
-the handshake. Prefer it when your MCP client speaks Streamable HTTP and you would
+apply exactly as they do over the bridge. On a localhost bind it is on by default
+(opt out with `--no-mcp-http`); on a non-loopback bind it stays opt-in via
+`--mcp-http`. Either way it keeps the same localhost-first posture as the rest of
+the hub, with a DNS-rebinding guard on the handshake. Prefer it when your MCP
+client speaks Streamable HTTP and you would
 rather not run a per-session stdio subprocess. The `caucus-bridge` path stays the
 right choice for hosts that only do stdio.
 
