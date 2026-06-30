@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -149,3 +151,83 @@ async def test_leave_drops_peer_from_roster(
         left = await _call(a, "leave")
         assert left["left"] is True
     assert "alpha" not in state.peers()
+
+
+async def test_python_m_launch_shares_state_with_mcp_endpoint() -> None:
+    """python -m caucus.hub shares one HubState with the /mcp endpoint.
+
+    Regression for the state-split bug: ``python -m caucus.hub --mcp-http``
+    used to execute hub.py as ``__main__``, a second distinct module object
+    from the ``caucus.hub`` that ``mcp_http`` imports.  The two had separate
+    ``HubState`` instances: ``join()`` registered on ``__main__.state`` while
+    REST endpoints (``/peers``, ``/send``) read from ``caucus.hub.state`` --
+    so ``/peers`` returned ``[]`` and ``say()`` failed with a 401.
+
+    The fix delegates ``__main__``'s entry point to ``caucus.hub.main()`` so
+    both invocation paths share exactly one module object.  This test drives a
+    real subprocess via real MCP Streamable HTTP transport to reproduce the
+    exact failure scenario end to end.
+    """
+    import asyncio
+
+    port = _free_port()
+    cmd = [
+        sys.executable, "-m", "caucus.hub",
+        "--host", "127.0.0.1", "--port", str(port),
+        "--mcp-http", "--no-browser",
+    ]
+    hub = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # Poll until the TCP port accepts connections (hub subprocess start-up).
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    break
+            except OSError:
+                await asyncio.sleep(0.2)
+        else:  # pragma: no cover - CI timeout guard
+            pytest.fail("hub subprocess did not become ready within 20 s")
+
+        base = f"http://127.0.0.1:{port}"
+
+        async with _session(base) as a, _session(base) as b:
+            # Both sessions set up and join -- writes go to the subprocess's state.
+            assert (await _call(a, "setup"))["ready"] is True
+            assert (await _call(a, "join", project="alpha"))["joined"] is True
+
+            await _call(b, "setup")
+            assert (await _call(b, "join", project="beta"))["joined"] is True
+
+            # The REST /peers endpoint must read from the SAME HubState that the
+            # MCP join() wrote to; if it reads a split state it returns [].
+            resp = httpx.get(f"{base}/peers", timeout=5.0)
+            assert resp.status_code == 200, f"/peers returned {resp.status_code}"
+            peers = resp.json()["peers"]
+            assert {"alpha", "beta"} <= set(peers), (
+                f"State split detected: /peers={peers!r} but both MCP sessions "
+                "joined successfully -- the two HubState instances diverged."
+            )
+
+            # alpha broadcasts; routing must traverse the shared state so beta
+            # appears in delivered_to and can drain the message on its next listen.
+            say = await _call(a, "say", content="state-coherence probe", to="all")
+            assert "beta" in (say.get("delivered_to") or []), (
+                f"say not delivered to beta: {say!r}"
+            )
+
+            inbound = await _call(b, "listen", timeout=5.0)
+            assert any(
+                "state-coherence probe" in m.get("content", "")
+                for m in inbound.get("messages", [])
+            ), f"beta did not receive alpha's broadcast: {inbound!r}"
+    finally:
+        hub.terminate()
+        try:
+            hub.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            hub.kill()
