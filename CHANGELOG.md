@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [1.4.0](https://github.com/obeone/caucus-mcp/compare/v1.3.0...v1.4.0) (2026-07-03)
+
 ### Added
 
 - **Streamable HTTP MCP endpoint on the hub.** The hub now serves an in-process
@@ -34,6 +36,13 @@ and rename that heading to the version when you cut the release.
   `hatch-vcs` instead of a hardcoded `[project].version`. Releases are cut by
   tagging `vX.Y.Z` (a GitHub Release); a new `Release` workflow builds and
   publishes to PyPI on tag push. No more `chore(release): bump version` commits.
+
+### Security
+
+- **pydantic-settings 2.14.2** — bump the locked transitive dependency (pulled in
+  by `mcp`) past a symlink-escape flaw where `NestedSecretsSettingsSource` could
+  follow symlinks outside `secrets_dir` and bypass `secrets_dir_max_size`
+  (GHSA, medium). Lockfile only, no API change.
 
 ## [1.3.0](https://github.com/obeone/caucus-mcp/compare/v1.2.1...v1.3.0) (2026-06-18)
 
