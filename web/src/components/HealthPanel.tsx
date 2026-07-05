@@ -23,6 +23,8 @@ import {
   Play,
   Pause,
   Clock,
+  Square,
+  RotateCcw,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -64,6 +66,8 @@ interface PeerCardProps {
   onPause: (name: string) => void;
   onResume: (name: string) => void;
   onHeartbeat: (name: string) => void;
+  onInterrupt: (name: string) => void;
+  onReset: (name: string) => void;
 }
 
 /** Single peer card in the health grid (default / non-compact mode). */
@@ -76,6 +80,8 @@ function PeerCard({
   onPause,
   onResume,
   onHeartbeat,
+  onInterrupt,
+  onReset,
 }: PeerCardProps) {
   const accent = colorFor(peer.name);
   const isOperator = role === "operator";
@@ -166,7 +172,8 @@ function PeerCard({
 
       {/* Operator action buttons */}
       {isOperator && peer.state !== "reaped" && (
-        <div className="flex gap-1 pt-1 border-t border-line/50">
+        <>
+          <div className="flex gap-1 pt-1 border-t border-line/50">
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -216,6 +223,34 @@ function PeerCard({
             kick
           </button>
         </div>
+        {/* Per-agent turn control — reaches the agent even mid-turn / paused. */}
+        <div className="flex gap-1 pt-1">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onInterrupt(peer.name);
+            }}
+            className="flex-1 text-[10px] font-mono text-dim hover:text-cyan hover:bg-cyan/10 border border-transparent hover:border-cyan/40 rounded-sm px-1 py-0.5 transition-all flex items-center justify-center gap-1"
+            aria-label={`Interrupt ${peer.name}'s current turn`}
+            title="Abort the agent's current turn"
+          >
+            <Square size={9} />
+            interrupt
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onReset(peer.name);
+            }}
+            className="flex-1 text-[10px] font-mono text-dim hover:text-amber hover:bg-amber/10 border border-transparent hover:border-amber/40 rounded-sm px-1 py-0.5 transition-all flex items-center justify-center gap-1"
+            aria-label={`Reset ${peer.name}'s context`}
+            title="Wipe the agent's conversation context"
+          >
+            <RotateCcw size={9} />
+            reset
+          </button>
+          </div>
+        </>
       )}
     </div>
   );
@@ -234,6 +269,8 @@ interface CompactPeerRowProps {
   onPause: (name: string) => void;
   onResume: (name: string) => void;
   onHeartbeat: (name: string) => void;
+  onInterrupt: (name: string) => void;
+  onReset: (name: string) => void;
 }
 
 /**
@@ -251,6 +288,8 @@ function CompactPeerRow({
   onPause,
   onResume,
   onHeartbeat,
+  onInterrupt,
+  onReset,
 }: CompactPeerRowProps) {
   const accent = colorFor(peer.name);
   const isOperator = role === "operator";
@@ -337,6 +376,22 @@ function CompactPeerRow({
             </button>
           )}
           <button
+            onClick={(e) => { e.stopPropagation(); onInterrupt(peer.name); }}
+            className="p-0.5 text-dim hover:text-cyan hover:bg-cyan/10 rounded-sm transition-colors"
+            aria-label={`Interrupt ${peer.name}'s current turn`}
+            title="Interrupt"
+          >
+            <Square size={9} />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onReset(peer.name); }}
+            className="p-0.5 text-dim hover:text-amber hover:bg-amber/10 rounded-sm transition-colors"
+            aria-label={`Reset ${peer.name}'s context`}
+            title="Reset"
+          >
+            <RotateCcw size={9} />
+          </button>
+          <button
             onClick={(e) => { e.stopPropagation(); onKick(peer.name); }}
             className="p-0.5 text-dim hover:text-red hover:bg-red/10 rounded-sm transition-colors"
             aria-label={`Kick ${peer.name}`}
@@ -373,6 +428,7 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
   const sendPausePeer = useDashStore((s) => s.sendPausePeer);
   const sendResumePeer = useDashStore((s) => s.sendResumePeer);
   const sendHeartbeat = useDashStore((s) => s.sendHeartbeat);
+  const sendCommand = useDashStore((s) => s.sendCommand);
   const health = useDashStore((s) => s.health);
   const { toast } = useToast();
 
@@ -414,6 +470,27 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
       toast({ title: `Heartbeat sent to ${name}`, description: "Waiting for result…" });
     },
     [sendHeartbeat, toast]
+  );
+
+  const handleInterrupt = useCallback(
+    (name: string) => {
+      sendCommand(name, "interrupt");
+      toast({ title: `Interrupted ${name}`, description: "Aborted its current turn." });
+    },
+    [sendCommand, toast]
+  );
+
+  const handleReset = useCallback(
+    (name: string) => {
+      if (!confirm(`Reset "${name}" — wipe its conversation context?`)) return;
+      sendCommand(name, "reset");
+      toast({
+        title: `Reset ${name}`,
+        description: "Rebuilt with a clean context.",
+        variant: "success",
+      });
+    },
+    [sendCommand, toast]
   );
 
   const live = peers.filter((p) => p.state === "live");
@@ -472,6 +549,8 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
                   onPause={handlePause}
                   onResume={handleResume}
                   onHeartbeat={handleHeartbeat}
+                  onInterrupt={handleInterrupt}
+                  onReset={handleReset}
                 />
               </div>
             ))
@@ -543,6 +622,8 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
                   onPause={handlePause}
                   onResume={handleResume}
                   onHeartbeat={handleHeartbeat}
+                  onInterrupt={handleInterrupt}
+                  onReset={handleReset}
                 />
               </div>
             ))}
