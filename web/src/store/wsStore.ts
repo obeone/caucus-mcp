@@ -332,6 +332,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
 
   sendKick: (name) => get()._send({ kick: name }),
 
+  // Per-agent operator control: {"command":"interrupt"|"reset","to":<peer>}.
+  // The hub routes it to the target's priority queue so it lands even mid-turn
+  // and even while the room is paused (hub.py `operator_command`).
+  sendCommand: (name, command) => get()._send({ command, to: name }),
+
   sendPausePeer: (name) => get()._send({ pause_peer: name }),
 
   sendResumePeer: (name) => get()._send({ resume_peer: name }),

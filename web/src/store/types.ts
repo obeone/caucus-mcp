@@ -309,6 +309,7 @@ export interface DashboardState {
   // WS commands
   sendMode: (action: "pause" | "resume" | "reset" | "stop") => void;
   sendKick: (name: string) => void;
+  sendCommand: (name: string, command: "interrupt" | "reset") => void;
   sendPausePeer: (name: string) => void;
   sendResumePeer: (name: string) => void;
   sendHeartbeat: (name: string) => void;

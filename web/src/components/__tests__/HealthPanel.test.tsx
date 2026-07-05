@@ -5,8 +5,8 @@
  * with fixture data before each test via setState().
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { useDashStore } from "../../store/wsStore";
 import type { PeerInfo } from "../../store/types";
 import HealthPanel from "../HealthPanel";
@@ -146,6 +146,47 @@ describe("HealthPanel — PeerCard ARIA labels", () => {
     expect(
       screen.getByRole("button", { name: /Send heartbeat to agent-alpha/i })
     ).toBeInTheDocument();
+  });
+
+  it("live peer gets interrupt and reset buttons", () => {
+    render(<HealthPanel />, { wrapper: Wrapper });
+    expect(
+      screen.getByRole("button", {
+        name: /Interrupt agent-alpha's current turn/i,
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Reset agent-alpha's context/i })
+    ).toBeInTheDocument();
+  });
+
+  it("interrupt sends immediately; reset asks for confirmation first", () => {
+    const sendCommand = vi.fn();
+    useDashStore.setState({ sendCommand });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<HealthPanel />, { wrapper: Wrapper });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /Interrupt agent-alpha's current turn/i,
+      })
+    );
+    expect(sendCommand).toHaveBeenCalledWith("agent-alpha", "interrupt");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Reset agent-alpha's context/i })
+    );
+    expect(sendCommand).toHaveBeenCalledWith("agent-alpha", "reset");
+
+    // A declined confirmation must not fire a reset.
+    sendCommand.mockClear();
+    confirmSpy.mockReturnValue(false);
+    fireEvent.click(
+      screen.getByRole("button", { name: /Reset agent-alpha's context/i })
+    );
+    expect(sendCommand).not.toHaveBeenCalled();
+
+    confirmSpy.mockRestore();
   });
 
   it("paused peer shows Resume button instead of Pause", () => {
