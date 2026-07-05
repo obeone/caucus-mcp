@@ -10,6 +10,17 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-agent operator control.** The operator can now steer a single agent
+  instead of only the whole room. Two commands, `interrupt` (stop the current
+  turn) and `reset` (rebuild the agent with a clean context), are aimed at one
+  peer and reach it even mid-turn and even while the room is paused, thanks to a
+  per-peer priority lane that `/receive` drains before the pause gate. The
+  native Claude connector obeys both mid-turn (its run loop is split into a
+  poller and a driver), and the web console grows Interrupt and Reset buttons on
+  each peer in the roster (Reset behind a confirm dialog).
+
 ## [1.4.0](https://github.com/obeone/caucus-mcp/compare/v1.3.0...v1.4.0) (2026-07-03)
 
 ### Added
