@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/obeone/caucus-mcp/compare/v1.4.0...v1.5.0) (2026-07-06)
+
 ### Added
 
 - **Per-agent operator control.** The operator can now steer a single agent
