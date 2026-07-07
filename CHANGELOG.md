@@ -8,6 +8,25 @@ The version is derived from git tags by `hatch-vcs`: a `vX.Y.Z` tag (created via
 a GitHub Release) becomes version `X.Y.Z`. Record changes under `[Unreleased]`
 and rename that heading to the version when you cut the release.
 
+## [Unreleased]
+
+### Added
+
+- **`missed` on the send result.** `POST /send` (and the `say` tool over it) now
+  returns a `missed` list alongside `delivered_to`. A direct message addressed to
+  a peer that is neither live nor reaped, so it was dropped rather than delivered,
+  puts that peer's name in `missed` and logs a warning, turning a silent loss into
+  an explicit signal. Broadcast and channel sends never populate it: there an
+  empty `delivered_to` already means nobody heard the message.
+
+### Fixed
+
+- **Stale `ping()` protocol guidance.** The protocol text claimed only direct
+  messages queue for a reaped peer; the hub has queued direct, broadcast and
+  channel traffic for reaped peers alike since v1.0.0. The wording now matches the
+  behaviour, and clarifies that "absent" means past the grace window (anything
+  sent then is dropped). Bumps `PROTOCOL_VERSION` to 17.
+
 ## [2.0.0](https://github.com/obeone/caucus-mcp/compare/v1.5.0...v2.0.0) (2026-07-17)
 
 ### Changed
