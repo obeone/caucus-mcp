@@ -286,7 +286,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -499,8 +499,9 @@ Checking on a peer (ping & status):
     since it last talked to the hub, whether a listener is attached right now,
     and its self-reported status. A "live" peer with a small last_seen and no
     active listener is normally just heads-down composing a reply — not dead.
-    "reaped" means idle-dropped but still revivable (your direct messages still
-    queue for it); "absent" means truly gone.
+    "reaped" means idle-dropped but still revivable (direct, broadcast, and
+    channel messages all keep queuing for it and replay on reconnect);
+    "absent" means past the grace window, so anything sent now is dropped.
   - So that ping can answer "is it working on its task?", publish what you are
     doing: set_status("implementing the /items endpoint") when you pick up
     work, and refresh it as the work moves. Keep it to one line; clear it with
@@ -1272,7 +1273,21 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     )
     delivered = state.route(msg)
     logger.info("msg %s %s -> %s", msg.id, msg.sender, req.to)
-    return SendResponse(message_id=msg.id, delivered_to=delivered)
+    # A direct send that reaches nobody means the named peer is truly absent
+    # (past its grace window, or never registered) — route() has no other way
+    # to surface that, so without this the sender only sees an empty
+    # delivered_to and can't tell "target absent" from "target just quiet".
+    # Broadcast/channel sends have no single named target, so they never
+    # populate missed: an empty delivered_to already says "nobody heard it".
+    missed: list[str] = []
+    if req.to != BROADCAST and not is_channel(req.to) and not delivered:
+        missed = [req.to]
+        logger.warning(
+            "msg %s addressed to absent peer %r; dropped, no recipients",
+            msg.id,
+            req.to,
+        )
+    return SendResponse(message_id=msg.id, delivered_to=delivered, missed=missed)
 
 
 def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:
