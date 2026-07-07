@@ -298,6 +298,21 @@ class SendResponse(BaseModel):
 
     message_id: str
     delivered_to: list[str]
+    missed: list[str] = PydField(default_factory=list)
+    """Addressed recipients that could not be delivered.
+
+    Populated only for a direct (non-broadcast, non-channel) send whose
+    target is neither live nor reaped when :func:`~caucus.state.HubState.route`
+    runs — i.e. a peer name that is truly absent (past its grace window) or
+    was never registered. In that case this list holds exactly the one
+    addressed name, giving the sender an explicit signal that its message was
+    dropped rather than silently swallowed.
+
+    Always empty on a successful direct delivery. Also always empty for
+    broadcast and channel sends: there, an empty ``delivered_to`` is itself
+    the "nobody heard it" signal, since those targets have no single named
+    recipient to report as missed.
+    """
 
 
 class ReceivedMessage(BaseModel):

@@ -90,10 +90,12 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_16() -> None:
-    # Revision 16 slims the tool surface: the talking-stick verbs fuse into
-    # floor(action=...) and the explicit setup step is gone (lazy arming).
-    assert PROTOCOL_VERSION == 16
+def test_protocol_version_is_17() -> None:
+    # Revision 17 corrects the ping() docstring's claim that only direct
+    # messages queue for a reaped peer (route() actually queues all kinds:
+    # direct, broadcast, and channel), on top of revision 16's floor(action=...)
+    # tool-surface slimming.
+    assert PROTOCOL_VERSION == 17
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
@@ -207,6 +209,52 @@ def test_broadcast_excludes_sender(client: TestClient) -> None:
 
     got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
     assert any("v2.3.0" in m["content"] for m in got["messages"])
+
+
+def test_direct_send_to_registered_peer_reports_no_missed(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    _register(client, "beta")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "beta", "content": "hi"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == ["beta"]
+    assert body["missed"] == []
+
+
+def test_direct_send_to_absent_peer_reports_missed(client: TestClient) -> None:
+    """A direct message to a name that was never registered is silently
+    dropped by route() (nobody to reach); ``missed`` must surface that so
+    the sender can tell "target absent" from "target just quiet".
+    """
+    alpha = _register(client, "alpha")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "ghost", "content": "hi"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == []
+    assert body["missed"] == ["ghost"]
+
+
+def test_broadcast_to_empty_room_reports_no_missed(client: TestClient) -> None:
+    """Broadcast never populates ``missed``, even when it reaches nobody.
+
+    There is no single named target to report as missed for a broadcast; the
+    empty ``delivered_to`` is itself the "nobody heard it" signal.
+    """
+    alpha = _register(client, "alpha")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "all", "content": "hi"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == []
+    assert body["missed"] == []
 
 
 def test_receive_times_out_empty(client: TestClient) -> None:
