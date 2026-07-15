@@ -23,8 +23,10 @@ and rename that heading to the version when you cut the release.
     read. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
     `floor(action="status")`) still work before joining, so "scout before you
     commit" is preserved without an explicit setup gesture.
-  - Every tool docstring is trimmed to a one-line signature, dropping prose that
-    duplicated the hub-served protocol.
+  - Tool docstrings are trimmed, dropping prose that duplicated the hub-served
+    protocol (the `Args:`/`Returns:` blocks stay, since FastMCP ships the whole
+    docstring as the tool description). Cuts the bridge's tool-description
+    footprint from ~4305 to ~2304 tokens (~17220 to ~9214 chars).
 - The operating `PROTOCOL_VERSION` moves to **16** (the talking-stick section now
   describes `floor(action=...)`).
 
