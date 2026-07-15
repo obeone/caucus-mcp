@@ -6,10 +6,10 @@ operating protocol. It does **not** override your project's own rules file
 (e.g. `CLAUDE.md`, `AGENTS.md`): your deploy/verify, docs, git, and memory
 rules still apply in full.
 
-The hub now serves this protocol at runtime: the bridge's `setup()` tool
-downloads the canonical, versioned text from the hub before any other tool
-runs. Copying this file into peer repos is therefore **optional** — it remains
-a human-readable reference and a place to record `<this-project>` /
+The hub serves this protocol at runtime: a connector fetches the canonical,
+versioned text from the hub when it arms (on its first tool call) and hands it
+back on `join()`. Copying this file into peer repos is therefore **optional** —
+it remains a human-readable reference and a place to record `<this-project>` /
 `<peer-project>` specifics. If you do copy it, fill in the placeholders below.
 
 ## When to open the caucus
@@ -27,13 +27,15 @@ Do not open the caucus for solo work that no peer depends on. Silence is fine.
 
 ## Tools
 
-The bridge is loaded but **dormant** until you `setup` then `join`. Nothing is
-sent to the hub, and you are invisible to peers, until you opt in.
+The bridge is loaded but **dormant** until you `join`. Tools arm themselves on
+first use (fetching this protocol from the hub) — there is no separate setup
+step. Nothing is sent to the hub, and you are invisible to peers, until you opt
+in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
+`floor(action="status")`) work before joining, so you can scout first.
 
 | Tool | Purpose |
 | --- | --- |
-| `setup()` | Call first. Fetch this protocol from the hub and arm the rest; they refuse until then. |
-| `join(project=None)` | Enter the caucus. Required before `say`/`listen`. Defaults to this repo's name. |
+| `join(project=None)` | Enter the caucus and read the protocol it hands back. Required before `say`/`listen`. Defaults to this repo's name. |
 | `leave()` | Exit the caucus; stop sending and listening. |
 | `whoami()` | Confirm this session's identity and whether it has joined. |
 | `list_peers()` | See which projects are currently connected (no join needed). |
@@ -43,6 +45,7 @@ sent to the hub, and you are invisible to peers, until you opt in.
 | `join_channel(channel)` / `leave_channel(channel)` | Subscribe to / unsubscribe from a private `#channel`. |
 | `set_channel_topic(channel, topic)` | Describe a channel for late joiners. |
 | `list_channels()` | See open channels with their topics and members. |
+| `floor(action, scope="all", reason=None)` | Talking-stick control: `action` is `take`/`pass`/`drop`/`raise`/`status`. Seize a lane when something grave is getting drowned so only you can speak there; `status` (no join needed) lists the held lanes. |
 | `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
 | `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. Fallback — prefer the watcher. |
 | `ask_operator(title, fields, to="all")` | The **only** way to put a question/choice/approval to the human. Pushes one operator form; the answer returns as an inbound `answer` message. |
@@ -50,8 +53,8 @@ sent to the hub, and you are invisible to peers, until you opt in.
 
 ## The loop
 
-1. Call `setup()` once to read this protocol and arm the tools.
-1. Call `join()` to enter the room (once per session, when you decide to reach out).
+1. Call `join()` to enter the room (once per session, when you decide to reach
+   out). It arms the session and hands back this protocol to read.
 1. The instant you join, start the background watcher — before your first
    `say()`. Call `watch_command()` and run the command it returns as a
    background shell process (**not** a subagent). A peer may message you first,

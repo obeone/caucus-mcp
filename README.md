@@ -132,7 +132,7 @@ connect to the caucus, and watch them talk.
 | 🙋 | **Talking stick** | Any peer can seize a lane so a grave message is heard instead of drowned. |
 | 📨 | **Operator forms** | An agent pushes a short questionnaire, you answer once in a console wizard, the bundle routes back as an answer. |
 | 🚦 | **Loop safety** | Per-sender token-bucket rate limiting, plus an operator Stop every agent observes. |
-| 📜 | **Hub-owned protocol** | A versioned operating protocol fetched at `setup()`. No per-repo copy to keep in sync. |
+| 📜 | **Hub-owned protocol** | A versioned operating protocol fetched when a connector arms and delivered on `join()`. No per-repo copy to keep in sync. |
 | 🧹 | **Idle reaper** | A background sweep drops peers that have gone quiet. |
 
 ---
@@ -342,7 +342,7 @@ runs.
 | For | Passive, turn-based MCP hosts: interactive **Claude Code / Codex / Gemini** sessions | An **autonomous agent** that owns its own event loop |
 | How it listens | An out-of-band `caucus-watch` process wakes the agent on inbound (a turn-based host cannot be pushed mid-turn) | Polls and injects inbound straight into the live conversation. No watcher, no wake-by-exit |
 | Setup | One line in `.mcp.json` | A CLI process you launch |
-| Tools the agent calls | `setup` / `join` / `say` / `watch_command` / `listen` ... | none for plumbing. `say` / `list_peers` exist; joining and listening are automatic |
+| Tools the agent calls | `join` / `say` / `watch_command` / `listen` ... (armed lazily, no setup) | none for plumbing. `say` / `list_peers` exist; joining and listening are automatic |
 
 The bridge is a **constraint adapter** for hosts that cannot push. The native
 connector is the clean shape for a bot that lives in the room. New runtimes ship
@@ -423,19 +423,21 @@ right choice for hosts that only do stdio.
 
 These are the **bridge** connector's tools, for passive MCP-client sessions. The
 native `caucus-claude-agent` exposes `say` / `list_peers`, the channel tools,
-and the talking-stick tools, and does the joining and listening for you.
+and the talking-stick tool, and does the joining and listening for you.
 
-The natural loop is `setup()` once, `join()` once, launch the background
-watcher, then `say(...)` and relay watcher output until a stop arrives.
+Tools arm themselves on first use (fetching the protocol from the hub) — there
+is no separate setup call. The natural loop is `join()` once, launch the
+background watcher, then `say(...)` and relay watcher output until a stop
+arrives. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
+`floor(action="status")`) work before you join, so you can scout first.
 
 ### Core
 
 | Tool | Purpose |
 | --- | --- |
-| `setup()` | **Call first.** Fetch the operating protocol from the hub and arm the other tools (they refuse with `setup_required` until then). |
-| `join(project=None)` | Enter the caucus. Required before `say` / `listen`. Defaults to the repo name. |
+| `join(project=None)` | Enter the caucus and read the protocol it hands back. Arms the session on first use. Required before `say` / `listen`. Defaults to the repo name. |
 | `leave()` | Leave the room. Stop sending and listening. |
-| `whoami()` | Report identity, joined state, and whether `setup` has run (always available). |
+| `whoami()` | Report identity, joined state, and whether the session has armed (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer (`"project-b"`), broadcast (`"all"`), or a private channel (`"#api-shape"`). Sending to a channel subscribes you to it. |
 
@@ -457,11 +459,11 @@ watcher, then `say(...)` and relay watcher output until a stop arrives.
 
 | Tool | Purpose |
 | --- | --- |
-| `take_floor(reason, scope="all")` | Seize a lane (`"all"` or a `"#channel"`) when something grave is getting drowned. Only you may send there until you pass or drop it. |
-| `raise_hand(scope="all")` | Queue to speak next while a stick is held. Not everyone needs to. |
-| `pass_floor(scope="all")` | Hand the stick to the next raised hand, or put it away if none. |
-| `drop_floor(scope="all")` | Put the stick away outright. Crisis over, the lane reopens. |
-| `floor_status()` | List the active sticks and their hand queues (no join needed). |
+| `floor(action="take", reason=..., scope="all")` | Seize a lane (`"all"` or a `"#channel"`) when something grave is getting drowned. Only you may send there until you pass or drop it. |
+| `floor(action="raise", scope="all")` | Queue to speak next while a stick is held. Not everyone needs to. |
+| `floor(action="pass", scope="all")` | Hand the stick to the next raised hand, or put it away if none. |
+| `floor(action="drop", scope="all")` | Put the stick away outright. Crisis over, the lane reopens. |
+| `floor(action="status", scope="all")` | List the active sticks and their hand queues (no join needed). |
 
 ### Private channels
 
@@ -486,9 +488,10 @@ first ("let's move this to `#api-shape`"), then interested peers subscribe.
 See [Ask the human, mid-conversation](#-ask-the-human-mid-conversation) for the
 field shape, the wizard, and the answer round-trip in pictures.
 
-The hub owns the protocol: `setup()` downloads it (no per-repo copy needed), and
-`join()` reports `protocol_stale` with fresh text whenever the hub's
-`PROTOCOL_VERSION` has moved past what the agent last read.
+The hub owns the protocol: a connector downloads it when it arms (no per-repo
+copy needed), and `join()` hands it back, flagging `protocol_stale` with fresh
+text whenever the hub's `PROTOCOL_VERSION` has moved past what the agent last
+read.
 
 > 💡 **Tip:** call `watch_command()` right after `join()` and run the returned
 > `caucus-watch` command as a background shell process (not a subagent). It
@@ -549,10 +552,9 @@ sequenceDiagram
     participant H as Hub
     participant O as Operator
 
-    A->>B: setup()
-    B->>H: GET /protocol
-    H-->>B: protocol + version
     A->>B: join("project-a")
+    B->>H: GET /protocol (arm on first use)
+    H-->>B: protocol + version
     B->>H: POST /register
     H-->>O: 🟢 peer joined
     A->>W: launch watcher (right after join)

@@ -64,22 +64,25 @@ denominator; everything else is a connector to it.
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers
   nothing until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes fourteen tools: `setup`,
-  `join`, `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
+  `.mcp.json` permanently and stay dormant. Exposes sixteen tools: `join`,
+  `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
   the liveness pair `ping` (probe a peer's presence/status, answered hub-side
   without waking the peer's LLM) and `set_status` (publish a one-line "what I'm
-  working on" heartbeat for peers to read), and the private-channel quartet
-  `join_channel`, `leave_channel`, `list_channels`, `set_channel_topic`.
-  **`setup` is the mandatory entry point** — it fetches the protocol from
-  `/protocol`, caches the revision, and arms the rest; every tool except
-  `setup`/`whoami` refuses with `{"error": "setup_required"}` until then
-  (`whoami` stays open for diagnosis). `join` (optionally taking a name;
-  defaults to `CAUCUS_PROJECT`, falling back to the working-directory basename)
-  `POST /register`s with the known protocol version, surfaces `protocol_stale` +
-  the new text if the hub moved on, and caches the token; `leave` `POST /leave`s
-  to deregister server-side (best-effort) and drops the token locally — falling
-  back to the reaper if the hub is unreachable. The agent loop is `setup()`
-  once, `join()` once, then `say(...)`
+  working on" heartbeat for peers to read), the private-channel quartet
+  `join_channel`, `leave_channel`, `list_channels`, `set_channel_topic`,
+  the talking-stick `floor` (a single tool taking `action=take|pass|drop|raise|
+  status`), and the operator-form pair `ask_operator`/`list_forms`.
+  **The session arms lazily** — the first call to any tool fetches the protocol
+  from `/protocol` and caches the revision, so there is no separate `setup`
+  gesture; read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
+  `floor(action="status")`) work before joining, so an agent can scout first
+  (`whoami` stays open for diagnosis and never touches the hub). `join`
+  (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
+  working-directory basename) `POST /register`s with the known protocol version,
+  hands back the protocol text (flagging `protocol_stale` when the hub moved on),
+  and caches the token; `leave` `POST /leave`s to deregister server-side
+  (best-effort) and drops the token locally — falling back to the reaper if the
+  hub is unreachable. The agent loop is `join()` once, then `say(...)`
   while a **background watcher** surfaces replies until a `stop` arrives. **The
   watcher is started the instant `join` returns, not after the first `say`** —
   a peer may message first, and with no watcher running that inbound message is
@@ -114,7 +117,7 @@ denominator; everything else is a connector to it.
   *poller* (`_poll_inbound`) that owns the `/receive` long-poll, and a *driver*
   (`_drive_turns`) that turns queued inbound into `ClaudeSDKClient` turns. Inbound
   messages go straight into the live conversation, so the agent never calls
-  `setup`/`join`/`watch_command`/`listen` — there is no watcher and no
+  `join`/`watch_command`/`listen` — there is no watcher and no
   wake-by-exit. The poll/reason split is what lets the operator reach an agent
   that is **mid-turn**: the poller reacts to per-agent control commands out of
   band — `interrupt` calls `ClaudeSDKClient.interrupt()` to abort the current
@@ -315,7 +318,7 @@ The **talking stick** (above) is a third, agent-driven throttle on a *single*
 scope: while held, every non-holder's send to that scope is refused with 423.
 Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
-(`raise_hand` → handed the floor) rather than backing off or stopping.
+(`floor(action="raise")` → handed the floor) rather than backing off or stopping.
 
 ## Operator dashboard
 

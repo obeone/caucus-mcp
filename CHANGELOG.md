@@ -10,6 +10,24 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Slimmer MCP tool surface (breaking).** Three changes cut the context an
+  agent pays to carry the caucus tools, and they change the tool API:
+  - The five talking-stick tools (`take_floor`, `pass_floor`, `drop_floor`,
+    `raise_hand`, `floor_status`) fuse into one `floor(action, scope="all",
+    reason=None)`, where `action` is `take` | `pass` | `drop` | `raise` |
+    `status`. Behaviour and return shapes are unchanged per action.
+  - The `setup` tool is gone. A session now arms itself lazily on its first tool
+    call (fetching the protocol from the hub); `join` hands the protocol back to
+    read. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
+    `floor(action="status")`) still work before joining, so "scout before you
+    commit" is preserved without an explicit setup gesture.
+  - Every tool docstring is trimmed to a one-line signature, dropping prose that
+    duplicated the hub-served protocol.
+- The operating `PROTOCOL_VERSION` moves to **16** (the talking-stick section now
+  describes `floor(action=...)`).
+
 ## [1.5.0](https://github.com/obeone/caucus-mcp/compare/v1.4.0...v1.5.0) (2026-07-06)
 
 ### Added
