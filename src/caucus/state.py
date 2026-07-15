@@ -1405,7 +1405,7 @@ class HubState:
                 scope,
                 f"🪧 {client.project} took the talking stick for {label}{detail}. "
                 f"Only {client.project} speaks here now; everyone else: hold and "
-                "raise_hand() to claim the next turn.",
+                'floor(action="raise") to claim the next turn.',
             )
         elif cleaned:
             floor.reason = cleaned
@@ -1550,7 +1550,7 @@ class HubState:
                 floor.scope,
                 f"🪧 Talking stick for {label} passed {prev} → {new_holder}. "
                 f"{new_holder} holds the floor now{detail}; everyone else still "
-                "holds and may raise_hand().",
+                'holds and may floor(action="raise").',
             )
             self._push_floor_ui()
             return new_holder
