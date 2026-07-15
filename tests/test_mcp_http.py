@@ -89,10 +89,18 @@ async def test_tools_fail_closed_without_session_id(state: HubState) -> None:
 
 
 async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
+    """Scout-before-join parity with the stdio bridge (see test_bridge.py's
+    ``test_readonly_tools_work_before_join``): every read-only tool succeeds
+    without ever calling ``join``, arming the session as a side effect only.
+    """
     server = _build()
     ctx = _ctx("s1")  # known session id, never joined
     assert "peers" in await _tool(server, "list_peers")(ctx)
     assert (await _tool(server, "whoami")(ctx))["armed"] is True
+    assert (await _tool(server, "ping")(ctx, peer="nobody"))["state"] == "absent"
+    assert "channels" in await _tool(server, "list_channels")(ctx)
+    assert "forms" in await _tool(server, "list_forms")(ctx)
+    assert "floors" in await _tool(server, "floor")(ctx, action="status")
 
 
 async def test_say_requires_join(state: HubState) -> None:
@@ -183,6 +191,82 @@ async def test_watch_command_uses_self_url_and_token_file(state: HubState) -> No
     assert not os.path.exists(path)
 
 
+# --- floor: per-action dispatch (mirrors tests/test_bridge.py's talking-stick
+# coverage) so a future raise<->pass swap or a wrong drop/pass fall-through in
+# the HTTP floor() dispatch (mcp_http.py) is caught, not just proxied silently.
+
+
+async def test_floor_action_take(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alice")
+    res = await _tool(server, "floor")(
+        ctx, action="take", scope="all", reason="prod is down"
+    )
+    assert res == {
+        "ok": True,
+        "scope": "all",
+        "holder": "alice",
+        "reason": "prod is down",
+    }
+
+
+async def test_floor_action_raise(state: HubState) -> None:
+    server = _build()
+    holder, waiter = _ctx("holder"), _ctx("waiter")
+    await _tool(server, "join")(holder, project="alice")
+    await _tool(server, "join")(waiter, project="bob")
+    await _tool(server, "floor")(holder, action="take", reason="x")
+    res = await _tool(server, "floor")(waiter, action="raise")
+    assert res == {"ok": True, "scope": "all", "position": 1}
+
+
+async def test_floor_action_pass(state: HubState) -> None:
+    server = _build()
+    holder, waiter = _ctx("holder"), _ctx("waiter")
+    await _tool(server, "join")(holder, project="alice")
+    await _tool(server, "join")(waiter, project="bob")
+    await _tool(server, "floor")(holder, action="take", reason="x")
+    await _tool(server, "floor")(waiter, action="raise")
+    res = await _tool(server, "floor")(holder, action="pass")
+    assert res["passed_to"] == "bob"
+    # The stick genuinely moved: the old holder is now barred, the new one
+    # is not — this is what would break if raise/pass were swapped.
+    assert (await _tool(server, "floor")(waiter, action="pass")).get("released") is True
+
+
+async def test_floor_action_drop(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alice")
+    await _tool(server, "floor")(ctx, action="take", reason="x")
+    res = await _tool(server, "floor")(ctx, action="drop")
+    assert res["released"] is True
+    # Dropped, not merely passed: status shows the lane fully reopened.
+    assert (await _tool(server, "floor")(ctx, action="status"))["floors"] == {}
+
+
+async def test_floor_action_status_works_before_join(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")  # armed only, never joined
+    assert (await _tool(server, "floor")(ctx, action="status")) == {"floors": {}}
+
+
+async def test_floor_take_requires_join(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")  # armed only, never joined
+    res = await _tool(server, "floor")(ctx, action="take", reason="x")
+    assert res == {"error": "not_joined", "hint": "call join() first"}
+
+
+async def test_floor_rejects_unknown_action(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alice")
+    res = await _tool(server, "floor")(ctx, action="wiggle")
+    assert res["error"] == "invalid_action"
+
+
 def test_mcp_floor_exposes_streamable_and_security() -> None:
     """A7: the installed mcp floor exposes both required capabilities."""
     from mcp.server.fastmcp import FastMCP
@@ -201,8 +285,31 @@ def _schema_signature(schema: dict[str, Any]) -> tuple[Any, Any]:
     return props, frozenset(schema.get("required", []))
 
 
+# Tools whose descriptions are known-good, *verified* divergences rather than
+# accidental drift: each was checked against the actual runtime behaviour of
+# both connectors (see the ``feat/slim-tool-surface`` history) and genuinely
+# differs because the HTTP-mounted server drives these calls through
+# HubConnector methods with a coarser error surface than the stdio bridge's
+# direct status-code handling (``join``/``join_channel``/``leave_channel``/
+# ``set_channel_topic``), or because each connector correctly names its own
+# component (``listen``'s "connector" vs "bridge" tracks the seq). Any other
+# tool drifting out of the two lists below is a genuine regression.
+_KNOWN_DESCRIPTION_DIVERGENCE = {
+    "join",
+    "join_channel",
+    "leave_channel",
+    "set_channel_topic",
+    "listen",
+}
+
+
+def _normalize_description(text: str) -> str:
+    """Collapse whitespace so cosmetic docstring re-wrapping cannot trip the guard."""
+    return " ".join(text.split())
+
+
 async def test_tool_surface_matches_bridge(state: HubState) -> None:
-    """A2 drift guard: identical tool names and input arg schemas vs the bridge."""
+    """A2 drift guard: identical tool names, descriptions, and input arg schemas vs the bridge."""
     server = _build()
     http_tools = {t.name: t for t in await server.list_tools()}
     bridge_tools = {t.name: t for t in await mcp_bridge.mcp.list_tools()}
@@ -212,6 +319,11 @@ async def test_tool_surface_matches_bridge(state: HubState) -> None:
         http_sig = _schema_signature(http_tools[name].inputSchema)
         bridge_sig = _schema_signature(bridge_tools[name].inputSchema)
         assert http_sig == bridge_sig, f"schema drift on tool {name!r}"
+        if name in _KNOWN_DESCRIPTION_DIVERGENCE:
+            continue
+        http_desc = _normalize_description(http_tools[name].description)
+        bridge_desc = _normalize_description(bridge_tools[name].description)
+        assert http_desc == bridge_desc, f"description drift on tool {name!r}"
 
 
 async def test_session_reaper_sweeps_dead_sessions(

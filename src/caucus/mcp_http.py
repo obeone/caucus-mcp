@@ -682,8 +682,8 @@ def build_mcp_server(
         """List the active private channels and their members. Works before join (scout before you commit).
 
         Returns:
-            ``{"channels": {"#name": {...}, ...}}``, or ``{"error":
-            "hub_unreachable", ...}``.
+            ``{"channels": {"#name": {"topic": str | None, "members": [name,
+            ...]}, ...}}``, or ``{"error": "hub_unreachable", ...}``.
         """
         _, gate = await _ensure_armed(ctx)
         if gate is not None:
