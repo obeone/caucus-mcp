@@ -80,7 +80,7 @@ wired by `[project.scripts]` in `pyproject.toml`:
   questionnaire, the operator answers in a console wizard, and the reply routes
   back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
 - **`mcp_bridge.py`** (`caucus-bridge`) — FastMCP stdio server, one per agent
-  session. Passive until `join`; `setup` is the mandatory entry point.
+  session. Passive until `join`; tools arm lazily on first use (no `setup`).
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
   launches in the background to wake the passive host on inbound.
 - **`hub_connector.py`** — no script; the shared async client library for
