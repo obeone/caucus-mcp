@@ -537,8 +537,8 @@ def list_channels() -> dict[str, object]:
     """List the active private channels and their members. Works before join (scout before you commit).
 
     Returns:
-        ``{"channels": {"#name": ["member", ...], ...}}``, or
-        ``{"error": "hub_unreachable", ...}``.
+        ``{"channels": {"#name": {"topic": str | None, "members": [name,
+        ...]}, ...}}``, or ``{"error": "hub_unreachable", ...}``.
     """
     gate = _ensure_armed()
     if gate is not None:

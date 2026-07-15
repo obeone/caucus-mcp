@@ -108,6 +108,50 @@ def test_join_is_current_and_delivers_protocol(
     assert "Caucus operating protocol" in result["protocol"]
 
 
+def test_join_surfaces_automode_under_claude_code(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude-Code auto-mode detection moved from the old setup() gesture into
+    join() (see mcp_bridge.py's automode.is_claude_code() gate); under a
+    Claude Code host, join's result must still carry the ``automode`` block.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "automode-joiner")
+    monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
+    monkeypatch.setattr(
+        bridge.automode, "detect", lambda: {"operator_rule": "missing"}
+    )
+    result = bridge.join()
+    assert result["joined"] is True
+    assert result["automode"] == {"operator_rule": "missing"}
+
+
+def test_join_omits_automode_outside_claude_code(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-Claude-Code hosts (Codex, Gemini, ...) get no automode noise on join."""
+    monkeypatch.setattr(bridge, "PROJECT", "non-automode-joiner")
+    monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: False)
+    result = bridge.join()
+    assert result["joined"] is True
+    assert "automode" not in result
+
+
+def test_join_survives_automode_detect_failure(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken auto-mode probe must never fail the join itself (non-fatal)."""
+    monkeypatch.setattr(bridge, "PROJECT", "automode-boom-joiner")
+    monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
+
+    def _boom() -> dict[str, object]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bridge.automode, "detect", _boom)
+    result = bridge.join()
+    assert result["joined"] is True
+    assert result["automode"] == {"operator_rule": "unknown"}
+
+
 # --- identity ------------------------------------------------------------
 
 
