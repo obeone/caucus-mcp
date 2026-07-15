@@ -95,10 +95,7 @@ _CAUCUS_TOOLS = [
     "mcp__caucus__join_channel",
     "mcp__caucus__leave_channel",
     "mcp__caucus__set_channel_topic",
-    "mcp__caucus__take_floor",
-    "mcp__caucus__raise_hand",
-    "mcp__caucus__pass_floor",
-    "mcp__caucus__drop_floor",
+    "mcp__caucus__floor",
 ]
 
 # Built-in Claude Code tools (filesystem, shell, web, sub-agents). A ``talker``
@@ -249,9 +246,9 @@ def compose_system_prompt(
     """Build the agent's system prompt: runtime framing plus the hub protocol.
 
     The hub protocol is written for the bridge runtime (it talks about
-    ``setup``/``join``/``watch_command``/``listen``). This preamble re-frames it
-    for the native connector, where joining and listening are automatic and the
-    agent only ever needs ``say``/``list_peers`` and the channel tools.
+    ``join``/``watch_command``/``listen``). This preamble re-frames it for the
+    native connector, where joining and listening are automatic and the agent
+    only ever needs ``say``/``list_peers`` and the channel tools.
 
     Args:
         project: The name this agent is registered under.
@@ -272,7 +269,7 @@ def compose_system_prompt(
         "at any moment.\n\n"
         "Runtime note (read carefully):\n"
         "- You run as a native Claude connector, NOT through the MCP bridge. Do "
-        "NOT call setup(), join(), watch_command() or listen(): the connector "
+        "NOT call join(), watch_command() or listen(): the connector "
         "has already joined the room and listens continuously for you.\n"
         "- Inbound peer messages arrive automatically as user turns prefixed "
         'with "[caucus inbound]", each naming the sender and recipient.\n'
@@ -291,12 +288,13 @@ def compose_system_prompt(
         "Give a channel a purpose with `set_channel_topic` so peers arriving "
         "later know what it is for.\n"
         "- When something grave risks being drowned out, grab the talking stick "
-        "with `take_floor(reason, scope)` (scope ``\"all\"`` for the whole room or "
-        "a ``\"#channel\"`` name) so only you can speak in that scope; others "
-        "signal intent with `raise_hand`; call `pass_floor` to hand the stick to "
-        "the next queued peer, or `drop_floor` to release it once the crisis is "
-        "over. If your `say` returns ``floor_held``, someone else holds the stick "
-        "— use `raise_hand` instead of retrying.\n"
+        "with `floor(action=\"take\", reason=..., scope=...)` (scope ``\"all\"`` "
+        "for the whole room or a ``\"#channel\"`` name) so only you can speak in "
+        "that scope; others signal intent with `floor(action=\"raise\")`; call "
+        "`floor(action=\"pass\")` to hand the stick to the next queued peer, or "
+        "`floor(action=\"drop\")` to release it once the crisis is over. If your "
+        "`say` returns ``floor_held``, someone else holds the stick — use "
+        "`floor(action=\"raise\")` instead of retrying.\n"
         "- If a turn does not warrant a reply, simply stay silent — do not call "
         "say.\n"
         "- When the operator stops the room, your session ends; do not try to "
@@ -765,65 +763,54 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
-        "take_floor",
-        "Claim the talking stick for a scope so only you can speak there.",
-        {"reason": str, "scope": str},
+        "floor",
+        "Talking-stick control. action is one of take|pass|drop|raise|status. "
+        "take (needs reason) claims the stick for scope so only you can speak "
+        "there; raise queues you for it; pass hands it to the next queued peer "
+        "or releases it; drop releases it outright; status lists the held "
+        'floors. scope is "all" or a "#channel".',
+        {"action": str, "scope": str, "reason": str},
     )
-    async def take_floor(args: dict[str, Any]) -> dict[str, Any]:
-        result = await connector.take_floor(
-            token, args.get("scope") or "all", args["reason"]
-        )
-        if result.get("ok"):
-            text = f"took the stick for {result['scope']}"
-        elif result.get("error") == "floor_held":
-            text = (
-                f"{result.get('held_by')} already holds it — "
-                f"you're queued at position {result.get('position')}"
-            )
-        else:
-            text = str(result)
-        return {"content": [{"type": "text", "text": text}]}
-
-    @tool(
-        "raise_hand",
-        "Join the talking-stick queue to signal you want the floor next.",
-        {"scope": str},
-    )
-    async def raise_hand(args: dict[str, Any]) -> dict[str, Any]:
-        result = await connector.raise_hand(token, args.get("scope") or "all")
-        if result.get("ok"):
-            text = f"hand raised; position {result.get('position')} in queue"
-        else:
-            text = str(result)
-        return {"content": [{"type": "text", "text": text}]}
-
-    @tool(
-        "pass_floor",
-        "Pass the talking stick to the next queued peer, or release it if the queue is empty.",
-        {"scope": str},
-    )
-    async def pass_floor(args: dict[str, Any]) -> dict[str, Any]:
-        result = await connector.pass_floor(token, args.get("scope") or "all")
-        if result.get("ok"):
-            if result.get("passed_to"):
-                text = f"stick passed to {result['passed_to']}"
+    async def floor(args: dict[str, Any]) -> dict[str, Any]:
+        action = args.get("action") or ""
+        scope = args.get("scope") or "all"
+        if action == "status":
+            floors = await connector.floors()
+            text = f"held floors: {floors}" if floors else "no floors held"
+            return {"content": [{"type": "text", "text": text}]}
+        if action == "take":
+            result = await connector.take_floor(token, scope, args.get("reason") or "")
+            if result.get("ok"):
+                text = f"took the stick for {result['scope']}"
+            elif result.get("error") == "floor_held":
+                text = (
+                    f"{result.get('held_by')} already holds it — "
+                    f"you're queued at position {result.get('position')}"
+                )
             else:
-                text = "stick released (queue was empty)"
+                text = str(result)
+        elif action == "raise":
+            result = await connector.raise_hand(token, scope)
+            text = (
+                f"hand raised; position {result.get('position')} in queue"
+                if result.get("ok")
+                else str(result)
+            )
+        elif action == "pass":
+            result = await connector.pass_floor(token, scope)
+            if result.get("ok"):
+                text = (
+                    f"stick passed to {result['passed_to']}"
+                    if result.get("passed_to")
+                    else "stick released (queue was empty)"
+                )
+            else:
+                text = str(result)
+        elif action == "drop":
+            result = await connector.drop_floor(token, scope)
+            text = "stick dropped; floor is open" if result.get("ok") else str(result)
         else:
-            text = str(result)
-        return {"content": [{"type": "text", "text": text}]}
-
-    @tool(
-        "drop_floor",
-        "Unconditionally release the talking stick and discard the queue.",
-        {"scope": str},
-    )
-    async def drop_floor(args: dict[str, Any]) -> dict[str, Any]:
-        result = await connector.drop_floor(token, args.get("scope") or "all")
-        if result.get("ok"):
-            text = "stick dropped; floor is open"
-        else:
-            text = str(result)
+            text = f"unknown action {action!r}; use take|pass|drop|raise|status"
         return {"content": [{"type": "text", "text": text}]}
 
     return create_sdk_mcp_server(
@@ -837,10 +824,7 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
             join_channel,
             leave_channel,
             set_channel_topic,
-            take_floor,
-            raise_hand,
-            pass_floor,
-            drop_floor,
+            floor,
         ],
     )
 

@@ -2,16 +2,17 @@
 
 The bridge is **passive on load**: it can sit in every repo's ``.mcp.json``
 permanently and does nothing until the agent explicitly ``join(...)``s the War
-Room. After joining it exposes tools so the agent can talk to its peers and
-listen for replies. The natural loop is ``join()`` once, then ``say(...)`` and
-``listen(...)`` until a stop control arrives. For focused side-conversations it
-also exposes private channels (``join_channel`` / ``leave_channel`` /
-``list_channels`` / ``set_channel_topic``): a ``#``-prefixed room whose traffic
-reaches only its members, so a subset of peers can work a sub-topic without
-spamming the rest, each carrying an IRC-like topic so late joiners know its
-purpose. Floor control (``take_floor`` / ``raise_hand`` / ``pass_floor`` /
-``drop_floor`` / ``floor_status``) lets agents claim the talking stick to
-prevent message storms during critical moments.
+Room. The session arms itself lazily — the first call to any tool fetches the
+operating protocol from the hub and caches its revision — so no explicit setup
+gesture is needed. After joining it exposes tools so the agent can talk to its
+peers and listen for replies. The natural loop is ``join()`` once, then
+``say(...)`` and ``listen(...)`` until a stop control arrives. For focused
+side-conversations it also exposes private channels (``join_channel`` /
+``leave_channel`` / ``list_channels`` / ``set_channel_topic``): a ``#``-prefixed
+room whose traffic reaches only its members, so a subset of peers can work a
+sub-topic without spamming the rest, each carrying an IRC-like topic so late
+joiners know its purpose. Floor control (``floor(action=...)``) lets agents claim
+the talking stick to prevent message storms during critical moments.
 
 Configuration via environment variables:
 
@@ -63,9 +64,10 @@ PROJECT = os.environ.get("CAUCUS_PROJECT") or _default_project()
 mcp = FastMCP(
     "caucus",
     instructions=(
-        "Call setup() before any other tool. It returns the Caucus operating "
-        "protocol (fetched from the hub) and arms join/say/listen, which refuse "
-        "until then."
+        "Tools arm automatically on first use (no setup step). Read-only tools "
+        "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
+        "work before joining; call join() to enter the room, then say(), "
+        "watch_command() and listen()."
     ),
 )
 
@@ -78,13 +80,17 @@ _joined_as: str | None = None
 # :func:`leave`. ``None`` when none is live.
 _token_file: str | None = None
 
-# Flipped by :func:`setup`. The active tools refuse until then, so the agent
-# always reads the protocol before acting.
-_setup_done: bool = False
+# Flipped by :func:`_ensure_armed` on the first tool call. Once armed, the
+# session has fetched the protocol from the hub, so no explicit setup is needed.
+_armed: bool = False
 
-# Protocol revision learned from the last :func:`setup`. Sent on :func:`join`
-# so the hub can flag drift. ``None`` until setup has run.
+# Protocol revision learned when the session armed. Sent on :func:`join` so the
+# hub can flag drift. ``None`` until the session has armed.
 _known_protocol_version: int | None = None
+
+# Protocol text cached when the session armed, re-delivered on :func:`join` so a
+# lazily-armed agent still reads the operating manual. ``None`` until armed.
+_protocol_text: str | None = None
 
 # Highest message seq ACKed in this bridge session. Piggybacked on the next
 # :func:`listen` call so the hub can prune the unacked buffer without a
@@ -112,7 +118,7 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
     :class:`json.JSONDecodeError` — and an unhandled raise aborts the agent's
     whole tool turn. This decorator catches both and returns the same
     ``{"error": "hub_unreachable", "detail": ..., "hub": HUB_URL}`` contract the
-    hand-written handlers in :func:`setup` / :func:`join` already use.
+    hand-written handlers in :func:`_ensure_armed` / :func:`join` already use.
 
     The success path is untouched: on no error the wrapped function's return
     value is passed straight through. Only the failure path changes — a network
@@ -139,10 +145,33 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
     return wrapper
 
 
-def _require_setup() -> dict[str, object] | None:
-    """Return a gate error if :func:`setup` has not run, else ``None``."""
-    if not _setup_done:
-        return {"error": "setup_required", "hint": "call setup() first"}
+def _ensure_armed() -> dict[str, object] | None:
+    """Arm the session on first use; return an error dict if the hub is down.
+
+    The first tool call fetches the operating protocol from the hub, caching its
+    revision (for :func:`join`'s drift check) and text (re-delivered on
+    :func:`join`). Idempotent: once armed it is a cheap no-op. Replaces the old
+    explicit ``setup`` gesture — every tool calls this before touching the hub.
+
+    Returns:
+        ``None`` once the session is armed, or
+        ``{"error": "hub_unreachable", ...}`` when the protocol fetch fails.
+    """
+    global _armed, _known_protocol_version, _protocol_text
+    if _armed:
+        return None
+    try:
+        with _client() as http:
+            resp = http.get("/protocol")
+            resp.raise_for_status()
+            body = resp.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        logger.error("arming failed: %s", exc)
+        return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
+    _known_protocol_version = int(body["version"])
+    _protocol_text = body["text"]
+    _armed = True
+    logger.info("session armed (protocol v%s)", _known_protocol_version)
     return None
 
 
@@ -189,93 +218,27 @@ def _cleanup_token_file() -> None:
 
 
 @mcp.tool()
-def setup() -> dict[str, object]:
-    """Read the Caucus protocol from the hub and arm the other tools.
-
-    Must be called before ``join``/``leave``/``list_peers``/``say``/``listen``;
-    they refuse with ``setup_required`` until then. Fetches the canonical
-    protocol (and its revision) from the hub so no local copy is needed, caches
-    the revision for :func:`join`'s drift check, and returns the protocol text
-    to read now.
-
-    Returns:
-        ``{"ready": true, "protocol_version": <int>, "protocol": "<text>",
-        "default_project": "<name>", "hub": "<url>", "automode": {...}}`` on
-        success, or ``{"error": "hub_unreachable", ...}`` if the hub cannot be
-        reached. The ``automode`` block is present **only when running under
-        Claude Code** (auto mode is Claude-Code-specific); it reports whether
-        auto mode already treats caucus operator answers as user decisions
-        (``operator_rule``: ``"present"`` | ``"missing"`` | ``"unknown"``); when
-        ``"missing"``, propose running ``caucus-setup-automode --apply`` before
-        relying on operator form answers to authorize gated actions.
-    """
-    global _setup_done, _known_protocol_version
-    try:
-        with _client() as http:
-            resp = http.get("/protocol")
-            resp.raise_for_status()
-            body = resp.json()
-    except httpx.HTTPError as exc:
-        logger.error("setup failed: %s", exc)
-        return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
-    _known_protocol_version = int(body["version"])
-    _setup_done = True
-    logger.info("setup complete (protocol v%s)", _known_protocol_version)
-    result: dict[str, object] = {
-        "ready": True,
-        "protocol_version": _known_protocol_version,
-        "protocol": body["text"],
-        "default_project": PROJECT,
-        "hub": HUB_URL,
-    }
-    # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
-    # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
-    # never-fatal probe: does auto mode already know a caucus operator answer is
-    # a user decision? If not, the agent can propose installing the rule (see
-    # automode.py / the `caucus-setup-automode` script).
-    if automode.is_claude_code():
-        try:
-            result["automode"] = automode.detect()
-        except Exception as exc:  # pragma: no cover - must never break setup
-            logger.warning("auto-mode detection skipped: %s", exc)
-            result["automode"] = {"operator_rule": "unknown"}
-    return result
-
-
-@mcp.tool()
 def join(project: str | None = None) -> dict[str, object]:
-    """Join the Caucus, registering this agent with the hub.
+    """Enter the Caucus under ``project`` (defaults to CAUCUS_PROJECT or the connector default); returns the protocol to read now.
 
-    Nothing is sent to the hub until this is called, so the bridge can live in
-    a repo's ``.mcp.json`` permanently and stay dormant. Calling ``join`` again
-    is idempotent on the hub side — the cached token is re-sent to prove
-    identity (REAFFIRMED outcome), so the same process re-joining is never
-    mistaken for a duplicate.
-
-    The instant this returns, launch the background ``listen`` watcher (a cheap
-    model such as haiku) — do not wait until after your first ``say``. A peer
-    may message you first, and with no watcher running that inbound message is
-    never observed.
+    Idempotent: re-joining re-sends the cached token to prove identity, so the
+    hub reaffirms the same process (REAFFIRMED) instead of refusing it as a
+    duplicate. Arms the session on first use; read-only tools work without
+    joining, but ``say``/``listen``/``watch_command`` need it.
 
     Args:
         project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or the
-            repo directory name.
-
-    Requires ``setup`` first. Sends the protocol revision learned at setup so
-    the hub can flag drift; if the hub's protocol moved on, the result carries
-    ``protocol_stale=True`` and the new ``protocol`` text to re-read.
+            connector's default identity.
 
     Returns:
         ``{"joined": true, "project": "<name>", "hub": "<url>",
-        "protocol_version": <int>, "protocol_stale": bool}`` on success (plus
-        ``protocol`` when stale and ``note`` when the hub sends an advisory),
-        ``{"error": "name_in_use", "project": "<name>", "note": "<msg>",
-        "hub": "<url>"}`` when a live peer already holds the name and the
-        cached token did not match (re-join under a different name),
-        ``{"error": "setup_required"}`` if setup has not run, or
+        "protocol_version": <int>, "protocol": "<text>", "protocol_stale": bool,
+        "channels": {...}}`` on success (plus ``note`` on an advisory),
+        ``{"error": "name_in_use", ...}`` when a live peer already holds the name
+        and the cached token did not match (re-join under a different name), or
         ``{"error": "hub_unreachable", ...}`` if the hub cannot be reached.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     global _token, _joined_as, _known_protocol_version
@@ -325,30 +288,43 @@ def join(project: str | None = None) -> dict[str, object]:
         # see what side rooms exist and what they are about, up front.
         "channels": body.get("channels", {}),
     }
+    # Always deliver the protocol: with the setup step gone, join is where a
+    # lazily-armed agent reads the operating manual. Prefer the hub's fresh copy
+    # when we were behind, else the text cached when the session armed.
     if stale:
         result["protocol"] = body.get("protocol_text")
         result["note"] = "protocol updated; re-read the protocol below"
-    elif body.get("note"):
-        # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
-        result["note"] = body["note"]
+    else:
+        result["protocol"] = _protocol_text
+        if body.get("note"):
+            # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
+            result["note"] = body["note"]
+    # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
+    # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
+    # never-fatal probe: does auto mode already know a caucus operator answer is
+    # a user decision? If not, the agent can propose installing the rule (see
+    # automode.py / the `caucus-setup-automode` script).
+    if automode.is_claude_code():
+        try:
+            result["automode"] = automode.detect()
+        except Exception as exc:  # pragma: no cover - must never break join
+            logger.warning("auto-mode detection skipped: %s", exc)
+            result["automode"] = {"operator_rule": "unknown"}
     return result
 
 
 @mcp.tool()
 def leave() -> dict[str, object]:
-    """Leave the Caucus, deregistering this agent from the hub roster.
+    """Leave the Caucus and drop this peer from the roster; stop the watcher when you do.
 
-    Best-effort tells the hub to drop this peer immediately (``POST /leave``) so
-    the operator roster stays accurate, then clears the cached token locally. If
-    the hub is unreachable the local drop still happens; the idle reaper removes
-    the stale peer shortly after. Stop the background watcher when you leave.
-
-    Requires ``setup`` first.
+    Best-effort: drops this peer immediately so the operator roster stays
+    accurate, then clears the cached token. If the hub is unreachable the local
+    drop still happens; the idle reaper removes the stale peer shortly after.
 
     Returns:
         ``{"left": true, "project": "<name>"}``.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     global _token, _joined_as
@@ -366,18 +342,17 @@ def leave() -> dict[str, object]:
 
 @mcp.tool()
 def whoami() -> dict[str, object]:
-    """Report this agent's identity and Caucus status.
+    """Report this agent's identity and Caucus status; always available, never gated.
 
-    Always available (not gated), so it can diagnose why the other tools are
-    refusing: it reports whether :func:`setup` has run and the known protocol
-    revision alongside the joined state.
+    Diagnoses why the other tools may be refusing: reports whether the session
+    has armed and the known protocol revision alongside the joined state.
     """
     return {
         "default_project": PROJECT,
         "joined_as": _joined_as,
         "hub": HUB_URL,
         "joined": _token is not None,
-        "setup_done": _setup_done,
+        "armed": _armed,
         "known_protocol_version": _known_protocol_version,
     }
 
@@ -385,16 +360,12 @@ def whoami() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def list_peers() -> dict[str, object]:
-    """List the project names currently connected to the Caucus.
-
-    Requires ``setup`` first, but not ``join`` — useful to scout who is around
-    before deciding to ``join``.
+    """List the project names currently connected. Works before join (scout before you commit).
 
     Returns:
-        ``{"peers": ["<name>", ...]}``, or ``{"error": "setup_required"}`` if
-        setup has not run.
+        ``{"peers": ["<name>", ...]}``, or ``{"error": "hub_unreachable", ...}``.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     with _client() as http:
@@ -406,15 +377,10 @@ def list_peers() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def ping(peer: str) -> dict[str, object]:
-    """Check whether a peer is still around and what it is working on.
+    """Check a peer's liveness and status without waking it: ``peer`` is the project name. Works before join (scout before you commit).
 
-    Use this instead of messaging a peer "you still there?" — that would burn
-    the peer's whole turn just to reply "yes". ``ping`` is answered by the hub
-    from its own bookkeeping, so the target agent is never disturbed and you get
-    an instant, LLM-free read on it.
-
-    Requires ``setup`` first, but not ``join`` — you can scout a peer before
-    deciding to enter the room.
+    Answered by the hub from its own bookkeeping, so the target agent is never
+    disturbed — use it instead of messaging "you still there?".
 
     Args:
         peer: The project name to check.
@@ -422,15 +388,11 @@ def ping(peer: str) -> dict[str, object]:
     Returns:
         ``{"peer": "<name>", "state": "live"|"reaped"|"absent", ...}``. A
         ``live`` peer also reports ``last_seen_age`` (seconds since it last
-        talked to the hub; small means a listener is attached), ``listening``
-        (``True`` while a poll is in flight right now — ``False`` with a small
-        ``last_seen_age`` is the normal "heads-down composing a reply" shape),
-        and its ``status``/``status_age`` (what it last said it was doing).
-        ``reaped`` means idle-dropped but still revivable — your direct messages
-        still queue for it; ``absent`` means truly gone. Returns
-        ``{"error": "setup_required"}`` if setup has not run.
+        talked to the hub), ``listening`` (a poll is in flight right now), and
+        its ``status``/``status_age`` (what it last said it was doing).
+        ``reaped`` means idle-dropped but still revivable; ``absent`` means gone.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     with _client() as http:
@@ -442,26 +404,21 @@ def ping(peer: str) -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def say(content: str, to: str = "all") -> dict[str, object]:
-    """Send a message to a peer, a private channel, or broadcast to everyone.
-
-    Requires ``setup`` then ``join`` first.
+    """Send ``content`` to ``to`` (a peer name, "all" to broadcast, or a "#channel"); sending to a channel subscribes you. Requires join.
 
     Args:
         content: The message text.
         to: Target project name, ``"all"`` to broadcast to every peer, or a
-            ``"#channel"`` name to talk in a private channel. Sending to a
-            channel subscribes you to it automatically (you then receive its
-            replies); announce the channel in broadcast first so the peers you
-            want can ``join_channel`` it.
+            ``"#channel"`` name to talk in a private channel.
 
     Returns:
         A dict with the delivered message id and the recipients, or an error
-        with ``retry_after`` when rate-limited, or a ``stopped`` flag when the
+        with ``retry_after`` when rate-limited, a ``stopped`` flag when the
         operator has stopped the room, or ``{"error": "floor_held", ...}`` when
         a talking stick bars the sender in the target scope (call
-        ``raise_hand`` to queue for the floor, or wait for ``drop_floor``).
+        ``floor(action="raise")`` to queue for the floor).
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -489,25 +446,16 @@ def say(content: str, to: str = "all") -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def set_status(status: str = "") -> dict[str, object]:
-    """Publish a one-line "what I'm working on" so peers can ``ping`` you.
-
-    This is your heartbeat for the room: when you pick up a task, set a short
-    status ("implementing the /items endpoint"); refresh it as the work moves;
-    clear it with ``set_status("")`` when idle. A peer's ``ping`` surfaces this
-    line and its age without ever waking your LLM, so it can tell you are alive
-    and on task instead of nagging you with "you still there?".
-
-    Requires ``setup`` then ``join`` first.
+    """Publish a one-line ``status`` ("what I'm working on") so peers can ping you; empty clears it. Requires join.
 
     Args:
         status: The one-line activity description; empty clears it.
 
     Returns:
         ``{"status": "<text>" | None}`` on success, ``{"error":
-        "rate_limited", ...}`` when throttled, or the usual ``setup_required`` /
-        ``not_joined`` gate errors.
+        "rate_limited", ...}`` when throttled, or the ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -524,16 +472,7 @@ def set_status(status: str = "") -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def join_channel(channel: str) -> dict[str, object]:
-    """Subscribe to a private channel to start receiving its messages.
-
-    Channels are named side rooms prefixed with ``#`` (e.g. ``#api-shape``).
-    Only members receive a channel's traffic, so two or more peers can work a
-    sub-topic without spamming the rest of the room. Typically a peer announces
-    the channel in broadcast first ("let's move this to #api-shape"); interested
-    peers then ``join_channel`` it. Sending to a channel via ``say`` already
-    joins you, so this is for *listening* to a channel you have not spoken in.
-
-    Requires ``setup`` then ``join`` first.
+    """Subscribe to private channel ``channel`` (a "#"-prefixed name) to receive its messages. Requires join.
 
     Args:
         channel: The ``#``-prefixed channel name to join.
@@ -541,9 +480,9 @@ def join_channel(channel: str) -> dict[str, object]:
     Returns:
         ``{"joined": true, "channel": "<name>"}`` on success,
         ``{"error": "invalid_channel"}`` if the name lacks the ``#`` prefix, or
-        the usual ``setup_required`` / ``not_joined`` gate errors.
+        the usual ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -564,9 +503,7 @@ def join_channel(channel: str) -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def leave_channel(channel: str) -> dict[str, object]:
-    """Unsubscribe from a private channel once the sub-topic is resolved.
-
-    Requires ``setup`` then ``join`` first.
+    """Unsubscribe from private channel ``channel`` once the sub-topic is resolved. Requires join.
 
     Args:
         channel: The ``#``-prefixed channel name to leave.
@@ -574,9 +511,9 @@ def leave_channel(channel: str) -> dict[str, object]:
     Returns:
         ``{"left": true, "channel": "<name>"}`` on success,
         ``{"error": "invalid_channel"}`` if the name lacks the ``#`` prefix, or
-        the usual ``setup_required`` / ``not_joined`` gate errors.
+        the usual ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -597,16 +534,13 @@ def leave_channel(channel: str) -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def list_channels() -> dict[str, object]:
-    """List the active private channels and their members.
-
-    Requires ``setup`` first, but not ``join`` — useful to scout which side
-    rooms exist before deciding to join one.
+    """List the active private channels and their members. Works before join (scout before you commit).
 
     Returns:
         ``{"channels": {"#name": ["member", ...], ...}}``, or
-        ``{"error": "setup_required"}`` if setup has not run.
+        ``{"error": "hub_unreachable", ...}``.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     with _client() as http:
@@ -618,15 +552,7 @@ def list_channels() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
-    """Set or change a private channel's topic so late joiners know its purpose.
-
-    A channel's topic is a one-line description (e.g. "Designing the v2 items
-    API"). Any member can set it; an empty ``topic`` clears it. The topic shows
-    up in ``list_channels`` and in the directory handed to peers when they join,
-    so an agent arriving later can scan topics and pick which rooms to join.
-
-    Requires ``setup`` then ``join`` first, and you must be a member of the
-    channel (send to it or ``join_channel`` it before setting its topic).
+    """Set private channel ``channel``'s ``topic`` (empty clears it) so late joiners know its purpose; members only. Requires join.
 
     Args:
         channel: The ``#``-prefixed channel name.
@@ -636,9 +562,9 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
         ``{"channel": "<name>", "topic": "<text>" | None}`` on success,
         ``{"error": "invalid_channel"}`` for a bad name, ``{"error":
         "not_a_member"}`` if you have not joined the channel, ``{"error":
-        "rate_limited", ...}`` when throttled, or the usual gate errors.
+        "rate_limited", ...}`` when throttled, or the ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -661,187 +587,61 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
 
 @mcp.tool()
 @_resilient_hub_call
-def take_floor(reason: str, scope: str = "all") -> dict[str, object]:
-    """Grab the talking stick to cut through noise when something grave is getting drowned.
+def floor(
+    action: str, scope: str = "all", reason: str | None = None
+) -> dict[str, object]:
+    """Talking-stick control: ``action`` is take|pass|drop|raise|status, ``scope`` is "all" or a "#channel", ``reason`` explains a take.
 
-    Use this when an urgent, critical concern risks being buried in ongoing
-    chatter — e.g. a security issue, a blocking contradiction, or an
-    irreversible decision about to be made on wrong premises. Once you hold
-    the floor in a scope, ``say`` calls by other peers in that scope are
-    rejected with ``floor_held`` until you ``pass_floor`` or ``drop_floor``.
-    If someone else already holds the floor you are automatically queued
-    (the hub returns ``floor_held``); call ``raise_hand`` instead to signal
-    interest without blocking.
-
-    Requires ``setup`` then ``join`` first.
+    ``take`` grabs the stick so only you can speak in ``scope`` (others get
+    ``floor_held``); ``raise`` queues you for it; ``pass`` hands it to the next
+    hand or reopens the lane; ``drop`` releases it outright; ``status`` lists
+    every held floor. ``status`` works before join (scout a held floor);
+    ``take``/``pass``/``drop``/``raise`` require join.
 
     Args:
-        reason: A short, honest description of why you need the floor — this
-            is shown to peers so they understand the interruption.
-        scope: ``"all"`` to hold the floor room-wide, or a ``"#channel"``
-            name to hold it only within that channel.
+        action: One of ``"take"``, ``"pass"``, ``"drop"``, ``"raise"``,
+            ``"status"``.
+        scope: ``"all"`` for the whole room, or a ``"#channel"`` name.
+        reason: Short justification, used only by ``action="take"``.
 
     Returns:
-        ``{"ok": true}`` on success, ``{"ok": false, "error": "floor_held",
-        ...}`` when someone else already holds the floor in that scope (you
-        are queued), or ``{"error": "rate_limited", "retry_after": ...}``
-        when throttled, or the usual ``setup_required`` / ``not_joined``
-        gate errors.
+        For ``status``: ``{"floors": {"<scope>": {...}, ...}}``. For the verbs:
+        ``{"ok": true, ...}`` on success, ``{"error": "floor_held", ...}`` /
+        ``{"error": "not_holder"}`` on refusal, ``{"error": "rate_limited",
+        ...}`` when throttled, ``{"error": "invalid_action", ...}`` for an
+        unknown action, or the ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
+    # status is a read-only scout, allowed before join, like floor_status was.
+    if action == "status":
+        with _client() as http:
+            resp = http.get("/floor")
+            resp.raise_for_status()
+            return {"floors": dict(resp.json().get("floors", {}))}
+    if action not in ("take", "pass", "drop", "raise"):
+        return {
+            "error": "invalid_action",
+            "hint": "action must be take|pass|drop|raise|status",
+        }
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
     with _client() as http:
         resp = http.post(
             "/floor",
-            json={"token": _token, "action": "take", "scope": scope, "reason": reason},
+            json={
+                "token": _token,
+                "action": action,
+                "scope": scope,
+                "reason": reason or "",
+            },
         )
         if resp.status_code == 429:
             body = resp.json()
             return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
-
-
-@mcp.tool()
-@_resilient_hub_call
-def raise_hand(scope: str = "all") -> dict[str, object]:
-    """Signal interest in speaking without seizing the floor outright.
-
-    When another peer currently holds the floor, ``raise_hand`` queues you
-    to receive it automatically when they call ``pass_floor`` or
-    ``drop_floor``. If no one holds the floor this is a lightweight
-    advisory; you can still call ``take_floor`` to claim it.
-
-    Requires ``setup`` then ``join`` first.
-
-    Args:
-        scope: ``"all"`` to raise your hand room-wide, or a ``"#channel"``
-            name to raise it within that channel only.
-
-    Returns:
-        ``{"ok": true}`` on success, ``{"error": "rate_limited",
-        "retry_after": ...}`` when throttled, or the usual
-        ``setup_required`` / ``not_joined`` gate errors.
-    """
-    gate = _require_setup()
-    if gate is not None:
-        return gate
-    if _token is None:
-        return {"error": "not_joined", "hint": "call join() first"}
-    with _client() as http:
-        resp = http.post(
-            "/floor",
-            json={"token": _token, "action": "raise", "scope": scope, "reason": ""},
-        )
-        if resp.status_code == 429:
-            body = resp.json()
-            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
-        resp.raise_for_status()
-        return dict(resp.json())
-
-
-@mcp.tool()
-@_resilient_hub_call
-def pass_floor(scope: str = "all") -> dict[str, object]:
-    """Hand the talking stick to the next peer waiting in the queue.
-
-    You must currently hold the floor in the given scope. If another peer
-    has raised their hand the floor transfers to them immediately; if the
-    queue is empty the stick is put away and all peers in that scope can
-    speak freely again.
-
-    Requires ``setup`` then ``join`` first.
-
-    Args:
-        scope: ``"all"`` to pass the room-wide floor, or a ``"#channel"``
-            name to pass it within that channel only.
-
-    Returns:
-        ``{"ok": true}`` on success, ``{"ok": false, "error":
-        "not_holder"}`` when you do not hold the floor in that scope,
-        ``{"error": "rate_limited", "retry_after": ...}`` when throttled,
-        or the usual ``setup_required`` / ``not_joined`` gate errors.
-    """
-    gate = _require_setup()
-    if gate is not None:
-        return gate
-    if _token is None:
-        return {"error": "not_joined", "hint": "call join() first"}
-    with _client() as http:
-        resp = http.post(
-            "/floor",
-            json={"token": _token, "action": "pass", "scope": scope, "reason": ""},
-        )
-        if resp.status_code == 429:
-            body = resp.json()
-            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
-        resp.raise_for_status()
-        return dict(resp.json())
-
-
-@mcp.tool()
-@_resilient_hub_call
-def drop_floor(scope: str = "all") -> dict[str, object]:
-    """Relinquish the talking stick outright — crisis over, room unblocked.
-
-    Unlike ``pass_floor`` (which hands to the next queued peer),
-    ``drop_floor`` unconditionally releases the floor and clears the
-    queue, letting all peers speak freely again. Use it when the urgent
-    situation is resolved and normal conversation can resume.
-
-    Requires ``setup`` then ``join`` first.
-
-    Args:
-        scope: ``"all"`` to drop the room-wide floor, or a ``"#channel"``
-            name to drop it within that channel only.
-
-    Returns:
-        ``{"ok": true}`` on success, ``{"ok": false, "error":
-        "not_holder"}`` when you do not hold the floor in that scope,
-        ``{"error": "rate_limited", "retry_after": ...}`` when throttled,
-        or the usual ``setup_required`` / ``not_joined`` gate errors.
-    """
-    gate = _require_setup()
-    if gate is not None:
-        return gate
-    if _token is None:
-        return {"error": "not_joined", "hint": "call join() first"}
-    with _client() as http:
-        resp = http.post(
-            "/floor",
-            json={"token": _token, "action": "drop", "scope": scope, "reason": ""},
-        )
-        if resp.status_code == 429:
-            body = resp.json()
-            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
-        resp.raise_for_status()
-        return dict(resp.json())
-
-
-@mcp.tool()
-@_resilient_hub_call
-def floor_status() -> dict[str, object]:
-    """Report the current floor-control state for all active scopes.
-
-    Requires ``setup`` first, but not ``join`` — useful to scout which
-    scopes are currently gated before deciding to join or speak.
-
-    Returns:
-        ``{"floors": {"all": {"scope": "all", "holder": "<name>",
-        "reason": "<text>", "hands": [...], "since": <timestamp>}, ...}}``
-        keyed by scope. An empty dict means no floors are currently held.
-        Returns ``{"error": "setup_required"}`` if setup has not run.
-    """
-    gate = _require_setup()
-    if gate is not None:
-        return gate
-    with _client() as http:
-        resp = http.get("/floor")
-        resp.raise_for_status()
-        return {"floors": dict(resp.json().get("floors", {}))}
 
 
 @mcp.tool()
@@ -849,18 +649,12 @@ def floor_status() -> dict[str, object]:
 def ask_operator(
     title: str, fields: list[dict[str, object]], to: str = "all"
 ) -> dict[str, object]:
-    """Push a small questionnaire to the human operator and get a form id back.
+    """Push a questionnaire to the human operator: ``title`` headline, ``fields`` questions, ``to`` audience ("all" or a "#channel"). Requires join.
 
-    Use this when the work needs a HUMAN decision (a choice, an approval, a
-    value only the operator can give). Agree in-room on a focused set of
-    questions first, then have ONE agent call this — do not have every agent ask
-    separately. Call :func:`list_forms` beforehand; if a pending form already
-    covers the need, do not open a duplicate. The operator fills a wizard and the
-    answer returns to you as a normal inbound message of kind ``answer`` (surfaced
-    by the watcher), carrying the bundle in its ``meta``; a cancellation returns
-    the same way with ``status: "cancelled"``.
-
-    Requires ``setup`` then ``join`` first.
+    Use when the work needs a HUMAN decision. Agree in-room first, then have ONE
+    agent call this; check :func:`list_forms` so you do not open a duplicate. The
+    operator fills a wizard and the answer returns as a normal inbound message of
+    kind ``answer`` carrying the bundle in its ``meta``.
 
     Args:
         title: Short headline shown atop the wizard.
@@ -868,17 +662,15 @@ def ask_operator(
             ``{"key": str, "label": str, "type": "radio"|"checkbox"|"text"|
             "textarea", "options": [str, ...], "required": bool,
             "allow_other": bool}``. ``options`` are required for ``radio``/
-            ``checkbox`` and must be omitted (or empty) for ``text``/
-            ``textarea``.
-        to: Audience for the answer — ``"all"`` (whole room) or a ``"#channel"``
-            (only that side-room's members).
+            ``checkbox`` and must be omitted for ``text``/``textarea``.
+        to: Audience for the answer — ``"all"`` or a ``"#channel"``.
 
     Returns:
         ``{"form_id": "<id>", "to": "<audience>"}`` on success, ``{"error":
         ...}`` on a bad request (rate-limited, stopped, or invalid form), or the
-        usual ``setup_required`` / ``not_joined`` gate errors.
+        ``not_joined`` gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -903,16 +695,13 @@ def ask_operator(
 @mcp.tool()
 @_resilient_hub_call
 def list_forms() -> dict[str, object]:
-    """List the operator forms currently awaiting an answer.
-
-    Call this before :func:`ask_operator` so you do not open a form that
-    duplicates one already pending. Requires ``setup`` first, but not ``join``.
+    """List the operator forms awaiting an answer (call before ask_operator to avoid duplicates). Works before join (scout before you commit).
 
     Returns:
         ``{"forms": [{"id": ..., "title": ..., "fields": [...], ...}, ...]}``,
-        or ``{"error": "setup_required"}`` if setup has not run.
+        or ``{"error": "hub_unreachable", ...}``.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     with _client() as http:
@@ -924,17 +713,13 @@ def list_forms() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def listen(timeout: float = 30.0) -> dict[str, object]:
-    """Wait for messages addressed to this agent (or broadcast).
+    """Long-poll up to ``timeout`` seconds for messages addressed to this agent (or broadcast). Requires join.
 
-    Requires ``setup`` then ``join`` first. Blocks up to ``timeout`` seconds.
     Returns an empty ``messages`` list on a quiet poll (call again to keep
     listening). If a control ``stop`` arrives, the result contains
-    ``{"stop": true}`` and the agent should end the exchange.
-
-    Each call piggybacks an ACK for the previous batch so the hub can prune
-    its replay buffer without an extra round-trip. The ``seq`` field on each
-    returned message is the hub-assigned sequence number; it is informational
-    only — the bridge tracks and ACKs it automatically.
+    ``{"stop": true}`` and the agent should end the exchange. Each call
+    piggybacks an ACK for the previous batch; the bridge tracks the ``seq``
+    automatically.
 
     Args:
         timeout: Maximum seconds to wait for inbound traffic.
@@ -942,7 +727,7 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     Returns:
         ``{"messages": [...], "mode": "<mode>", "stop": bool}``.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
@@ -974,31 +759,25 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
 
 @mcp.tool()
 def watch_command() -> dict[str, object]:
-    """Return a ready-to-run shell command for the zero-token inbound watcher.
+    """Return a ready-to-run ``caucus-watch`` shell command for the zero-token inbound watcher; run it in the background after join.
 
-    This is the **default** way to listen — preferred over spawning a subagent
-    to loop :func:`listen`. A subagent re-pays its full boot context (~100k
-    tokens) every spawn just to sit on a long-poll and decide nothing; the
-    ``caucus-watch`` process does the same watching for ~0 tokens. Launch the
-    returned command in the background (e.g. a backgrounded shell) the instant
+    This is the **default** way to listen — preferred over spawning a subagent to
+    loop :func:`listen`. Launch the returned command in the background the instant
     :func:`join` returns: it long-polls the hub and prints each inbound message
     (and the operator ``stop``) to stdout, waking your main turn only on real
-    traffic. Relay what it surfaces; never block your main turn on
-    :func:`listen`.
+    traffic.
 
-    The hub access token is written to a private (0600) temp file and the
-    command references it by path, so the secret stays out of the process argv
-    and your transcript. ``leave()`` deletes that file. The watcher reuses this
-    bridge's identity — it does not register a second peer.
-
-    Requires ``setup`` then ``join`` first.
+    The hub access token is written to a private (0600) temp file and the command
+    references it by path, so the secret stays out of the process argv and your
+    transcript; ``leave()`` deletes that file. The watcher reuses this session's
+    identity — it does not register a second peer. Requires join.
 
     Returns:
         ``{"command": "caucus-watch --hub <url> --token-file <path>",
-        "background": true, "note": "..."}`` on success, ``{"error":
-        "setup_required"}`` / ``{"error": "not_joined"}`` otherwise.
+        "background": true, "note": "..."}`` on success, or the ``not_joined``
+        gate error.
     """
-    gate = _require_setup()
+    gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:

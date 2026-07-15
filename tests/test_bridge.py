@@ -17,16 +17,17 @@ from caucus import mcp_bridge as bridge_module
 
 @pytest.fixture
 def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
-    """Point the bridge module at the live hub with a clean, armed slate.
+    """Point the bridge module at the live hub with a clean, disarmed slate.
 
-    ``_setup_done`` is pre-armed so the gated tools run; the gate itself is
-    exercised by tests that flip it back to ``False``.
+    ``_armed`` starts ``False`` so the first tool call arms the session against
+    the live hub, exactly as production does — no explicit setup gesture.
     """
     monkeypatch.setattr(bridge_module, "HUB_URL", live_hub)
     monkeypatch.setattr(bridge_module, "_token", None)
     monkeypatch.setattr(bridge_module, "_joined_as", None)
-    monkeypatch.setattr(bridge_module, "_setup_done", True)
+    monkeypatch.setattr(bridge_module, "_armed", False)
     monkeypatch.setattr(bridge_module, "_known_protocol_version", None)
+    monkeypatch.setattr(bridge_module, "_protocol_text", None)
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "reset"})
     return bridge_module
@@ -38,63 +39,73 @@ def _register_peer(base: str, project: str) -> str:
         return str(http.post("/register", json={"project": project}).json()["token"])
 
 
-# --- setup & gate --------------------------------------------------------
+# --- lazy arming & gate --------------------------------------------------
 
 
-def test_setup_arms_and_returns_protocol(
+def test_first_tool_call_arms_the_session(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
-    result = bridge.setup()
-    assert result["ready"] is True
-    assert isinstance(result["protocol_version"], int)
-    assert "Caucus operating protocol" in result["protocol"]
-    assert bridge.whoami()["setup_done"] is True
-
-
-def test_gated_tools_refuse_before_setup(
-    bridge, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
-    expected = {"error": "setup_required", "hint": "call setup() first"}
-    assert bridge.join() == expected
-    assert bridge.leave() == expected
-    assert bridge.list_peers() == expected
-    assert bridge.say("hi") == expected
-    assert bridge.listen(timeout=0) == expected
-    assert bridge.ping("someone") == expected
-    assert bridge.set_status("busy") == expected
-
-
-def test_whoami_is_available_before_setup(
-    bridge, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
+    # Disarmed to start; a read-only tool call arms it against the live hub.
+    assert bridge.whoami()["armed"] is False
+    result = bridge.list_peers()
+    assert "peers" in result
     info = bridge.whoami()
-    assert info["setup_done"] is False
+    assert info["armed"] is True
+    assert isinstance(info["known_protocol_version"], int)
+
+
+def test_readonly_tools_work_before_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Scout-before-join: read-only tools succeed without joining, just arming.
+    assert "peers" in bridge.list_peers()
+    assert "channels" in bridge.list_channels()
+    assert "forms" in bridge.list_forms()
+    assert bridge.ping("nobody")["state"] == "absent"
+    assert "floors" in bridge.floor(action="status")
+
+
+def test_write_tools_require_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    not_joined = {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.say("hi") == not_joined
+    assert bridge.set_status("busy") == not_joined
+    assert bridge.listen(timeout=0) == not_joined
+    assert bridge.floor(action="take", reason="x") == not_joined
+
+
+def test_whoami_is_available_before_arming(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # whoami never arms or touches the hub, so it stays a pure diagnostic.
+    info = bridge.whoami()
+    assert info["armed"] is False
     assert info["joined"] is False
 
 
 def test_join_flags_stale_protocol_when_behind(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Fixture leaves _known_protocol_version=None, i.e. "never read it".
     monkeypatch.setattr(bridge, "PROJECT", "stale-joiner")
+    # Arm, then pretend the session learned an ancient revision so join is stale.
+    bridge.list_peers()
+    monkeypatch.setattr(bridge, "_known_protocol_version", 0)
     result = bridge.join()
     assert result["joined"] is True
     assert result["protocol_stale"] is True
     assert "Caucus operating protocol" in result["protocol"]
 
 
-def test_join_is_current_after_setup(
+def test_join_is_current_and_delivers_protocol(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "fresh-joiner")
-    bridge.setup()  # learn the hub's current protocol revision
     result = bridge.join()
     assert result["joined"] is True
     assert result["protocol_stale"] is False
-    assert "protocol" not in result
+    # join always hands back the protocol now that there is no setup step.
+    assert "Caucus operating protocol" in result["protocol"]
 
 
 # --- identity ------------------------------------------------------------
@@ -162,7 +173,7 @@ def test_list_peers_includes_self(bridge, monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_ping_absent_peer(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "pinger")
-    # ping needs only setup, not join — scout before entering.
+    # ping needs no join — scout before entering.
     result = bridge.ping("nobody-here")
     assert result == {"peer": "nobody-here", "state": "absent", "present": False}
 
@@ -285,13 +296,13 @@ def test_take_floor_then_status_reports_it(
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "stick-holder")
     bridge.join()
-    taken = bridge.take_floor("prod is down")
+    taken = bridge.floor(action="take", reason="prod is down")
     assert taken["ok"] is True
     assert taken["holder"] == "stick-holder"
-    status = bridge.floor_status()
+    status = bridge.floor(action="status")
     assert status["floors"]["all"]["holder"] == "stick-holder"
     # Release so the module-scoped hub does not carry the stick into the next test.
-    assert bridge.drop_floor()["released"] is True
+    assert bridge.floor(action="drop")["released"] is True
 
 
 def test_say_is_blocked_while_another_holds_the_floor(
@@ -310,7 +321,7 @@ def test_say_is_blocked_while_another_holds_the_floor(
         assert result["error"] == "floor_held"
         assert result["held_by"] == "floor-holder"
         # The barred peer can still queue for the next turn.
-        assert bridge.raise_hand()["ok"] is True
+        assert bridge.floor(action="raise")["ok"] is True
     finally:
         with httpx.Client(base_url=live_hub, timeout=5.0) as http:
             http.post("/floor", json={"token": holder, "action": "drop", "scope": "all"})
@@ -319,10 +330,19 @@ def test_say_is_blocked_while_another_holds_the_floor(
 def test_take_floor_without_join_errors(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert bridge.take_floor("x") == {
+    assert bridge.floor(action="take", reason="x") == {
         "error": "not_joined",
         "hint": "call join() first",
     }
+
+
+def test_floor_rejects_unknown_action(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "floor-bad-action")
+    bridge.join()
+    result = bridge.floor(action="wiggle")
+    assert result["error"] == "invalid_action"
 
 
 def test_listen_quiet_poll_is_empty(
@@ -398,14 +418,11 @@ def test_leave_channel_unsubscribes(
     assert result == {"left": True, "channel": "#br-leave"}
 
 
-def test_channel_tools_refuse_before_setup(
+def test_list_channels_works_before_join(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
-    expected = {"error": "setup_required", "hint": "call setup() first"}
-    assert bridge.join_channel("#x") == expected
-    assert bridge.leave_channel("#x") == expected
-    assert bridge.list_channels() == expected
+    # Read-only scout: list_channels arms and answers without a join.
+    assert "channels" in bridge.list_channels()
 
 
 def test_channel_membership_tools_require_join(
@@ -508,26 +525,19 @@ def test_list_forms_reflects_pending(
     assert "Pending one" in titles
 
 
-def test_form_tools_refuse_before_setup(
+def test_list_forms_works_before_join(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
-    expected = {"error": "setup_required", "hint": "call setup() first"}
-    assert bridge.ask_operator("t", [_radio_field()]) == expected
-    assert bridge.list_forms() == expected
+    # Read-only scout: list_forms arms and answers without a join; ask_operator
+    # still needs one.
+    assert "forms" in bridge.list_forms()
+    assert bridge.ask_operator("t", [_radio_field()]) == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
 
 
 # --- watch_command -------------------------------------------------------
-
-
-def test_watch_command_requires_setup(
-    bridge, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(bridge, "_setup_done", False)
-    assert bridge.watch_command() == {
-        "error": "setup_required",
-        "hint": "call setup() first",
-    }
 
 
 def test_watch_command_requires_join(

@@ -49,24 +49,21 @@ def _build() -> Any:
     return build_mcp_server(hub_module.app, self_url=_SELF_URL)
 
 
-async def test_setup_arms_session_and_join_registers(state: HubState) -> None:
+async def test_join_arms_session_and_registers(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")
-    setup_res = await _tool(server, "setup")(ctx)
-    assert setup_res["ready"] is True
-    assert setup_res["hub"] == _SELF_URL
-
+    # No setup step: join arms the session (fetches the protocol) then registers.
     join_res = await _tool(server, "join")(ctx, project="alpha")
     assert join_res["joined"] is True
     assert join_res["project"] == "alpha"
+    assert join_res["hub"] == _SELF_URL
+    assert "Caucus operating protocol" in join_res["protocol"]
     assert "alpha" in state.peers()
 
 
 async def test_sessions_are_isolated(state: HubState) -> None:
     server = _build()
     s1, s2 = _ctx("s1"), _ctx("s2")
-    await _tool(server, "setup")(s1)
-    await _tool(server, "setup")(s2)
     await _tool(server, "join")(s1, project="alpha")
     await _tool(server, "join")(s2, project="beta")
 
@@ -84,25 +81,23 @@ async def test_sessions_are_isolated(state: HubState) -> None:
 
 
 async def test_tools_fail_closed_without_session_id(state: HubState) -> None:
-    """A3: with no Mcp-Session-Id, every gated tool returns setup_required."""
+    """A3: with no Mcp-Session-Id, every gated tool fails closed to no_session."""
     server = _build()
     ctx = _ctx(None)
-    assert (await _tool(server, "setup")(ctx))["error"] == "setup_required"
-    assert (await _tool(server, "list_peers")(ctx))["error"] == "setup_required"
-    assert (await _tool(server, "join")(ctx))["error"] == "setup_required"
+    assert (await _tool(server, "list_peers")(ctx))["error"] == "no_session"
+    assert (await _tool(server, "join")(ctx))["error"] == "no_session"
 
 
-async def test_gated_tools_require_setup(state: HubState) -> None:
+async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
     server = _build()
-    ctx = _ctx("s1")  # known session id, but setup never called
-    assert (await _tool(server, "join")(ctx))["error"] == "setup_required"
-    assert (await _tool(server, "say")(ctx, content="hi"))["error"] == "setup_required"
+    ctx = _ctx("s1")  # known session id, never joined
+    assert "peers" in await _tool(server, "list_peers")(ctx)
+    assert (await _tool(server, "whoami")(ctx))["armed"] is True
 
 
-async def test_say_requires_join_after_setup(state: HubState) -> None:
+async def test_say_requires_join(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
     res = await _tool(server, "say")(ctx, content="hi")
     assert res["error"] == "not_joined"
 
@@ -120,7 +115,6 @@ async def test_join_name_in_use_on_contested(state: HubState) -> None:
 
     server = _build()
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
     res = await _tool(server, "join")(ctx, project="alpha")
     assert res["error"] == "name_in_use"
     assert res["project"] == "alpha"
@@ -133,7 +127,6 @@ async def test_join_replaced_includes_note(state: HubState) -> None:
 
     server = _build()
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
     res = await _tool(server, "join")(ctx, project="alpha")
     assert res["joined"] is True
     assert "mid-conversation" in res["note"]
@@ -143,7 +136,6 @@ async def test_join_cap_exceeded(state: HubState, monkeypatch: pytest.MonkeyPatc
     """A1: a CapExceeded from register is surfaced as a clean error, not a crash."""
     server = _build()
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
 
     def _boom(*_a: object, **_k: object) -> None:
         raise CapExceeded("client limit reached")
@@ -159,8 +151,9 @@ async def test_join_protocol_stale(
     """A1: a session behind the protocol revision gets stale + fresh text."""
     server = _build()
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
-    # Bump the hub's protocol past what this session learned at setup.
+    # Arm at the current revision via a read-only tool, then bump the hub's
+    # protocol past it so the subsequent join sees the session as behind.
+    await _tool(server, "list_peers")(ctx)
     monkeypatch.setattr(
         hub_module, "PROTOCOL_VERSION", hub_module.PROTOCOL_VERSION + 1
     )
@@ -176,7 +169,6 @@ async def test_watch_command_uses_self_url_and_token_file(state: HubState) -> No
 
     server = build_mcp_server(hub_module.app, self_url="http://127.0.0.1:9999")
     ctx = _ctx("s1")
-    await _tool(server, "setup")(ctx)
     await _tool(server, "join")(ctx, project="alpha")
 
     res = await _tool(server, "watch_command")(ctx)
@@ -227,8 +219,8 @@ async def test_session_reaper_sweeps_dead_sessions(
 ) -> None:
     """Reaper sweeps joined sessions whose hub client has died, unlinking token files.
 
-    A setup-only session (token=None, never joined) must NOT be swept: it has
-    not registered a hub client yet and must remain eligible to complete join.
+    An armed-but-unjoined session (token=None, never joined) must NOT be swept:
+    it has not registered a hub client yet and must remain eligible to join.
     """
     import os
 
@@ -236,10 +228,10 @@ async def test_session_reaper_sweeps_dead_sessions(
 
     server = _build()
     ctx_joined = _ctx("joined")
-    ctx_setup_only = _ctx("setup-only")
+    ctx_armed_only = _ctx("armed-only")
 
-    await _tool(server, "setup")(ctx_joined)
-    await _tool(server, "setup")(ctx_setup_only)
+    # Arm the second session without joining (a read-only tool arms it).
+    await _tool(server, "list_peers")(ctx_armed_only)
     await _tool(server, "join")(ctx_joined, project="alpha")
 
     # Obtain the token-file path written by watch_command.
@@ -256,6 +248,6 @@ async def test_session_reaper_sweeps_dead_sessions(
     # The joined session's token file must have been unlinked.
     assert not os.path.exists(token_path)
 
-    # The setup-only session (token=None) must NOT have been swept.
-    who = await _tool(server, "whoami")(ctx_setup_only)
+    # The armed-but-unjoined session (token=None) must NOT have been swept.
+    who = await _tool(server, "whoami")(ctx_armed_only)
     assert who["joined"] is False
