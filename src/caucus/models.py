@@ -393,7 +393,9 @@ class FloorRequest(BaseModel):
     ``action`` selects the operation: ``take`` (claim the stick for ``scope``),
     ``pass`` (hand it to the next raised hand or put it away), ``drop`` (put it
     away outright, crisis over), ``raise`` (queue to speak next), or ``lower``
-    (withdraw from the queue). ``scope`` is the conversation lane the stick
+    (withdraw from the queue). ``lower`` is reachable only through this HTTP
+    endpoint — it is not exposed as an MCP ``floor`` action (the MCP enum is
+    take|pass|drop|raise|status). ``scope`` is the conversation lane the stick
     governs — :data:`BROADCAST` (the whole room) or a ``#``-prefixed channel;
     its 64-char ceiling matches a channel/peer name. ``reason`` carries the
     crisis description and is only meaningful for ``take``.

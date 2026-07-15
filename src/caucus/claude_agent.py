@@ -677,7 +677,7 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         elif result.floor_held:
             text = (
                 f"floor_held: {result.floor_holder} holds the talking stick for "
-                f"{result.floor_scope}; raise_hand to claim the next turn."
+                f'{result.floor_scope}; floor(action="raise") to claim the next turn.'
             )
         else:
             text = f"delivered (id={result.message_id}) to {result.delivered_to}"
