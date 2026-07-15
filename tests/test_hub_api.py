@@ -90,10 +90,10 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_15() -> None:
-    # The F3/F5 amendment (forms-only contact, signal-before-private, and the
-    # strengthened sign-of-life cadence) ships under protocol revision 15.
-    assert PROTOCOL_VERSION == 15
+def test_protocol_version_is_16() -> None:
+    # Revision 16 slims the tool surface: the talking-stick verbs fuse into
+    # floor(action=...) and the explicit setup step is gone (lazy arming).
+    assert PROTOCOL_VERSION == 16
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(

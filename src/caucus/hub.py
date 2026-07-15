@@ -282,11 +282,11 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 
-# The protocol agents must follow once in the room. Delivered by ``setup`` and
-# re-shipped on ``join`` whenever the caller is behind. This is the canonical
-# copy — peer repos no longer need a local protocol file.
+# The protocol agents must follow once in the room. Fetched by a connector when
+# it arms (on its first tool call) and delivered on ``join``. This is the
+# canonical copy — peer repos no longer need a local protocol file.
 PROTOCOL_TEXT = """\
 Caucus operating protocol
 ===========================
@@ -395,29 +395,32 @@ The talking stick (when something grave is getting drowned):
     assumption everyone is building on, a decision that must not ship — while
     the room is busy and each peer is heads-down in its own bubble. A normal
     say() risks being one more line nobody stops for. For exactly this, grab the
-    talking stick: take_floor(reason, scope). It locks one conversation lane so
-    only you can speak there; every other peer's send to that scope is refused by
-    the hub until you let go. Use it sparingly — it is for genuinely grave,
-    cross-cutting issues, not to win an argument or hold the room hostage.
+    talking stick: floor(action="take", reason=..., scope=...). It locks one
+    conversation lane so only you can speak there; every other peer's send to
+    that scope is refused by the hub until you let go. Use it sparingly — it is
+    for genuinely grave, cross-cutting issues, not to win an argument or hold the
+    room hostage.
   - scope is the lane you freeze: "all" (the whole room's broadcast) or a single
     "#channel". Pick the narrowest lane that fits — freeze "#deploy" if the
     crisis is about the deploy, freeze "all" only when it concerns everyone.
     Other lanes keep flowing; a stick on "all" does not silence channels, and a
     channel stick does not silence the rest of the room. To take a "#channel"
-    stick you must be a member of it.
+    stick you must be a member of it. floor(action="status") lists which lanes
+    are currently held, if you want to scout before you speak.
   - When you take it, the hub announces it to the scope so everyone learns at
     once to hold. If you try to take a stick someone else already holds, you are
     automatically queued behind them — your hand is raised. If you have nothing
     to add, you do NOT have to raise a hand; just stay quiet and let it pass.
   - While a stick is up and you are not the holder, your say() to that scope
     comes back as floor_held (HTTP 423) naming the holder. Do not retry it in a
-    loop — raise_hand(scope) if you genuinely need the next turn, then wait for
-    the hub to hand you the floor.
+    loop — floor(action="raise", scope=...) if you genuinely need the next turn,
+    then wait for the hub to hand you the floor.
   - Holding the stick is a turn, not a monologue: make your point, then move it
-    on. pass_floor(scope) hands the stick to the next raised hand, or — if no
-    hands are up — puts it away and reopens the lane. drop_floor(scope) puts it
-    away outright (crisis over) even if hands are still up. When the floor is
-    passed to you, the hub tells you directly; speak, then pass or drop in turn.
+    on. floor(action="pass", scope=...) hands the stick to the next raised hand,
+    or — if no hands are up — puts it away and reopens the lane.
+    floor(action="drop", scope=...) puts it away outright (crisis over) even if
+    hands are still up. When the floor is passed to you, the hub tells you
+    directly; speak, then pass or drop in turn.
   - You never get stuck behind a vanished holder: if the holder leaves, is
     kicked, or times out, the hub automatically hands the stick to the next hand
     or puts it away. The human operator can always speak regardless of any stick,
@@ -918,8 +921,8 @@ async def channel_topic(req: ChannelTopicRequest) -> dict[str, object] | JSONRes
 async def protocol() -> dict[str, object]:
     """Return the current operating protocol and its revision.
 
-    The hub is the single source of truth for the protocol; the bridge fetches
-    this on ``setup`` so peer repos need no local copy.
+    The hub is the single source of truth for the protocol; a connector fetches
+    this when it arms (on its first tool call) so peer repos need no local copy.
     """
     return {"version": PROTOCOL_VERSION, "text": PROTOCOL_TEXT}
 
@@ -1062,7 +1065,8 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
                 "reason": blocking.reason or None,
                 "hint": (
                     f"{blocking.holder} holds the talking stick for "
-                    f"{blocking.scope}; raise_hand() to claim the next turn."
+                    f"{blocking.scope}; floor(action=\"raise\") to claim the "
+                    "next turn."
                 ),
             },
         )

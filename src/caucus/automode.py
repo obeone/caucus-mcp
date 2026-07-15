@@ -14,7 +14,7 @@ This module closes that gap *cleanly* and *without* depending on the
 
 - **Detect** (cheap, pure file I/O, no subprocess) whether the Caucus rule is
   already present in any auto-mode ``allow`` list the classifier reads. Used by
-  the bridge's ``setup()`` so the agent can propose installing it.
+  the bridge's ``join()`` so the agent can propose installing it.
 - **Apply** the rule to ``.claude/settings.local.json`` (atomic write, backup,
   ``0600`` mode) and then run ``claude auto-mode critique`` -- the *canonical
   gate*, a first-class Claude Code CLI command, not a skill artifact -- so the
@@ -122,7 +122,7 @@ def is_claude_code() -> bool:
     """Return ``True`` when running under Claude Code, ``False`` on other hosts.
 
     Auto mode is a Claude Code feature; Codex, Gemini and other MCP hosts do not
-    have it, so the bridge only *surfaces* the auto-mode signal in ``setup()``
+    have it, so the bridge only *surfaces* the auto-mode signal in ``join()``
     when this is true (otherwise the hint to run ``claude auto-mode critique``
     would be irrelevant noise). Claude Code exports ``CLAUDECODE=1`` into the
     environment of the child processes it spawns, and the bridge is one of them.

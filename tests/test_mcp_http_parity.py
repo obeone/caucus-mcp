@@ -132,7 +132,6 @@ async def test_say_blocked_when_room_stopped(mcp_hub: tuple[str, HubState]) -> N
     """Operator STOP (REST 409) reaches the MCP say path as a stopped signal."""
     url, _ = mcp_hub
     async with _session(url) as a:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
         with httpx.Client(base_url=url, timeout=5.0) as http:
             http.post("/control", json={"action": "stop"})
@@ -144,12 +143,10 @@ async def test_say_blocked_by_held_floor(mcp_hub: tuple[str, HubState]) -> None:
     """A held floor (REST 423) bars another peer's MCP say in that scope."""
     url, _ = mcp_hub
     async with _session(url) as a, _session(url) as b:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
-        await _call(b, "setup")
         await _call(b, "join", project="beta")
 
-        took = await _call(a, "take_floor", reason="grave", scope="all")
+        took = await _call(a, "floor", action="take", reason="grave", scope="all")
         assert took.get("ok") is True
 
         res = await _call(b, "say", content="blocked?", to="all")
@@ -161,7 +158,6 @@ async def test_say_rate_limited_under_flood(mcp_hub: tuple[str, HubState]) -> No
     """The per-sender bucket (REST 429) reaches the MCP say path."""
     url, _ = mcp_hub
     async with _session(url) as a:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
         results = [
             await _call(a, "say", content=f"spam {i}", to="all") for i in range(15)
@@ -173,9 +169,7 @@ async def test_sessions_have_isolated_queues(mcp_hub: tuple[str, HubState]) -> N
     """Two MCP sessions are distinct peers: a direct message reaches only one."""
     url, _ = mcp_hub
     async with _session(url) as a, _session(url) as b:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
-        await _call(b, "setup")
         await _call(b, "join", project="beta")
 
         # alpha addresses beta directly; alpha's own queue must stay empty.
@@ -238,7 +232,6 @@ async def test_many_joins_bypass_register_flood(state: HubState) -> None:
     server = build_mcp_server(hub_module.app, self_url="http://127.0.0.1:8765")
     for i in range(25):
         ctx = _ctx(f"s{i}")
-        await _tool(server, "setup")(ctx)
         res = await _tool(server, "join")(ctx, project=f"peer{i}")
         assert res.get("joined") is True, res
     assert set(state.peers()) >= {f"peer{i}" for i in range(25)}
@@ -267,19 +260,18 @@ async def test_duplicate_name_yields_name_in_use_both_paths(
 
     # In-process MCP path.
     async with _session(url) as a:
-        await _call(a, "setup")
         mcp_res = await _call(a, "join", project="dup")
     assert mcp_res["error"] == "name_in_use"
     assert mcp_res["project"] == "dup"
 
     # Stdio bridge path, pointed at the same hub. Reset the bridge globals so
-    # setup/join start clean; monkeypatch restores them after the test.
+    # arming/join start clean; monkeypatch restores them after the test.
     monkeypatch.setattr(mcp_bridge, "HUB_URL", url)
     monkeypatch.setattr(mcp_bridge, "_token", None)
-    monkeypatch.setattr(mcp_bridge, "_setup_done", False)
+    monkeypatch.setattr(mcp_bridge, "_armed", False)
     monkeypatch.setattr(mcp_bridge, "_joined_as", None)
     monkeypatch.setattr(mcp_bridge, "_known_protocol_version", None)
-    mcp_bridge.setup()
+    monkeypatch.setattr(mcp_bridge, "_protocol_text", None)
     bridge_res = mcp_bridge.join("dup")
     assert bridge_res["error"] == "name_in_use"
     assert bridge_res["project"] == "dup"

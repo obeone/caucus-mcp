@@ -100,18 +100,17 @@ async def test_initialize_and_tool_listing(mcp_hub: tuple[str, HubState]) -> Non
     async with _session(url) as session:
         tools = await session.list_tools()
     names = {t.name for t in tools.tools}
-    assert {"setup", "join", "say", "listen", "watch_command"} <= names
+    assert {"join", "say", "listen", "watch_command"} <= names
+    assert "setup" not in names
 
 
-async def test_setup_join_say_listen_roundtrip(
+async def test_join_say_listen_roundtrip(
     mcp_hub: tuple[str, HubState]
 ) -> None:
     """Two MCP sessions are distinct peers; a broadcast reaches the other."""
     url, state = mcp_hub
     async with _session(url) as a, _session(url) as b:
-        assert (await _call(a, "setup"))["ready"] is True
         assert (await _call(a, "join", project="alpha"))["joined"] is True
-        await _call(b, "setup")
         assert (await _call(b, "join", project="beta"))["joined"] is True
 
         # The roster reflects both in-process MCP peers.
@@ -131,7 +130,6 @@ async def test_rest_surface_served_alongside_mcp(
     """The REST API still serves on the same hub the MCP endpoint is mounted on."""
     url, _ = mcp_hub
     async with _session(url) as a:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
         with httpx.Client(base_url=url, timeout=5.0) as http:
             resp = http.get("/peers")
@@ -145,7 +143,6 @@ async def test_leave_drops_peer_from_roster(
     """Lifecycle: an explicit leave deregisters the session's peer at once."""
     url, state = mcp_hub
     async with _session(url) as a:
-        await _call(a, "setup")
         await _call(a, "join", project="alpha")
         assert "alpha" in state.peers()
         left = await _call(a, "leave")
@@ -196,11 +193,9 @@ async def test_python_m_launch_shares_state_with_mcp_endpoint() -> None:
         base = f"http://127.0.0.1:{port}"
 
         async with _session(base) as a, _session(base) as b:
-            # Both sessions set up and join -- writes go to the subprocess's state.
-            assert (await _call(a, "setup"))["ready"] is True
+            # Both sessions join (arming lazily) -- writes go to the subprocess state.
             assert (await _call(a, "join", project="alpha"))["joined"] is True
 
-            await _call(b, "setup")
             assert (await _call(b, "join", project="beta"))["joined"] is True
 
             # The REST /peers endpoint must read from the SAME HubState that the
