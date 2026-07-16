@@ -51,8 +51,9 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
@@ -132,6 +133,11 @@ class _Membership:
         token_file: Path of the 0600 watcher token file written by
             :func:`watch_command`, cleaned up on :func:`leave`. ``None`` when
             none is live.
+        last_active: ``time.time()`` of this session's most recent tool call.
+            Only load-bearing while the session is *unjoined*: it is the sole
+            liveness signal such a record has (it owns no hub client), so the
+            sweep ages it out against ``HubState.client_ttl``. Once joined, the
+            hub's own ``last_seen`` supersedes it.
     """
 
     armed: bool = False
@@ -140,6 +146,7 @@ class _Membership:
     joined_as: str | None = None
     last_acked_seq: int = 0
     token_file: str | None = None
+    last_active: float = field(default_factory=time.time)
 
 
 # Type of an async MCP tool body: takes any args, returns the result dict.
@@ -202,8 +209,9 @@ def _remove_token_file(path: str | None) -> None:
 
 # Callback set by build_mcp_server() so hub._reaper_loop() can sweep dead
 # sessions without importing mcp_http in the hot loop.  None until the first
-# build_mcp_server() call.
-_session_reaper_fn: Callable[[], None] | None = None
+# build_mcp_server() call.  Callable[..., None] rather than Callable[[], None]:
+# the reaper calls it bare, but it accepts an optional ``now`` for tests.
+_session_reaper_fn: Callable[..., None] | None = None
 
 
 def _transport_security(
@@ -269,19 +277,40 @@ def build_mcp_server(
     # Per-session caucus membership, keyed on the Mcp-Session-Id.
     sessions: dict[str, _Membership] = {}
 
-    def _sweep_dead_sessions() -> None:
-        """Remove per-session state and token files for sessions whose hub client has died.
+    def _sweep_dead_sessions(*, now: float | None = None) -> None:
+        """Remove per-session state and token files for sessions that are gone.
 
-        Called by the hub reaper on every sweep tick.  Only joined sessions
-        (``member.token is not None``) are inspected; an armed-but-unjoined
-        session is left in place so it can still complete its join without being
-        evicted prematurely.
+        Called by the hub reaper on every sweep tick, right after
+        :meth:`HubState.reap_stale`. Two kinds of corpse, because the two kinds
+        of session carry their liveness in different places:
+
+        * **Joined** (``token is not None``) — the hub client *is* the liveness
+          record, refreshed by the watcher's ``/receive`` polls and aged out by
+          ``reap_stale`` against ``client_ttl``. So the sweep simply follows the
+          hub's verdict: no client behind the token, no session.
+        * **Unjoined** (``token is None``) — armed on a first tool call but never
+          in the room, so it owns no hub client and the check above can never
+          fire; left to that rule alone it would leak for the process lifetime.
+          Its only liveness signal is :attr:`_Membership.last_active`, so it is
+          aged out here against the *same* ``client_ttl`` idle window a joined
+          peer gets, rather than a second knob of its own. Any tool call re-arms
+          the clock, so a session on its way to joining is never evicted
+          mid-flight.
+
+        Args:
+            now: Reference timestamp for the idle window; defaults to
+                ``time.time()``. Injectable for tests, mirroring
+                :meth:`HubState.reap_stale`.
         """
-        dead = [
-            sid
-            for sid, m in list(sessions.items())
-            if m.token is not None and _hub.state.client_for(m.token) is None
-        ]
+        ref = time.time() if now is None else now
+        ttl = _hub.state.client_ttl
+        dead: list[str] = []
+        for sid, m in list(sessions.items()):
+            if m.token is not None:
+                if _hub.state.client_for(m.token) is None:
+                    dead.append(sid)
+            elif ref - m.last_active > ttl:
+                dead.append(sid)
         for sid in dead:
             member = sessions.pop(sid, None)
             if member is not None:
@@ -335,11 +364,19 @@ def build_mcp_server(
         return wrapper
 
     def _session(ctx: _Ctx) -> _Membership | None:
-        """Return the membership for the current session, or ``None``."""
+        """Return the membership for the current session, or ``None``.
+
+        Touches ``last_active``: ``whoami`` is the one tool that reads a
+        membership without passing the arming gate, and it is still a live tool
+        call, so it must count against the unjoined idle sweep.
+        """
         sid = _session_id(ctx)
         if sid is None:
             return None
-        return sessions.get(sid)
+        member = sessions.get(sid)
+        if member is not None:
+            member.last_active = time.time()
+        return member
 
     async def _ensure_armed(
         ctx: _Ctx,
@@ -351,12 +388,16 @@ def build_mcp_server(
         ``setup`` gesture. Fails closed to ``no_session`` when the request lacks
         an ``Mcp-Session-Id`` (only before the MCP handshake, where no tool
         runs), and to ``hub_unreachable`` when the protocol fetch fails.
+
+        Every gated tool passes through here, so this is also where a session's
+        ``last_active`` clock is re-armed against the unjoined idle sweep.
         """
         sid = _session_id(ctx)
         if sid is None:
             return None, {"error": "no_session", "hint": "missing Mcp-Session-Id"}
         member = sessions.get(sid)
         if member is not None and member.armed:
+            member.last_active = time.time()
             return member, None
         try:
             connector = await _connector()
@@ -371,6 +412,7 @@ def build_mcp_server(
         member = sessions.setdefault(sid, _Membership())
         member.known_protocol_version = proto.version
         member.armed = True
+        member.last_active = time.time()
         return member, None
 
     # ------------------------------------------------------------------ tools
