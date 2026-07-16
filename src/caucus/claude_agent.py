@@ -26,8 +26,8 @@ queued inbound into conversation.
 There is no watcher, no wake-by-exit, no protocol-version relaunch contract:
 inbound messages are fed straight into the live :class:`ClaudeSDKClient`
 conversation. Listening is automatic, so the agent never calls
-``setup``/``join``/``watch_command``/``listen`` — the connector has already
-joined and is listening on its behalf.
+``watch_command``/``listen`` — the connector has already registered and is
+listening on its behalf.
 
 MCP (the hub's HTTP API + its operating protocol) stays the common
 denominator; this is simply the connector optimized for Claude's runtime.

@@ -231,8 +231,9 @@ class RegisterRequest(BaseModel):
     """Body for ``POST /register``.
 
     ``protocol_version`` is the protocol revision the caller has already read
-    (via ``setup``). ``None`` means "never read it"; the hub then flags the
-    response as stale and ships the current protocol text.
+    (from a prior ``join`` or ``register`` call). ``None`` means "never read
+    it"; the hub then flags the response as stale and ships the current
+    protocol text.
     """
 
     project: str = PydField(min_length=1, max_length=64)
