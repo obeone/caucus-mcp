@@ -786,9 +786,9 @@ def build_mcp_server(
         Returns:
             For ``status``: ``{"floors": {"<scope>": {...}, ...}}``. For the verbs:
             ``{"ok": true, ...}`` on success, ``{"error": "floor_held", ...}`` /
-            ``{"error": "not_holder"}`` on refusal, ``{"error": "rate_limited",
-            ...}`` when throttled, ``{"error": "invalid_action", ...}`` for an
-            unknown action, or the ``not_joined`` gate error.
+            ``{"error": "not_holder"}`` on refusal, ``{"error":
+            "invalid_action", ...}`` for an unknown action, or the
+            ``not_joined`` gate error.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
