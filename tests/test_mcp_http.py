@@ -14,6 +14,7 @@ origin rejection, lifecycle) lives in :mod:`tests.test_mcp_http_integration`.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -331,8 +332,10 @@ async def test_session_reaper_sweeps_dead_sessions(
 ) -> None:
     """Reaper sweeps joined sessions whose hub client has died, unlinking token files.
 
-    An armed-but-unjoined session (token=None, never joined) must NOT be swept:
-    it has not registered a hub client yet and must remain eligible to join.
+    A *recently active* armed-but-unjoined session (token=None) must NOT be
+    swept: it has registered no hub client yet and must stay eligible to join.
+    Ageing it out once it goes idle is a separate rule, covered by
+    :func:`test_sweep_reaps_idle_unjoined_sessions`.
     """
     import os
 
@@ -363,3 +366,38 @@ async def test_session_reaper_sweeps_dead_sessions(
     # The armed-but-unjoined session (token=None) must NOT have been swept.
     who = await _tool(server, "whoami")(ctx_armed_only)
     assert who["joined"] is False
+
+
+async def test_sweep_reaps_idle_unjoined_sessions(state: HubState) -> None:
+    """An armed-but-unjoined record is aged out once it idles past client_ttl.
+
+    Regression: the sweep only ever inspected joined sessions, so a client that
+    opened an MCP session, armed with one tool call, then walked away without
+    joining leaked its ``_Membership`` for the whole process lifetime.
+
+    The clock is injected (as :meth:`HubState.reap_stale` allows) rather than
+    slept through: ``sweep()`` at real-now proves a fresh record survives, and a
+    sweep one TTL later proves the idle one does not.
+    """
+    from caucus import mcp_http
+
+    server = _build()
+    idler, joiner = _ctx("idler"), _ctx("joiner")
+    await _tool(server, "list_peers")(idler)  # armed, never joined
+    await _tool(server, "join")(joiner, project="alpha")
+
+    assert mcp_http._session_reaper_fn is not None
+    sweep = mcp_http._session_reaper_fn
+
+    # Both were active a moment ago: a sweep now reaps neither.
+    sweep()
+    assert (await _tool(server, "whoami")(idler))["armed"] is True
+    assert (await _tool(server, "whoami")(joiner))["joined"] is True
+
+    # One TTL past their last tool call, the unjoined record is gone...
+    sweep(now=time.time() + state.client_ttl + 1)
+    assert (await _tool(server, "whoami")(idler))["armed"] is False
+    # ...but the joined one is spared: its liveness is the hub client (kept
+    # fresh by the watcher's /receive polls), not last_active. A joined agent
+    # that calls no tool for an hour while its watcher listens must survive.
+    assert (await _tool(server, "whoami")(joiner))["joined"] is True
