@@ -108,6 +108,45 @@ def test_join_is_current_and_delivers_protocol(
     assert "Caucus operating protocol" in result["protocol"]
 
 
+def test_rejoin_after_protocol_upgrade_keeps_serving_the_new_text(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the stale branch must refresh the cached protocol text.
+
+    Arming caches the hub's text and revision. When the hub then ships a new
+    revision, the first join is flagged stale and hands back the fresh text —
+    but if it advances ``_known_protocol_version`` without refreshing
+    ``_protocol_text``, the *second* join computes ``stale=False`` and serves the
+    superseded text under the new version label. The second join below is the one
+    that catches it.
+    """
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "upgrade-joiner")
+    # Arm against the hub's current revision, caching that text.
+    bridge.list_peers()
+    armed_at = bridge._known_protocol_version
+    assert isinstance(armed_at, int)
+
+    # The hub ships a new protocol revision (as a restart carrying a bump would).
+    new_version = armed_at + 1
+    new_text = "Caucus operating protocol (upgraded revision)"
+    monkeypatch.setattr(hub_module, "PROTOCOL_VERSION", new_version)
+    monkeypatch.setattr(hub_module, "PROTOCOL_TEXT", new_text)
+
+    first = bridge.join()
+    assert first["protocol_stale"] is True
+    assert first["protocol_version"] == new_version
+    assert first["protocol"] == new_text
+
+    # Second join: no longer stale, so the bridge answers from its own cache —
+    # which must hold the NEW text, not the one cached at arming time.
+    second = bridge.join()
+    assert second["protocol_stale"] is False
+    assert second["protocol_version"] == new_version
+    assert second["protocol"] == new_text
+
+
 def test_join_surfaces_automode_under_claude_code(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
