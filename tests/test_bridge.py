@@ -147,6 +147,25 @@ def test_rejoin_after_protocol_upgrade_keeps_serving_the_new_text(
     assert second["protocol"] == new_text
 
 
+def test_tool_reports_hub_unreachable_when_arming_fails(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arming gate fails closed: a dead hub yields a structured error.
+
+    Distinct from the ``_resilient_hub_call`` decorator (tests/test_security_low.py):
+    here the very first tool call cannot fetch /protocol, so ``_ensure_armed``
+    itself returns the error and the tool body never runs.
+    """
+    dead_hub = "http://127.0.0.1:1"
+    monkeypatch.setattr(bridge, "HUB_URL", dead_hub)
+    result = bridge.list_peers()
+    assert result["error"] == "hub_unreachable"
+    assert result["hub"] == dead_hub
+    assert "detail" in result
+    # The failed arming left the session disarmed, so a retry can still arm.
+    assert bridge.whoami()["armed"] is False
+
+
 def test_join_surfaces_automode_under_claude_code(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -417,6 +436,52 @@ def test_take_floor_without_join_errors(
         "error": "not_joined",
         "hint": "call join() first",
     }
+
+
+def test_floor_action_raise_queues_behind_the_holder(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    holder = _register_peer(live_hub, "raise-holder")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post(
+            "/floor",
+            json={"token": holder, "action": "take", "scope": "all", "reason": "x"},
+        )
+    monkeypatch.setattr(bridge, "PROJECT", "raise-waiter")
+    bridge.join()
+    try:
+        assert bridge.floor(action="raise") == {"ok": True, "scope": "all", "position": 1}
+    finally:
+        with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+            http.post("/floor", json={"token": holder, "action": "drop", "scope": "all"})
+
+
+def test_floor_action_pass_hands_the_stick_to_the_next_hand(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    waiter = _register_peer(live_hub, "pass-waiter")
+    monkeypatch.setattr(bridge, "PROJECT", "pass-holder")
+    bridge.join()
+    bridge.floor(action="take", reason="mine first")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/floor", json={"token": waiter, "action": "raise", "scope": "all"})
+    result = bridge.floor(action="pass")
+    # The stick genuinely moved rather than merely being released.
+    assert result["passed_to"] == "pass-waiter"
+    assert bridge.floor(action="status")["floors"]["all"]["holder"] == "pass-waiter"
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/floor", json={"token": waiter, "action": "drop", "scope": "all"})
+
+
+def test_floor_action_drop_reopens_the_lane(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "dropper")
+    bridge.join()
+    bridge.floor(action="take", reason="brief crisis")
+    assert bridge.floor(action="drop")["released"] is True
+    # Dropped outright, not passed on: the lane is fully open again.
+    assert bridge.floor(action="status")["floors"] == {}
 
 
 def test_floor_rejects_unknown_action(

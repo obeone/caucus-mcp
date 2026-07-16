@@ -17,10 +17,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 from caucus import hub as hub_module
 from caucus import mcp_bridge
+from caucus.hub_connector import HubConnector
 from caucus.mcp_http import build_mcp_server
 from caucus.state import CapExceeded, HubState
 
@@ -87,6 +89,37 @@ async def test_tools_fail_closed_without_session_id(state: HubState) -> None:
     ctx = _ctx(None)
     assert (await _tool(server, "list_peers")(ctx))["error"] == "no_session"
     assert (await _tool(server, "join")(ctx))["error"] == "no_session"
+
+
+async def test_arming_failure_returns_hub_unreachable(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hub blip on the first tool call is refused by the arming gate, not raised.
+
+    ``_ensure_armed`` fetches the protocol before any tool body runs; when that
+    fetch dies it must return the structured ``hub_unreachable`` contract. Only
+    ``fetch_protocol`` is broken here (``/peers`` still answers), so a pass would
+    prove the *gate* refused, not merely that the tool body blew up.
+    """
+    server = _build()
+    ctx = _ctx("s1")
+
+    async def _boom(_self: Any) -> None:
+        raise httpx.ConnectError("hub down")
+
+    monkeypatch.setattr(HubConnector, "fetch_protocol", _boom)
+    res = await _tool(server, "list_peers")(ctx)
+    assert res["error"] == "hub_unreachable"
+    assert res["hub"] == _SELF_URL
+    assert "hub down" in str(res["detail"])
+    # The gate bailed before sessions.setdefault(): no half-armed record is left
+    # behind for the retry to inherit.
+    assert (await _tool(server, "whoami")(ctx))["armed"] is False
+
+    # Not terminal: once the hub answers again the same session arms and works.
+    monkeypatch.undo()
+    assert "peers" in await _tool(server, "list_peers")(ctx)
+    assert (await _tool(server, "whoami")(ctx))["armed"] is True
 
 
 async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
