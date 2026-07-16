@@ -612,9 +612,8 @@ def floor(
     Returns:
         For ``status``: ``{"floors": {"<scope>": {...}, ...}}``. For the verbs:
         ``{"ok": true, ...}`` on success, ``{"error": "floor_held", ...}`` /
-        ``{"error": "not_holder"}`` on refusal, ``{"error": "rate_limited",
-        ...}`` when throttled, ``{"error": "invalid_action", ...}`` for an
-        unknown action, or the ``not_joined`` gate error.
+        ``{"error": "not_holder"}`` on refusal, ``{"error": "invalid_action",
+        ...}`` for an unknown action, or the ``not_joined`` gate error.
     """
     gate = _ensure_armed()
     if gate is not None:
@@ -642,9 +641,6 @@ def floor(
                 "reason": reason or "",
             },
         )
-        if resp.status_code == 429:
-            body = resp.json()
-            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 
