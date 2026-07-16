@@ -241,7 +241,7 @@ def join(project: str | None = None) -> dict[str, object]:
     gate = _ensure_armed()
     if gate is not None:
         return gate
-    global _token, _joined_as, _known_protocol_version
+    global _token, _joined_as, _known_protocol_version, _protocol_text
     name = project or PROJECT
     payload: dict[str, object] = {
         "project": name,
@@ -292,7 +292,12 @@ def join(project: str | None = None) -> dict[str, object]:
     # lazily-armed agent reads the operating manual. Prefer the hub's fresh copy
     # when we were behind, else the text cached when the session armed.
     if stale:
-        result["protocol"] = body.get("protocol_text")
+        # Refresh the cache alongside the revision counter — they must move
+        # together. Advancing _known_protocol_version while leaving the old text
+        # cached would make the *next* join compute stale=False and hand back the
+        # superseded text under the new version label (silent protocol drift).
+        _protocol_text = body.get("protocol_text")
+        result["protocol"] = _protocol_text
         result["note"] = "protocol updated; re-read the protocol below"
     else:
         result["protocol"] = _protocol_text
