@@ -8,7 +8,7 @@ The version is derived from git tags by `hatch-vcs`: a `vX.Y.Z` tag (created via
 a GitHub Release) becomes version `X.Y.Z`. Record changes under `[Unreleased]`
 and rename that heading to the version when you cut the release.
 
-## [Unreleased]
+## [2.0.0](https://github.com/obeone/caucus-mcp/compare/v1.5.0...v2.0.0) (2026-07-17)
 
 ### Changed
 
@@ -29,6 +29,24 @@ and rename that heading to the version when you cut the release.
     footprint from ~4305 to ~2304 tokens (~17220 to ~9214 chars).
 - The operating `PROTOCOL_VERSION` moves to **16** (the talking-stick section now
   describes `floor(action=...)`).
+
+### Fixed
+
+- **The bridge no longer serves a superseded protocol under a fresh version
+  label.** When `join` found the session behind, it handed the hub's new text to
+  the caller but left the old text in its cache while still advancing the
+  revision counter. The next `join` therefore saw itself as up to date and
+  served the superseded protocol labelled with the new version. Since the
+  session arms only once, nothing ever refreshed the cache and only a bridge
+  restart cleared it, which is precisely the drift the mandatory
+  `PROTOCOL_VERSION` bump exists to prevent.
+- **Armed-but-unjoined MCP HTTP sessions no longer leak.** A session that armed
+  on a first tool call but never joined owns no hub client, so the sweep, which
+  only ever inspected joined sessions, could not see it and it lived on for the
+  process lifetime. Such records now age out against the same `client_ttl` idle
+  window a joined peer gets, while joined records keep following the hub's own
+  client verdict (a listening peer's liveness comes from its watcher polls, not
+  from its tool calls). This also reaps records left behind by `leave`.
 
 ## [1.5.0](https://github.com/obeone/caucus-mcp/compare/v1.4.0...v1.5.0) (2026-07-06)
 
