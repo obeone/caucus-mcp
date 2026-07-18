@@ -63,6 +63,30 @@ Two details are load-bearing:
 Prefer a hub that is always up? `--at-login` flips `RunAtLoad` on launchd and
 enables the systemd unit; the hook is then unnecessary and is not offered.
 
+### When the hook is not enough
+
+A `SessionStart` hook fires before MCP servers finish connecting, but nothing
+waits for it: MCP startup is non-blocking, so the hook and the connection
+attempts race. Which transport you use decides whether that matters.
+
+**Through `caucus-bridge` (stdio): fine.** The bridge opens nothing at startup.
+It is passive until `join`, and its tools arm lazily on first use, so its first
+contact with the hub happens seconds or minutes after the session opened, long
+after the hook. And if the hub is still down by then, the bridge asks the
+service manager for it itself (see [`autostart.py`](../src/caucus/autostart.py))
+before reporting `hub_unreachable`. That second net matters, because a stdio
+server gets no automatic retry.
+
+**Straight to `/mcp` over Streamable HTTP: prefer `--at-login`.** That client
+dials in immediately, while the hook may still be running. Startup connection
+errors are retried a few times, which often absorbs the hub coming up, but it
+is a race you are betting on rather than a guarantee, and a server that
+exhausts its retries stays marked failed until you reconnect it by hand.
+
+The same reasoning applies to the native connector: `caucus-claude-agent` owns
+its own process and no host hooks its startup, so it wakes the service itself
+on the failure path. On demand works there without any hook at all.
+
 ## Options
 
 | Option | Why you would use it |
