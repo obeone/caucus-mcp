@@ -20,6 +20,46 @@ unit in `~/.config/systemd/user`. The script picks based on `uname`. It never
 uses `sudo`, writes nothing outside your home directory, and refuses to run as
 root.
 
+### On demand, or at login
+
+By default the service is **defined but not started at login**. Nothing runs
+until something asks for the hub. That fits how Caucus is actually used, in
+bursts, and the hub's state is ephemeral anyway, so a process idling for days
+buys nothing.
+
+What asks for it is a `SessionStart` hook on your agent host:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/caucus-mcp/contrib/hooks/caucus-hub-ensure.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+[`hooks/caucus-hub-ensure.sh`](hooks/caucus-hub-ensure.sh) asks the service
+manager to start an already-defined service, which is idempotent: several
+sessions starting at once cannot race, because launchd and systemd each
+serialise on the service identity. It stays silent and exits 0 when no service
+is installed, so it never blocks a session.
+
+This is why the hook does not simply run `nohup caucus-hub &`. That version
+races on the port when sessions start concurrently, leaves the surviving
+process owned by whichever session happened to win, and never restarts after a
+crash.
+
+Prefer a hub that is always up? `--at-login` flips `RunAtLoad` on launchd and
+enables the systemd unit, and then you do not need the hook at all.
+
 `--help` lists every option. The ones that matter:
 
 | Option | Why you would use it |
@@ -30,6 +70,7 @@ root.
 | `--binary` | Point at a `caucus-hub` that is not on your `PATH`. |
 | `--log-file` | Move the service's stdout/stderr away from the default. |
 | `--label` | Run more than one instance, on different ports. |
+| `--at-login` | Start the hub at login and keep it up, instead of on demand. |
 
 ### Things worth knowing before you install this
 

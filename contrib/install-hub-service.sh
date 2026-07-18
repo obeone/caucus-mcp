@@ -27,6 +27,10 @@ OBSERVER_TOKEN=""
 LOGFILE=""
 DRY_RUN=0
 UNINSTALL=0
+# On-demand by default: define the service, but let something start it when it
+# is actually needed (see contrib/hooks/). Caucus is used in bursts, and the
+# hub's state is ephemeral anyway, so a permanent daemon buys little.
+AT_LOGIN=0
 
 usage() {
     cat <<'EOF'
@@ -51,6 +55,11 @@ Options:
                        (default: ~/Library/Logs/caucus-hub.log on macOS,
                        ~/.local/state/caucus/hub.log on Linux).
   --label NAME         Service identifier (default: com.github.obeone.caucus-hub).
+  --at-login           Start the hub at login and keep it running. The default
+                       is on demand: the service is defined but idle until
+                       something starts it, which is what the SessionStart hook
+                       in contrib/hooks/ is for.
+  --on-demand          The default, spelled out.
   --dry-run            Print the generated files and the commands, change
                        nothing.
   --uninstall          Stop the service and remove its definition.
@@ -82,6 +91,8 @@ while [ $# -gt 0 ]; do
         --observer-token) OBSERVER_TOKEN="${2:-}"; shift 2 ;;
         --log-file) LOGFILE="${2:-}"; shift 2 ;;
         --label) LABEL="${2:-}"; shift 2 ;;
+        --at-login) AT_LOGIN=1; shift ;;
+        --on-demand) AT_LOGIN=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -223,6 +234,11 @@ RENDERED="${RENDERED//@PORT@/$PORT}"
 RENDERED="${RENDERED//@LOGFILE@/$LOGFILE}"
 RENDERED="${RENDERED//@ENVFILE@/$ENVFILE}"
 RENDERED="${RENDERED//@ENVIRONMENT@/$ENV_XML}"
+if [ "$AT_LOGIN" = "1" ]; then
+    RENDERED="${RENDERED//@RUNATLOAD@/true}"
+else
+    RENDERED="${RENDERED//@RUNATLOAD@/false}"
+fi
 
 # --- Report ------------------------------------------------------------------
 
@@ -232,12 +248,19 @@ else
     AUTH_DESC="open (loopback only)"
 fi
 
+if [ "$AT_LOGIN" = "1" ]; then
+    MODE_DESC="at login, kept running"
+else
+    MODE_DESC="on demand (nothing starts it at login)"
+fi
+
 cat <<EOF
 
 Caucus hub service ($PLATFORM)
 
   binary    $BINARY
   listen    http://$HOST:$PORT/
+  starts    $MODE_DESC
   operator  $AUTH_DESC
   unit      $UNIT_PATH
   log       $LOGFILE
@@ -282,12 +305,21 @@ fi
 # --- Load --------------------------------------------------------------------
 
 if [ "$PLATFORM" = "launchd" ]; then
+    # bootout then bootstrap so a re-run picks up the new definition. bootstrap
+    # loads the service; with RunAtLoad false it stays idle until kickstarted,
+    # here and by the SessionStart hook later.
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$UNIT_PATH"
     launchctl kickstart -k "gui/$(id -u)/${LABEL}"
 else
     systemctl --user daemon-reload
-    systemctl --user enable --now caucus-hub.service
+    if [ "$AT_LOGIN" = "1" ]; then
+        systemctl --user enable caucus-hub.service
+    else
+        # Not enabled means not wired to default.target, so nothing starts it
+        # at login. Starting it now still proves the unit works.
+        systemctl --user disable caucus-hub.service 2>/dev/null || true
+    fi
     systemctl --user restart caucus-hub.service
 fi
 
@@ -310,6 +342,18 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     if curl -fsS --max-time 2 "$PROBE_URL" >/dev/null 2>&1; then
         echo "Hub is up: ${PROBE_URL%/version}/"
         echo "Logs: $LOGFILE"
+        if [ "$AT_LOGIN" != "1" ]; then
+            cat <<EOF
+
+It is running now, but nothing will start it after a reboot. Wire it to your
+agent sessions with the SessionStart hook:
+
+    $SCRIPT_DIR/hooks/caucus-hub-ensure.sh
+
+See contrib/README.md for the settings.json snippet, or re-run with
+--at-login to start the hub at login instead.
+EOF
+        fi
         exit 0
     fi
     sleep 1
