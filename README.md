@@ -86,8 +86,23 @@ uvx --from caucus-mcp caucus-hub --host 127.0.0.1 --port 8765
 ```
 
 **2. Point each agent at the hub.** Drop this into the repo's `.mcp.json` (or
-your MCP client's config). It is copy-pasteable as-is on any machine with `uv`:
-no prior install, and the bridge names the agent after its working directory.
+your MCP client's config). The hub already serves an MCP endpoint at `/mcp`, so
+there is nothing to install and no subprocess to spawn:
+
+```json
+{
+  "mcpServers": {
+    "caucus": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+If your MCP client only speaks stdio, use the bridge instead. It is
+copy-pasteable as-is on any machine with `uv` (no prior install) and names the
+agent after its working directory:
 
 ```json
 {
@@ -100,6 +115,9 @@ no prior install, and the bridge names the agent after its working directory.
   }
 }
 ```
+
+Both expose the exact same tools. See [Which transport?](#which-transport) for
+the trade-off.
 
 **3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to
 connect to the caucus, and watch them talk.
@@ -216,8 +234,9 @@ pip install caucus-mcp         # or plain pip
 
 Update with `uv tool upgrade caucus-mcp` (or `pipx upgrade caucus-mcp`).
 
-Once installed, the hub command and the `.mcp.json` snippet drop the `uvx`
-wrapper:
+Only the machine running the hub needs this. Agents that connect over
+Streamable HTTP install nothing at all; the snippet below is for the stdio
+bridge, which drops the `uvx` wrapper once installed:
 
 ```bash
 caucus-hub --host 127.0.0.1 --port 8765
@@ -255,7 +274,7 @@ uv pip install -e ".[dev]"
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge connects to. |
+| `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge and the native connector reach out to. Unused when the client speaks Streamable HTTP to `/mcp`, where the URL is the config. |
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under. Set it only when you want a name different from the directory, or when two checkouts share a basename. |
 | `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 
@@ -337,14 +356,16 @@ Node is a build-time dependency only. The running hub has no Node requirement.
 The hub is the common ground. How an agent reaches it depends on how that agent
 runs.
 
-| | **Bridge connector** (`caucus-bridge`) | **Native connector** (`caucus-claude-agent`) |
+| | **MCP connector** (`/mcp` or `caucus-bridge`) | **Native connector** (`caucus-claude-agent`) |
 | --- | --- | --- |
 | For | Passive, turn-based MCP hosts: interactive **Claude Code / Codex / Gemini** sessions | An **autonomous agent** that owns its own event loop |
 | How it listens | An out-of-band `caucus-watch` process wakes the agent on inbound (a turn-based host cannot be pushed mid-turn) | Polls and injects inbound straight into the live conversation. No watcher, no wake-by-exit |
-| Setup | One line in `.mcp.json` | A CLI process you launch |
+| Setup | One block in `.mcp.json`: a URL (preferred) or a stdio command | A CLI process you launch |
 | Tools the agent calls | `join` / `say` / `watch_command` / `listen` ... (armed lazily, no setup) | none for plumbing. `say` / `list_peers` exist; joining and listening are automatic |
 
-The bridge is a **constraint adapter** for hosts that cannot push. The native
+The MCP connector comes in two transports, Streamable HTTP and the stdio bridge,
+which expose an identical tool surface: see [Which transport?](#which-transport).
+Either way it is a **constraint adapter** for hosts that cannot push. The native
 connector is the clean shape for a bot that lives in the room. New runtimes ship
 their own native connector against the same hub, so the protocol stays shared.
 
@@ -412,16 +433,48 @@ request handlers, so the operator brakes (Pause, Stop, rate limit, talking stick
 apply exactly as they do over the bridge. On a localhost bind it is on by default
 (opt out with `--no-mcp-http`); on a non-loopback bind it stays opt-in via
 `--mcp-http`. Either way it keeps the same localhost-first posture as the rest of
-the hub, with a DNS-rebinding guard on the handshake. Prefer it when your MCP
-client speaks Streamable HTTP and you would
-rather not run a per-session stdio subprocess. The `caucus-bridge` path stays the
-right choice for hosts that only do stdio.
+the hub, with a DNS-rebinding guard on the handshake.
+
+The session is keyed on the `Mcp-Session-Id` header, so many agents share the one
+hub process; a background sweep drops sessions that armed but never joined.
+
+### Which transport?
+
+Both paths expose the **same tools, with the same schemas and the same
+docstrings**, so they cost the **same number of tokens**. What differs is what
+runs on your machine per agent session:
+
+| | **Streamable HTTP** (`/mcp`) | **stdio bridge** (`caucus-bridge`) |
+| --- | --- | --- |
+| Processes per agent | none | one Python subprocess |
+| Hops per tool call | none: the MCP server is mounted *inside* the hub and reaches `HubState` over an in-process ASGI transport | tool → bridge → loopback HTTP → hub |
+| HTTP client | async `HubConnector` | synchronous `httpx.Client` |
+| Startup | already warm | interpreter spawn + imports per session |
+
+**Default to Streamable HTTP.** With N agents, the stdio path means N Python
+interpreters whose only job is to proxy calls one extra hop. Reach for
+`caucus-bridge` when:
+
+- your MCP host does not speak Streamable HTTP (still a few of them);
+- the hub is remote and you would rather not expose `/mcp` (the bridge already
+  sits outside it);
+- you are debugging and a separate, inspectable process helps.
+
+One operational nuance: over stdio the session lives and dies with the process,
+which is coarser but very predictable. Over HTTP it is tied to the session id and
+subject to the reaper.
+
+Neither transport changes the token bill in a running caucus. That is driven by
+inbound messages and by `listen()` polling, which is exactly why
+`watch_command()` exists: it hands the waiting to a separate process with no LLM
+attached.
 
 ---
 
 ## 🧰 Tools exposed to each agent
 
-These are the **bridge** connector's tools, for passive MCP-client sessions. The
+These are the **MCP** connector's tools, for passive MCP-client sessions. They
+are identical over Streamable HTTP and over the stdio bridge. The
 native `caucus-claude-agent` exposes `say` / `list_peers`, the channel tools,
 and the talking-stick tool, and does the joining and listening for you.
 
@@ -516,12 +569,11 @@ flowchart TB
         N1["caucus-claude-agent<br/>(ClaudeSDKClient)"]
     end
 
-    A1 -- stdio --> B1["caucus-bridge"]
+    A1 -- "Streamable HTTP (/mcp)" --> H[("Hub · FastAPI<br/>single source of truth")]
     A2 -- stdio --> B2["caucus-bridge"]
-    B1 -- HTTP --> H[("Hub · FastAPI<br/>single source of truth")]
     B2 -- HTTP --> H
     W["caucus-watch<br/>(wakes the agent)"] -. HTTP .-> H
-    B1 -. spawns .-> W
+    passive -. "runs, either transport" .-> W
 
     N1 -- "HTTP (HubConnector)" --> H
 
