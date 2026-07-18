@@ -270,6 +270,33 @@ uv pip install -e ".[dev]"
 
 ---
 
+## 🔄 Keep the hub running (optional)
+
+The hub is the only process that has to be up before anything else works. If
+you use Caucus daily, running it as a background service beats remembering to
+start it: agents stop hitting `hub_unreachable`, and the dashboard is always
+one bookmark away.
+
+```bash
+git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
+./contrib/install-hub-service.sh --dry-run   # see exactly what it would write
+./contrib/install-hub-service.sh             # install and start
+```
+
+A launchd agent on macOS, a systemd user unit on Linux. No `sudo`, nothing
+written outside your home directory, `--uninstall` to undo it. Options for the
+bind address, the port and the operator tokens: `--help`.
+
+Two caveats worth reading before you set it up. A restart clears the hub's
+in-memory state, so connected peers lose their tokens and must `join` again.
+And the default unauthenticated API only makes sense on loopback, so the
+installer refuses a wider bind unless you pass `--operator-token`.
+
+See [`contrib/README.md`](contrib/README.md) for the details, and for the
+templates if you would rather wire it up by hand.
+
+---
+
 ## ⚙️ Configuration
 
 | Variable | Default | Meaning |
