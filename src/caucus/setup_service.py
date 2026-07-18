@@ -736,6 +736,17 @@ def describe_plan(
         "One thing worth knowing: restarting the hub clears its in-memory state,",
         "so connected peers lose their tokens and have to join again.",
     ]
+    if not at_login:
+        # A SessionStart hook fires before MCP servers connect, but nothing
+        # waits for it. The stdio bridge does not care (it only touches the hub
+        # on first tool use, and falls back to caucus.autostart), but a client
+        # pointed straight at /mcp connects immediately and can lose the race.
+        lines += [
+            "",
+            "If your MCP clients connect straight to the hub over Streamable HTTP",
+            "(a /mcp URL) rather than through caucus-bridge, prefer --at-login:",
+            "session hooks are not guaranteed to finish before those clients dial in.",
+        ]
     return "\n".join(lines)
 
 
