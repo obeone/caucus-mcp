@@ -31,8 +31,12 @@
   <dict>
 @ENVIRONMENT@  </dict>
 
+  <!-- false in on-demand mode (the default): the service is defined and loaded
+       at login but stays idle until something starts it, typically the
+       SessionStart hook in contrib/hooks/. true makes the hub come up with
+       your session and stay up. -->
   <key>RunAtLoad</key>
-  <true/>
+  <@RUNATLOAD@/>
 
   <!-- Restart on crash, but not on a clean exit: a restart wipes the hub's
        in-memory state, so every peer loses its token and must join again. -->

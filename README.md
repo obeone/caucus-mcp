@@ -280,12 +280,18 @@ one bookmark away.
 ```bash
 git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
 ./contrib/install-hub-service.sh --dry-run   # see exactly what it would write
-./contrib/install-hub-service.sh             # install and start
+./contrib/install-hub-service.sh             # install
 ```
 
 A launchd agent on macOS, a systemd user unit on Linux. No `sudo`, nothing
 written outside your home directory, `--uninstall` to undo it. Options for the
 bind address, the port and the operator tokens: `--help`.
+
+By default the hub starts **on demand** rather than at login: a `SessionStart`
+hook ([`contrib/hooks/caucus-hub-ensure.sh`](contrib/hooks/caucus-hub-ensure.sh))
+asks the service manager for it when an agent session opens, which is
+idempotent even when several sessions start at once. Pass `--at-login` if you
+would rather keep it running permanently.
 
 Two caveats worth reading before you set it up. A restart clears the hub's
 in-memory state, so connected peers lose their tokens and must `join` again.
