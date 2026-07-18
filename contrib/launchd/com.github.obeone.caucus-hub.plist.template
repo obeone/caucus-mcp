@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Caucus hub, as a per-user launchd agent (no root, no sudo).
+
+  The at-sign placeholders below are filled in by contrib/install-hub-service.sh.
+  Installing this by hand means substituting them yourself; the binary path
+  must be absolute, since launchd does not inherit your shell PATH.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+
+  <!-- --no-browser is not optional here: without it the hub pops a browser
+       window on every login and on every automatic restart. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BINARY@</string>
+    <string>--host</string>
+    <string>@HOST@</string>
+    <string>--port</string>
+    <string>@PORT@</string>
+    <string>--no-browser</string>
+  </array>
+
+  <!-- Tokens live here rather than on the command line so they stay out of
+       `ps` output. The installer chmods this file to 600. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+@ENVIRONMENT@  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart on crash, but not on a clean exit: a restart wipes the hub's
+       in-memory state, so every peer loses its token and must join again. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>@LOGFILE@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOGFILE@</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
