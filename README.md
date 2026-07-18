@@ -278,28 +278,26 @@ start it: agents stop hitting `hub_unreachable`, and the dashboard is always
 one bookmark away.
 
 ```bash
-git clone https://github.com/obeone/caucus-mcp.git && cd caucus-mcp
-./contrib/install-hub-service.sh --dry-run   # see exactly what it would write
-./contrib/install-hub-service.sh             # install
+caucus-setup-service        # ships with the package; --dry-run to look first
 ```
 
-A launchd agent on macOS, a systemd user unit on Linux. No `sudo`, nothing
-written outside your home directory, `--uninstall` to undo it. Options for the
-bind address, the port and the operator tokens: `--help`.
+It tells you exactly what it is about to do and waits for a yes. A launchd
+agent on macOS, a systemd user unit on Linux. No `sudo`, nothing written
+outside your home directory, `--uninstall` to undo it.
 
-By default the hub starts **on demand** rather than at login: a `SessionStart`
-hook ([`contrib/hooks/caucus-hub-ensure.sh`](contrib/hooks/caucus-hub-ensure.sh))
-asks the service manager for it when an agent session opens, which is
-idempotent even when several sessions start at once. Pass `--at-login` if you
-would rather keep it running permanently.
+By default the hub starts **on demand** rather than at login: the installer
+offers to add a `SessionStart` hook that asks the service manager for the hub
+when an agent session opens, which stays idempotent even when several sessions
+start at once. `--at-login` keeps it running permanently instead, and
+`--no-hook` leaves your settings file alone.
 
 Two caveats worth reading before you set it up. A restart clears the hub's
 in-memory state, so connected peers lose their tokens and must `join` again.
 And the default unauthenticated API only makes sense on loopback, so the
 installer refuses a wider bind unless you pass `--operator-token`.
 
-See [`contrib/README.md`](contrib/README.md) for the details, and for the
-templates if you would rather wire it up by hand.
+See [running the hub as a service](docs/running-as-a-service.md) for the
+options, the security notes, and the manual route.
 
 ---
 
