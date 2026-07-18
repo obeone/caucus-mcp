@@ -38,7 +38,7 @@ from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from . import __version__, automode
+from . import __version__, automode, autostart
 from .logging_setup import configure_logging
 from .urlguard import validate_hub_url
 
@@ -166,8 +166,24 @@ def _ensure_armed() -> dict[str, object] | None:
             resp.raise_for_status()
             body = resp.json()
     except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        logger.error("arming failed: %s", exc)
-        return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
+        # The hub may simply be an installed-but-idle service: this host has no
+        # SessionStart hook, or the hook never ran. Ask the service manager for
+        # it once and retry. A no-op when no service is installed.
+        if not autostart.ensure_running(HUB_URL):
+            logger.error("arming failed: %s", exc)
+            return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
+        try:
+            with _client() as http:
+                resp = http.get("/protocol")
+                resp.raise_for_status()
+                body = resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as retry_exc:
+            logger.error("arming failed after starting the hub: %s", retry_exc)
+            return {
+                "error": "hub_unreachable",
+                "detail": str(retry_exc),
+                "hub": HUB_URL,
+            }
     _known_protocol_version = int(body["version"])
     _protocol_text = body["text"]
     _armed = True

@@ -56,7 +56,7 @@ from typing import Any, Literal, Protocol, cast
 
 import httpx
 
-from . import __version__
+from . import __version__, autostart
 from .hub_connector import HubConnector, NameInUseError
 from .logging_setup import configure_logging
 from .urlguard import validate_hub_url
@@ -861,7 +861,17 @@ async def run_session(
     """
     allowed_tools, disallowed_tools = tool_policy(agent_type)
     async with HubConnector(hub_url) as connector:
-        proto = await connector.fetch_protocol()
+        try:
+            proto = await connector.fetch_protocol()
+        except httpx.HTTPError:
+            # Nothing hooks this connector's startup the way an MCP host's
+            # SessionStart hook covers the bridge: it owns its own process. So
+            # it asks for the installed service itself, then retries once. A
+            # no-op when no service is installed, and the original error
+            # surfaces unchanged.
+            if not await autostart.ensure_running_async(hub_url):
+                raise
+            proto = await connector.fetch_protocol()
         try:
             me = await connector.register(project, proto.version)
         except NameInUseError as exc:
