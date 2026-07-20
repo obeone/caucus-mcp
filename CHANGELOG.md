@@ -236,6 +236,16 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **`/mcp` CORS** — the in-process Streamable HTTP MCP endpoint now answers the
+  browser CORS preflight `OPTIONS` and stamps CORS headers (reflected `Origin`,
+  exposed `Mcp-Session-Id`) on its responses, so a browser-based MCP client
+  (e.g. the MCP Inspector on its own localhost origin) can connect. Loopback on
+  any port is allowed by default, alongside the served host:port and any
+  operator `--allowed-origin` entries; the allowlist is shared with the
+  transport's DNS-rebinding check so the two never drift.
+
 ## [1.2.1] — 2026-06-18
 
 ### Security
