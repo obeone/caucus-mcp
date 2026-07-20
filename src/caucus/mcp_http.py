@@ -50,6 +50,7 @@ import functools
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -214,6 +215,50 @@ def _remove_token_file(path: str | None) -> None:
 _session_reaper_fn: Callable[..., None] | None = None
 
 
+def effective_allowed_origins(extra: list[str] | None) -> list[str]:
+    """Return the full browser-Origin allowlist for the ``/mcp`` endpoint.
+
+    The loopback defaults (any port on ``127.0.0.1`` / ``localhost`` / ``[::1]``)
+    followed by the operator-approved extras (the served ``host:port`` and any
+    ``--allowed-origin`` entries). This is the single source of truth shared by
+    :func:`_transport_security` (the transport's own DNS-rebinding check) and the
+    hub's CORS layer (:class:`caucus.hub.MCPPreflightCORSMiddleware`), so the two
+    allowlists can never drift apart.
+
+    Args:
+        extra: Operator-approved origins to append after the loopback defaults,
+            or ``None``.
+
+    Returns:
+        The ordered list of allowed-origin patterns (defaults first).
+    """
+    return [*_DEFAULT_ALLOWED_ORIGINS, *(extra or [])]
+
+
+def origin_allowed(origin: str, patterns: list[str]) -> bool:
+    """Return whether ``origin`` matches any allowlist ``patterns`` entry.
+
+    ``*`` is the only wildcard (the ``:*`` port glob the loopback defaults carry,
+    e.g. ``http://127.0.0.1:*``, matches any concrete port); every other
+    character is literal. Deliberately not :func:`fnmatch.fnmatchcase`, whose
+    ``[...]`` character-class syntax would mangle the ``[::1]`` IPv6 bracket
+    literal. An exact operator origin matches only itself.
+
+    Args:
+        origin: The request ``Origin`` header value to test.
+        patterns: The allowlist patterns from :func:`effective_allowed_origins`.
+
+    Returns:
+        ``True`` when the origin is allowed, ``False`` otherwise.
+    """
+    for pattern in patterns:
+        # Escape the literal parts, then re-open only the '*' as ".*".
+        regex = re.escape(pattern).replace(r"\*", ".*")
+        if re.fullmatch(regex, origin) is not None:
+            return True
+    return False
+
+
 def _transport_security(
     allowed_hosts: list[str] | None, allowed_origins: list[str] | None
 ) -> TransportSecuritySettings:
@@ -221,6 +266,8 @@ def _transport_security(
 
     Starts from the loopback defaults (matching the hub's ``_origin_allowed``
     posture) and appends the served host:port plus any operator-approved extras.
+    The origin side goes through :func:`effective_allowed_origins` so the CORS
+    layer and the transport share one allowlist.
 
     Args:
         allowed_hosts: Extra ``Host`` header values to allow (e.g. the served
@@ -233,7 +280,7 @@ def _transport_security(
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[*_DEFAULT_ALLOWED_HOSTS, *(allowed_hosts or [])],
-        allowed_origins=[*_DEFAULT_ALLOWED_ORIGINS, *(allowed_origins or [])],
+        allowed_origins=effective_allowed_origins(allowed_origins),
     )
 
 
