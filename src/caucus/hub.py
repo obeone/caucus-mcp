@@ -181,6 +181,10 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     allowed_origins: frozenset[str] = frozenset()
+    mcp_path: str = "/mcp"
+    """Path the in-process MCP endpoint serves at; read by the CORS layer to
+    scope preflight handling to exactly that route (set in
+    :func:`_mount_mcp_http`)."""
 
 
 server_config = ServerConfig()
@@ -739,6 +743,178 @@ def _body_too_large_response() -> JSONResponse:
 # /ui WebSocket handshake bypasses HTTP middleware and the bodyless GETs clear
 # the cap trivially, so nothing legitimate is affected.
 app.add_middleware(BodySizeLimitMiddleware)
+
+
+class MCPPreflightCORSMiddleware:
+    """Answer CORS preflight and stamp CORS headers for the ``/mcp`` endpoint.
+
+    A browser-based MCP client (the MCP Inspector, a web console) is served from
+    its own ``http://localhost:<port>`` origin, distinct from the hub's, so
+    before the actual Streamable HTTP ``POST``/``GET``/``DELETE`` the browser
+    fires a CORS preflight ``OPTIONS``. The MCP transport registers no
+    ``OPTIONS`` handler, so left alone the preflight ``405``s ("Method Not
+    Allowed") and the browser never sends the real request. This middleware
+    answers the preflight and stamps the CORS response headers on the actual
+    replies so the exchange completes.
+
+    Scope discipline — it touches nothing it should not:
+
+    * It acts only once the MCP endpoint is actually mounted
+      (:data:`_mcp_server` is not ``None``) and only for requests whose path is
+      :attr:`ServerConfig.mcp_path`. Every other request — the REST API, the
+      operator console, the ``/ui`` WebSocket handshake — passes straight
+      through.
+    * The Origin allowlist is the *same* one the transport enforces for
+      DNS-rebinding (:func:`caucus.mcp_http.effective_allowed_origins`): loopback
+      on any port by default (so ``http://127.0.0.1:<port>`` and
+      ``http://localhost:<port>`` are accepted out of the box), plus the served
+      ``host:port`` and any operator ``--allowed-origin`` entries. A missing or
+      disallowed Origin gets no CORS headers, so a cross-site page stays blocked
+      exactly as it was before this middleware existed.
+    * ``Mcp-Session-Id`` is exposed so the client JS can read the session id the
+      transport assigns on ``initialize``. Credentials are never allowed (the
+      hub authenticates with a bearer token, not cookies), so reflecting the
+      concrete Origin back is safe.
+    """
+
+    #: Methods the Streamable HTTP endpoint serves, advertised on the preflight.
+    _ALLOW_METHODS = "GET, POST, DELETE, OPTIONS"
+    #: Response header the browser must be allowed to read (the MCP session id).
+    _EXPOSE_HEADERS = "Mcp-Session-Id"
+    #: Preflight cache lifetime (seconds) to spare repeat OPTIONS round-trips.
+    _MAX_AGE = "600"
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap ``app`` with the ``/mcp`` CORS layer.
+
+        Args:
+            app: The downstream ASGI application to wrap.
+        """
+        self.app = app
+
+    def _origin_patterns(self) -> list[str]:
+        """Return the browser-Origin allowlist patterns for the current config.
+
+        Mirrors the transport's own allowlist so the two never drift: the
+        loopback defaults (any port) plus the concrete served ``host:port`` and
+        the operator-approved extras. Recomputed per request so a config swap in
+        tests is honored.
+        """
+        from . import mcp_http
+
+        extra: list[str] = []
+        host, port = server_config.host, server_config.port
+        # A bind-all address is not a connectable origin; only add a concrete host.
+        if host and host not in ("0.0.0.0", "::"):
+            extra.append(f"http://{host}:{port}")
+        extra.extend(server_config.allowed_origins)
+        return mcp_http.effective_allowed_origins(extra)
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        """Gate one ASGI event: preflight / tag for ``/mcp``, else pass through.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive callable (the inbound event channel).
+            send: The ASGI send callable (the outbound event channel).
+        """
+        # Only touch HTTP requests to the mounted /mcp path; everything else
+        # (WebSocket, lifespan, REST, the console) is none of our business.
+        if (
+            scope["type"] != "http"
+            or _mcp_server is None
+            or scope.get("path") != server_config.mcp_path
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            name.decode("latin-1").lower(): value.decode("latin-1")
+            for name, value in scope.get("headers", [])
+        }
+        origin = headers.get("origin")
+        from . import mcp_http
+
+        # No Origin => a raw (non-browser) MCP client, which needs no CORS; a
+        # disallowed Origin gets no headers either, so the browser blocks it and
+        # the transport's own Origin check still fires. Either way, pass through.
+        if not origin or not mcp_http.origin_allowed(origin, self._origin_patterns()):
+            await self.app(scope, receive, send)
+            return
+
+        if scope["method"] == "OPTIONS":
+            await self._preflight(origin, headers, scope, receive, send)
+            return
+
+        await self.app(scope, receive, self._tag_send(origin, send))
+
+    async def _preflight(
+        self,
+        origin: str,
+        headers: dict[str, str],
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        """Emit the ``204`` CORS preflight response for an allowed Origin.
+
+        Args:
+            origin: The allowed request Origin, reflected back verbatim.
+            headers: The lower-cased request headers (for the requested-headers echo).
+            scope: The ASGI connection scope of the preflight request.
+            receive: The ASGI receive callable (unused; present for symmetry).
+            send: The ASGI send callable used to write the response.
+        """
+        # Echo the headers the browser announced it will send (content-type,
+        # mcp-session-id, ...); fall back to "*" when the hint is absent (no
+        # non-simple headers, so the value is immaterial there).
+        requested = headers.get("access-control-request-headers", "*")
+        response = Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": self._ALLOW_METHODS,
+                "Access-Control-Allow-Headers": requested,
+                "Access-Control-Max-Age": self._MAX_AGE,
+                "Vary": "Origin",
+            },
+        )
+        await response(scope, receive, send)
+
+    def _tag_send(self, origin: str, send: Send) -> Send:
+        """Wrap ``send`` so the actual response carries the CORS headers.
+
+        Args:
+            origin: The allowed request Origin, reflected on the response.
+            send: The downstream ASGI send callable.
+
+        Returns:
+            A send callable that appends the CORS headers to the response start.
+        """
+
+        async def wrapped(message: ASGIMessage) -> None:
+            if message["type"] == "http.response.start":
+                raw = list(message.get("headers", []))
+                raw.append(
+                    (b"access-control-allow-origin", origin.encode("latin-1"))
+                )
+                raw.append(
+                    (b"access-control-expose-headers", self._EXPOSE_HEADERS.encode())
+                )
+                raw.append((b"vary", b"Origin"))
+                message = {**message, "headers": raw}
+            await send(message)
+
+        return wrapped
+
+
+# Register the /mcp CORS layer outermost (added last => wraps the body brake),
+# so a preflight OPTIONS is answered before any body handling. It no-ops unless
+# the MCP endpoint is mounted and the request targets its path, so the REST/UI
+# surface and non-MCP deployments are unaffected.
+app.add_middleware(MCPPreflightCORSMiddleware)
 
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 _UI_INDEX = _UI_DIR / "index.html"
@@ -1777,6 +1953,9 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
     global _mcp_server
     from . import mcp_http
 
+    # Record the served path so the CORS layer scopes its preflight handling to
+    # exactly this route.
+    server_config.mcp_path = mcp_path
     browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     self_url = f"http://{browse_host}:{port}"
     allowed_hosts: list[str] = []
