@@ -310,6 +310,36 @@ def test_mcp_floor_exposes_streamable_and_security() -> None:
     assert hasattr(probe.settings, "transport_security")
 
 
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        # Loopback on ANY port is allowed by default (the Inspector case).
+        ("http://127.0.0.1:8765", True),
+        ("http://127.0.0.1:6274", True),
+        ("http://localhost:6274", True),
+        ("http://[::1]:9999", True),
+        # An operator-approved extra origin matches only itself.
+        ("https://console.example.com", True),
+        ("https://console.example.com:1", False),
+        # A cross-site origin is refused.
+        ("http://evil.example.com", False),
+        ("http://127.0.0.1.evil.com:6274", False),
+    ],
+)
+def test_origin_allowed_matches_loopback_and_extras(
+    origin: str, expected: bool
+) -> None:
+    """The CORS/transport allowlist accepts loopback (any port) plus extras.
+
+    Guards the shared allowlist the CORS layer and the transport both read, so
+    the ``:*`` port wildcard and the exact-match extras behave as documented.
+    """
+    from caucus.mcp_http import effective_allowed_origins, origin_allowed
+
+    patterns = effective_allowed_origins(["https://console.example.com"])
+    assert origin_allowed(origin, patterns) is expected
+
+
 def _schema_signature(schema: dict[str, Any]) -> tuple[Any, Any]:
     """Normalize an MCP input schema to (properties-without-title, required)."""
     props = {

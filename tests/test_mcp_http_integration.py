@@ -150,6 +150,77 @@ async def test_leave_drops_peer_from_roster(
     assert "alpha" not in state.peers()
 
 
+def test_cors_preflight_allows_loopback_origin(
+    mcp_hub: tuple[str, HubState]
+) -> None:
+    """A browser preflight from a loopback origin gets a 204 with CORS headers.
+
+    Reproduces the MCP Inspector case: it is served from its own
+    ``http://localhost:<port>`` and fires an ``OPTIONS`` preflight before the
+    real ``POST``. Without the CORS layer this 405s ("Method Not Allowed").
+    """
+    url, _ = mcp_hub
+    with httpx.Client(base_url=url, timeout=5.0) as http:
+        resp = http.request(
+            "OPTIONS",
+            "/mcp",
+            headers={
+                "Origin": "http://localhost:6274",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+    assert resp.status_code == 204
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:6274"
+    assert "POST" in resp.headers["access-control-allow-methods"]
+    assert "content-type" in resp.headers["access-control-allow-headers"]
+
+
+def test_cors_headers_stamped_on_actual_request(
+    mcp_hub: tuple[str, HubState]
+) -> None:
+    """An allowed loopback origin gets CORS headers on the real response too.
+
+    The GET is served by the transport regardless of its status; the browser
+    must be able to read the reply (and the ``Mcp-Session-Id`` the transport
+    assigns), so the reflected Origin and the expose-headers must be present.
+    """
+    url, _ = mcp_hub
+    with httpx.Client(base_url=url, timeout=5.0) as http:
+        resp = http.get(
+            "/mcp",
+            headers={
+                "Origin": "http://127.0.0.1:9999",
+                "Accept": "text/event-stream",
+            },
+        )
+    assert resp.headers.get("access-control-allow-origin") == "http://127.0.0.1:9999"
+    assert "Mcp-Session-Id" in resp.headers.get("access-control-expose-headers", "")
+
+
+def test_cors_preflight_rejects_foreign_origin(
+    mcp_hub: tuple[str, HubState]
+) -> None:
+    """A cross-site origin gets no CORS approval; the request stays blocked.
+
+    The middleware passes a disallowed Origin straight through, so no
+    ``Access-Control-Allow-Origin`` is emitted and the transport's own OPTIONS
+    handling (a 405) stands — the browser blocks the exchange as before.
+    """
+    url, _ = mcp_hub
+    with httpx.Client(base_url=url, timeout=5.0) as http:
+        resp = http.request(
+            "OPTIONS",
+            "/mcp",
+            headers={
+                "Origin": "http://evil.example.com",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+    assert "access-control-allow-origin" not in resp.headers
+    assert resp.status_code != 204
+
+
 async def test_python_m_launch_shares_state_with_mcp_endpoint() -> None:
     """python -m caucus.hub shares one HubState with the /mcp endpoint.
 
