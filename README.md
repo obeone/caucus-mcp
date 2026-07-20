@@ -222,9 +222,10 @@ ask_operator(
 permanent setup, a hub you run daily and agents you start often, install the
 CLIs once so they live on your `PATH`.
 
-Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**.
-All CLIs (`caucus-hub`, `caucus-bridge`, `caucus-watch`, `caucus-claude-agent`)
-ship with it.
+Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**. It
+ships every CLI: `caucus-hub`, `caucus-bridge`, `caucus-watch` and
+`caucus-claude-agent`, plus the `caucus-setup-service` and
+`caucus-setup-automode` setup helpers.
 
 ```bash
 uv tool install caucus-mcp     # recommended (with uv)
