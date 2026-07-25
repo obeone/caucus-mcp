@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [2.3.0](https://github.com/obeone/caucus-mcp/compare/v2.2.0...v2.3.0) (2026-07-25)
+
 ### Added
 
 - **`missed` on the send result.** `POST /send` (and the `say` tool over it) now
@@ -26,6 +28,37 @@ and rename that heading to the version when you cut the release.
   channel traffic for reaped peers alike since v1.0.0. The wording now matches the
   behaviour, and clarifies that "absent" means past the grace window (anything
   sent then is dropped). Bumps `PROTOCOL_VERSION` to 17.
+
+## [2.2.0](https://github.com/obeone/caucus-mcp/compare/v2.1.0...v2.2.0) (2026-07-20)
+
+### Added
+
+- **`/mcp` CORS preflight.** The in-process Streamable HTTP MCP endpoint now
+  answers the browser CORS preflight `OPTIONS` and stamps CORS headers (reflected
+  `Origin`, exposed `Mcp-Session-Id`) on its responses, so a browser-based MCP
+  client (e.g. the MCP Inspector on its own localhost origin) can connect.
+  Loopback on any port is allowed by default, alongside the served host:port and
+  any operator `--allowed-origin` entries; the allowlist is shared with the
+  transport's DNS-rebinding check so the two never drift.
+
+## [2.1.0](https://github.com/obeone/caucus-mcp/compare/v2.0.0...v2.1.0) (2026-07-20)
+
+### Added
+
+- **Run the hub as an on-demand background service.** A new `caucus-setup-service`
+  console script installs the hub as a per-user background service, a `systemd`
+  user unit on Linux or a `launchd` LaunchAgent on macOS, brought up on demand
+  rather than kept running from login. Any connector, the stdio bridge, the
+  native connector, or an MCP HTTP client, can wake an installed service, so an
+  agent no longer has to find the hub already running. Service templates and a
+  per-user installer ship under `contrib/`, and `docs/running-as-a-service.md`
+  documents the setup.
+
+### Changed
+
+- **Streamable HTTP is now the default transport.** The README quickstart points
+  MCP clients at the hub's `/mcp` endpoint first, with the `caucus-bridge`
+  subprocess presented as the fallback for turn-based hosts.
 
 ## [2.0.0](https://github.com/obeone/caucus-mcp/compare/v1.5.0...v2.0.0) (2026-07-17)
 
@@ -253,18 +286,6 @@ and rename that heading to the version when you cut the release.
 * single-source the package version from pyproject.toml ([c88c9ce](https://github.com/obeone/caucus-mcp/commit/c88c9ce3ccb9d70a7119e5cbf7c38cc901365ed1))
 * **ui:** drop dead channel branch in recipient rendering ([1af200d](https://github.com/obeone/caucus-mcp/commit/1af200d6154b603a830167b86292a0af760de5aa))
 
-## [Unreleased]
-
-### Added
-
-- **`/mcp` CORS** — the in-process Streamable HTTP MCP endpoint now answers the
-  browser CORS preflight `OPTIONS` and stamps CORS headers (reflected `Origin`,
-  exposed `Mcp-Session-Id`) on its responses, so a browser-based MCP client
-  (e.g. the MCP Inspector on its own localhost origin) can connect. Loopback on
-  any port is allowed by default, alongside the served host:port and any
-  operator `--allowed-origin` entries; the allowlist is shared with the
-  transport's DNS-rebinding check so the two never drift.
-
 ## [1.2.1] — 2026-06-18
 
 ### Security
@@ -361,7 +382,7 @@ history for per-commit detail):
   dashboard WebSocket protocol with auth/RBAC and static asset serving, richer
   peer/health state with per-peer pause, and an opt-in JSONL event log.
 
-[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v2.3.0...HEAD
 [1.2.1]: https://github.com/obeone/caucus-mcp/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/obeone/caucus-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/obeone/caucus-mcp/compare/v1.0.0...v1.1.0
