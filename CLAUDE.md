@@ -138,6 +138,20 @@ the artifacts. A PR template plus a `PreToolUse` hook
 (`.claude/hooks/pr-version-reminder.sh`) remind humans and Claude not to bump
 the version in a PR.
 
+**Update `CHANGELOG.md` as you work, never after the fact (mandatory).** Every PR
+that changes behaviour, the HTTP API, the operating protocol, the CLI surface, or
+dependencies MUST add its entry under the `[Unreleased]` heading in that same PR,
+in the right Keep a Changelog bucket (`Added` / `Changed` / `Fixed` / `Security`).
+This is not optional: a merged change with no `[Unreleased]` line is an incomplete
+change, and a reviewer should treat the missing entry as a blocker. There is
+exactly **one** `[Unreleased]` section and it lives at the top of the file, right
+under the intro, never buried mid-history. Cutting a release is then a mechanical
+rename: `[Unreleased]` becomes `## [X.Y.Z](compare/vPREV...vX.Y.Z) (DATE)`, a fresh
+empty `[Unreleased]` is added back on top, the footer `[Unreleased]` compare link
+is repointed at the new tag, and the GitHub Release `vX.Y.Z` is created. Never
+reconstruct a version's entry from git log at release time, that is how entries get
+lost (2.1.0 and 2.2.0 shipped undocumented precisely this way).
+
 > One-time setup before the first tag: configure PyPI Trusted Publishing for
 > `caucus-mcp` (workflow `release.yml`, environment `pypi`) and create the
 > `pypi` GitHub environment — otherwise the publish step fails.
