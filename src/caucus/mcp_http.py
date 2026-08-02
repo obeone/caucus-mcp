@@ -26,13 +26,23 @@ Design (the load-bearing decisions):
   directly and replicates the *full* ``/register`` response shaping (CONTESTED
   ``name_in_use``, ``CapExceeded``, REPLACED note, protocol-stale, channel
   directory), intentionally skipping only the host bucket. The duplicate-name
-  brake (``name_in_use``) is preserved.
+  brake (``name_in_use``) is preserved. Because that shortcut also skips the
+  ``RegisterRequest`` pydantic model, ``join`` re-applies its two name guards
+  itself: the 1-64 character bound, and the reserved-name rejection that stops a
+  peer registering as ``human``/``hub``/``system`` and fabricating control-plane
+  authority in the ``sender`` field.
 
 * **Per-session identity.** Each Streamable HTTP session has an
   ``Mcp-Session-Id``; the caucus membership (the hub token, joined name, ack
   cursor, watcher token file) is keyed on it, so many agents share the one hub
   process without sharing identity. The id is read from the request header and
-  the tools fail closed to ``no_session`` when it is absent.
+  the tools fail closed to ``no_session`` when it is absent. The *default* name
+  is per-session too (the handshake's ``clientInfo.name``, see
+  :func:`_default_project`), because a process-wide default put every client on
+  one name, where the hub's REPLACED path then merged them onto one Client record.
+  Two live sessions contending for a name are refused in :func:`join`: the hub
+  measures liveness by the in-flight long-poll and so cannot tell that the
+  incumbent is alive, but this process can.
 
 * **Listening is unchanged.** ``listen`` long-polls ``/receive`` through the
   connector exactly as the bridge does, and ``watch_command`` still returns a
@@ -65,6 +75,7 @@ from starlette.requests import Request
 
 from . import hub as _hub
 from .hub_connector import HubConnector
+from .models import RESERVED_NAMES
 from .state import CapExceeded, RegisterOutcome
 
 logger = logging.getLogger("caucus.mcp_http")
@@ -87,11 +98,27 @@ _INTERNAL_BASE_URL = "http://caucus.mcp.internal"
 # ASGITransport multiplexes on one cooperative loop, so a small pool is ample.
 _POOL_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
-# Fallback project name when a client calls ``join`` without one. Multiple HTTP
-# clients sharing the hub should each pass an explicit name; the default is a
-# convenience for a single client (a second one joining under it collides into
-# the duplicate-name ``name_in_use`` brake, exactly as two bridge processes do).
-_DEFAULT_PROJECT = os.environ.get("CAUCUS_PROJECT") or "mcp-client"
+# Last-resort project name, used only when a client calls ``join`` without one
+# AND the MCP handshake carried no usable ``clientInfo.name``.
+#
+# Deliberately NOT read from ``CAUCUS_PROJECT``: that env var names the *hub*
+# process, while this server is shared by every HTTP client. Honouring it handed
+# all of them one and the same name, and because a session's liveness at the hub
+# is its in-flight long-poll, the second joiner met REPLACED (not CONTESTED) and
+# inherited the first one's Client record: same token, same inbox. Two agents,
+# one identity. The per-session default now comes from :func:`_default_project`.
+_FALLBACK_PROJECT = "mcp-client"
+
+# Mirrors ``RegisterRequest.project``'s ``max_length``. The ``/mcp`` join path
+# calls :meth:`HubState.register` directly (A1), so the pydantic model that
+# normally enforces the name rules never runs; they are re-enforced here instead.
+_PROJECT_MAX_LEN = 64
+
+# Characters kept when deriving a project name from a client-supplied
+# ``clientInfo.name``. Everything else collapses to a single dash, so a hostile
+# or merely sloppy client cannot smuggle whitespace or control characters into
+# the roster and the operator console.
+_PROJECT_UNSAFE_RE = re.compile(r"[^\w.-]+", re.UNICODE)
 
 # Default DNS-rebinding allowlist, mirroring the SDK's loopback defaults and the
 # hub's own ``_origin_allowed`` posture. Extra hosts/origins (the served
@@ -175,6 +202,102 @@ def _session_id(ctx: _Ctx) -> str | None:
     if request is None:
         return None
     return cast(Request, request).headers.get(_MCP_SESSION_ID_HEADER)
+
+
+def _sanitize_project(raw: object) -> str | None:
+    """Coerce a client-supplied name into a registrable project name.
+
+    Applied only to names *this module invents* (the ``clientInfo.name``
+    fallback), never to a ``project`` the agent passed explicitly: silently
+    renaming an explicit choice would leave the agent believing it holds a name
+    it does not. An explicit name is validated and refused instead, by
+    :func:`_reject_project`.
+
+    Args:
+        raw: The candidate name, typically ``clientInfo.name``. Anything that is
+            not a ``str`` is rejected.
+
+    Returns:
+        The cleaned name, or ``None`` when nothing usable survives (empty after
+        cleaning, or a reserved control-plane identity).
+    """
+    if not isinstance(raw, str):
+        return None
+    cleaned = _PROJECT_UNSAFE_RE.sub("-", raw.strip()).strip("-")
+    # Truncate *after* collapsing, then re-strip: the cut can land on a dash.
+    cleaned = cleaned[:_PROJECT_MAX_LEN].strip("-")
+    if not cleaned or cleaned.lower() in RESERVED_NAMES:
+        return None
+    return cleaned
+
+
+def _default_project(ctx: _Ctx) -> str:
+    """Return this session's default project name.
+
+    The MCP ``initialize`` handshake carries a per-session ``clientInfo.name``,
+    which is the closest thing to a client identity the transport offers. Using
+    it keeps two HTTP clients apart by default, where the old hub-wide constant
+    collapsed them onto one name (and, via REPLACED, onto one hub identity).
+
+    It is only a *default*: clients that care should pass ``project`` explicitly.
+    Two instances of the same MCP host still announce the same ``clientInfo``,
+    and that collision is now refused rather than merged.
+
+    Args:
+        ctx: The FastMCP-injected request context.
+
+    Returns:
+        The sanitized client name, or :data:`_FALLBACK_PROJECT` when the
+        handshake carried nothing usable.
+    """
+    try:
+        params = ctx.session.client_params
+    except (AttributeError, ValueError):
+        # No session yet, or a stand-in context without one.
+        return _FALLBACK_PROJECT
+    info = getattr(params, "clientInfo", None) if params is not None else None
+    return _sanitize_project(getattr(info, "name", None)) or _FALLBACK_PROJECT
+
+
+def _reject_project(name: str, hub: str) -> dict[str, object] | None:
+    """Return an error dict when ``name`` may not be registered, else ``None``.
+
+    Re-implements the two ``RegisterRequest`` guards that the A1 direct-register
+    shortcut bypasses: the length bound and the reserved-name rejection. Without
+    this, an MCP client could register as ``human`` or ``hub`` and fabricate
+    operator or control-plane authority in the ``sender`` field other agents
+    read; the REST path answers 422 for exactly that reason.
+
+    Args:
+        name: The explicit project name the caller asked for.
+        hub: The hub's reachable URL, echoed into the error for symmetry with
+            the other structured errors.
+
+    Returns:
+        ``None`` when the name is acceptable, otherwise the error dict to
+        return from :func:`join` verbatim.
+    """
+    if not 1 <= len(name) <= _PROJECT_MAX_LEN:
+        return {
+            "error": "invalid_name",
+            "project": name[:_PROJECT_MAX_LEN],
+            "note": (
+                f"project name must be 1-{_PROJECT_MAX_LEN} characters"
+                f" (got {len(name)})"
+            ),
+            "hub": hub,
+        }
+    if name.strip().lower() in RESERVED_NAMES:
+        return {
+            "error": "reserved_name",
+            "project": name,
+            "note": (
+                "this name is reserved for the operator and the hub itself;"
+                " re-join under a different name."
+            ),
+            "hub": hub,
+        }
+    return None
 
 
 def _write_token_file(token: str) -> str:
@@ -477,8 +600,11 @@ def build_mcp_server(
         joining, but ``say``/``listen``/``watch_command`` need it.
 
         Args:
-            project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or
-                the connector's default identity.
+            project: Name to register under. Defaults to this session's MCP
+                ``clientInfo.name`` (sanitized), falling back to
+                ``"mcp-client"``. Pass it explicitly whenever more than one
+                client shares the hub: two instances of the same MCP host
+                announce the same ``clientInfo`` and will collide.
 
         Returns:
             ``{"joined": true, "project": "<name>", "hub": "<url>",
@@ -486,14 +612,46 @@ def build_mcp_server(
             bool, "channels": {...}}`` on success (plus ``note`` on an advisory),
             ``{"error": "name_in_use", ...}`` when a live peer already holds the
             name and the cached token did not match (re-join under a different
-            name), or ``{"error": "cap_exceeded", ...}`` if the client cap is
-            reached.
+            name), ``{"error": "reserved_name", ...}`` for a control-plane
+            identity, ``{"error": "invalid_name", ...}`` for a name outside
+            1-64 characters, or ``{"error": "cap_exceeded", ...}`` if the client
+            cap is reached.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
         assert member is not None
-        name = project or _DEFAULT_PROJECT
+        # The A1 shortcut below bypasses RegisterRequest, so its name guards are
+        # applied here. An explicit name is refused rather than sanitized: an
+        # agent must never believe it holds a name the hub rewrote under it.
+        if project is not None:
+            bad_name = _reject_project(project, self_url)
+            if bad_name is not None:
+                logger.warning("join refused (bad name) project=%r", project[:80])
+                return bad_name
+        name = project or _default_project(ctx)
+        # Another *live* session in this process already holding the name is a
+        # collision the hub cannot see: its liveness signal is the in-flight
+        # /receive long-poll, so between two polls HubState.register reports
+        # REPLACED rather than CONTESTED and hands the newcomer the existing
+        # Client record: same token, same inbox, two agents merged into one
+        # identity. This process does know both sessions are alive, so it refuses
+        # here, matching the name_in_use contract the REST path gives.
+        sid = _session_id(ctx)
+        if any(
+            other_sid != sid and other.token is not None and other.joined_as == name
+            for other_sid, other in sessions.items()
+        ):
+            logger.warning("duplicate join refused (live session) project=%s", name)
+            return {
+                "error": "name_in_use",
+                "project": name,
+                "note": (
+                    "another live MCP session on this hub already holds this"
+                    " name; re-join with an explicit, distinct project."
+                ),
+                "hub": self_url,
+            }
         # A3-direct (A1): call HubState.register straight, skipping the per-host
         # /register flood bucket that ASGITransport would collide all sessions
         # into. Resolve the module global at call time so a test-swapped state
@@ -591,7 +749,9 @@ def build_mcp_server(
         """
         member = _session(ctx)
         return {
-            "default_project": _DEFAULT_PROJECT,
+            # Per session, not per process: the name this session would take if
+            # it joined without an explicit project.
+            "default_project": _default_project(ctx),
             "joined_as": member.joined_as if member else None,
             "hub": self_url,
             "joined": bool(member and member.token is not None),
