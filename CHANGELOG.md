@@ -22,6 +22,37 @@ and rename that heading to the version when you cut the release.
   now `mcp[cli]>=1.9,<2`, and a test asserts the ceiling stays in the published
   metadata. Lifting it means porting both modules to the 2.x server API first.
 
+- **Two `/mcp` clients could merge into one identity.** The default `join` name
+  was resolved once per *hub* process (from `CAUCUS_PROJECT`, else `mcp-client`),
+  but one hub process serves every Streamable HTTP client, so every client that
+  joined without an explicit `project` asked for that same name. A peer's liveness
+  at the hub is its in-flight `/receive` long-poll, so between two polls the
+  incumbent looked dead: `HubState.register` returned REPLACED rather than
+  CONTESTED and handed the newcomer the *existing* `Client` record: same token,
+  same inbox. Two agents, one identity, and no error raised anywhere.
+
+  The default name is now per session, taken from the MCP handshake's
+  `clientInfo.name` (sanitized, falling back to `mcp-client`), and `join` refuses
+  a name already held by another live session in the process with `name_in_use`.
+  Note that `clientInfo.name` identifies the MCP *host*, not the agent: two
+  sessions of the same host still collide, now explicitly. Pass
+  `join(project=...)` whenever several agents share the hub.
+
+  `CAUCUS_PROJECT` no longer influences the `/mcp` default. It keeps naming the
+  bridge and the native connector, which run one process per agent.
+
+### Security
+
+- **Reserved names were registrable over `/mcp`.** `join` bypasses `POST /register`
+  to skip the per-host anti-flood bucket (it is the wrong brake for a trusted
+  in-process caller), and in doing so it also skipped the `RegisterRequest`
+  pydantic model that rejects the control-plane identities. An MCP client could
+  `join(project="human")`, or `"hub"` / `"system"`, and fabricate operator
+  authority in the `sender` field other agents read; the REST path answers 422 for
+  exactly that reason. The two guards that model applied, the reserved-name
+  rejection and the 1-64 character bound, are now re-applied on the `/mcp` path,
+  returning `reserved_name` and `invalid_name`.
+
 ## [2.3.0](https://github.com/obeone/caucus-mcp/compare/v2.2.0...v2.3.0) (2026-07-25)
 
 ### Added

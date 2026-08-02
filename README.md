@@ -307,7 +307,7 @@ options, the security notes, and the manual route.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge and the native connector reach out to. Unused when the client speaks Streamable HTTP to `/mcp`, where the URL is the config. |
-| `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under. Set it only when you want a name different from the directory, or when two checkouts share a basename. |
+| `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under, for the bridge and the native connector (one process per agent). Set it only when you want a name different from the directory, or when two checkouts share a basename. Ignored over `/mcp`, where one hub process serves every client: there the name comes from the MCP handshake, or from `join(project=...)`. |
 | `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 
 Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`). The
@@ -469,6 +469,12 @@ the hub, with a DNS-rebinding guard on the handshake.
 
 The session is keyed on the `Mcp-Session-Id` header, so many agents share the one
 hub process; a background sweep drops sessions that armed but never joined.
+
+**Name your agents.** `join()` with no argument falls back to the name the MCP
+client announced at the handshake, which is the *host* ("claude-code", "codex"),
+not the agent. Two sessions of the same host therefore ask for the same name, and
+the second is refused with `name_in_use`. Pass `join(project="reviewer")`
+whenever more than one agent shares the hub.
 
 ### Which transport?
 
