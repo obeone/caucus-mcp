@@ -29,17 +29,25 @@ from caucus.state import CapExceeded, HubState
 _SELF_URL = "http://127.0.0.1:8765"
 
 
-def _ctx(session_id: str | None) -> Any:
+def _ctx(session_id: str | None, *, client_name: str | None = None) -> Any:
     """Build a minimal stand-in for a FastMCP ``Context`` carrying a session id.
 
-    The tools only ever read ``ctx.request_context.request.headers``; this fake
-    supplies exactly that. ``session_id=None`` yields a request whose headers
-    lack the key, exercising the A3 fail-closed path.
+    The tools read ``ctx.request_context.request.headers`` and, for the default
+    identity only, ``ctx.session.client_params.clientInfo.name``; this fake
+    supplies exactly those. ``session_id=None`` yields a request whose headers
+    lack the key, exercising the A3 fail-closed path. ``client_name=None`` omits
+    ``session`` entirely, exercising the ``mcp-client`` fallback for a handshake
+    that carried no usable client identity.
     """
     headers = {"mcp-session-id": session_id} if session_id is not None else {}
     request = type("_Req", (), {"headers": headers})()
     request_context = type("_RC", (), {"request": request})()
-    return type("_Ctx", (), {"request_context": request_context})()
+    attrs: dict[str, Any] = {"request_context": request_context}
+    if client_name is not None:
+        info = type("_Info", (), {"name": client_name})()
+        params = type("_Params", (), {"clientInfo": info})()
+        attrs["session"] = type("_Session", (), {"client_params": params})()
+    return type("_Ctx", (), attrs)()
 
 
 def _tool(server: Any, name: str) -> Any:
@@ -172,6 +180,137 @@ async def test_join_replaced_includes_note(state: HubState) -> None:
     res = await _tool(server, "join")(ctx, project="alpha")
     assert res["joined"] is True
     assert "mid-conversation" in res["note"]
+
+
+async def test_two_default_joins_do_not_merge_into_one_identity(
+    state: HubState,
+) -> None:
+    """Two sessions joining without a project must not collapse onto one peer.
+
+    The regression: the default name was a process-wide constant, so both
+    sessions asked for the same name. The first holds no in-flight ``/receive``
+    poll, so the hub saw ``active_polls == 0``, returned REPLACED instead of
+    CONTESTED, and handed the second session the *existing* Client record:
+    same token, same inbox. Two agents, one identity, no error anywhere.
+    """
+    server = _build()
+    a, b = _ctx("session-A"), _ctx("session-B")
+
+    first = await _tool(server, "join")(a)
+    assert first["joined"] is True
+
+    second = await _tool(server, "join")(b)
+    assert second["error"] == "name_in_use"
+    assert second["project"] == first["project"]
+
+    # The incumbent keeps its membership; the newcomer holds none.
+    assert (await _tool(server, "whoami")(a))["joined"] is True
+    assert (await _tool(server, "whoami")(b))["joined"] is False
+    assert state.peers() == [first["project"]]
+
+
+async def test_live_session_collision_refused_for_explicit_name(
+    state: HubState,
+) -> None:
+    """The same guard holds when both sessions name themselves explicitly.
+
+    Independent of how the default is derived: the hub cannot see that a peer
+    with no in-flight poll is alive, so the refusal has to come from this
+    process, which knows both sessions exist.
+    """
+    server = _build()
+    a, b = _ctx("session-A"), _ctx("session-B")
+    assert (await _tool(server, "join")(a, project="alpha"))["joined"] is True
+
+    res = await _tool(server, "join")(b, project="alpha")
+    assert res["error"] == "name_in_use"
+    assert "explicit" in res["note"]
+    assert state.peers() == ["alpha"]
+
+
+async def test_rejoining_same_session_is_not_a_collision(state: HubState) -> None:
+    """The live-session guard must not fire on a session re-joining itself.
+
+    ``join`` is documented idempotent (REAFFIRMED via the cached token); a
+    self-match in the session table would turn that into a spurious refusal.
+    """
+    server = _build()
+    ctx = _ctx("session-A")
+    assert (await _tool(server, "join")(ctx, project="alpha"))["joined"] is True
+    again = await _tool(server, "join")(ctx, project="alpha")
+    assert again["joined"] is True
+    assert state.peers() == ["alpha"]
+
+
+async def test_left_session_frees_the_name(state: HubState) -> None:
+    """A session that left releases its name for another session to take."""
+    server = _build()
+    a, b = _ctx("session-A"), _ctx("session-B")
+    await _tool(server, "join")(a, project="alpha")
+    await _tool(server, "leave")(a)
+    assert (await _tool(server, "join")(b, project="alpha"))["joined"] is True
+    assert state.peers() == ["alpha"]
+
+
+@pytest.mark.parametrize("name", ["human", "hub", "system", "HUMAN", " Hub "])
+async def test_join_refuses_reserved_names(state: HubState, name: str) -> None:
+    """A1 gap: the direct-register shortcut skipped RegisterRequest's guards.
+
+    ``POST /register`` answers 422 for these names because registering as
+    ``human`` or ``hub`` lets a peer fabricate operator or control-plane
+    authority in the ``sender`` field other agents read. The ``/mcp`` join path
+    bypasses that pydantic model, so it must refuse them itself.
+    """
+    server = _build()
+    res = await _tool(server, "join")(_ctx("s1"), project=name)
+    assert res["error"] == "reserved_name"
+    assert state.peers() == []
+
+
+@pytest.mark.parametrize("name", ["", "x" * 65])
+async def test_join_refuses_out_of_bounds_names(state: HubState, name: str) -> None:
+    """The 1-64 character bound from ``RegisterRequest.project`` is re-applied."""
+    server = _build()
+    res = await _tool(server, "join")(_ctx("s1"), project=name)
+    assert res["error"] == "invalid_name"
+    assert state.peers() == []
+
+
+async def test_default_project_comes_from_client_info(state: HubState) -> None:
+    """The default identity is per-session, taken from the MCP handshake."""
+    server = _build()
+    a = _ctx("session-A", client_name="codex")
+    b = _ctx("session-B", client_name="gemini")
+
+    assert (await _tool(server, "whoami")(a))["default_project"] == "codex"
+    assert (await _tool(server, "join")(a))["project"] == "codex"
+    assert (await _tool(server, "join")(b))["project"] == "gemini"
+    assert sorted(state.peers()) == ["codex", "gemini"]
+
+
+@pytest.mark.parametrize(
+    ("client_name", "expected"),
+    [
+        ("claude code", "claude-code"),  # whitespace collapsed, never raw
+        ("  spaced  ", "spaced"),  # surrounding dashes trimmed after collapse
+        ("bad\nname\x00", "bad-name"),  # control characters cannot reach the roster
+        ("human", "mcp-client"),  # a reserved clientInfo falls back, never wins
+        ("!!!", "mcp-client"),  # nothing usable survives cleaning
+        ("z" * 100, "z" * 64),  # truncated to the registrable bound
+    ],
+)
+async def test_client_info_name_is_sanitized(
+    state: HubState, client_name: str, expected: str
+) -> None:
+    """``clientInfo.name`` is client-controlled, so it is cleaned before use.
+
+    It lands in the roster and the operator console, and the reserved names are
+    exactly the ones a hostile client would pick.
+    """
+    server = _build()
+    res = await _tool(server, "join")(_ctx("s1", client_name=client_name))
+    assert res["project"] == expected
+    assert state.peers() == [expected]
 
 
 async def test_join_cap_exceeded(state: HubState, monkeypatch: pytest.MonkeyPatch) -> None:
