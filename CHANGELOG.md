@@ -10,6 +10,18 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A fresh install was unrunnable: `mcp` had no upper bound.** The dependency was
+  declared `mcp[cli]>=1.9`, and `mcp` 2.0.0 removed `mcp.server.fastmcp`, the
+  import both `mcp_bridge` and `mcp_http` are built on. Any install resolving to
+  2.x therefore produced a package with no working entry point: `caucus-bridge`
+  died on import, and `caucus-hub` died at boot on a loopback bind, because
+  `_mount_mcp_http` imports `mcp_http` lazily to serve `/mcp`. Only environments
+  installed from `uv.lock`, which pins 1.28.1, escaped it. The declared range is
+  now `mcp[cli]>=1.9,<2`, and a test asserts the ceiling stays in the published
+  metadata. Lifting it means porting both modules to the 2.x server API first.
+
 ## [2.3.0](https://github.com/obeone/caucus-mcp/compare/v2.2.0...v2.3.0) (2026-07-25)
 
 ### Added
