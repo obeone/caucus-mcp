@@ -43,7 +43,13 @@ dependencies = [
     # >=1.9: the floor that ships both streamable_http_app (added 1.8) and the
     # transport_security / DNS-rebinding settings (added 1.9), which the
     # in-process Streamable HTTP MCP endpoint (caucus.mcp_http) relies on.
-    "mcp[cli]>=1.9",
+    #
+    # <2: mcp 2.0.0 removed mcp.server.fastmcp, the import both mcp_bridge and
+    # mcp_http are built on. Without this ceiling a fresh install resolves to
+    # 2.x and every entry point dies: the bridge on import, and the hub at boot
+    # because _mount_mcp_http imports mcp_http lazily on a loopback bind.
+    # Lifting it means porting both modules to the 2.x server API first.
+    "mcp[cli]>=1.9,<2",
 ]
 
 [project.urls]
