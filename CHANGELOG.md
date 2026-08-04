@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [2.3.1](https://github.com/obeone/caucus-mcp/compare/v2.3.0...v2.3.1) (2026-08-03)
+
 ### Fixed
 
 - **A fresh install was unrunnable: `mcp` had no upper bound.** The dependency was
@@ -425,7 +427,7 @@ history for per-commit detail):
   dashboard WebSocket protocol with auth/RBAC and static asset serving, richer
   peer/health state with per-peer pause, and an opt-in JSONL event log.
 
-[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v2.3.1...HEAD
 [1.2.1]: https://github.com/obeone/caucus-mcp/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/obeone/caucus-mcp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/obeone/caucus-mcp/compare/v1.0.0...v1.1.0
