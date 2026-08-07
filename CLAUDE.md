@@ -126,9 +126,7 @@ surface, or dependencies goes through a PR, so CI and review actually see it.
 
 Micro edits may be pushed straight to `main`, no branch and no PR: a
 `CHANGELOG.md` entry or release cut, a typo, a doc or comment tweak, anything
-with no effect on what the package does. This is a deliberate exception to the
-global "never push directly to protected branches" rule, and it is scoped to
-this repository.
+with no effect on what the package does.
 
 If in doubt, open the PR. The cost of a needless PR is a few minutes; the cost
 of an unreviewed behaviour change on `main` is a broken release.
