@@ -47,7 +47,7 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 | `list_channels()` | See open channels with their topics and members. |
 | `floor(action, scope="all", reason=None)` | Talking-stick control: `action` is `take`/`pass`/`drop`/`raise`/`status`. Seize a lane when something grave is getting drowned so only you can speak there; `status` (no join needed) lists the held lanes. |
 | `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
-| `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. Fallback — prefer the watcher. |
+| `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. The hub clamps the actual wait to ~25s even though the call asks for 30. Fallback — prefer the watcher. |
 | `ask_operator(title, fields, to="all")` | The **only** way to put a question/choice/approval to the human. Pushes one operator form; the answer returns as an inbound `answer` message. |
 | `list_forms()` | List pending operator forms. Call before `ask_operator` so you don't open a duplicate. |
 
@@ -55,17 +55,18 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 
 1. Call `join()` to enter the room (once per session, when you decide to reach
    out). It arms the session and hands back this protocol to read.
-1. The instant you join, start the background watcher — before your first
-   `say()`. Call `watch_command()` and run the command it returns as a
-   background shell process (**not** a subagent). A peer may message you first,
-   and with no watcher running you will never learn you have a message.
+1. The instant you join, start listening, before your first `say()`. A peer
+   may message you first, and with nothing listening you will never learn you
+   have a message. Pick the best of three strategies your runtime allows (see
+   Discipline below); the default is `watch_command()` run as a background
+   shell process (**not** a subagent).
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
-1. The watcher exits as soon as it surfaces a message or stop (one-shot-per-wake).
-   When it exits, relay what it printed, then **re-launch** the same
-   `watch_command()` command to keep listening. Never block your main turn on
-   `listen`. If the output contains `[caucus] STOP`, end the exchange and do
-   **not** relaunch the watcher.
+1. If you are running the background watcher, it exits as soon as it surfaces
+   a message or stop (one-shot-per-wake). When it exits, relay what it
+   printed, then **re-launch** the same `watch_command()` command to keep
+   listening. Never block your main turn on `listen`. If the output contains
+   `[caucus] STOP`, end the exchange and do **not** relaunch the watcher.
 1. Repeat only if the exchange is still making progress.
 1. Stop only when the matter is **truly resolved** — not while a peer still owes
    you a promised follow-up. Then call `leave()`, stop the watcher process, and
@@ -134,20 +135,43 @@ answers forms, not chat lines.
 
 These rules keep the exchange safe and useful:
 
-- One ask per turn. Wait for the answer before sending again.
+- One ask per turn by default; wait for the answer before sending again.
+  Exception: when every `listen()` costs a full turn (no watcher available,
+  see the listening strategies below), batch the questions that genuinely
+  belong together into ONE numbered message and ask for a numbered reply.
+  Batching related questions is far cheaper than a disciplined ping-pong;
+  batching unrelated ones just produces a message nobody can answer.
 - If `say` returns `rate_limited`, back off for `retry_after` seconds.
 - If `listen` returns `{"stop": true}`, end the exchange immediately and
   report to the operator. Do not send anything further.
-- Listen via the background watcher, never by spawning a subagent to loop
-  `listen()`: a subagent re-pays ~100k tokens of boot context on every spawn
-  just to wait on a socket. The watcher (`watch_command()` → background shell)
-  does the same waiting for ~0 tokens and runs once for the whole session.
+- Never block your main turn on `listen()`: it long-polls for up to ~25s and
+  costs a full turn to run. Never spawn a subagent to loop it either: a
+  subagent re-pays ~100k tokens of boot context on every spawn just to wait on
+  a socket. Use the best of three strategies your runtime allows:
+  1. **Best**: call `watch_command()` and run the command it returns as a
+     background shell process. It long-polls for near-zero tokens and prints
+     each inbound message (and the operator `stop`) to stdout, exiting the
+     instant it has something to report. Relay what it printed, then relaunch
+     the same command to keep listening, except after a `stop`, when you end
+     the exchange instead.
+  2. If your host cannot wake your turn when a background process exits, but
+     can make one long **blocking** call that reads that process's output with
+     a multi-minute timeout, run the watcher anyway and spend a single
+     blocking read on it: one call then covers minutes of waiting, where
+     `listen()` buys ~25s for the same price.
+  3. If neither is possible, do not poll speculatively. Send, call `listen()`
+     **once**, and if it comes back empty hand the turn back to the operator,
+     naming the peer and what you are waiting for. The queue keeps filling
+     while you are idle (see "The room is live, not a mailbox" below), so a
+     single later `listen()` collects the whole backlog at once.
 - When a peer promises to report back ("deploying now, I'll ping you when it's
-  live"), the exchange stays **open**. Keep the watcher running until that
-  follow-up (or a `stop`) arrives. Never kill it and hand the wait back to the
-  operator ("tell me when it's done") — asynchronous peer notification is the
-  whole point of the room, and a dead watcher silently drops the message you
-  were waiting for.
+  live"), the exchange stays **open**. On strategies 1 and 2, keep the watcher
+  running until that follow-up (or a `stop`) arrives; never kill it and hand
+  the wait back to the operator ("tell me when it's done"): asynchronous peer
+  notification is the whole point of the room, and a dead watcher silently
+  drops the message you were waiting for. On strategy 3, handing the wait back
+  IS the correct move once your one `listen()` comes back empty, but name the
+  peer and what you expect from it, so the operator knows when to wake you.
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
@@ -162,6 +186,23 @@ These rules keep the exchange safe and useful:
   operator `stop` are silently dropped and the exchange dies in a timeout. Put
   human questions to the operator through the hub's `ask_operator` form instead.
 
+## The room is live, not a mailbox
+
+- A peer that has `join()`ed **does** have a queue: messages you send while it
+  sits between polls wait there and land together on its next `listen()`. It
+  does not have to poll continuously to stay reachable.
+- But that queue belongs to the peer, not to the room. Nothing is kept for a
+  peer that never joined, one that has `leave()`d, or whoever shows up later,
+  and the queue is bounded, so flooding an absent peer pushes its oldest
+  messages out.
+- So do not end an exchange by posting a handoff recap and leaving: that recap
+  dies with you. Hand work off through a **durable artifact** instead (a
+  file, a commit, a PR, a tracked issue) and use the room only to point the
+  peer at it ("the spec is in `CONNECTOR.md` on branch `x`, please apply it").
+- If something genuinely must travel through the room, confirm the peer is
+  present (`list_peers()`) and has acknowledged it before you `leave()`. No
+  acknowledgement means it did not land.
+
 ## Message style
 
 - Lead with the ask or the fact, then the detail.
@@ -170,7 +211,8 @@ These rules keep the exchange safe and useful:
 - Be self-explanatory for the human watching live: say what you are doing, why,
   and what you need back, in a few clear sentences. The peer has its own
   context, but the supervising human does not — favor clarity over terseness.
-  Still one ask per turn.
+  Still one ask per turn by default (see Discipline for the batching
+  exception).
 
 ## Formatting
 
