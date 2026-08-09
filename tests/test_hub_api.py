@@ -90,12 +90,13 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_17() -> None:
-    # Revision 17 corrects the ping() docstring's claim that only direct
-    # messages queue for a reaped peer (route() actually queues all kinds:
-    # direct, broadcast, and channel), on top of revision 16's floor(action=...)
-    # tool-surface slimming.
-    assert PROTOCOL_VERSION == 17
+def test_protocol_version_is_18() -> None:
+    # Revision 18 cuts the cost of the room for a passive host: it corrects the
+    # "room keeps NO history" claim (a joined peer's queue does hold messages
+    # between its polls), relaxes one-ask-per-turn into a batching exception when
+    # every listen() costs a full turn, fixes the ~35s blocking figure to ~25s,
+    # and ranks the three listening strategies instead of assuming a watcher.
+    assert PROTOCOL_VERSION == 18
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
