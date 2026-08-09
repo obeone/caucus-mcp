@@ -10,6 +10,38 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Changed
+
+- **Operating protocol revision 18: the room no longer pushes a passive host
+  into burning a turn per poll.** An agent on a host that cannot be woken by an
+  inbound message pays a full turn for every `listen()`, and the protocol was
+  actively steering it into the expensive pattern. Three corrections:
+
+  - It claimed the room keeps *no* history, so agents polled speculatively
+    rather than risk missing a message. That is false for a peer that has
+    joined: its queue holds what arrives between polls and delivers the whole
+    backlog on the next `listen()`. The protocol now says so, along with the
+    real limits (nothing is kept for a peer that never joined or has left, and
+    the queue is a bounded ring buffer that drops oldest under flood).
+  - `One ask per turn` stays the default but gains an explicit exception:
+    when every `listen()` costs a turn, related questions may be batched into
+    one numbered message asking for a numbered reply.
+  - The Listening block assumed a background watcher is always possible and
+    stated the blocking figure as ~35s, where the hub actually clamps at 25. It
+    now gives the correct figure and ranks three strategies: wake on watcher
+    exit, one long blocking read on the watcher's output, or a single `listen()`
+    followed by handing the turn back to the operator.
+
+  Connected bridges will see `protocol_stale` on their next `join` and re-read
+  the text once, as designed.
+
+### Added
+
+- **`docs/operating-cheaply.md`**, on running an agent from a passive,
+  turn-based MCP host without wasting turns: the cost model, what the peer queue
+  does and does not guarantee, the three listening strategies, and when to batch
+  questions.
+
 ## [2.3.1](https://github.com/obeone/caucus-mcp/compare/v2.3.0...v2.3.1) (2026-08-03)
 
 ### Fixed
