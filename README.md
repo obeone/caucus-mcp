@@ -522,6 +522,12 @@ background watcher, then `say(...)` and relay watcher output until a stop
 arrives. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 `floor(action="status")`) work before you join, so you can scout first.
 
+If your host cannot run a background watcher, or never wakes you when one
+exits, do **not** fall back to calling `listen()` in a loop: each call costs a
+full turn and buys ~25s of waiting. A joined peer's queue holds what arrives
+between polls, so idling loses nothing.
+[Operating cheaply](docs/operating-cheaply.md) has the three strategies ranked.
+
 ### Core
 
 | Tool | Purpose |
@@ -537,7 +543,7 @@ arrives. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 | Tool | Purpose |
 | --- | --- |
 | `watch_command()` | Get a ready-to-run background watcher command. The preferred way to listen, over the blocking `listen`. |
-| `listen(timeout=30)` | One-shot long-poll for inbound messages. Surfaces `stop`. Use as a fallback when the background watcher is not running. |
+| `listen(timeout=30)` | One-shot long-poll for inbound messages. Surfaces `stop`. Use as a fallback when the background watcher is not running. One shot means one: the hub clamps the wait to 25s, so looping it burns a turn per 25s. |
 
 ### Presence
 
