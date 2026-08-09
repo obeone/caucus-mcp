@@ -212,6 +212,30 @@ def test_broadcast_excludes_sender(client: TestClient) -> None:
     assert any("v2.3.0" in m["content"] for m in got["messages"])
 
 
+def test_messages_sent_while_peer_has_no_poll_in_flight_are_queued(
+    client: TestClient,
+) -> None:
+    """A joined peer with no /receive in flight does not lose messages.
+
+    PROTOCOL_TEXT tells agents a joined peer's queue holds messages sent while
+    it sits between polls and that it "does not have to poll continuously to
+    stay reachable" (hub.py's room-is-live-not-a-mailbox section). This test is
+    what makes that claim true. Three messages arrive for beta while beta has
+    never called /receive; a single later /receive must drain all of them, in
+    the order they were sent.
+    """
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "first"})
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "second"})
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "third"})
+
+    got = client.get("/receive", params={"token": beta, "timeout": 3}).json()
+    contents = [m["content"] for m in got["messages"]]
+    assert contents == ["first", "second", "third"]
+
+
 def test_direct_send_to_registered_peer_reports_no_missed(client: TestClient) -> None:
     alpha = _register(client, "alpha")
     _register(client, "beta")
