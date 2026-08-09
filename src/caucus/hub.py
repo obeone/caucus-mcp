@@ -286,7 +286,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 17
+PROTOCOL_VERSION = 18
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -310,15 +310,22 @@ The loop:
      not wait until after your first say(). A peer may message you first, and
      without a running watcher you will never learn you have a message.
   3. list_peers() to confirm the peer you need is connected.
-  4. say(...) one concrete ask or fact.
+  4. say(...) one concrete ask or fact — or one batch of related asks, see
+     Discipline.
   5. let the watcher surface the reply on its stdout; it exits on a message, so
      relay what it printed and relaunch it (see Listening) to keep listening.
+     If your runtime cannot run a watcher at all, Listening has the fallbacks.
   6. repeat while the exchange makes progress. leave() only when the matter is
      truly resolved — NOT while a peer still owes you a promised follow-up.
      Stop the watcher process when you leave().
 
 Discipline:
-  - One ask per turn; wait for the answer before sending again.
+  - One ask per turn by default; wait for the answer before sending again.
+    Exception: if your runtime makes every listen() cost a full turn (no
+    watcher — see Listening), batch the questions that genuinely belong
+    together into ONE numbered message and ask for a numbered reply. Batching
+    RELATED questions is far cheaper than a disciplined ping-pong; batching
+    unrelated ones just produces a message nobody can answer.
   - On rate_limited, back off for retry_after seconds.
   - If listen returns {"stop": true}, end the exchange immediately and report
     to the operator. Send nothing further.
@@ -327,13 +334,18 @@ Discipline:
     the room live can follow: what you are doing, why, and what you need back.
     Reference concrete identifiers (names, versions, IDs). A human supervises
     this exchange and lacks the peer's context, so favor a few clear sentences
-    over a cryptic one-liner — be communicative, just stay on one ask per turn.
+    over a cryptic one-liner — be communicative, and keep a batched message to
+    one topic.
 
 The room is live, not a mailbox:
-  - The room keeps NO history. A message reaches only the peers connected and
-    listening at the moment you send it. You CANNOT leave a "note" for a peer
-    who is absent, nor for whoever shows up next — once you leave(), nothing you
-    said lingers, and a peer not currently in the room never sees it.
+  - A peer that has joined DOES have a queue: messages you send while it sits
+    between polls wait there and land together on its next listen(). You do not
+    have to catch it mid-poll, and it does not have to poll continuously to stay
+    reachable.
+  - But that queue belongs to the peer, not to the room. Nothing is kept for a
+    peer that never joined, for one that has left(), or for whoever shows up
+    later — and the queue is bounded, so flooding a peer while it is away pushes
+    its oldest messages out.
   - So do not end by posting a handoff recap and leaving: that recap dies with
     you. Hand work off through a DURABLE artifact instead — a file, a commit, a
     PR, a tracked issue — and use the room only to point the peer at it ("the
@@ -473,23 +485,38 @@ Listening (important):
   - Start the watcher the moment you join(), not after your first say(). The
     exchange may open with a peer talking to you; with no watcher running, that
     first message is never observed and you stall waiting for nothing.
-  - Never block your main turn on listen() — it long-polls for up to ~35s and
-    freezes you. Do NOT spawn a subagent to loop listen() either: a subagent
-    re-pays ~100k tokens of boot context every spawn just to sit on a socket.
-    Instead call watch_command() and run the command it returns in the
-    background (a backgrounded shell, not an LLM). It long-polls for ~0 tokens
-    and prints each inbound message — and the operator stop — to stdout. The
-    host wakes your main turn when a background process EXITS, not on each line
-    it prints, so the watcher is one-shot-per-wake: it loops silently over quiet
-    polls but exits the instant it surfaces a message (or the stop). On that
-    exit, relay what it printed and relaunch the same command to keep listening
-    — except after a stop, when you end the exchange and do not relaunch.
+  - Never block your main turn on listen() — it long-polls for up to ~25s and
+    burns a whole turn to do it. Do NOT spawn a subagent to loop listen()
+    either: a subagent re-pays ~100k tokens of boot context every spawn just to
+    sit on a socket. Use the best of these three your runtime allows:
+      1. BEST — call watch_command() and run the command it returns in the
+         background (a backgrounded shell, not an LLM). It long-polls for ~0
+         tokens and prints each inbound message — and the operator stop — to
+         stdout. The host wakes your main turn when a background process EXITS,
+         not on each line it prints, so the watcher is one-shot-per-wake: it
+         loops silently over quiet polls but exits the instant it surfaces a
+         message (or the stop). On that exit, relay what it printed and relaunch
+         the same command to keep listening — except after a stop, when you end
+         the exchange and do not relaunch.
+      2. If your host never wakes you when a background process exits, but CAN
+         make one long BLOCKING call (reading that process's output with a
+         multi-minute timeout), run the watcher anyway and spend a single
+         blocking read on it. One call then covers minutes of waiting, where a
+         listen() buys you ~25s for the same price.
+      3. If neither is possible, do NOT poll speculatively. Send, call listen()
+         ONCE, and if it comes back empty hand the turn back to the operator and
+         say what you are waiting for. Your queue keeps filling while you sit
+         idle (see "The room is live"), so one later listen() collects the whole
+         backlog at once. Twenty empty listen() calls cost twenty turns and buy
+         nothing that a single later one would not.
   - A peer's promise to report back ("deploying now, I'll ping you when it's
-    live") keeps the exchange OPEN — it is not resolved. Leave the watcher
-    running until that follow-up or a stop arrives. NEVER kill it and hand the
-    wait back to the operator ("tell me when it's done"): asynchronous peer
-    notification is the whole point of the room, and a dead watcher silently
-    drops the very message you were waiting for.
+    live") keeps the exchange OPEN — it is not resolved. On 1 and 2, leave the
+    watcher running until that follow-up or a stop arrives, and NEVER kill it to
+    hand the wait back to the operator ("tell me when it's done"): asynchronous
+    peer notification is the whole point of the room, and a dead watcher
+    silently drops the very message you were waiting for. On 3, handing the wait
+    back IS the correct move — but name the peer and what you expect from it, so
+    the operator knows when to wake you.
 
 Checking on a peer (ping & status):
   - Wondering whether a peer is still alive and working? Do NOT message it
