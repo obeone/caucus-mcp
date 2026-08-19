@@ -435,8 +435,9 @@ class HubState:
           caller is the same agent reconnecting. ``last_seen`` is refreshed;
           no system notice is emitted. Also returned when ``token`` matches a
           *reaped* identity for this name (idle-dropped but still in its grace
-          window): the client is revived in place with the same token (a
-          "reconnected" notice is emitted in that case — see :meth:`_revive`).
+          window): the client is revived in place with the same token (an
+          operator-only "reconnected" notice is emitted in that case — see
+          :meth:`_revive`).
         * **REPLACED** — name exists but ``active_polls == 0`` (the prior
           listener is gone) and no valid token is presented. The existing
           client record is reused (same queue and channel memberships);
@@ -606,8 +607,12 @@ class HubState:
         reaped are already in the queue (placed there by the routing fix in
         :meth:`route`); unacked messages are prepended so they arrive first.
 
-        Emits a broadcast ``SYSTEM`` notice that includes the downtime duration,
-        so other peers know they may need to resend anything sent during the gap.
+        Emits a ``SYSTEM`` notice naming the downtime duration, to the operator
+        console and the log only (:meth:`_announce_system`), never into the peer
+        queues: a passive host burns a whole turn on every inbound message, so a
+        reconnect notice fanned out to N peers costs N turns for something none
+        of them has to act on. The replayed messages themselves still go through
+        :meth:`route` and reach their recipient.
 
         Fails (returning ``None``) when the name has meanwhile been claimed by
         another live peer: the reaped identity is then discarded for good
@@ -654,7 +659,7 @@ class HubState:
         for msg in pending_during_absence:
             self._safe_put(client, msg)
 
-        # Build and broadcast the reconnect notice to all peers.
+        # Build the reconnect notice for the operator console.
         if downtime is not None:
             mins, secs = divmod(int(downtime), 60)
             duration_str = f"{mins}m {secs}s" if mins else f"{secs}s"
@@ -666,19 +671,11 @@ class HubState:
         else:
             content = f"{client.project} reconnected"
 
-        notice = Message(
-            sender="hub",
-            recipient="all",
-            content=content,
-            kind=MessageKind.SYSTEM,
-            # Hub-generated provenance: consumers must trust this flag, not the
-            # free-text sender, to know the hub itself emitted the notice.
-            origin="hub",
-        )
-        # Use route() so the notice gets a seq, lands in peer queues, and is
-        # logged — at this point client is already in _clients so it also
-        # receives the notice, which is harmless and informative.
-        self.route(notice)
+        # UI + log only, like the joined/left/topic notices: routing it would
+        # wake every passive peer's host for a turn to read an announcement it
+        # cannot act on. The operator sees the reconnect; the peers see the
+        # replayed traffic, which is the part that actually concerns them.
+        self._announce_system(content)
 
         self._push_ui({"type": "peers", "peers": self.peers_info()})
         if client.channels:

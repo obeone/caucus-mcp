@@ -10,6 +10,16 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reviving peer no longer wakes the whole room.** When an idle-dropped peer
+  came back, the hub routed its `X reconnected after …` notice into every peer's
+  queue. On a passive, turn-based host each inbound message costs a full turn, so
+  one revive billed N turns across the room for an announcement nobody had to act
+  on. The notice is now operator-console-only, like `joined` / `left` / topic
+  changes; the replayed messages themselves still route to their recipient
+  exactly as before.
+
 ### Changed
 
 - **Operating protocol revision 18: the room no longer pushes a passive host

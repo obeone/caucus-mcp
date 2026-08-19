@@ -29,6 +29,14 @@ def _msg(sender: str, recipient: str, content: str = "x") -> Message:
     return Message(sender=sender, recipient=recipient, content=content)
 
 
+def _drain(queue: asyncio.Queue) -> list:  # type: ignore[type-arg]
+    """Pop everything currently sitting in ``queue`` and return it in order."""
+    drained = []
+    while not queue.empty():
+        drained.append(queue.get_nowait())
+    return drained
+
+
 def _radio(key: str = "ok", label: str = "Proceed?") -> Field:
     return Field(key=key, label=label, type=FieldType.RADIO, options=["yes", "no"])
 
@@ -862,36 +870,71 @@ async def test_revive_replays_unacked_before_messages_from_absence() -> None:
     assert pre_idx2 < absent_idx
 
 
-async def test_revive_broadcasts_reconnect_notice_with_downtime() -> None:
-    """The reconnect broadcast reaches live peers and names the downtime."""
+async def test_revive_announces_reconnect_to_the_ui_only() -> None:
+    """The reconnect notice reaches the operator console, never the peer queues.
+
+    Regression: the notice used to go through ``route()``, so every connected
+    peer got it in its inbox — and a passive, turn-based host burns a whole turn
+    per inbound message, making one revive cost N turns across the room for an
+    announcement none of them acts on. It is now UI-only, like joined/left.
+    """
+    state = HubState()
+    alpha = state.register("alpha").client
+    gamma = state.register("gamma").client
+    beta = state.register("beta").client
+    assert alpha is not None and gamma is not None and beta is not None
+
+    # Backdate beta only so the reaper targets it but not the two witnesses.
+    beta.last_seen -= 200.0
+    state.reap_stale(ttl=30.0)
+    assert "beta" not in state.peers()
+    assert {"alpha", "gamma"} <= set(state.peers())
+    # Clear the witnesses' queues of any reap-related system noise.
+    for witness in (alpha, gamma):
+        while not witness.queue.empty():
+            witness.queue.get_nowait()
+
+    ui = state.add_ui()
+    ui.get_nowait()  # priming snapshot
+
+    state.client_for(beta.token)
+
+    # No peer queue carries the notice.
+    for witness in (alpha, gamma):
+        assert witness.queue.empty(), "reconnect notice leaked into a peer queue"
+
+    # …but the operator console still sees it, downtime and all.
+    notices = [
+        e["message"]
+        for e in _drain(ui)
+        if e["type"] == "message" and "reconnected" in str(e["message"]["content"])
+    ]
+    assert notices, "no reconnect notice pushed to the UI"
+    content = str(notices[0]["content"])
+    assert "beta" in content
+    assert "away" in content  # the downtime, as "Xs" or "Xm Ys"
+
+
+async def test_revive_still_delivers_replayed_messages() -> None:
+    """Silencing the notice must not silence the replay it accompanied."""
     state = HubState()
     alpha = state.register("alpha").client
     beta = state.register("beta").client
-    assert alpha is not None
-    assert beta is not None
+    assert alpha is not None and beta is not None
 
-    # Backdate beta only so the reaper targets it but not alpha.
+    # A message delivered to beta but never ACKed, so revival must replay it.
+    pending = _msg("alpha", "beta", "unacked-before-reap")
+    state.route(pending)
+    beta.queue.get_nowait()
+    beta.unacked.append(pending)
+
     beta.last_seen -= 200.0
     state.reap_stale(ttl=30.0)
-    assert "alpha" in state.peers()  # alpha must still be live
-    assert "beta" not in state.peers()
-    # Clear alpha's queue of any reap-related system noise.
-    while not alpha.queue.empty():
-        alpha.queue.get_nowait()
+    state.route(_msg("alpha", "beta", "sent-while-away"))
 
-    # Revive beta; the reconnect notice should land in alpha's queue.
-    state.client_for(beta.token)
-
-    messages = []
-    while not alpha.queue.empty():
-        messages.append(alpha.queue.get_nowait())
-
-    notice_contents = [m.content for m in messages if "reconnected" in m.content]
-    assert notice_contents, "no reconnect notice received by alpha"
-    notice = notice_contents[0]
-    assert "beta" in notice
-    # The downtime should appear in the notice (some form of "Xs" or "Xm Ys").
-    assert "away" in notice
+    assert state.client_for(beta.token) is beta
+    contents = [m.content for m in _drain(beta.queue)]
+    assert contents == ["unacked-before-reap", "sent-while-away"]
 
 
 async def test_reap_stale_cleans_reaped_by_project_after_grace() -> None:
