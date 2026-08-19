@@ -75,6 +75,12 @@ logger = logging.getLogger("caucus.hub")
 # bridge can re-poll cleanly without spurious disconnects.
 LONG_POLL_SECONDS = 25.0
 
+# How long a single ``/receive`` wait may block before the loop re-checks the
+# things no queue can wake it on: client disconnect, a mode change to STOPPED,
+# and the two pause gates. Message delivery itself does not wait for a slice —
+# the loop races both queues — so this only bounds how stale those checks get.
+_POLL_SLICE_SECONDS = 1.0
+
 # How often the background reaper sweeps the roster for idle peers. Kept well
 # under the client TTL so a gone peer is detected within a couple of sweeps.
 REAP_INTERVAL_SECONDS = 15.0
@@ -1449,6 +1455,87 @@ def _record_unacked(client: Client, messages: list[Message]) -> None:
             client.unacked.append(msg)
 
 
+def _drain_now(queue: asyncio.Queue[Message]) -> list[Message]:
+    """Pop everything already sitting in ``queue``, without waiting.
+
+    Args:
+        queue: The queue to empty.
+
+    Returns:
+        The messages that were queued, in order (possibly empty).
+    """
+    drained: list[Message] = []
+    while True:
+        try:
+            drained.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return drained
+
+
+def _requeue_front(queue: asyncio.Queue[Message], msg: Message) -> None:
+    """Put ``msg`` back at the *head* of ``queue``, ahead of what is waiting.
+
+    ``asyncio.Queue`` only appends, so restoring a message that was already
+    dequeued would otherwise place it behind newer traffic and break the seq
+    ordering the caller relies on. Draining and re-adding is atomic here (one
+    event loop, no await), and the net count is unchanged, so a bounded queue
+    cannot overflow on the way back in.
+
+    Args:
+        queue: The queue to restore into.
+        msg: The message to put back at the head.
+    """
+    rest = _drain_now(queue)
+    queue.put_nowait(msg)
+    for item in rest:
+        queue.put_nowait(item)
+
+
+def _release_getter(
+    task: asyncio.Task[Message] | None, queue: asyncio.Queue[Message]
+) -> None:
+    """Retire a queue getter, returning any message it took but never delivered.
+
+    The poll races a getter on each queue, so when it ends (timeout, disconnect,
+    stop) one of them may have *already* dequeued a message that was never
+    returned to the caller. Cancelling such a task would silently swallow that
+    message, so it is put back at the head of its queue instead. A still-pending
+    getter is simply cancelled; :meth:`asyncio.Queue.get` hands its slot to the
+    next waiter on the way out, so nothing is lost there either.
+
+    Deliberately synchronous: this runs in the endpoint's ``finally`` block,
+    where awaiting could re-raise a pending :class:`asyncio.CancelledError` (the
+    client disconnected) and skip the rest of the cleanup.
+
+    Args:
+        task: The getter to retire, or ``None`` if none was armed.
+        queue: The queue the getter was reading from.
+    """
+    if task is None:
+        return
+    if task.done():
+        if not task.cancelled() and task.exception() is None:
+            _requeue_front(queue, task.result())
+        return
+    task.cancel()
+
+
+def _chatter_open(client: Client) -> bool:
+    """Whether peer chatter may be delivered to ``client`` at this instant.
+
+    Both gates must be open: the room-wide transmit gate (operator pause) and
+    the per-peer one. Operator traffic bypasses both, which is why it rides a
+    separate queue.
+
+    Args:
+        client: The polling client.
+
+    Returns:
+        ``True`` when the client's ordinary queue may be drained.
+    """
+    return state.transmit.is_set() and not client.paused
+
+
 @app.get("/receive")
 async def receive(
     request: Request,
@@ -1499,13 +1586,19 @@ async def receive(
         state.ack(client.token, ack_seq)
 
     client.active_polls += 1
+    loop = asyncio.get_event_loop()
+    # Long-lived getters, one per queue, raced against each other. Kept across
+    # loop iterations so a getter that is still waiting is never cancelled and
+    # re-armed (which is where a message could slip through the crack).
+    pri_get: asyncio.Task[Message] | None = None
+    chat_get: asyncio.Task[Message] | None = None
     try:
-        deadline = asyncio.get_event_loop().time() + min(timeout, LONG_POLL_SECONDS)
+        deadline = loop.time() + min(timeout, LONG_POLL_SECONDS)
         while True:
             if await request.is_disconnected():
                 return {"messages": [], "mode": state.mode.value}
 
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - loop.time()
             if remaining <= 0:
                 return {"messages": [], "mode": state.mode.value}
 
@@ -1513,53 +1606,57 @@ async def receive(
                 stop = state.control_signal("stop")
                 return {"messages": [stop.to_public()], "mode": state.mode.value}
 
-            # Operator traffic on the priority queue pierces the pause gate, so
+            # Operator traffic on the priority queue pierces both pause gates, so
             # the operator keeps a live grip (steer / interrupt / reset) on an
-            # agent even while the room is paused. Checked every iteration, ahead
-            # of the gate and the peer queue, so it always wins.
-            if not client.priority_queue.empty():
-                messages = [client.priority_queue.get_nowait()]
-                while not client.priority_queue.empty():
-                    messages.append(client.priority_queue.get_nowait())
+            # agent even while the room is paused. Its getter is therefore always
+            # armed; peer chatter's is armed only while the gates are open.
+            if pri_get is None:
+                pri_get = asyncio.ensure_future(client.priority_queue.get())
+            if chat_get is None and _chatter_open(client):
+                chat_get = asyncio.ensure_future(client.queue.get())
+
+            # Race the two queues instead of polling one and blocking on the
+            # other: blocking on chatter used to make an operator command wait
+            # out that block (up to a second) before the loop looked at the
+            # priority queue again. The slice below is what keeps the loop
+            # returning to the disconnect / mode / pause-gate checks; a paused
+            # peer still runs to its deadline and re-polls, refreshing
+            # ``last_seen`` so it is NOT reaped, with its queue left undrained.
+            await asyncio.wait(
+                {task for task in (pri_get, chat_get) if task is not None},
+                timeout=min(remaining, _POLL_SLICE_SECONDS),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            messages: list[Message] = []
+            if pri_get.done():
+                messages.append(pri_get.result())
+                messages.extend(_drain_now(client.priority_queue))
+                pri_get = None
+            # Re-check the gates before consuming chatter: the operator may have
+            # paused the room while we were waiting, and a message the getter
+            # pulled out must not slip past a gate that has since closed — it
+            # goes back to the head of the queue instead, to be delivered when
+            # the gate reopens. Either way the getter is retired, so a closed
+            # gate never leaves a completed task to spin the loop.
+            if chat_get is not None and chat_get.done():
+                if _chatter_open(client):
+                    messages.append(chat_get.result())
+                    messages.extend(_drain_now(client.queue))
+                else:
+                    _requeue_front(client.queue, chat_get.result())
+                chat_get = None
+
+            if messages:
                 _record_unacked(client, messages)
-                return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
-
-            # Pause gate: peer chatter is held back. Wait for resume (or stop);
-            # a priority message that lands during the wait is picked up on the
-            # next loop by the check above (≤1s later).
-            if not state.transmit.is_set():
-                try:
-                    await asyncio.wait_for(
-                        state.transmit.wait(), timeout=min(remaining, 1.0)
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                continue
-
-            # Per-peer pause gate: hold this peer's queue while the operator has
-            # it paused, the same way the global gate above holds the room. We
-            # poll the flag rather than block on an event so the loop keeps
-            # spinning to its deadline and returns normally — the watcher then
-            # re-polls, refreshing ``last_seen`` so a paused peer is NOT reaped.
-            # Queued messages stay in the queue (undrained) and are released the
-            # instant the operator resumes the peer.
-            if client.paused:
-                await asyncio.sleep(min(remaining, 1.0))
-                continue
-
-            try:
-                first = await asyncio.wait_for(
-                    client.queue.get(), timeout=min(remaining, 1.0)
-                )
-            except asyncio.TimeoutError:
-                continue
-
-            messages = [first]
-            while not client.queue.empty():
-                messages.append(client.queue.get_nowait())
-            _record_unacked(client, messages)
-            return {"messages": [m.to_public() for m in messages], "mode": state.mode.value}
+                return {
+                    "messages": [m.to_public() for m in messages],
+                    "mode": state.mode.value,
+                }
     finally:
+        # Hand back anything a getter dequeued but this response never carried.
+        _release_getter(pri_get, client.priority_queue)
+        _release_getter(chat_get, client.queue)
         client.active_polls -= 1
 
 

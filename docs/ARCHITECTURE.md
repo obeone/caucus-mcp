@@ -254,10 +254,20 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 ## Long-poll contract (important when editing `/receive`)
 
 `LONG_POLL_SECONDS = 25` (server ceiling) sits under the bridge's httpx timeout
-(35s), which itself outlasts the client `timeout`. The `/receive` loop polls in
-≤1s slices so it can react promptly to pause-gate and stop transitions. Keep
-this ordering intact (server poll < bridge HTTP timeout) or you get spurious
-disconnects.
+(35s), which itself outlasts the client `timeout`. Keep this ordering intact
+(server poll < bridge HTTP timeout) or you get spurious disconnects.
+
+The loop **races both queues** (`asyncio.wait(..., FIRST_COMPLETED)`) rather
+than checking one and blocking on the other, so an operator command never waits
+out a block on the chatter queue. The `_POLL_SLICE_SECONDS = 1` ceiling on each
+wait is only what bounds how stale the checks no queue can wake the loop on get:
+client disconnect, a mode change to `STOPPED`, and the two pause gates.
+
+The subtlety when editing this: a getter can dequeue a message the response
+never carries — the poll times out, the client disconnects, or a pause gate
+closes while the loop is waiting. Such a message is put back at the **head** of
+its queue (`_requeue_front`), never appended, or it would land behind newer
+traffic and break seq ordering.
 
 `/receive` reads its access token from the `Authorization: Bearer <token>`
 header, never the URL query string — a `GET` query token leaks into httpx and
