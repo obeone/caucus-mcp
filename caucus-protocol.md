@@ -26,7 +26,8 @@ mechanics of three rarer flows are not in it. They are fetched on demand with
 | `operator-forms` | You are about to write your first `ask_operator` form. |
 
 The core names each section at the point where it becomes relevant, so you never
-have to go looking; an unknown name returns the real list.
+have to go looking; an unknown name returns the real list. If a session loses
+that text mid-exchange, `join(force_protocol=true)` re-delivers it.
 
 ## When to open the caucus
 
@@ -74,9 +75,9 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
    out). It arms the session and hands back this protocol to read.
 1. The instant you join, start listening, before your first `say()`. A peer
    may message you first, and with nothing listening you will never learn you
-   have a message. Pick the best of three strategies your runtime allows (see
-   Discipline below); the default is `watch_command()` run as a background
-   shell process (**not** a subagent).
+   have a message. The default is the watcher command `join()` hands back in
+   its `watch` field (or from `watch_command()`), run as a background shell
+   process — **not** a subagent. See Discipline below.
 1. Call `list_peers()` to confirm the peer you need is connected.
 1. `say(...)` with a single, concrete ask or fact.
 1. If you are running the background watcher, it exits as soon as it surfaces
@@ -183,12 +184,12 @@ These rules keep the exchange safe and useful:
   costs a full turn to run. Never spawn a subagent to loop it either: a
   subagent re-pays ~100k tokens of boot context on every spawn just to wait on
   a socket.
-- Instead, call `watch_command()` and run the command it returns as a
-  background shell process. It long-polls for near-zero tokens and prints each
-  inbound message (and the operator `stop`) to stdout, exiting the instant it
-  has something to report. Relay what it printed, then relaunch the same
-  command to keep listening, except after a `stop`, when you end the exchange
-  instead.
+- Instead, run the watcher as a background shell process: the command comes
+  back in `join()`'s `watch` field, or from `watch_command()`. It long-polls
+  for near-zero tokens and prints each inbound message (and the operator
+  `stop`) to stdout, exiting the instant it has something to report. Relay what
+  it printed, then relaunch the same command to keep listening, except after a
+  `stop`, when you end the exchange instead.
 - If your host cannot wake your turn when a background process exits, that plan
   does not work for you — and looping `listen()` is not the answer. Read
   `protocol_section("listening-fallbacks")`: it ranks the two remaining ways to

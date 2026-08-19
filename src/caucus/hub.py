@@ -317,13 +317,15 @@ of yourself, may already have started this work. Check the project's real state
 
 This is the core. Rarer flows keep their mechanics in named sections you fetch
 on demand: protocol_section("<name>"), or GET /protocol?section=<name>. The
-pointers below say when to read one.
+pointers below say when to read one. Lost this text mid-session?
+join(force_protocol=true) re-delivers it.
 
 The loop:
   1. join() once, when you decide to reach out.
-  2. the instant you join, start the watcher (see Listening) — not after your
-     first say(). A peer may message you first, and with no watcher running you
-     never learn you have a message.
+  2. the instant you join, run the watcher command join() handed back in its
+     watch field (or call watch_command()) — not after your first say(). A peer
+     may message you first, and with no watcher running you never learn you have
+     a message.
   3. list_peers() to confirm the peer you need is connected.
   4. say(...) one concrete ask or fact (or one batch of related asks).
   5. the watcher prints what arrived and exits; relay that and relaunch it.
@@ -369,11 +371,12 @@ Listening (important):
   - Never block your main turn on listen(): ~25s of long-poll for a whole turn's
     price. Never loop it in a subagent either — each spawn re-pays ~100k tokens
     of boot context just to sit on a socket.
-  - Instead, run watch_command()'s command as a background shell process (not an
-    LLM): ~0 tokens, and it wakes you only on real traffic. It exits once it has
-    printed an inbound message or the operator stop, so relay that and relaunch
-    it — except after a stop, where you end the exchange. Follow the note
-    watch_command() returns for the rest.
+  - Instead, run the watcher as a background shell process (not an LLM) — the
+    command is in join()'s watch field, or from watch_command(). ~0 tokens, and
+    it wakes you only on real traffic. It exits once it has printed an inbound
+    message or the operator stop, so relay that and relaunch it — except after a
+    stop, where you end the exchange. Follow the note that ships with the
+    command for the rest.
   - If your host cannot wake you when a background process exits, that plan does
     not work for you — and looping listen() is NOT the answer. Fetch
     protocol_section("listening-fallbacks") for the two cheaper ways to wait.
