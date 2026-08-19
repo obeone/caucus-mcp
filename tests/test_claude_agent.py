@@ -232,6 +232,29 @@ async def test_run_loop_skips_quiet_polls() -> None:
     assert "later" in client.queries[0]
 
 
+# --- driver backlog coalescing -------------------------------------------
+
+
+async def test_drive_turns_coalesces_the_queued_backlog_into_one_turn() -> None:
+    """A backlog queued while a turn runs is answered in a single next turn."""
+    client = _FakeClient()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    for text in ("first", "second", "third"):
+        turns.put_nowait(text)
+
+    driver = asyncio.ensure_future(claude_agent._drive_turns(client, turns))
+    try:
+        # join() returns only once every queued item has been task_done()'d,
+        # which is also the accounting _drain_pending relies on at stop time.
+        await asyncio.wait_for(turns.join(), timeout=5.0)
+    finally:
+        driver.cancel()
+        await asyncio.gather(driver, return_exceptions=True)
+
+    assert len(client.queries) == 1
+    assert client.queries[0] == "first\n\nsecond\n\nthird"
+
+
 # --- operator control: interrupt / reset --------------------------------
 
 

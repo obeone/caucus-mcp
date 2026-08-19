@@ -447,24 +447,40 @@ async def _drive_turn(client: _AgentClient, prompt: str) -> None:
 
 
 async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
-    """Consume queued user turns and drive each to completion on ``client``.
+    """Consume queued user turns and drive each backlog to completion on ``client``.
 
     Runs as a background task for one client lifecycle, blocking on the shared
     ``turns`` queue so it idles silently between turns and resumes the moment the
-    poller enqueues inbound chatter or an operator injection. Each turn is marked
-    done so a stop-time :meth:`asyncio.Queue.join` can tell when the backlog is
-    fully drained.
+    poller enqueues inbound chatter or an operator injection.
+
+    Whatever is already queued behind the first item is **coalesced into that
+    same turn**. A busy room hands the driver several batches while one turn is
+    in flight; replaying them one turn at a time makes the agent answer stale
+    context repeatedly and pay a full round-trip per batch. Draining the backlog
+    into a single prompt lets it answer everything it knows at once. Every
+    drained item is marked done so a stop-time :meth:`asyncio.Queue.join` still
+    sees the backlog as fully consumed.
 
     Args:
         client: The SDK client driving the conversation.
         turns: Shared queue of user turns fed by :func:`_poll_inbound`.
     """
     while True:
-        prompt = await turns.get()
+        prompts = [await turns.get()]
+        # Non-blocking drain: anything queued while the previous turn ran joins
+        # this one rather than waiting for a turn of its own.
+        while True:
+            try:
+                prompts.append(turns.get_nowait())
+            except asyncio.QueueEmpty:
+                break
         try:
-            await _drive_turn(client, prompt)
+            await _drive_turn(client, "\n\n".join(prompts))
         finally:
-            turns.task_done()
+            # One task_done per item taken, or Queue.join() never unblocks and
+            # _drain_pending hangs the shutdown path.
+            for _ in prompts:
+                turns.task_done()
 
 
 def _max_seq(messages: list[dict[str, object]]) -> int:
