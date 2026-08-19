@@ -22,7 +22,7 @@ from caucus.models import (
     Message,
     MessageKind,
 )
-from caucus.state import HubState, RegisterOutcome
+from caucus.state import MAX_QUEUE_SIZE, HubState, RegisterOutcome
 
 
 def _msg(sender: str, recipient: str, content: str = "x") -> Message:
@@ -1059,28 +1059,25 @@ async def test_peek_pending_increments_on_route() -> None:
 
     state.route(_msg("alpha", "beta", "hello beta"))
 
-    assert beta.pending == 1
     result = state.peek(beta)
     assert result["pending"] == 1
     assert result["last"] == {"sender": "alpha", "preview": "hello beta"}
 
 
 async def test_peek_pending_decrements_to_zero_after_receive_drains() -> None:
-    """Peek mirrors what /receive actually drains, not the raw enqueue count."""
+    """Peek reads the queues' own qsize(), so a manual drain is reflected for free."""
     state = HubState()
     state.register("alpha")
     beta = state.register("beta").client
     assert beta is not None
     state.route(_msg("alpha", "beta", "one"))
     state.route(_msg("alpha", "beta", "two"))
-    assert beta.pending == 2
+    assert state.peek(beta)["pending"] == 2
 
-    # Simulate what GET /receive does: drain the whole queue, then account
-    # for exactly what was drained (see hub.py's receive()).
+    # Simulate what GET /receive does: drain the whole queue.
     drained = []
     while not beta.queue.empty():
         drained.append(beta.queue.get_nowait())
-    beta.pending = max(0, beta.pending - len(drained))
 
     assert len(drained) == 2
     assert state.peek(beta) == {"pending": 0, "last": None}
@@ -1095,6 +1092,66 @@ async def test_peek_preview_truncates_to_120_chars() -> None:
 
     preview = state.peek(beta)["last"]["preview"]  # type: ignore[index]
     assert preview == "x" * 120
+
+
+async def test_peek_is_exact_across_ring_buffer_overflow() -> None:
+    """The qsize()-based count is exact even when route() drops the oldest.
+
+    Previously peek() tracked a parallel counter that incremented on every
+    enqueue without accounting for the ring-buffer drop-oldest in
+    ``_safe_put`` — a sustained flood past ``MAX_QUEUE_SIZE`` would drift it
+    high. Reading ``queue.qsize()`` directly cannot drift: it is always
+    exactly how many messages are actually sitting there.
+    """
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+
+    for i in range(MAX_QUEUE_SIZE + 25):
+        state.route(_msg("alpha", "beta", f"msg-{i}"))
+
+    result = state.peek(beta)
+    assert result["pending"] == MAX_QUEUE_SIZE
+    # The oldest 25 were dropped; the newest survives and is what's previewed.
+    assert result["last"] == {
+        "sender": "alpha",
+        "preview": f"msg-{MAX_QUEUE_SIZE + 24}",
+    }
+
+
+async def test_peek_after_revive_reports_replayed_backlog() -> None:
+    """A revived client's peek reflects the backlog replayed back onto it.
+
+    Regression guard for the old parallel-counter design, which only
+    incremented on a fresh :meth:`HubState.route` enqueue and was never
+    touched by :meth:`HubState._revive`'s replay — a peer that peeked right
+    after reconnecting would undercount despite a full backlog sitting in its
+    queue. Asserted by comparing ``peek()`` against an actual drain rather
+    than a fixed number, since ``_revive`` also broadcasts a "reconnected"
+    notice the revived peer itself receives, on top of the 2 replayed
+    messages.
+    """
+    state = HubState()
+    beta = state.register("beta").client
+    state.register("alpha")
+    assert beta is not None
+    token = beta.token
+
+    state.route(_msg("alpha", "beta", "while away 1"))
+    state.route(_msg("alpha", "beta", "while away 2"))
+    beta.last_seen -= 1000.0
+    state.reap_stale(ttl=30.0)  # parks beta in the revival graveyard
+
+    revived = state.client_for(token)  # any authenticated call revives it
+    assert revived is beta
+
+    reported = state.peek(beta)["pending"]
+    drained = []
+    while not beta.queue.empty():
+        drained.append(beta.queue.get_nowait())
+    assert reported == len(drained)
+    assert [m.content for m in drained[:2]] == ["while away 1", "while away 2"]
 
 
 # --- operator forms ------------------------------------------------------
