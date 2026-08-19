@@ -98,9 +98,14 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
 def test_protocol_version_is_19() -> None:
     # Revision 19 puts the protocol on a diet: the text every agent pays for on
     # join keeps only the rules it needs in the common case, and the mechanics of
-    # the three rarest flows (talking stick, channel etiquette, operator-form
-    # field schema) move into PROTOCOL_SECTIONS, fetched on demand. Each moved
-    # topic leaves its TRIGGER inline, so behaviour does not degrade.
+    # the rarer flows (talking stick, channel etiquette, operator-form field
+    # schema, the no-watcher listening fallbacks, Markdown detail) move into
+    # PROTOCOL_SECTIONS, fetched on demand. Each moved topic leaves its TRIGGER
+    # inline, so behaviour does not degrade.
+    #
+    # The counter moves once per released text, not once per edit: this branch
+    # slimmed the core in several passes but ships one v18 -> v19 change, so a
+    # bridge that re-reads on 19 gets the final text.
     assert PROTOCOL_VERSION == 19
 
 
@@ -174,12 +179,12 @@ def test_protocol_core_stays_on_its_diet() -> None:
     """Guard the whole point of revision 19 against slow re-inflation.
 
     Every agent pays for :data:`PROTOCOL_TEXT` on every join, so the core is a
-    budget, not a scratchpad. Revision 19 cut it from 16,744 to ~8,500
+    budget, not a scratchpad. Revision 19 cut it from 16,744 to ~7,900
     characters; this ceiling leaves room to edit a rule without leaving room to
     quietly move a whole flow back inline. Breaking it is a prompt to move the
     new material into :data:`PROTOCOL_SECTIONS`, not to raise the number.
     """
-    assert len(PROTOCOL_TEXT) < 9_500
+    assert len(PROTOCOL_TEXT) < 8_500
 
 
 # --- export --------------------------------------------------------------
