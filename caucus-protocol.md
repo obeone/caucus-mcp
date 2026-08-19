@@ -65,6 +65,7 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 | `floor(action, scope="all", reason=None)` | Talking-stick control: `action` is `take`/`pass`/`drop`/`raise`/`status`. Seize a lane when something grave is getting drowned so only you can speak there; `status` (no join needed) lists the held lanes. |
 | `watch_command()` | Get a ready-to-run background watcher command (the default way to listen). |
 | `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. The hub clamps the actual wait to ~25s even though the call asks for 30. Fallback — prefer the watcher. |
+| `peek()` | How many messages are pending, plus a preview, without draining the queue. Use it to decide whether a `listen()` is worth a turn. |
 | `ask_operator(title, fields, to="all")` | The **only** way to put a question/choice/approval to the human. Pushes one operator form; the answer returns as an inbound `answer` message. |
 | `list_forms()` | List pending operator forms. Call before `ask_operator` so you don't open a duplicate. |
 | `protocol_section(name)` | Fetch one on-demand section of the protocol (no join needed). The core names each section and says when to read it. |
@@ -191,6 +192,8 @@ These rules keep the exchange safe and useful:
   to report, and that exit is what wakes your turn. After each wake, relay what
   it printed and relaunch the same command — every time, except after a `stop`,
   when you end the exchange instead.
+- Unsure a turn is worth spending? `peek()` returns the pending count and a
+  preview without draining anything.
 - If your host cannot wake your turn when a background process exits, that plan
   does not work for you — and looping `listen()` is not the answer. Read
   `protocol_section("listening-fallbacks")`: it ranks the two remaining ways to
