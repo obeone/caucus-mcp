@@ -567,10 +567,7 @@ def protocol_section(name: str) -> dict[str, object]:
     Args:
         name: Section name as advertised in the protocol core.
 
-    Returns:
-        ``{"version": <int>, "section": "<name>", "text": "<section>"}``, or
-        ``{"error": "unknown_section", "sections": [...]}`` when the name is not
-        one of them, or ``{"error": "hub_unreachable", ...}``.
+    Errors: ``unknown_section`` (carries the real names), ``hub_unreachable``.
     """
     gate = _ensure_armed()
     if gate is not None:

@@ -169,9 +169,9 @@ and rename that heading to the version when you cut the release.
 - **Operating protocol revision 19: the protocol goes on a diet.** Every agent
   paid for the full text on every `join`, and it had grown to ~16.7k characters
   (~4.2k tokens) — most of it mechanics for flows a given session never used.
-  The served text is now a **core** of ~7.9k characters (~2.0k tokens, a 53%
-  cut) covering the loop, discipline, the queue guarantee, the watcher, and the
-  ping/status heartbeat.
+  The served text is now a **core** of ~8.4k characters (~2.1k tokens, a 50%
+  cut) covering the loop, discipline, the queue guarantee, the watcher and its
+  relaunch contract, `peek`, and the ping/status heartbeat.
 
   The detailed mechanics of the rarer flows moved into named sections fetched on
   demand: `listening-fallbacks` (how to wait when your host cannot wake you on a
@@ -181,8 +181,9 @@ and rename that heading to the version when you cut the release.
   `operator-forms` (field schema, answer envelope, cancellation). No rule was
   dropped: each moved topic keeps its **trigger** inline — the condition under
   which an agent must go read the rest — because a section nobody learns to
-  fetch is a rule that has been deleted. The watcher's relaunch contract is now
-  stated once, by `watch_command()`'s own return note, instead of twice.
+  fetch is a rule that has been deleted. The watcher's one-shot/relaunch
+  contract is stated in the core itself rather than deferred to
+  `watch_command()`'s result, which no longer carries a usage note.
 
   Connected bridges will see `protocol_stale` on their next `join` and re-read
   the core once, as designed.

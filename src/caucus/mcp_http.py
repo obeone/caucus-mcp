@@ -783,10 +783,7 @@ def build_mcp_server(
         Args:
             name: Section name as advertised in the protocol core.
 
-        Returns:
-            ``{"version": <int>, "section": "<name>", "text": "<section>"}``, or
-            ``{"error": "unknown_section", "sections": [...]}`` when the name is not
-            one of them, or ``{"error": "hub_unreachable", ...}``.
+        Errors: ``unknown_section`` (carries the real names), ``hub_unreachable``.
         """
         _, gate = await _ensure_armed(ctx)
         if gate is not None:
