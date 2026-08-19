@@ -175,8 +175,8 @@ def _close_client() -> None:
     if _http is not None:
         try:
             _http.close()
-        except Exception:  # noqa: BLE001 - shutdown path, nothing to recover
-            pass
+        except Exception as exc:  # noqa: BLE001 - shutdown path, nothing to recover
+            logger.debug("closing the shared hub client failed: %s", exc)
         _http = None
     _http_base = None
 
