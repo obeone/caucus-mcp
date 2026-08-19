@@ -142,7 +142,6 @@ async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
     assert (await _tool(server, "ping")(ctx, peer="nobody"))["state"] == "absent"
     assert "channels" in await _tool(server, "list_channels")(ctx)
     assert "forms" in await _tool(server, "list_forms")(ctx)
-    assert "decisions" in await _tool(server, "decisions")(ctx)
     assert "floors" in await _tool(server, "floor")(ctx, action="status")
 
 
@@ -180,6 +179,13 @@ async def test_peek_reports_pending_without_draining(state: HubState) -> None:
     assert after == {"pending": 0, "last": None}
 
 
+async def test_decisions_requires_join(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    res = await _tool(server, "decisions")(ctx)
+    assert res["error"] == "not_joined"
+
+
 async def test_decisions_lists_settled_form(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")
@@ -205,6 +211,38 @@ async def test_decisions_lists_settled_form(state: HubState) -> None:
     assert any(
         e["title"] == "Deploy?" and e["asker"] == "form-decider" for e in entries
     )
+
+
+async def test_decisions_channel_scoped_answer_invisible_to_non_member(
+    state: HubState,
+) -> None:
+    server = _build()
+    asker_ctx, outsider_ctx = _ctx("asker"), _ctx("outsider")
+    await _tool(server, "join")(asker_ctx, project="channel-decider")
+    await _tool(server, "join")(outsider_ctx, project="channel-outsider")
+    form_id = (
+        await _tool(server, "ask_operator")(
+            asker_ctx,
+            title="Rotate the key?",
+            fields=[
+                {
+                    "key": "ok",
+                    "label": "Proceed?",
+                    "type": "radio",
+                    "options": ["yes", "no"],
+                }
+            ],
+            to="#secret",
+        )
+    )["form_id"]
+    state.answer_form(form_id, {"ok": "yes"})
+
+    # The asker auto-subscribed to #secret when it opened the form.
+    own = (await _tool(server, "decisions")(asker_ctx))["decisions"]
+    assert any(e["title"] == "Rotate the key?" for e in own)
+
+    outsider = (await _tool(server, "decisions")(outsider_ctx))["decisions"]
+    assert outsider == []
 
 
 async def test_join_name_in_use_on_contested(state: HubState) -> None:

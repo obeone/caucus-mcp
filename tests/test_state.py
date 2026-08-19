@@ -1207,6 +1207,7 @@ async def test_answer_form_routes_answer_to_broadcast_audience() -> None:
             "status": "answered",
             "answers": {"ok": "yes"},
             "asker": "alpha",
+            "to": BROADCAST,
         }
 
 
@@ -1284,6 +1285,7 @@ async def test_cancel_form_routes_cancellation_and_keeps_answers_none() -> None:
         "status": "cancelled",
         "answers": None,
         "asker": "alpha",
+        "to": BROADCAST,
     }
 
 
@@ -1378,6 +1380,44 @@ async def test_decisions_non_positive_limit_is_empty() -> None:
     form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
     state.answer_form(form.id, {"ok": "yes"})
     assert state.decisions(limit=0) == []
+
+
+async def test_decisions_channel_filter_hides_non_member_and_shows_broadcast() -> None:
+    """The ``channels`` gate scopes to broadcast plus the caller's own channels."""
+    state = HubState()
+    state.register("alpha")
+    broadcast_form = state.create_form("alpha", BROADCAST, "Broadcast Q", [_radio()])
+    state.answer_form(broadcast_form.id, {"ok": "yes"})
+    channel_form = state.create_form("alpha", "#secret", "Channel Q", [_radio()])
+    state.answer_form(channel_form.id, {"ok": "yes"})
+
+    # A caller in no channels at all still sees the broadcast decision.
+    non_member = state.decisions(channels=set())
+    assert [e["title"] for e in non_member] == ["Broadcast Q"]
+
+    # A caller subscribed to #secret sees both.
+    member = state.decisions(channels={"#secret"})
+    assert [e["title"] for e in member] == ["Broadcast Q", "Channel Q"]
+
+    # Unrestricted (operator/observer path) sees everything regardless.
+    unrestricted = state.decisions(channels=None)
+    assert [e["title"] for e in unrestricted] == ["Broadcast Q", "Channel Q"]
+
+
+async def test_decisions_channel_filter_applies_before_limit() -> None:
+    """Filtering happens before the limit cut, so visible entries aren't crowded out."""
+    state = HubState()
+    state.register("alpha")
+    for i in range(3):
+        form = state.create_form("alpha", "#other", f"Noise{i}", [_radio()])
+        state.answer_form(form.id, {"ok": "yes"})
+    visible_form = state.create_form("alpha", "#mine", "Visible", [_radio()])
+    state.answer_form(visible_form.id, {"ok": "yes"})
+
+    # limit=1 with an unfiltered view would return the last noise entry; the
+    # member-scoped view must still surface its one visible decision.
+    entries = state.decisions(limit=1, channels={"#mine"})
+    assert [e["title"] for e in entries] == ["Visible"]
 
 
 # --- runtime rate-limit control --------------------------------------

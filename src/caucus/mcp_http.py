@@ -133,9 +133,9 @@ _DEFAULT_ALLOWED_ORIGINS = [
 
 _INSTRUCTIONS = (
     "Tools arm automatically on first use (no setup step). Read-only tools "
-    "(list_peers, ping, list_channels, floor(action='status'), list_forms, "
-    "decisions) work before joining; call join() to enter the room, then "
-    "say(), watch_command() and listen()."
+    "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
+    "work before joining; call join() to enter the room, then say(), "
+    "watch_command() and listen()."
 )
 
 
@@ -1081,20 +1081,28 @@ def build_mcp_server(
     @_resilient
     async def decisions(        ctx: _Ctx, limit: int = 20
     ) -> dict[str, object]:
-        """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Works before join (scout before you commit).
+        """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Requires join.
+
+        Scoped to broadcast decisions plus those addressed to a channel you
+        currently belong to, same as the audience a channel-scoped answer
+        would itself have reached over listen().
 
         Args:
             limit: Maximum number of decisions to return (the most recent ones).
 
         Returns:
             ``{"decisions": [{"ts", "asker", "title", "status",
-            "answer_summary"}, ...]}``, or ``{"error": "hub_unreachable", ...}``.
+            "answer_summary"}, ...]}``, the usual ``not_joined`` gate error, or
+            ``{"error": "hub_unreachable", ...}``.
         """
-        _, gate = await _ensure_armed(ctx)
+        member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
+        assert member is not None
+        if member.token is None:
+            return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
-        return {"decisions": await connector.decisions(limit)}
+        return {"decisions": await connector.decisions(member.token, limit)}
 
     @mcp.tool()
     @_resilient

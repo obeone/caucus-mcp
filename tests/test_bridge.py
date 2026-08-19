@@ -62,7 +62,6 @@ def test_readonly_tools_work_before_join(
     assert "peers" in bridge.list_peers()
     assert "channels" in bridge.list_channels()
     assert "forms" in bridge.list_forms()
-    assert "decisions" in bridge.decisions()
     assert bridge.ping("nobody")["state"] == "absent"
     assert "floors" in bridge.floor(action="status")
 
@@ -76,6 +75,9 @@ def test_write_tools_require_join(
     assert bridge.listen(timeout=0) == not_joined
     assert bridge.floor(action="take", reason="x") == not_joined
     assert bridge.peek() == not_joined
+    # decisions() can carry channel-private answer text, so it now needs a
+    # session token too — no more scout-before-join for it.
+    assert bridge.decisions() == not_joined
 
 
 def test_whoami_is_available_before_arming(
@@ -1017,6 +1019,33 @@ def test_decisions_respects_limit(
     assert len(limited) == 2
     assert limited[-1]["title"] == "Q2"
     assert limited[0]["title"] == "Q1"
+
+
+def test_decisions_channel_scoped_answer_hidden_from_non_member(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from caucus import hub as hub_module
+
+    outsider = _register_peer(live_hub, "decisions-outsider")
+    monkeypatch.setattr(bridge, "PROJECT", "decisions-asker")
+    bridge.join()
+    form_id = bridge.ask_operator(
+        "Rotate the key?", [_radio_field()], to="#decisions-secret"
+    )["form_id"]
+    hub_module.state.answer_form(form_id, {"ok": "yes"})
+
+    # This bridge (the asker) auto-subscribed to #decisions-secret on ask, so
+    # it sees its own channel-scoped decision.
+    own = [e["title"] for e in bridge.decisions()["decisions"]]
+    assert "Rotate the key?" in own
+
+    # A peer that never joined the channel does not, over the raw HTTP token
+    # it was registered with.
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        outsider_decisions = http.get(
+            "/decisions", headers={"Authorization": f"Bearer {outsider}"}
+        ).json()["decisions"]
+    assert "Rotate the key?" not in [e["title"] for e in outsider_decisions]
 
 
 # --- watch_command -------------------------------------------------------

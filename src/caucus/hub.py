@@ -1438,15 +1438,31 @@ async def forms() -> dict[str, list[dict[str, object]]]:
 @app.get("/decisions")
 async def decisions(
     limit: int = Query(default=20, ge=1, le=500),
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
 ) -> dict[str, list[dict[str, object]]]:
     """List recently settled operator-form decisions, oldest first.
 
     The answered/cancelled counterpart to ``/forms``: a late-joining agent
     calls this to catch up on questions the operator already resolved, without
-    replaying the whole transcript. Read-only and unauthenticated, like
-    ``/forms`` — an operator-form answer is no more sensitive than the pending
-    form it resolved, and ``/forms`` already surfaces channel-scoped questions
-    the same way.
+    replaying the whole transcript. Unlike ``/forms`` (which only ever lists
+    still-*pending* questions), a settled decision can carry a channel's
+    private answer text, so this endpoint requires a token — no more
+    "works before join". The token is resolved exactly like ``/receive`` (see
+    :func:`_resolve_receive_token`) and tried two ways:
+
+    * A known **peer token** (:meth:`~caucus.state.HubState.client_for`) scopes
+      the result to broadcast decisions plus those addressed to a channel the
+      caller currently belongs to — the same audience that channel-scoped
+      answer would itself have reached over ``/receive``.
+    * When :attr:`AuthConfig.enabled`, an **operator/observer token**
+      (:meth:`AuthConfig.role_for`) is accepted for the unrestricted view —
+      the same escalation ``/export`` grants that role over the full
+      transcript, since a settled decision is no less sensitive than the log
+      entries ``/export`` already gates on it.
+
+    Anything else (no token, an unknown peer token, or — when auth is
+    disabled — a token matching neither role) is refused with 401.
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
@@ -1455,7 +1471,13 @@ async def decisions(
         ``{"decisions": [{"ts", "asker", "title", "status", "answer_summary"},
         ...]}`` — see :meth:`~caucus.state.HubState.decisions`.
     """
-    return {"decisions": state.decisions(limit)}
+    resolved = _resolve_receive_token(authorization, token)
+    client = state.client_for(resolved) if resolved is not None else None
+    if client is not None:
+        return {"decisions": state.decisions(limit, channels=client.channels)}
+    if auth_config.enabled and auth_config.role_for(resolved) in ("operator", "observer"):
+        return {"decisions": state.decisions(limit, channels=None)}
+    raise HTTPException(status_code=401, detail="unknown token")
 
 
 def _record_unacked(client: Client, messages: list[Message]) -> None:
