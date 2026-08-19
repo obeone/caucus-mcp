@@ -777,6 +777,25 @@ def build_mcp_server(
 
     @mcp.tool()
     @_resilient
+    async def protocol_section(ctx: _Ctx, name: str) -> dict[str, object]:
+        """Fetch one on-demand section of the operating protocol by ``name``; the protocol core names each section and states when to read it. Works before join.
+
+        Args:
+            name: Section name as advertised in the protocol core.
+
+        Returns:
+            ``{"version": <int>, "section": "<name>", "text": "<section>"}``, or
+            ``{"error": "unknown_section", "sections": [...]}`` when the name is not
+            one of them, or ``{"error": "hub_unreachable", ...}``.
+        """
+        _, gate = await _ensure_armed(ctx)
+        if gate is not None:
+            return gate
+        connector = await _connector()
+        return await connector.fetch_protocol_section(name)
+
+    @mcp.tool()
+    @_resilient
     async def list_peers(ctx: _Ctx) -> dict[str, object]:
         """List the project names currently connected. Works before join (scout before you commit)."""
         _, gate = await _ensure_armed(ctx)

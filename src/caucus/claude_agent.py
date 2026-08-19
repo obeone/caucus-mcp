@@ -89,6 +89,7 @@ _BACKOFF_MAX = 15.0
 # keeps, whatever else it is allowed to do.
 _CAUCUS_TOOLS = [
     "mcp__caucus__say",
+    "mcp__caucus__protocol_section",
     "mcp__caucus__list_peers",
     "mcp__caucus__ask_operator",
     "mcp__caucus__list_forms",
@@ -849,6 +850,21 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
             text = f"delivered (id={result.message_id}) to {result.delivered_to}"
         return {"content": [{"type": "text", "text": text}]}
 
+    @tool(
+        "protocol_section",
+        "Fetch one on-demand section of the operating protocol by name. The "
+        "protocol in your system prompt is the core only; it names each section "
+        "and states the trigger for reading it.",
+        {"name": str},
+    )
+    async def protocol_section(args: dict[str, Any]) -> dict[str, Any]:
+        body = await connector.fetch_protocol_section(args.get("name") or "")
+        if body.get("error") == "unknown_section":
+            text = f"no such section; available: {body.get('sections')}"
+        else:
+            text = str(body.get("text", ""))
+        return {"content": [{"type": "text", "text": text}]}
+
     @tool("list_peers", "List the project names currently connected.", {})
     async def list_peers(args: dict[str, Any]) -> dict[str, Any]:
         peers = await connector.peers()
@@ -984,6 +1000,7 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         version="1.0.0",
         tools=[
             say,
+            protocol_section,
             list_peers,
             ask_operator,
             list_forms,

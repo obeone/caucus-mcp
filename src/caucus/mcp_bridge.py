@@ -561,6 +561,30 @@ def whoami() -> dict[str, object]:
 
 @mcp.tool()
 @_resilient_hub_call
+def protocol_section(name: str) -> dict[str, object]:
+    """Fetch one on-demand section of the operating protocol by ``name``; the protocol core names each section and states when to read it. Works before join.
+
+    Args:
+        name: Section name as advertised in the protocol core.
+
+    Returns:
+        ``{"version": <int>, "section": "<name>", "text": "<section>"}``, or
+        ``{"error": "unknown_section", "sections": [...]}`` when the name is not
+        one of them, or ``{"error": "hub_unreachable", ...}``.
+    """
+    gate = _ensure_armed()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/protocol", params={"section": name})
+        if resp.status_code == 404:
+            return dict(resp.json())
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+@_resilient_hub_call
 def list_peers() -> dict[str, object]:
     """List the project names currently connected. Works before join (scout before you commit)."""
     gate = _ensure_armed()
