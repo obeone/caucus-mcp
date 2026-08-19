@@ -368,6 +368,67 @@ async def test_set_status_safe_swallows_errors() -> None:
     await claude_agent._set_status_safe(_Boom(), "tok", "busy")  # type: ignore[arg-type]
 
 
+async def test_set_status_safe_bounds_a_hanging_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connector whose set_status never returns cannot hang the turn.
+
+    Regression guard for ``_STATUS_TIMEOUT``: without an internal bound, a
+    stuck transport (TCP stuck in SYN_SENT, a hub that accepts the socket but
+    never answers) would block indefinitely, breaking the "never delay the
+    turn" contract the docstring promises.
+    """
+    monkeypatch.setattr(claude_agent, "_STATUS_TIMEOUT", 0.05)
+
+    class _Hanging:
+        async def set_status(self, token: str, status: str) -> dict[str, object]:
+            await asyncio.sleep(10)
+            return {"status": status}  # pragma: no cover - never reached
+
+    # The outer wait_for is a generous safety margin: if the internal
+    # _STATUS_TIMEOUT bound were missing, this call would itself time out
+    # and the test would fail instead of hanging forever.
+    await asyncio.wait_for(
+        claude_agent._set_status_safe(_Hanging(), "tok", "busy"),  # type: ignore[arg-type]
+        timeout=2.0,
+    )
+
+
+async def test_drive_turn_clears_status_despite_cancellation() -> None:
+    """A turn cancelled mid-flight still clears its composing status.
+
+    ``_run_loop`` cancels the driver task on an operator interrupt/reset/
+    stop, which can land inside ``_drive_turn``'s own ``finally``. Without
+    shielding the status-clear call there, that cancellation would abort the
+    clear before it ever reaches the hub, leaving "composing a reply"
+    published forever.
+    """
+    connector = _FakeConnector([])
+
+    class _HangingClient:
+        async def query(self, prompt: str) -> None:
+            return None
+
+        async def receive_response(self) -> AsyncIterator[Any]:
+            await asyncio.sleep(10)
+            yield None  # pragma: no cover - never reached
+
+    task = asyncio.ensure_future(
+        claude_agent._drive_turn(_HangingClient(), "hi", connector, "tok")  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)  # let it reach the hang point inside receive_response
+    assert connector.statuses == [claude_agent._COMPOSING_STATUS]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Give the shielded background clear a moment to actually run — it is
+    # a separate task from the one we just awaited the cancellation of.
+    await asyncio.sleep(0.05)
+
+    assert connector.statuses == [claude_agent._COMPOSING_STATUS, ""]
+
+
 # --- operator control: interrupt / reset --------------------------------
 
 

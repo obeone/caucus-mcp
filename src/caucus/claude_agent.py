@@ -443,15 +443,23 @@ def _agent_text(message: object) -> str | None:
 #: Status line published for the duration of a turn — see :func:`_drive_turn`.
 _COMPOSING_STATUS = "composing a reply"
 
+#: Ceiling on a single status-heartbeat call — see :func:`_set_status_safe`.
+# Bounds the "never delay the turn" claim: without this a hung connector (a
+# TCP connect stuck in SYN_SENT, a hub that accepts the socket but never
+# answers) would block on the underlying httpx call indefinitely, since
+# HubConnector's own timeout only covers the *response*, not a stalled send.
+_STATUS_TIMEOUT = 2.0
+
 
 async def _set_status_safe(connector: HubConnector, token: str, status: str) -> None:
-    """Best-effort ``set_status`` call that never raises.
+    """Best-effort ``set_status`` call that never raises and never hangs.
 
     Used to publish the turn-lifecycle heartbeat (:data:`_COMPOSING_STATUS` on
     start, cleared on end) around :func:`_drive_turn`. A status update is a
     courtesy to peers running :meth:`~caucus.hub_connector.HubConnector.ping`,
-    not load-bearing for the conversation, so a transport failure or an
-    unexpected hub response is logged and swallowed rather than propagated —
+    not load-bearing for the conversation, so a transport failure, an
+    unexpected hub response, or the call simply taking too long
+    (:data:`_STATUS_TIMEOUT`) is logged and swallowed rather than propagated —
     it must never abort or delay the turn it is decorating.
 
     Args:
@@ -460,8 +468,13 @@ async def _set_status_safe(connector: HubConnector, token: str, status: str) -> 
         status: The one-line activity description; empty clears it.
     """
     try:
-        await connector.set_status(token, status)
+        await asyncio.wait_for(
+            connector.set_status(token, status), timeout=_STATUS_TIMEOUT
+        )
     except Exception as exc:  # noqa: BLE001 - best-effort, not actionable
+        # Catches asyncio.TimeoutError too (a plain alias of TimeoutError on
+        # the Python versions this package supports), so a stalled call is
+        # exactly as harmless as a failed one.
         logger.debug("set_status(%r) failed (best-effort): %s", status, exc)
 
 
@@ -492,7 +505,20 @@ async def _drive_turn(
             if text:
                 logger.info("agent: %s", text)
     finally:
-        await _set_status_safe(connector, token, "")
+        # _run_loop cancels the driver task on an operator interrupt/reset/
+        # stop, which can land here — inside this very finally. A bare
+        # `await` at that point would raise CancelledError immediately (the
+        # event loop delivers a pending cancellation at the next await
+        # point), so the status would never actually clear and "composing a
+        # reply" would stay published forever. asyncio.shield runs the clear
+        # as its own task, immune to *this* task's cancellation (it is still
+        # bounded by _STATUS_TIMEOUT inside _set_status_safe, so it cannot
+        # hang); we only need to swallow the CancelledError shield raises
+        # back at the await site so this finally itself still unwinds.
+        try:
+            await asyncio.shield(_set_status_safe(connector, token, ""))
+        except asyncio.CancelledError:
+            pass
 
 
 async def _drive_turns(
