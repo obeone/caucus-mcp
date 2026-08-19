@@ -85,6 +85,44 @@ def test_whoami_is_available_before_arming(
     assert info["joined"] is False
 
 
+# --- HTTP transport ------------------------------------------------------
+
+
+def test_tool_calls_share_one_keepalive_http_client(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successive tool calls reuse one client instead of reopening a connection.
+
+    The bridge used to build a fresh ``httpx.Client`` per tool call, paying a
+    full TCP (and, over a remote hub, TLS) handshake for every say/listen/join.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "keepalive")
+    bridge.join()
+    with bridge._client() as first:
+        pass
+    bridge.list_peers()
+    bridge.list_channels()
+    with bridge._client() as second:
+        pass
+
+    assert second is first
+    assert not first.is_closed  # the borrow must not close the shared client
+
+
+def test_repointing_the_hub_url_rebuilds_the_client(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached client is never reused against a different hub address."""
+    with bridge._client() as original:
+        pass
+    monkeypatch.setattr(bridge, "HUB_URL", "http://127.0.0.1:1")
+    with bridge._client() as rebuilt:
+        pass
+
+    assert rebuilt is not original
+    assert original.is_closed
+
+
 def test_join_flags_stale_protocol_when_behind(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
