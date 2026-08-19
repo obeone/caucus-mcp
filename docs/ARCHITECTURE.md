@@ -134,9 +134,20 @@ denominator; everything else is a connector to it.
   The driver also brackets each turn with a best-effort status heartbeat via
   `HubConnector.set_status`: `_drive_turn` publishes "composing a reply" before
   querying the SDK client and clears it again once the response is drained (in
-  a `finally`, so a raising turn still clears it), so a peer's `ping` sees the
-  agent mid-turn instead of a stale idle status. A status failure is logged and
-  swallowed — it must never abort or delay the turn it decorates.
+  a `finally`, so a raising *or cancelled* turn still clears it), so a peer's
+  `ping` sees the agent mid-turn instead of a stale idle status. A status
+  failure, or the call taking longer than `_STATUS_TIMEOUT` (2s), is logged and
+  swallowed rather than propagated. The clearing call always runs even when
+  `_run_loop` cancels the driver task (an operator interrupt/reset/stop) —
+  wrapped in `asyncio.shield` so a *second* cancel landing exactly during that
+  call cannot abort it, only detach the driver task from waiting on it. This
+  is deliberately not "never delay the turn": a driver cancellation can delay
+  the task's own shutdown by up to `_STATUS_TIMEOUT` while the clear
+  completes, in exchange for the status never staying stuck published. An
+  earlier version swallowed the shield's own `CancelledError` here to avoid
+  that delay, which instead deadlocked `_run_loop`'s shutdown entirely
+  (the swallowed cancellation never reached `_drive_turns`, so the driver
+  looped back to `turns.get()` forever) — fixed by letting it propagate.
 - **`mcp_http.py`** (no script): an in-process **Streamable HTTP** MCP server the
   hub mounts at `--mcp-path` (default `/mcp`), on by default for a loopback bind
   and opt-in (`--mcp-http`) for a non-loopback one. It

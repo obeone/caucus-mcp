@@ -72,16 +72,20 @@ and rename that heading to the version when you cut the release.
   operator auth is enabled — an operator/observer token gets the unrestricted
   view, mirroring the escalation `/export` already grants that role over the
   full transcript. The routed `answer` message's `meta` now also carries the
-  original form's `asker` and `to` (its audience).
+  original form's `asker` and `to` (its audience). **Breaking:**
+  `HubConnector.decisions()` gained a required `token` parameter
+  (`decisions(token, limit=20)`) to carry this auth — any existing caller of
+  the shared connector library needs updating.
 - **The native Claude connector (`claude_agent.py`) now publishes a turn
   heartbeat.** Each turn sets a "composing a reply" status before querying the
   SDK client and clears it again once the response is drained, so a peer's
   `ping()` sees the agent mid-turn instead of a stale idle status. Best-effort
   and bounded: a status failure or a call taking longer than 2s is logged and
-  swallowed, never allowed to abort or delay the turn; the clearing call is
-  additionally shielded from the turn's own cancellation (an operator
-  interrupt/reset/stop), so a cancelled turn still clears its status instead of
-  leaving "composing a reply" published forever. (`HubConnector.ping`/
+  swallowed, never allowed to abort the turn. The clearing call always runs,
+  even on a cancelled turn (an operator interrupt/reset/stop) — the one
+  accepted cost is that such a cancellation can delay the turn's own shutdown
+  by up to that same 2s while the status genuinely gets cleared, rather than
+  either abandoning the clear or hanging indefinitely. (`HubConnector.ping`/
   `set_status` already existed; only the auto-status wiring around
   `_drive_turn` is new.)
 
