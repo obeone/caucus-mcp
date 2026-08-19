@@ -64,19 +64,22 @@ denominator; everything else is a connector to it.
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers
   nothing until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes sixteen tools: `join`,
+  `.mcp.json` permanently and stay dormant. Exposes eighteen tools: `join`,
   `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
   the liveness pair `ping` (probe a peer's presence/status, answered hub-side
   without waking the peer's LLM) and `set_status` (publish a one-line "what I'm
-  working on" heartbeat for peers to read), the private-channel quartet
+  working on" heartbeat for peers to read), `peek` (a non-draining "is a turn
+  worth it?" probe of one's own pending queue), the private-channel quartet
   `join_channel`, `leave_channel`, `list_channels`, `set_channel_topic`,
   the talking-stick `floor` (a single tool taking `action=take|pass|drop|raise|
-  status`), and the operator-form pair `ask_operator`/`list_forms`.
+  status`), the operator-form pair `ask_operator`/`list_forms`, and `decisions`
+  (the settled-decisions ledger, so a late joiner catches up on resolved
+  operator forms without replaying the transcript).
   **The session arms lazily** — the first call to any tool fetches the protocol
   from `/protocol` and caches the revision, so there is no separate `setup`
   gesture; read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
-  `floor(action="status")`) work before joining, so an agent can scout first
-  (`whoami` stays open for diagnosis and never touches the hub). `join`
+  `decisions`, `floor(action="status")`) work before joining, so an agent can
+  scout first (`whoami` stays open for diagnosis and never touches the hub). `join`
   (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
   working-directory basename) `POST /register`s with the known protocol version,
   hands back the protocol text on the session's first join and whenever the hub
@@ -128,6 +131,12 @@ denominator; everything else is a connector to it.
   single sequential loop could not poll and reason at once, so it would only
   notice an interrupt once the turn was already over. Built-in tools
   (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
+  The driver also brackets each turn with a best-effort status heartbeat via
+  `HubConnector.set_status`: `_drive_turn` publishes "composing a reply" before
+  querying the SDK client and clears it again once the response is drained (in
+  a `finally`, so a raising turn still clears it), so a peer's `ping` sees the
+  agent mid-turn instead of a stale idle status. A status failure is logged and
+  swallowed — it must never abort or delay the turn it decorates.
 - **`mcp_http.py`** (no script): an in-process **Streamable HTTP** MCP server the
   hub mounts at `--mcp-path` (default `/mcp`), on by default for a loopback bind
   and opt-in (`--mcp-http`) for a non-loopback one. It
@@ -226,6 +235,19 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   replies. Channel membership lives in `Client.channels` and is ephemeral —
   `channels()` derives the live map and a channel vanishes once its last member
   leaves or is reaped.
+- **Peek (`GET /peek`, `HubState.peek`).** A non-draining "is a turn worth
+  it?" probe, authenticated exactly like `/receive`. `route()` maintains
+  `Client.pending` (+1) and `Client.last_pending` alongside each enqueue —
+  never by inspecting `Client.queue`/`Client.priority_queue` themselves —
+  and `GET /receive` mirrors the drain (`-len(drained)`) in both its priority
+  and regular-queue branches, so peeking can never race or interfere with a
+  concurrent receive. `peek()` returns `{"pending": int, "last": {"sender",
+  "preview"} | None}`, with `last` truncated to `PEEK_PREVIEW_CHARS` (120)
+  characters and `None` whenever nothing is pending. This is a cheap
+  approximation, not a hard invariant: the rare ring-buffer drop-oldest in
+  `_safe_put` (queue at `MAX_QUEUE_SIZE`) is not specially accounted for, so
+  sustained flooding of one peer could drift the counter a little high until
+  the next drain.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds the **chatter** queue without draining it (the priority queue still
   flows — see Routing); `STOPPED` floods a `stop` control into every queue and
@@ -296,9 +318,9 @@ operator answers once and the bundle fans back out to the right peers.
   `{"type":"form"}` UI event, and drops a system notice into the feed.
   `answer_form` / `cancel_form` pop it from the pending registry, **route an
   `answer`-kind `Message`** whose `meta` holds `{form_id, title, status,
-  answers}`, and push `{"type":"form_resolved"}` so the console clears the card.
-  `list_forms` returns only the still-pending forms; the `/ui` snapshot now
-  carries them so a reconnecting operator sees the backlog.
+  answers, asker}`, and push `{"type":"form_resolved"}` so the console clears
+  the card. `list_forms` returns only the still-pending forms; the `/ui`
+  snapshot now carries them so a reconnecting operator sees the backlog.
 - **Audience = routing, reused.** The answer is sent as `sender="human"`, so
   `route()`'s sender-exclusion delivers it to every other peer (the asker
   included) for a broadcast form, or to channel members only for a `#channel`
@@ -309,6 +331,15 @@ operator answers once and the bundle fans back out to the right peers.
   `list_forms()` (`GET /forms`) on both the bridge and the native connector;
   the protocol (revision 14) tells agents to `list_forms()` before pushing so a
   pending form is never duplicated.
+- **Decisions ledger (`GET /decisions`).** `HubState.decisions(limit=20)`
+  filters the bounded `_log` for `ANSWER`-kind messages (already routed there
+  by `answer_form`/`cancel_form`) and reshapes each into `{ts, asker, title,
+  status, answer_summary}`, oldest first, capped at `limit`. It reuses the
+  message's own recap text as `answer_summary` rather than re-rendering the
+  answers, so a late-joining agent can `decisions()` to catch up on questions
+  the operator already settled without replaying the whole transcript. Open
+  and unauthenticated, like `/forms` (an operator-form answer is no more
+  sensitive than the pending form it resolved).
 - **Operator surface.** `index.html` renders pending forms as a queue; the
   wizard walks one card per field (radio/checkbox/text/textarea, required
   validation, an `allow_other` "Other…" escape) to a recap card, then sends

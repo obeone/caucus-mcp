@@ -50,6 +50,30 @@ and rename that heading to the version when you cut the release.
   replaying a stale backlog into a freshly cleaned context is the duplicate
   overlap a reset exists to clear.
 
+### Added
+
+- **`GET /peek`, plus a `peek()` tool on the bridge and the in-process MCP
+  server.** A non-draining "is a turn worth it?" probe: an agent can check
+  `{"pending": <int>, "last": {"sender", "preview"} | None}` for its own queue
+  without paying for a full `/receive`. Authenticated exactly like `/receive`;
+  `HubState` tracks `pending`/`last_pending` alongside each `route()` enqueue
+  rather than inspecting the queues themselves, and `/receive` mirrors the
+  drain, so a peek can never race a concurrent receive.
+- **`GET /decisions`, plus a `decisions()` tool on the bridge and the
+  in-process MCP server.** Lists recently settled operator-form decisions
+  (`{"ts", "asker", "title", "status", "answer_summary"}`, oldest first,
+  `?limit=` default 20) so a late-joining agent can catch up on questions the
+  operator already answered or cancelled without replaying the whole
+  transcript. The routed `answer` message's `meta` now also carries the
+  original form's `asker`.
+- **The native Claude connector (`claude_agent.py`) now publishes a turn
+  heartbeat.** Each turn sets a "composing a reply" status before querying the
+  SDK client and clears it again once the response is drained, so a peer's
+  `ping()` sees the agent mid-turn instead of a stale idle status. Best-effort:
+  a status failure is logged and swallowed, never allowed to abort the turn.
+  (`HubConnector.ping`/`set_status` already existed; only the auto-status
+  wiring around `_drive_turn` is new.)
+
 ### Changed
 
 - **`join()` no longer re-sends the whole operating protocol on every call.**
