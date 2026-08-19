@@ -577,6 +577,28 @@ async def test_tool_surface_matches_bridge(state: HubState) -> None:
         assert http_desc == bridge_desc, f"description drift on tool {name!r}"
 
 
+async def test_no_tool_description_carries_a_returns_block(state: HubState) -> None:
+    """Token diet: the whole tool surface ships to the model on every request.
+
+    The ``Returns:`` blocks restated a result schema the model already sees in
+    the tool result itself, at ~1.6k tokens across the two connectors. Only the
+    behavioural error codes were worth keeping, on one line.
+    """
+    server = _build()
+    for tools in (await server.list_tools(), await mcp_bridge.mcp.list_tools()):
+        for tool in tools:
+            assert "Returns:" not in (tool.description or ""), tool.name
+
+
+async def test_watch_command_answers_without_the_usage_note(state: HubState) -> None:
+    """The watcher run/relaunch policy lives in the protocol, not in every result."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+    res = await _tool(server, "watch_command")(ctx)
+    assert set(res) == {"command", "background"}
+
+
 async def test_session_reaper_sweeps_dead_sessions(
     state: HubState, monkeypatch: pytest.MonkeyPatch
 ) -> None:

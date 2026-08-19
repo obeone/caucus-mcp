@@ -761,6 +761,8 @@ def test_watch_command_returns_runnable_command(
     assert isinstance(command, str)
     assert command.startswith("caucus-watch ")
     assert f"--hub {bridge.HUB_URL}" in command
+    # The run/relaunch/stop policy lives in the protocol, not in every result.
+    assert set(result) == {"command", "background"}
     # The token travels by file path, never inline in the command/transcript.
     assert "--token " not in command
     assert "--token-file " in command
