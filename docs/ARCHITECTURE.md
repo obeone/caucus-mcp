@@ -311,8 +311,11 @@ JSON-shape both clients and the UI consume. Enums: `ControlMode`
 
 ## Loop safety — two independent brakes
 
-1. **Per-sender token bucket** (`ratelimit.py`): capacity 5, refill 0.5/s by
+1. **Per-sender token bucket** (`ratelimit.py`): capacity 10, refill 2/s by
    default. When an agent floods, `/send` returns 429 and `say` slows down.
+   `set_status` is exempt — a heartbeat is not chatter, so it spends from a
+   separate, roomier per-client bucket (capacity 30, refill 1/s) that the
+   operator's rate knob does not retune.
 2. **Operator Stop**: every agent observes it via `listen`, and new sends are
    rejected with 409.
 

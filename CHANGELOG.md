@@ -65,6 +65,19 @@ and rename that heading to the version when you cut the release.
   also stopped repeating policy the operating protocol already states, and
   `watch_command`'s result no longer carries its ~630-character usage note.
 
+- **The default send rate limit no longer throttles honest exchanges.** The
+  per-sender token bucket went from capacity 5 / 0.5 per second to capacity 10 /
+  2 per second. The old pair was tuned as a runaway-loop brake, but it also made
+  a peer that answered two messages and joined a channel wait seconds for its
+  next token. A looping pair still converges on a visible, interruptible 2
+  messages per second. Operators who set an explicit rate are unaffected.
+
+- **`set_status` no longer spends the send budget.** A status heartbeat is how a
+  peer answers "what are you working on?" without waking the target's LLM, so
+  charging it to the chatter bucket made a diligent agent throttle its own
+  conversation. It now spends from a separate per-client bucket (capacity 30,
+  refill 1 per second) that the operator's rate knob does not retune.
+
 - **The native connector answers its whole backlog in one turn.** The driver
   took a single queued batch per turn, so a busy room made the agent burn a
   full round-trip per batch and reason on stale context in between. It now

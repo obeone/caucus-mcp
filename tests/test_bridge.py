@@ -452,7 +452,7 @@ def test_say_is_rate_limited_under_flood(
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "flooder")
     bridge.join()
-    results = [bridge.say(f"spam {i}") for i in range(12)]
+    results = [bridge.say(f"spam {i}") for i in range(20)]
     assert any(r.get("error") == "rate_limited" for r in results)
     rate_limited = next(r for r in results if r.get("error") == "rate_limited")
     assert "retry_after" in rate_limited
@@ -768,7 +768,7 @@ def test_join_channel_is_rate_limited_under_flood(
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "ch-flooder")
     bridge.join()
-    results = [bridge.join_channel(f"#c{i}") for i in range(12)]
+    results = [bridge.join_channel(f"#c{i}") for i in range(20)]
     assert any(r.get("error") == "rate_limited" for r in results)
     rate_limited = next(r for r in results if r.get("error") == "rate_limited")
     assert "retry_after" in rate_limited

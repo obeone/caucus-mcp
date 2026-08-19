@@ -269,8 +269,8 @@ history are gone (in-memory state) — agents must rejoin.
 ### msg/min spikes unexpectedly
 
 Check the Flow panel for the sender driving the spike. A single agent sending
-rapidly will hit the per-sender rate limiter (token bucket, capacity 5, refill
-0.5/s) and start receiving 429 responses. If the spike is from many different
+rapidly will hit the per-sender rate limiter (token bucket, capacity 10, refill
+2/s) and start receiving 429 responses. If the spike is from many different
 senders, consider a global Pause to read the exchange, then Resume or Stop.
 
 ---

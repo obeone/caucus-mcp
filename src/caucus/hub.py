@@ -1045,21 +1045,47 @@ async def export(
     )
 
 
+def _spend(bucket: TokenBucket) -> JSONResponse | None:
+    """Take one token from ``bucket``, or return the 429 body if it is empty.
+
+    Args:
+        bucket: The limiter to charge.
+
+    Returns:
+        ``None`` when the call is allowed, else a 429 :class:`JSONResponse`
+        carrying the ``retry_after`` hint the connectors surface to the agent.
+    """
+    if bucket.allow():
+        return None
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "rate limited", "retry_after": round(bucket.retry_after(), 2)},
+    )
+
+
 def _check_rate_limit(client: Client) -> JSONResponse | None:
-    """Return a 429 response if the client's token bucket is empty, else ``None``.
+    """Return a 429 response if the client's chatter bucket is empty, else ``None``.
 
     Shared by the write endpoints so channel membership churn is held to the
     same per-sender brake as ``/send`` — otherwise a join/leave loop could flood
     every operator UI queue with membership events, bypassing the rate limiter.
+    ``/status`` is the one exception: see :func:`_check_status_rate_limit`.
     """
     assert client.bucket is not None
-    if not client.bucket.allow():
-        retry = round(client.bucket.retry_after(), 2)
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "rate limited", "retry_after": retry},
-        )
-    return None
+    return _spend(client.bucket)
+
+
+def _check_status_rate_limit(client: Client) -> JSONResponse | None:
+    """Return a 429 response if the client's heartbeat bucket is empty.
+
+    A ``set_status`` update is a heartbeat, not conversation: it is how a peer
+    answers "what are you working on?" without waking the target's LLM. Charging
+    it to the chatter bucket made a diligent agent throttle its own exchange, so
+    it spends from :attr:`~caucus.state.Client.status_bucket` instead — roomier,
+    and untouched by the operator's chatter rate knob. Still bounded, so the
+    endpoint is not a free unauthenticated-by-volume write.
+    """
+    return _spend(client.status_bucket)
 
 
 @app.post("/channels/join", response_model=None)
@@ -1562,12 +1588,14 @@ async def status_set(req: StatusRequest) -> dict[str, object] | JSONResponse:
     its task?" — so an agent publishes a one-line "what I'm doing" here when it
     picks up work and refreshes it as the work moves. A blank ``status`` clears
     it. Rejected with 401 when the token is unknown, and 429 when the caller
-    exceeds its rate limit (the same per-sender brake as ``/send``).
+    exceeds its *heartbeat* rate limit — a separate, roomier bucket from the
+    ``/send`` brake, so reporting progress never eats into an agent's ability to
+    talk (see :func:`_check_status_rate_limit`).
     """
     client = state.client_for(req.token)
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
-    limited = _check_rate_limit(client)
+    limited = _check_status_rate_limit(client)
     if limited is not None:
         return limited
     state.set_status(req.token, req.status)
