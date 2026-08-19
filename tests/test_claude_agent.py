@@ -12,10 +12,12 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import pytest
 
 from caucus import claude_agent
-from caucus.hub_connector import Inbound
+from caucus import hub as hub_module
+from caucus.hub_connector import HubConnector, Inbound
 
 
 # --- tool policy ---------------------------------------------------------
@@ -163,12 +165,20 @@ def _factory(*clients: _FakeClient) -> Any:
 
 
 class _FakeConnector:
-    """Replays a scripted sequence of :class:`Inbound` batches, then stops."""
+    """Replays a scripted sequence of :class:`Inbound` batches, then stops.
+
+    Records the ``ack_seq`` piggybacked on each poll in :attr:`acks`, so tests
+    can assert the poller acknowledges the batch it just consumed.
+    """
 
     def __init__(self, script: list[Inbound]) -> None:
         self._script = list(script)
+        self.acks: list[int | None] = []
 
-    async def receive(self, token: str, timeout: float) -> Inbound:
+    async def receive(
+        self, token: str, timeout: float, *, ack_seq: int | None = None
+    ) -> Inbound:
+        self.acks.append(ack_seq)
         if self._script:
             return self._script.pop(0)
         return Inbound(messages=[], mode="running", stop=True)
@@ -274,6 +284,114 @@ async def test_run_loop_reset_rebuilds_client_with_fresh_context() -> None:
     # the one that answers the post-reset traffic.
     assert first.interrupts == 1
     assert any("again" in q for q in second.queries)
+
+
+# --- ACK piggyback -------------------------------------------------------
+
+
+async def test_poll_inbound_acks_the_previous_batch_on_the_next_poll() -> None:
+    """Each poll piggybacks the highest seq of the batch the previous one gave.
+
+    Without this the hub's unacked ring buffer never drains and a reap+revive
+    replays the whole backlog as fresh inbound.
+    """
+    client = _FakeClient()
+    connector = _FakeConnector(
+        [
+            Inbound(
+                [
+                    {"sender": "a", "recipient": "all", "content": "one", "seq": 7},
+                    {"sender": "a", "recipient": "all", "content": "two", "seq": 9},
+                ],
+                "running",
+                False,
+            ),
+            Inbound([], "running", False),  # quiet: nothing new to acknowledge
+        ]
+    )
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    await claude_agent._poll_inbound(
+        connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+    )
+    # First poll has nothing to ack; the second carries the batch's highest seq;
+    # the third (after a quiet poll) carries nothing again.
+    assert connector.acks[:3] == [None, 9, None]
+
+
+async def test_poll_inbound_retries_an_unsent_ack_after_a_hub_error() -> None:
+    """A failed poll must not swallow the ACK it was carrying."""
+
+    class _FlakyConnector(_FakeConnector):
+        """Raises once on the poll that would have carried the first ACK."""
+
+        def __init__(self, script: list[Inbound]) -> None:
+            super().__init__(script)
+            self._boom = True
+
+        async def receive(
+            self, token: str, timeout: float, *, ack_seq: int | None = None
+        ) -> Inbound:
+            if ack_seq is not None and self._boom:
+                self._boom = False
+                self.acks.append(ack_seq)
+                raise httpx.ConnectError("hub went away")
+            return await super().receive(token, timeout, ack_seq=ack_seq)
+
+    client = _FakeClient()
+    connector = _FlakyConnector(
+        [Inbound([{"sender": "a", "recipient": "all", "content": "hi", "seq": 4}], "running", False)]
+    )
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    # The backoff floor is 1s; shrink it so the retry is immediate.
+    original = claude_agent._BACKOFF_MIN
+    claude_agent._BACKOFF_MIN = 0.0
+    try:
+        await claude_agent._poll_inbound(
+            connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+        )
+    finally:
+        claude_agent._BACKOFF_MIN = original
+    # The ACK the failed poll was carrying is re-sent on the retry, not lost.
+    assert connector.acks.count(4) == 2
+
+
+async def test_poll_inbound_acks_drain_the_hub_replay_buffer(live_hub: str) -> None:
+    """End to end: the hub's unacked buffer drains as the poller acknowledges.
+
+    Runs the real poller against a real hub, so the regression is pinned on the
+    hub-side bookkeeping (``last_acked_seq`` / ``unacked``) rather than on the
+    connector call alone.
+    """
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("ack-drain-rx", None)
+        peer = await hub.register("ack-drain-tx", None)
+        await hub.send(peer.token, "ack-drain-rx", "please ack me")
+
+        client = _FakeClient()
+        stop, reset = asyncio.Event(), asyncio.Event()
+        turns: asyncio.Queue[str] = asyncio.Queue()
+        poller = asyncio.ensure_future(
+            claude_agent._poll_inbound(
+                hub, me.token, client, turns, 1.0, stop, reset  # type: ignore[arg-type]
+            )
+        )
+        try:
+            hub_client = hub_module.state.client_for(me.token)
+            assert hub_client is not None
+            deadline = asyncio.get_event_loop().time() + 10.0
+            while (
+                hub_client.last_acked_seq == 0
+                and asyncio.get_event_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.05)
+        finally:
+            poller.cancel()
+            await asyncio.gather(poller, return_exceptions=True)
+
+    assert hub_client.last_acked_seq > 0
+    assert not [m for m in hub_client.unacked if m.seq > hub_client.last_acked_seq]
 
 
 async def test_safe_interrupt_swallows_errors() -> None:
