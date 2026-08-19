@@ -131,6 +131,65 @@ async def test_flooding_both_queues_loses_and_reorders_nothing(
     assert [c for c in received if c.startswith("o")] == [f"o{i}" for i in range(rounds)]
 
 
+async def test_requeue_front_restores_the_head_and_preserves_order() -> None:
+    """The happy path: the message goes back ahead of what is already queued."""
+    queue: asyncio.Queue[Message] = asyncio.Queue(maxsize=4)
+    held = Message(sender="peer", recipient="alpha", content="held", seq=1)
+    for i in range(2, 4):
+        queue.put_nowait(Message(sender="peer", recipient="alpha", content=f"m{i}", seq=i))
+
+    hub_module._requeue_front(queue, held)
+
+    assert [queue.get_nowait().content for _ in range(3)] == ["held", "m2", "m3"]
+
+
+async def test_requeue_front_drops_the_newest_when_the_queue_refilled() -> None:
+    """A queue that filled up while the getter held a message must not raise.
+
+    The getter completes on an earlier scheduling step, so ``route`` can refill
+    the queue to capacity before the message is handed back. Re-adding all of it
+    then overflows: that used to raise ``QueueFull`` out of the poll's cleanup
+    path, which would strand ``active_polls`` and wedge the peer's identity.
+    """
+    queue: asyncio.Queue[Message] = asyncio.Queue(maxsize=3)
+    held = Message(sender="peer", recipient="alpha", content="held", seq=1)
+    # The queue refilled to capacity while `held` sat outside it.
+    for i in range(2, 5):
+        queue.put_nowait(Message(sender="peer", recipient="alpha", content=f"m{i}", seq=i))
+    assert queue.full()
+
+    hub_module._requeue_front(queue, held)  # must not raise
+
+    # The older head survives in order; the newest leftover is dropped, exactly
+    # as HubState._safe_put keeps the queue a bounded ring buffer.
+    assert queue.qsize() == 3
+    assert [queue.get_nowait().content for _ in range(3)] == ["held", "m2", "m3"]
+
+
+async def test_poll_cleanup_failure_still_releases_the_listener_slot(
+    state: HubState, http: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``active_polls`` is decremented even if the cleanup path blows up.
+
+    A leaked count makes ``register`` refuse every re-join under that name as a
+    colliding duplicate, so the project loses its own identity until the hub
+    restarts. The counter must survive a failure it did not cause.
+    """
+    token = _join(state, "alpha")
+    client = state.client_for(token)
+    assert client is not None
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("cleanup exploded")
+
+    monkeypatch.setattr(hub_module, "_release_getter", _boom)
+
+    with pytest.raises(RuntimeError, match="cleanup exploded"):
+        await http.get("/receive", params={"timeout": 0.2}, headers=_auth(token))
+
+    assert client.active_polls == 0
+
+
 async def test_one_response_returns_both_queues_in_seq_order(
     state: HubState, http: httpx.AsyncClient
 ) -> None:
