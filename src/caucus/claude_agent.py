@@ -440,25 +440,67 @@ def _agent_text(message: object) -> str | None:
     return " ".join(parts) if parts else None
 
 
-async def _drive_turn(client: _AgentClient, prompt: str) -> None:
+#: Status line published for the duration of a turn — see :func:`_drive_turn`.
+_COMPOSING_STATUS = "composing a reply"
+
+
+async def _set_status_safe(connector: HubConnector, token: str, status: str) -> None:
+    """Best-effort ``set_status`` call that never raises.
+
+    Used to publish the turn-lifecycle heartbeat (:data:`_COMPOSING_STATUS` on
+    start, cleared on end) around :func:`_drive_turn`. A status update is a
+    courtesy to peers running :meth:`~caucus.hub_connector.HubConnector.ping`,
+    not load-bearing for the conversation, so a transport failure or an
+    unexpected hub response is logged and swallowed rather than propagated —
+    it must never abort or delay the turn it is decorating.
+
+    Args:
+        connector: The hub connector to publish the status through.
+        token: The agent's access token.
+        status: The one-line activity description; empty clears it.
+    """
+    try:
+        await connector.set_status(token, status)
+    except Exception as exc:  # noqa: BLE001 - best-effort, not actionable
+        logger.debug("set_status(%r) failed (best-effort): %s", status, exc)
+
+
+async def _drive_turn(
+    client: _AgentClient, prompt: str, connector: HubConnector, token: str
+) -> None:
     """Send one user turn and drain the agent's response to completion.
 
     The response is consumed fully (no early ``break``, per the SDK's async
     cleanup guidance); any assistant text is logged to stderr so the operator
-    can follow the agent's reasoning alongside the live room feed.
+    can follow the agent's reasoning alongside the live room feed. Publishes
+    :data:`_COMPOSING_STATUS` for the duration of the turn and clears it again
+    once the response is drained (in a ``finally``, so a raising turn still
+    clears it), letting a peer's :meth:`~caucus.hub_connector.HubConnector.ping`
+    see "composing a reply" instead of a stale idle status.
 
     Args:
         client: The SDK client (or a structural stand-in).
         prompt: The user turn to send.
+        connector: The hub connector to publish the status through.
+        token: The agent's access token.
     """
-    await client.query(prompt)
-    async for message in client.receive_response():
-        text = _agent_text(message)
-        if text:
-            logger.info("agent: %s", text)
+    await _set_status_safe(connector, token, _COMPOSING_STATUS)
+    try:
+        await client.query(prompt)
+        async for message in client.receive_response():
+            text = _agent_text(message)
+            if text:
+                logger.info("agent: %s", text)
+    finally:
+        await _set_status_safe(connector, token, "")
 
 
-async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
+async def _drive_turns(
+    client: _AgentClient,
+    turns: asyncio.Queue[str],
+    connector: HubConnector,
+    token: str,
+) -> None:
     """Consume queued user turns and drive each backlog to completion on ``client``.
 
     Runs as a background task for one client lifecycle, blocking on the shared
@@ -476,6 +518,9 @@ async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
     Args:
         client: The SDK client driving the conversation.
         turns: Shared queue of user turns fed by :func:`_poll_inbound`.
+        connector: The hub connector, threaded through to :func:`_drive_turn`
+            for the turn-lifecycle status heartbeat.
+        token: The agent's access token.
     """
     while True:
         prompts = [await turns.get()]
@@ -487,7 +532,7 @@ async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
             except asyncio.QueueEmpty:
                 break
         try:
-            await _drive_turn(client, "\n\n".join(prompts))
+            await _drive_turn(client, "\n\n".join(prompts), connector, token)
         finally:
             # One task_done per item taken, or Queue.join() never unblocks and
             # _drain_pending hangs the shutdown path.
@@ -707,7 +752,9 @@ async def _run_loop(
     while not stop.is_set():
         reset = asyncio.Event()
         async with client_factory() as client:
-            driver = asyncio.ensure_future(_drive_turns(client, turns))
+            driver = asyncio.ensure_future(
+                _drive_turns(client, turns, connector, token)
+            )
             poller = asyncio.ensure_future(
                 _poll_inbound(
                     connector, token, client, turns, poll_timeout, stop, reset
