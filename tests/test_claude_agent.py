@@ -397,11 +397,16 @@ async def test_set_status_safe_bounds_a_hanging_connector(
 async def test_drive_turn_clears_status_despite_cancellation() -> None:
     """A turn cancelled mid-flight still clears its composing status.
 
-    ``_run_loop`` cancels the driver task on an operator interrupt/reset/
-    stop, which can land inside ``_drive_turn``'s own ``finally``. Without
-    shielding the status-clear call there, that cancellation would abort the
-    clear before it ever reaches the hub, leaving "composing a reply"
-    published forever.
+    The common case: ``_run_loop`` cancels the driver task on an operator
+    interrupt/reset/stop while it is mid-turn (inside ``client.query()`` /
+    ``receive_response()``, the ``try`` body). That single cancellation is
+    delivered and consumed there, so ``_drive_turn``'s ``finally`` then runs
+    the clearing call as an ordinary, no-longer-cancelled await — it
+    completes normally before the original ``CancelledError`` finishes
+    propagating out of the coroutine. See
+    ``test_cancel_during_shielded_clear_does_not_hang_shutdown`` for the
+    separate, narrower race this ``finally`` also has to survive: a *second*
+    cancel landing exactly while awaiting the clear itself.
     """
     connector = _FakeConnector([])
 
@@ -422,11 +427,68 @@ async def test_drive_turn_clears_status_despite_cancellation() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # Give the shielded background clear a moment to actually run — it is
-    # a separate task from the one we just awaited the cancellation of.
-    await asyncio.sleep(0.05)
 
+    # The clear ran to completion as part of this same task's unwind (the
+    # cancellation had already been consumed by receive_response's sleep),
+    # so it is visible immediately with no extra wait needed.
     assert connector.statuses == [claude_agent._COMPOSING_STATUS, ""]
+
+
+class _SlowClearConnector:
+    """Records ``set_status`` calls; the *clearing* call blocks until sleep elapses.
+
+    Lets a test synchronize on "the driver is now suspended inside the
+    shielded clear" (via :attr:`clear_started`) before cancelling it —
+    reproducing the exact race :func:`asyncio.shield` exists for, which
+    ``test_drive_turn_clears_status_despite_cancellation`` above does not
+    construct (there, the cancel lands earlier, in the turn body).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.clear_started = asyncio.Event()
+
+    async def set_status(self, token: str, status: str) -> dict[str, object]:
+        self.calls.append(status)
+        if status == "":
+            self.clear_started.set()
+            await asyncio.sleep(0.5)  # slow round-trip -> wide cancel window
+        return {"status": status or None}
+
+
+async def test_cancel_during_shielded_clear_does_not_hang_shutdown() -> None:
+    """A cancel landing exactly inside the shielded clear must not deadlock.
+
+    Regression test for a real hang, reproduced independently during review:
+    with a ``try/except CancelledError: pass`` around the shielded clear, a
+    cancellation delivered while awaiting it was *swallowed* instead of
+    propagating — so ``_drive_turns`` fell through to ``turns.get()`` and
+    waited forever instead of ending, and ``_run_loop``'s
+    ``await asyncio.gather(driver, poller, ...)`` never returned. The fix is
+    a bare ``await asyncio.shield(...)`` with no surrounding try/except: only
+    the outer await is cancelled (verified to return immediately, not
+    bounded by the shielded call's own duration), so the cancellation still
+    reaches and ends ``_drive_turns`` promptly; the shielded call itself
+    keeps running in the background to actually clear the status.
+    """
+    connector = _SlowClearConnector()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+    driver = asyncio.ensure_future(
+        claude_agent._drive_turns(_FakeClient(), turns, connector, "tok")  # type: ignore[arg-type]
+    )
+    await turns.put("hello")
+    await asyncio.wait_for(connector.clear_started.wait(), timeout=2.0)
+    # The driver is now suspended inside `await asyncio.shield(...)`.
+    driver.cancel()
+
+    # Must settle promptly — this is what actually deadlocked before the fix.
+    await asyncio.wait_for(asyncio.gather(driver, return_exceptions=True), timeout=1.0)
+    assert driver.cancelled()
+
+    # The clear's own append happens before its simulated network delay, so
+    # it is already recorded even though the round-trip itself is still
+    # running in the background at this point.
+    assert connector.calls == [claude_agent._COMPOSING_STATUS, ""]
 
 
 # --- operator control: interrupt / reset --------------------------------

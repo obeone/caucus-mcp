@@ -487,9 +487,11 @@ async def _drive_turn(
     cleanup guidance); any assistant text is logged to stderr so the operator
     can follow the agent's reasoning alongside the live room feed. Publishes
     :data:`_COMPOSING_STATUS` for the duration of the turn and clears it again
-    once the response is drained (in a ``finally``, so a raising turn still
-    clears it), letting a peer's :meth:`~caucus.hub_connector.HubConnector.ping`
-    see "composing a reply" instead of a stale idle status.
+    once the response is drained (in a ``finally``, so a raising or cancelled
+    turn still clears it — see the ``finally`` block for why the clear must
+    run unconditionally, and its bounded shutdown-delay cost), letting a
+    peer's :meth:`~caucus.hub_connector.HubConnector.ping` see "composing a
+    reply" instead of a stale idle status.
 
     Args:
         client: The SDK client (or a structural stand-in).
@@ -506,19 +508,33 @@ async def _drive_turn(
                 logger.info("agent: %s", text)
     finally:
         # _run_loop cancels the driver task on an operator interrupt/reset/
-        # stop, which can land here — inside this very finally. A bare
-        # `await` at that point would raise CancelledError immediately (the
-        # event loop delivers a pending cancellation at the next await
-        # point), so the status would never actually clear and "composing a
-        # reply" would stay published forever. asyncio.shield runs the clear
-        # as its own task, immune to *this* task's cancellation (it is still
-        # bounded by _STATUS_TIMEOUT inside _set_status_safe, so it cannot
-        # hang); we only need to swallow the CancelledError shield raises
-        # back at the await site so this finally itself still unwinds.
-        try:
-            await asyncio.shield(_set_status_safe(connector, token, ""))
-        except asyncio.CancelledError:
-            pass
+        # stop. The common case: that cancellation lands in the try body
+        # above (e.g. mid query()/receive_response()), so by the time we
+        # reach this line it has already been delivered and consumed —
+        # this await now runs as an ordinary, non-cancelled one, so it
+        # blocks until the clear actually completes (bounded by
+        # _STATUS_TIMEOUT inside _set_status_safe). That is a real, accepted
+        # cost: a driver cancellation can delay this task's own shutdown —
+        # and therefore _run_loop's gather() — by up to _STATUS_TIMEOUT
+        # while the status genuinely gets cleared, rather than leaving
+        # "composing a reply" published forever.
+        #
+        # asyncio.shield exists for the rarer case where a *second* cancel
+        # lands exactly while we are awaiting the clear itself. Without it,
+        # that second cancellation would abort the clear along with this
+        # await. With it, only the outer await is cancelled (returning
+        # immediately — verified empirically, not bounded by the timeout);
+        # the shielded call keeps running as its own task in the background,
+        # still clearing the status within _STATUS_TIMEOUT, just no longer
+        # observed by this (now-finishing) task.
+        #
+        # Do NOT wrap this in try/except CancelledError. Swallowing it here
+        # was tried and reproduced a shutdown hang: the exception never
+        # reaches _drive_turns, so the driver falls through to
+        # `turns.get()` and waits forever instead of actually ending, and
+        # _run_loop's `await asyncio.gather(driver, poller, ...)` never
+        # returns.
+        await asyncio.shield(_set_status_safe(connector, token, ""))
 
 
 async def _drive_turns(
