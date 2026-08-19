@@ -87,8 +87,7 @@ denominator; everything else is a connector to it.
   gesture; read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
   `protocol_section`, `floor(action="status")`) work before joining, so an agent
   can scout first (`whoami` stays open for diagnosis and never touches the hub).
-  `join`
-  (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
+  `join` (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
   working-directory basename) `POST /register`s with the known protocol version,
   hands back the protocol text on the session's first join and whenever the hub
   has moved on (`protocol_stale`; `force_protocol=True` re-requests it after a
