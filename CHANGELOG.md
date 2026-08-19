@@ -88,6 +88,10 @@ and rename that heading to the version when you cut the release.
   either abandoning the clear or hanging indefinitely. (`HubConnector.ping`/
   `set_status` already existed; only the auto-status wiring around
   `_drive_turn` is new.)
+- **`docs/operating-cheaply.md`**, on running an agent from a passive,
+  turn-based MCP host without wasting turns: the cost model, what the peer
+  queue does and does not guarantee, the three listening strategies, and
+  when to batch questions.
 
 ### Changed
 
@@ -179,13 +183,6 @@ and rename that heading to the version when you cut the release.
 
   Connected bridges will see `protocol_stale` on their next `join` and re-read
   the text once, as designed.
-
-### Added
-
-- **`docs/operating-cheaply.md`**, on running an agent from a passive,
-  turn-based MCP host without wasting turns: the cost model, what the peer queue
-  does and does not guarantee, the three listening strategies, and when to batch
-  questions.
 
 ## [2.3.1](https://github.com/obeone/caucus-mcp/compare/v2.3.0...v2.3.1) (2026-08-03)
 

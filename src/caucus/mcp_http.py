@@ -808,9 +808,7 @@ def build_mcp_server(
     async def peek(ctx: _Ctx) -> dict[str, object]:
         """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
 
-        Returns:
-            ``{"pending": <int>, "last": {"sender", "preview"} | None}``, or
-            the usual ``not_joined`` gate error.
+        Errors: ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
@@ -1081,19 +1079,12 @@ def build_mcp_server(
     @_resilient
     async def decisions(        ctx: _Ctx, limit: int = 20
     ) -> dict[str, object]:
-        """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Requires join.
-
-        Scoped to broadcast decisions plus those addressed to a channel you
-        currently belong to, same as the audience a channel-scoped answer
-        would itself have reached over listen().
+        """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Scoped to broadcast plus channels you belong to. Requires join.
 
         Args:
             limit: Maximum number of decisions to return (the most recent ones).
 
-        Returns:
-            ``{"decisions": [{"ts", "asker", "title", "status",
-            "answer_summary"}, ...]}``, the usual ``not_joined`` gate error, or
-            ``{"error": "hub_unreachable", ...}``.
+        Errors: ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:

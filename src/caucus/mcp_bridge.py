@@ -598,9 +598,7 @@ def ping(peer: str) -> dict[str, object]:
 def peek() -> dict[str, object]:
     """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
 
-    Returns:
-        ``{"pending": <int>, "last": {"sender", "preview"} | None}``, or the
-        usual ``not_joined`` gate error.
+    Errors: ``not_joined``.
     """
     gate = _ensure_armed()
     if gate is not None:
@@ -886,19 +884,12 @@ def list_forms() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def decisions(limit: int = 20) -> dict[str, object]:
-    """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Requires join.
-
-    Scoped to broadcast decisions plus those addressed to a channel you
-    currently belong to, same as the audience a channel-scoped answer
-    would itself have reached over listen().
+    """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Scoped to broadcast plus channels you belong to. Requires join.
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
 
-    Returns:
-        ``{"decisions": [{"ts", "asker", "title", "status",
-        "answer_summary"}, ...]}``, the usual ``not_joined`` gate error, or
-        ``{"error": "hub_unreachable", ...}``.
+    Errors: ``not_joined``.
     """
     gate = _ensure_armed()
     if gate is not None:
