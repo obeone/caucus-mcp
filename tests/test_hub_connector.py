@@ -416,15 +416,21 @@ async def test_decisions_lists_settled_form(live_hub: str) -> None:
     from caucus.models import BROADCAST, Field, FieldType
 
     async with HubConnector(live_hub) as hub:
-        await hub.register("conn-decisions-asker", None)
+        asker = await hub.register("conn-decisions-asker", None)
         fld = Field(key="ok", label="Proceed?", type=FieldType.RADIO, options=["yes"])
         form = hub_module.state.create_form(
             "conn-decisions-asker", BROADCAST, "Ship it?", [fld]
         )
         hub_module.state.answer_form(form.id, {"ok": "yes"})
 
-        entries = await hub.decisions()
+        entries = await hub.decisions(asker.token)
     assert any(e["title"] == "Ship it?" and e["asker"] == "conn-decisions-asker" for e in entries)
+
+
+async def test_decisions_requires_a_token(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        with pytest.raises(httpx.HTTPStatusError):
+            await hub.decisions("bogus")
 
 
 async def test_receive_passes_answer_meta_through(live_hub: str) -> None:

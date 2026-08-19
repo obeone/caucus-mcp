@@ -593,14 +593,19 @@ class HubConnector:
         resp.raise_for_status()
         return list(resp.json().get("forms", []))
 
-    async def decisions(self, limit: int = 20) -> list[dict[str, object]]:
+    async def decisions(self, token: str, limit: int = 20) -> list[dict[str, object]]:
         """List recently settled operator-form decisions, oldest first.
 
         The answered/cancelled counterpart to :meth:`list_forms`: lets a
         late-joining agent catch up on questions the operator already
-        resolved, without replaying the whole transcript.
+        resolved, without replaying the whole transcript. Requires a token
+        (unlike :meth:`list_forms`) — a settled decision can carry a
+        channel's private answer text, so the hub scopes the result to
+        broadcast decisions plus those addressed to a channel the token
+        holder currently belongs to.
 
         Args:
+            token: The caller's access token.
             limit: Maximum number of decisions to return (the most recent
                 ones).
 
@@ -609,10 +614,15 @@ class HubConnector:
             "title", "status", "answer_summary"}``.
 
         Raises:
-            httpx.HTTPError: If the hub is unreachable or returns an error.
+            httpx.HTTPError: If the hub is unreachable or returns an error
+                (e.g. 401 unknown token).
         """
         http = self._require_http()
-        resp = await http.get("/decisions", params={"limit": limit})
+        resp = await http.get(
+            "/decisions",
+            params={"limit": limit},
+            headers={"Authorization": f"Bearer {token}"},
+        )
         resp.raise_for_status()
         return list(resp.json().get("decisions", []))
 

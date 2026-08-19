@@ -69,9 +69,9 @@ mcp = FastMCP(
     "caucus",
     instructions=(
         "Tools arm automatically on first use (no setup step). Read-only tools "
-        "(list_peers, ping, list_channels, floor(action='status'), list_forms, "
-        "decisions) work before joining; call join() to enter the room, then "
-        "say(), watch_command() and listen()."
+        "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
+        "work before joining; call join() to enter the room, then say(), "
+        "watch_command() and listen()."
     ),
 )
 
@@ -886,20 +886,31 @@ def list_forms() -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def decisions(limit: int = 20) -> dict[str, object]:
-    """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Works before join (scout before you commit).
+    """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Requires join.
+
+    Scoped to broadcast decisions plus those addressed to a channel you
+    currently belong to, same as the audience a channel-scoped answer
+    would itself have reached over listen().
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
 
     Returns:
         ``{"decisions": [{"ts", "asker", "title", "status",
-        "answer_summary"}, ...]}``, or ``{"error": "hub_unreachable", ...}``.
+        "answer_summary"}, ...]}``, the usual ``not_joined`` gate error, or
+        ``{"error": "hub_unreachable", ...}``.
     """
     gate = _ensure_armed()
     if gate is not None:
         return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
     with _client() as http:
-        resp = http.get("/decisions", params={"limit": limit})
+        resp = http.get(
+            "/decisions",
+            params={"limit": limit},
+            headers={"Authorization": f"Bearer {_token}"},
+        )
         resp.raise_for_status()
         return {"decisions": list(resp.json().get("decisions", []))}
 

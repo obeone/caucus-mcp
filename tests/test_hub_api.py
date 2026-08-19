@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import caucus.hub as hub_module
-from caucus.hub import PROTOCOL_VERSION
+from caucus.hub import PROTOCOL_VERSION, AuthConfig
 from caucus.state import HubState
 
 
@@ -1197,22 +1197,42 @@ def test_peek_no_token_anywhere_is_401(client: TestClient) -> None:
 # --- /decisions --------------------------------------------------------
 
 
-def test_decisions_empty_when_nothing_answered(client: TestClient) -> None:
-    assert client.get("/decisions").json() == {"decisions": []}
-
-
-def test_decisions_lists_answered_form(client: TestClient) -> None:
-    token = _register(client, "alpha")
-    form_id = client.post(
-        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
-    ).json()["form_id"]
-
+def _answer(client: TestClient, form_id: str, answers: dict[str, object]) -> None:
+    """Answer a pending form over /ui (mirrors the operator wizard's flow)."""
     with client.websocket_connect("/ui") as ws:
         assert ws.receive_json()["type"] == "auth_ok"
         assert ws.receive_json()["type"] == "snapshot"
-        ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
+        ws.send_json({"answer": {"id": form_id, "answers": answers}})
 
-    decisions = client.get("/decisions").json()["decisions"]
+
+def test_decisions_requires_a_token(client: TestClient) -> None:
+    assert client.get("/decisions").status_code == 401
+
+
+def test_decisions_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.get("/decisions", headers={"Authorization": "Bearer bogus"})
+    assert resp.status_code == 401
+
+
+def test_decisions_empty_when_nothing_answered(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    body = client.get(
+        "/decisions", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert body == {"decisions": []}
+
+
+def test_decisions_broadcast_visible_to_any_joined_peer(client: TestClient) -> None:
+    asker = _register(client, "alpha")
+    bystander = _register(client, "beta")  # never touches the form at all
+    form_id = client.post(
+        "/ask", json={"token": asker, "title": "Deploy?", "fields": [_radio_field()]}
+    ).json()["form_id"]
+    _answer(client, form_id, {"ok": "yes"})
+
+    decisions = client.get(
+        "/decisions", headers={"Authorization": f"Bearer {bystander}"}
+    ).json()["decisions"]
     assert len(decisions) == 1
     entry = decisions[0]
     assert entry["asker"] == "alpha"
@@ -1220,6 +1240,95 @@ def test_decisions_lists_answered_form(client: TestClient) -> None:
     assert entry["status"] == "answered"
     assert "Deploy?" in entry["answer_summary"]
     assert "ts" in entry
+
+
+def test_decisions_channel_scoped_answer_invisible_to_non_member(
+    client: TestClient,
+) -> None:
+    asker = _register(client, "alpha")
+    outsider = _register(client, "beta")  # never joins #secret
+    form_id = client.post(
+        "/ask",
+        json={
+            "token": asker,
+            "to": "#secret",
+            "title": "Rotate the key?",
+            "fields": [_radio_field()],
+        },
+    ).json()["form_id"]
+    _answer(client, form_id, {"ok": "yes"})
+
+    decisions = client.get(
+        "/decisions", headers={"Authorization": f"Bearer {outsider}"}
+    ).json()["decisions"]
+    assert decisions == []
+
+
+def test_decisions_channel_scoped_answer_visible_to_member(
+    client: TestClient,
+) -> None:
+    asker = _register(client, "alpha")
+    member = _register(client, "beta")
+    client.post("/channels/join", json={"token": member, "channel": "#secret"})
+    form_id = client.post(
+        "/ask",
+        json={
+            "token": asker,
+            "to": "#secret",
+            "title": "Rotate the key?",
+            "fields": [_radio_field()],
+        },
+    ).json()["form_id"]
+    _answer(client, form_id, {"ok": "yes"})
+
+    decisions = client.get(
+        "/decisions", headers={"Authorization": f"Bearer {member}"}
+    ).json()["decisions"]
+    assert [d["title"] for d in decisions] == ["Rotate the key?"]
+
+
+def test_decisions_channel_scoped_answer_invisible_to_unauthenticated_caller(
+    client: TestClient,
+) -> None:
+    asker = _register(client, "alpha")
+    form_id = client.post(
+        "/ask",
+        json={
+            "token": asker,
+            "to": "#secret",
+            "title": "Rotate the key?",
+            "fields": [_radio_field()],
+        },
+    ).json()["form_id"]
+    _answer(client, form_id, {"ok": "yes"})
+
+    assert client.get("/decisions").status_code == 401
+
+
+def test_decisions_operator_token_sees_channel_scoped_answer(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When auth is enabled, the operator/observer token bypasses channel scoping."""
+    asker = _register(client, "alpha")
+    form_id = client.post(
+        "/ask",
+        json={
+            "token": asker,
+            "to": "#secret",
+            "title": "Rotate the key?",
+            "fields": [_radio_field()],
+        },
+    ).json()["form_id"]
+    _answer(client, form_id, {"ok": "yes"})
+
+    monkeypatch.setattr(
+        hub_module, "auth_config", AuthConfig(operator="op-tok", observer="ob-tok")
+    )
+    for role_token in ("op-tok", "ob-tok"):
+        decisions = client.get(
+            "/decisions", headers={"Authorization": f"Bearer {role_token}"}
+        ).json()["decisions"]
+        assert [d["title"] for d in decisions] == ["Rotate the key?"]
 
 
 def test_decisions_respects_limit_and_stays_chronological(
@@ -1231,13 +1340,13 @@ def test_decisions_respects_limit_and_stays_chronological(
             "/ask",
             json={"token": token, "title": f"Q{i}", "fields": [_radio_field()]},
         ).json()["form_id"]
-        with client.websocket_connect("/ui") as ws:
-            assert ws.receive_json()["type"] == "auth_ok"
-            assert ws.receive_json()["type"] == "snapshot"
-            ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
+        _answer(client, form_id, {"ok": "yes"})
 
-    all_decisions = client.get("/decisions").json()["decisions"]
+    headers = {"Authorization": f"Bearer {token}"}
+    all_decisions = client.get("/decisions", headers=headers).json()["decisions"]
     assert [d["title"] for d in all_decisions] == ["Q0", "Q1", "Q2"]
 
-    limited = client.get("/decisions", params={"limit": 2}).json()["decisions"]
+    limited = client.get(
+        "/decisions", params={"limit": 2}, headers=headers
+    ).json()["decisions"]
     assert [d["title"] for d in limited] == ["Q1", "Q2"]

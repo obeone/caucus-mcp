@@ -1760,12 +1760,13 @@ class HubState:
         resolved. Otherwise marks it ANSWERED, stores ``answers``, removes it
         from the pending map, and routes a single :attr:`MessageKind.ANSWER`
         message (``sender="human"``) to the form's audience carrying the answer
-        bundle in ``meta`` (``form_id``, ``title``, ``status``, ``answers``, and
-        the original ``asker`` — see :meth:`decisions`, which reads this same
-        message back out of the log for late joiners). Because :meth:`route`
-        excludes the sender, every real agent — including the asker — receives
-        it; a channel form reaches only that channel's members. Finally fans a
-        ``form_resolved`` event to the UI.
+        bundle in ``meta`` (``form_id``, ``title``, ``status``, ``answers``, the
+        original ``asker``, and the audience ``to`` it was answered into — see
+        :meth:`decisions`, which reads this same message back out of the log
+        for late joiners and uses ``to`` to gate channel-scoped answers to
+        members only). Because :meth:`route` excludes the sender, every real
+        agent — including the asker — receives it; a channel form reaches only
+        that channel's members. Finally fans a ``form_resolved`` event to the UI.
 
         Args:
             form_id: Identifier of the form to resolve.
@@ -1798,6 +1799,7 @@ class HubState:
                     "status": "answered",
                     "answers": answers,
                     "asker": form.asker,
+                    "to": form.to,
                 },
             )
         )
@@ -1845,6 +1847,7 @@ class HubState:
                     "status": "cancelled",
                     "answers": None,
                     "asker": form.asker,
+                    "to": form.to,
                 },
             )
         )
@@ -1861,20 +1864,32 @@ class HubState:
         """
         return [f.to_public() for f in self._forms.values()]
 
-    def decisions(self, limit: int = 20) -> list[dict[str, object]]:
+    def decisions(
+        self, limit: int = 20, *, channels: set[str] | None = None
+    ) -> list[dict[str, object]]:
         """Return the most recently settled operator-form decisions, oldest first.
 
         A settled decision is one :attr:`~caucus.models.MessageKind.ANSWER`
         message already sitting in the bounded log — :meth:`answer_form` and
         :meth:`cancel_form` both route one, with the form's ``asker``, ``title``,
-        and ``status`` carried in ``meta`` (see their docstrings). This just
-        filters the log for that kind and reuses the message's already-rendered
-        recap as the summary, so a late joiner can catch up on settled questions
-        without replaying the whole transcript.
+        ``status``, and audience ``to`` carried in ``meta`` (see their
+        docstrings). This filters the log for that kind, applies the
+        ``channels`` visibility gate (matching the private-channel traffic that
+        message would itself have been routed to), and reuses the message's
+        already-rendered recap as the summary, so a late joiner can catch up on
+        settled questions without replaying the whole transcript. Filtering
+        happens *before* the ``limit`` cut, so a caller restricted to a couple
+        of channels still gets its most recent ``limit`` visible decisions
+        rather than losing slots to entries it could never see anyway.
 
         Args:
             limit: Maximum number of decisions to return (the most recent
                 ones); non-positive values yield an empty list.
+            channels: Restrict to broadcast decisions plus those whose ``to``
+                is one of these channel names — the calling peer's own
+                membership. ``None`` means unrestricted (the hub.py caller's
+                operator/observer path): every decision is visible, mirroring
+                the full-transcript access ``/export`` grants that role.
 
         Returns:
             Up to ``limit`` dicts, oldest first, each
@@ -1883,6 +1898,13 @@ class HubState:
         if limit <= 0:
             return []
         resolved = [m for m in self._log if m.kind is MessageKind.ANSWER]
+        if channels is not None:
+            resolved = [
+                m
+                for m in resolved
+                if (m.meta or {}).get("to") == BROADCAST
+                or (m.meta or {}).get("to") in channels
+            ]
         recent = resolved[-limit:]
         return [
             {
