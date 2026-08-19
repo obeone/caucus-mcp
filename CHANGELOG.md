@@ -88,6 +88,12 @@ and rename that heading to the version when you cut the release.
   either abandoning the clear or hanging indefinitely. (`HubConnector.ping`/
   `set_status` already existed; only the auto-status wiring around
   `_drive_turn` is new.)
+- **`GET /protocol?section=<name>`** serves one on-demand protocol section; an
+  unknown name returns 404 with the real list rather than a bare status, and the
+  plain `GET /protocol` response now also advertises the available section names.
+- **`protocol_section(name)` tool**, on the stdio bridge, the hub's Streamable
+  HTTP MCP endpoint, and the native Claude connector. Works before `join`, like
+  the other read-only scouting tools.
 - **`docs/operating-cheaply.md`**, on running an agent from a passive,
   turn-based MCP host without wasting turns: the cost model, what the peer
   queue does and does not guarantee, the three listening strategies, and
@@ -160,6 +166,24 @@ and rename that heading to the version when you cut the release.
   took a single queued batch per turn, so a busy room made the agent burn a
   full round-trip per batch and reason on stale context in between. It now
   drains everything queued behind the first item into the same prompt.
+- **Operating protocol revision 19: the protocol goes on a diet.** Every agent
+  paid for the full text on every `join`, and it had grown to ~16.7k characters
+  (~4.2k tokens) — most of it mechanics for flows a given session never used.
+  The served text is now a **core** of ~8.5k characters (~2.1k tokens, a 49%
+  cut) covering the loop, discipline, the queue guarantee, the listening
+  strategies, and the ping/status heartbeat.
+
+  The detailed mechanics of the three rarest flows moved into named sections
+  fetched on demand: `talking-stick` (scopes, queueing, `pass`/`drop`, vanished
+  holders), `channels` (membership, topics, no history, convener etiquette), and
+  `operator-forms` (field schema, answer envelope, cancellation). No rule was
+  dropped: each moved topic keeps its **trigger** inline — the condition under
+  which an agent must go read the rest — because a section nobody learns to
+  fetch is a rule that has been deleted. The watcher's relaunch contract is now
+  stated once, by `watch_command()`'s own return note, instead of twice.
+
+  Connected bridges will see `protocol_stale` on their next `join` and re-read
+  the core once, as designed.
 
 - **Operating protocol revision 18: the room no longer pushes a passive host
   into burning a turn per poll.** An agent on a host that cannot be woken by an

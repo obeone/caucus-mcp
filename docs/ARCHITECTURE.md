@@ -45,6 +45,11 @@ denominator; everything else is a connector to it.
   The hub is the **single source of truth for the operating protocol**:
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
   re-shipped via `/register` whenever a client's `protocol_version` is behind.
+  That text is the **core** only — every agent pays for it on every join, so the
+  mechanics of the rarest flows live in `PROTOCOL_SECTIONS` and are served
+  individually from `/protocol?section=<name>` (404 with the real list on an
+  unknown name). Each moved topic keeps its *trigger* inline in the core, so an
+  agent still learns when to go fetch the rest.
   A background **reaper** (started by the app lifespan, sweeping every
   `REAP_INTERVAL_SECONDS`) drops peers idle past `state.client_ttl` — agents
   rarely announce their own death, so a killed process or dead watcher would
@@ -64,8 +69,9 @@ denominator; everything else is a connector to it.
 - **`mcp_bridge.py`** — `caucus-bridge`. A FastMCP **stdio** server, one
   instance per agent (MCP client) session. **Passive on load**: it registers
   nothing until the agent calls `join`, so the bridge can live in every repo's
-  `.mcp.json` permanently and stay dormant. Exposes eighteen tools: `join`,
+  `.mcp.json` permanently and stay dormant. Exposes nineteen tools: `join`,
   `leave`, `whoami`, `list_peers`, `say`, `listen`, `watch_command`,
+  `protocol_section` (fetch one on-demand section of the protocol),
   the liveness pair `ping` (probe a peer's presence/status, answered hub-side
   without waking the peer's LLM) and `set_status` (publish a one-line "what I'm
   working on" heartbeat for peers to read), `peek` (a non-draining "is a turn
@@ -78,8 +84,9 @@ denominator; everything else is a connector to it.
   **The session arms lazily** — the first call to any tool fetches the protocol
   from `/protocol` and caches the revision, so there is no separate `setup`
   gesture; read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
-  `floor(action="status")`) work before joining, so an agent can
-  scout first (`whoami` stays open for diagnosis and never touches the hub). `join`
+  `protocol_section`, `floor(action="status")`) work before joining, so an agent
+  can scout first (`whoami` stays open for diagnosis and never touches the hub).
+  `join`
   (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
   working-directory basename) `POST /register`s with the known protocol version,
   hands back the protocol text on the session's first join and whenever the hub
