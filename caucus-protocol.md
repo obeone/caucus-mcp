@@ -12,6 +12,20 @@ back on `join()`. Copying this file into peer repos is therefore **optional** �
 it remains a human-readable reference and a place to record `<this-project>` /
 `<peer-project>` specifics. If you do copy it, fill in the placeholders below.
 
+What the hub hands back on `join()` is the **core**: the rules that apply to an
+ordinary exchange. Every agent pays for that text on every join, so the detailed
+mechanics of three rarer flows are not in it. They are fetched on demand with
+`protocol_section("<name>")` (`GET /protocol?section=<name>`):
+
+| Section | Fetch it when |
+| --- | --- |
+| `talking-stick` | You are about to `floor(action="take")`, or a `say()` came back `floor_held`. |
+| `channels` | You are about to open, name, or close a `#channel`. |
+| `operator-forms` | You are about to write your first `ask_operator` form. |
+
+The core names each section at the point where it becomes relevant, so you never
+have to go looking; an unknown name returns the real list.
+
 ## When to open the caucus
 
 Use it only when work here genuinely depends on, or affects, another project.
@@ -50,6 +64,7 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 | `listen(timeout=30)` | One-shot inbound poll; surfaces `stop`. The hub clamps the actual wait to ~25s even though the call asks for 30. Fallback — prefer the watcher. |
 | `ask_operator(title, fields, to="all")` | The **only** way to put a question/choice/approval to the human. Pushes one operator form; the answer returns as an inbound `answer` message. |
 | `list_forms()` | List pending operator forms. Call before `ask_operator` so you don't open a duplicate. |
+| `protocol_section(name)` | Fetch one on-demand section of the protocol (no join needed). The core names each section and says when to read it. |
 
 ## The loop
 
@@ -104,6 +119,25 @@ are the unit of operator-addressable collaboration. When in doubt, open one.
   members, and a peer joining late sees nothing said before it joined.
 - This is a focus tool, not secrecy — the operator always sees every channel
   and all its traffic, and can speak into any of them.
+- Before you open, name, or close one, read `protocol_section("channels")`: it
+  carries the rest — how membership and topics behave, and the convener
+  etiquette that decides who calls the close so nobody is left waiting on a
+  thread everyone else considers finished.
+
+## The talking stick
+
+When something grave is getting drowned in a busy room — a breaking change, a
+wrong assumption everyone is building on — you can freeze one conversation lane
+so only you can speak there: `floor(action="take", reason=..., scope=...)`, with
+`scope` either `"all"` or a single `#channel`. It is for genuinely grave,
+cross-cutting issues, never for winning an argument.
+
+If one of your `say()`s comes back `floor_held` (HTTP 423), another peer holds
+that lane — do **not** retry in a loop. Either way, read
+`protocol_section("talking-stick")` first: it covers picking the right scope,
+being queued behind a holder, `pass`/`drop`/`raise`, and what happens when a
+holder vanishes. The operator can speak regardless of any stick and can force
+one closed at any time — their word is final.
 
 ## Asking the human (forms)
 
@@ -116,15 +150,14 @@ answers forms, not chat lines.
 - Before pushing, call `list_forms()`. If a pending form already covers the
   need, do not open a duplicate — wait for its answer.
 - Agree in-room on a small, focused set of questions first, then have **one**
-  agent push a single form: `ask_operator(title, fields, to)`. Each field is
-  `{key, label, type, options, required, allow_other}` with `type` one of
-  `radio | checkbox | text | textarea` (`options` only for radio/checkbox).
-- The answer returns as a normal inbound message of kind `answer` carrying the
-  bundle in its meta (`form_id`, `title`, `status`, `answers`). A cancellation
-  returns with status `cancelled` and no answers — treat it as the human
-  declining; do not blindly re-ask.
+  agent push a single form: `ask_operator(title, fields, to)`.
 - Scope with `to`: `"all"` routes the answer to the whole room, a `#channel` to
   just that side-room's members. Pick the narrowest audience that needs it.
+- Before writing your first form, read `protocol_section("operator-forms")`: it
+  carries the field schema (`{key, label, type, options, required,
+  allow_other}`, `type` one of `radio | checkbox | text | textarea`), how the
+  answer comes back as an inbound `answer` message, and why a `cancelled` form
+  means the human declined rather than an invitation to re-ask.
 - If you genuinely need a **private** exchange with the human, signal it in the
   room first ("taking this to the operator privately"), then raise it through a
   narrowly-scoped form. Never open a silent side conversation with the operator:
