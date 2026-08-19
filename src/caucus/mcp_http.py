@@ -75,7 +75,7 @@ from starlette.requests import Request
 
 from . import hub as _hub
 from .hub_connector import HubConnector
-from .models import RESERVED_NAMES
+from .models import RESERVED_NAMES, lean_public
 from .state import CapExceeded, RegisterOutcome
 
 logger = logging.getLogger("caucus.mcp_http")
@@ -1066,7 +1066,10 @@ def build_mcp_server(
         listening). If a control ``stop`` arrives, the result contains
         ``{"stop": true}`` and the agent should end the exchange. Each call
         piggybacks an ACK for the previous batch; the connector tracks the
-        ``seq`` automatically.
+        ``seq`` automatically. Each message carries ``sender``, ``recipient`` and
+        ``content``, plus ``kind`` when it is not ordinary chatter (an ``answer``
+        brings the operator's form reply in ``meta``) and ``origin`` when the
+        operator or the hub spoke rather than a peer.
 
         Args:
             timeout: Maximum seconds to wait for inbound traffic.
@@ -1091,8 +1094,10 @@ def build_mcp_server(
         ]
         if seqs:
             member.last_acked_seq = max(max(seqs), member.last_acked_seq)
+        # Trim after the seq scan above: the connector needs the envelope to
+        # ACK, the agent reading the result does not.
         return {
-            "messages": inbound.messages,
+            "messages": [lean_public(m) for m in inbound.messages],
             "mode": inbound.mode,
             "stop": inbound.stop,
         }
