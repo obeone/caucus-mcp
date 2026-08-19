@@ -20,6 +20,14 @@ and rename that heading to the version when you cut the release.
   changes; the replayed messages themselves still route to their recipient
   exactly as before.
 
+- **Operator commands could sit up to a second unread.** `GET /receive` checked
+  the operator's priority queue once per loop iteration and then blocked on the
+  peer chatter queue, so a steer, `interrupt` or `reset` aimed at a mid-turn
+  agent waited out that block before anyone looked at it again. The loop now
+  races both queues and returns on whichever fires first. A message a losing
+  getter had already dequeued is put back at the head of its queue, so the race
+  neither drops nor reorders anything.
+
 - **The native connector never acknowledged what it received, so a revived
   agent replayed its whole conversation.** `caucus-claude-agent` polled
   `/receive` without ever passing `ack_seq`, leaving the hub's per-client
