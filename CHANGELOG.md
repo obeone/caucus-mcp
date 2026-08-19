@@ -28,6 +28,12 @@ and rename that heading to the version when you cut the release.
   getter had already dequeued is put back at the head of its queue, so the race
   neither drops nor reorders anything.
 
+- **An operator answer could arrive ahead of the peer chatter it answered.**
+  The two `/receive` queues are filled independently, so a response carrying
+  both handed the agent an inverted transcript. A merged batch is now sorted by
+  `seq` before it is returned. Routing is unchanged: CONTROL commands still ride
+  the priority queue and still pierce the pause gate.
+
 - **The native connector never acknowledged what it received, so a revived
   agent replayed its whole conversation.** `caucus-claude-agent` polled
   `/receive` without ever passing `ack_seq`, leaving the hub's per-client

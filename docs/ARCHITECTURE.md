@@ -267,7 +267,10 @@ The subtlety when editing this: a getter can dequeue a message the response
 never carries — the poll times out, the client disconnects, or a pause gate
 closes while the loop is waiting. Such a message is put back at the **head** of
 its queue (`_requeue_front`), never appended, or it would land behind newer
-traffic and break seq ordering.
+traffic and break seq ordering. A response that carries both queues' batches
+merges them and sorts by `seq`, so an operator answer cannot overtake peer
+chatter sent before it. That is presentation only: CONTROL commands still ride
+the priority queue and still pierce the pause gate.
 
 `/receive` reads its access token from the `Authorization: Bearer <token>`
 header, never the URL query string — a `GET` query token leaks into httpx and

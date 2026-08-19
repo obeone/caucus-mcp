@@ -131,6 +131,26 @@ async def test_flooding_both_queues_loses_and_reorders_nothing(
     assert [c for c in received if c.startswith("o")] == [f"o{i}" for i in range(rounds)]
 
 
+async def test_one_response_returns_both_queues_in_seq_order(
+    state: HubState, http: httpx.AsyncClient
+) -> None:
+    """A merged batch is ordered by seq, so the operator cannot overtake chatter.
+
+    The two queues are filled independently, so returning the priority batch
+    first would hand the agent an inverted transcript: an operator answer read
+    before the peer question it answers.
+    """
+    token = _join(state, "alpha")
+    state.route(Message(sender="peer", recipient="alpha", content="asked first"))
+    state.route(Message(sender="human", recipient="alpha", content="answered second"))
+
+    resp = await http.get("/receive", params={"timeout": 3}, headers=_auth(token))
+    body = resp.json()["messages"]
+
+    assert [m["content"] for m in body] == ["asked first", "answered second"]
+    assert [m["seq"] for m in body] == sorted(m["seq"] for m in body)
+
+
 async def test_paused_room_still_delivers_operator_traffic_only(
     state: HubState, http: httpx.AsyncClient
 ) -> None:
