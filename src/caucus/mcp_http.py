@@ -715,7 +715,10 @@ def build_mcp_server(
             if stale:
                 notes.append("protocol updated; re-read the protocol below")
         else:
-            notes.append("protocol unchanged; already delivered this session")
+            notes.append(
+                "protocol unchanged; already delivered this session"
+                " (pass force_protocol=true to re-read it)"
+            )
         if reg.outcome is RegisterOutcome.REPLACED:
             # Took over a timed-out slot — advise the caller it may be joining
             # mid-conversation, exactly as the /register handler does.
