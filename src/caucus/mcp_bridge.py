@@ -26,13 +26,15 @@ Configuration via environment variables:
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
 import functools
 import json
 import logging
 import os
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -113,9 +115,73 @@ _protocol_delivered: bool = False
 _last_acked_seq: int = 0
 
 
-def _client() -> httpx.Client:
-    """Return an HTTP client with a timeout that outlasts the hub long-poll."""
-    return httpx.Client(base_url=HUB_URL, timeout=35.0)
+# The process-wide HTTP client, created on first use. One client per bridge
+# session instead of one per tool call: a fresh client meant a fresh TCP (and,
+# over a remote hub, TLS) handshake on every say/listen/join, paying a full
+# connection setup for a request that is usually a few hundred bytes. Keeping it
+# alive lets httpx reuse the pooled connection. Cached alongside the base URL it
+# was built for so repointing ``HUB_URL`` (tests do) transparently rebuilds it.
+_http: httpx.Client | None = None
+_http_base: str | None = None
+
+# Client-side ceiling, deliberately above the hub's LONG_POLL_SECONDS (25) so a
+# server long-poll always returns before httpx gives up — see the long-poll
+# ordering invariant in CLAUDE.md.
+_HTTP_TIMEOUT = 35.0
+
+
+def _open_client() -> httpx.Client:
+    """Return the shared HTTP client, building it on first use.
+
+    Rebuilds it when ``HUB_URL`` no longer matches the URL the cached client was
+    bound to, or when the client has been closed, so a repointed bridge never
+    keeps talking to the old address.
+
+    Returns:
+        The live client bound to the current ``HUB_URL``.
+    """
+    global _http, _http_base
+    if _http is None or _http.is_closed or _http_base != HUB_URL:
+        _close_client()
+        _http = httpx.Client(base_url=HUB_URL, timeout=_HTTP_TIMEOUT)
+        _http_base = HUB_URL
+    return _http
+
+
+@contextlib.contextmanager
+def _client() -> Iterator[httpx.Client]:
+    """Lend the shared hub HTTP client for the duration of one tool call.
+
+    Deliberately does **not** close the client on exit — that is the whole
+    point, so the next tool call reuses the pooled connection instead of
+    reopening one. It stays a context manager because every call site already
+    borrows it that way, which keeps the borrow visually scoped to the call that
+    needs it; the process-wide close happens once, at exit.
+
+    Yields:
+        The shared client, bound to the current ``HUB_URL``.
+    """
+    yield _open_client()
+
+
+def _close_client() -> None:
+    """Close the shared HTTP client if one is live; safe to call repeatedly.
+
+    Registered with :mod:`atexit` so the pooled connection is released when the
+    MCP host tears the bridge process down, and called internally when the hub
+    URL changes out from under a cached client.
+    """
+    global _http, _http_base
+    if _http is not None:
+        try:
+            _http.close()
+        except Exception:  # noqa: BLE001 - shutdown path, nothing to recover
+            pass
+        _http = None
+    _http_base = None
+
+
+atexit.register(_close_client)
 
 
 # Type of an MCP tool body: takes any args, returns the result dict.
