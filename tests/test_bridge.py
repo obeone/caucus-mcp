@@ -774,6 +774,32 @@ def test_watch_command_returns_runnable_command(
     assert (os.stat(token_path).st_mode & 0o777) == 0o600
 
 
+def test_join_hands_back_the_watch_command(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """join() folds in what watch_command() would return, sparing a round-trip.
+
+    Starting the watcher is the documented next step after joining, so making
+    the agent spend a second tool call on watch_command() was a turn for nothing.
+    """
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watch-in-join")
+    joined = bridge.join()
+    folded = joined["watch"]
+    assert isinstance(folded, str)
+    assert folded.startswith(f"caucus-watch --hub {bridge.HUB_URL} --token-file ")
+
+    # Same shape watch_command() mints, token file and all — one code path.
+    minted = bridge.watch_command()["command"]
+    assert minted.rsplit("--token-file ", 1)[0] == folded.rsplit("--token-file ", 1)[0]
+    path = bridge._token_file
+    assert path is not None and os.path.exists(path)
+    with open(path, encoding="utf-8") as fh:
+        assert fh.read().strip() == bridge._token
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+
+
 def test_leave_deletes_watcher_token_file(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:

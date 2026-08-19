@@ -229,6 +229,26 @@ def _write_token_file(token: str) -> str:
     return path
 
 
+def _watch_command_for(token: str) -> str:
+    """Mint a ready-to-run ``caucus-watch`` command for ``token``.
+
+    Writes ``token`` to a fresh private (0600) file and points the command at
+    it by path, so the secret never rides the process argv or the launching
+    transcript. Any previous token file is replaced. Shared by :func:`join`
+    (which hands the command back up front) and :func:`watch_command`, so the
+    two can never disagree on how the watcher is invoked.
+
+    Args:
+        token: The hub access token the watcher will poll with.
+
+    Returns:
+        The shell command to run in the background.
+    """
+    global _token_file
+    _token_file = _write_token_file(token)
+    return f"caucus-watch --hub {HUB_URL} --token-file {_token_file}"
+
+
 def _cleanup_token_file() -> None:
     """Remove the watcher token file if one is live; ignore if already gone."""
     global _token_file
@@ -251,8 +271,11 @@ def join(
     duplicate. Arms the session on first use; read-only tools work without
     joining, but ``say``/``listen``/``watch_command`` need it.
 
-    The protocol text comes back on the first join of a session and whenever the
-    hub's revision has moved; a later join says so instead of re-sending it.
+    The result carries a ``watch`` field: the ready-to-run ``caucus-watch``
+    command to launch in the background right away, so no separate
+    ``watch_command()`` call is needed. The protocol text comes back on the first
+    join of a session and whenever the hub's revision has moved; a later join
+    says so instead of re-sending it.
 
     Args:
         project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or the
@@ -296,7 +319,8 @@ def join(
                 }
             resp.raise_for_status()
             body = resp.json()
-            _token = body["token"]
+            token: str = body["token"]
+            _token = token
     except httpx.HTTPError as exc:
         logger.error("join failed: %s", exc)
         return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
@@ -336,6 +360,13 @@ def join(
         notes.append(str(body["note"]))
     if notes:
         result["note"] = "; ".join(notes)
+    # Starting the watcher is the documented next step after join, so hand its
+    # command over here instead of charging the agent a second tool round-trip
+    # for watch_command(). A token-file failure must never sink a good join.
+    try:
+        result["watch"] = _watch_command_for(token)
+    except OSError as exc:  # pragma: no cover - needs an unwritable temp dir
+        logger.warning("watch command unavailable: %s", exc)
     # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
     # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
     # never-fatal probe: does auto mode already know a caucus operator answer is
@@ -745,7 +776,9 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
 def watch_command() -> dict[str, object]:
     """Return a ready-to-run ``caucus-watch`` shell command for the zero-token inbound watcher; run it in the background after join.
 
-    How to run and relaunch the watcher is in the protocol. Requires join.
+    ``join()`` already returns this command in its ``watch`` field, so call this
+    only to mint a fresh one mid-session. How to run and relaunch the watcher is
+    in the protocol. Requires join.
 
     Errors: ``not_joined``.
     """
@@ -754,13 +787,10 @@ def watch_command() -> dict[str, object]:
         return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
-    global _token_file
-    _token_file = _write_token_file(_token)
-    command = f"caucus-watch --hub {HUB_URL} --token-file {_token_file}"
     # No usage note here: the protocol already carries the run/relaunch/stop
     # rules verbatim, and repeating them on every call bought the agent nothing
     # it had not already read.
-    return {"command": command, "background": True}
+    return {"command": _watch_command_for(_token), "background": True}
 
 
 def main() -> None:
