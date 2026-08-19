@@ -183,20 +183,18 @@ class Client:
             transmit gate) so delivery is withheld until the operator resumes
             it. The peer keeps polling, so it is not reaped and its queued
             messages survive a reap and are replayed on revival.
-        pending: Running count of messages queued for this client (across both
-            :attr:`queue` and :attr:`priority_queue`) that ``GET /receive``
-            has not yet drained. Maintained in :meth:`HubState.route` (+1 per
-            enqueue) and :func:`~caucus.hub.receive` (-len(drained) per poll),
-            never by inspecting the queues themselves — see :meth:`HubState.peek`.
-            A cheap approximation: the rare ring-buffer drop-oldest in
-            :meth:`HubState._safe_put` (queue at :data:`MAX_QUEUE_SIZE`) is not
-            specially accounted for, so sustained flooding of one peer could
-            drift this a little high until the next drain.
-        last_pending: The most recently enqueued :class:`~caucus.models.Message`
-            still counted in :attr:`pending`, or ``None`` before anything has
-            arrived. Surfaced (sender + a short preview) by
-            :meth:`HubState.peek` so a peer can glance at what is waiting
-            without spending a turn to receive it.
+        last_pending: The most recently enqueued :class:`~caucus.models.Message`,
+            or ``None`` before anything has ever arrived. Updated wherever a
+            message lands in either queue — :meth:`HubState.route` and the
+            unacked/backlog replay in :meth:`HubState._revive` — so it can
+            never go stale after a reap/revive cycle. May still hold a message
+            after both queues have drained; :meth:`HubState.peek` only reads
+            it once it has confirmed something is actually pending (see below),
+            so a drained queue never surfaces a stale ``last``. Peek's pending
+            *count*, unlike this field, is never cached: it is computed on
+            demand from ``queue.qsize() + priority_queue.qsize()``, which is
+            exact under asyncio's single-threaded cooperative scheduling — no
+            parallel counter to drift.
     """
 
     project: str
@@ -233,7 +231,6 @@ class Client:
     first_seen: float = field(default_factory=time.time)
     msg_count: int = 0
     paused: bool = False
-    pending: int = 0
     last_pending: Message | None = None
 
 
@@ -710,11 +707,16 @@ class HubState:
         ]
         replayed.sort(key=lambda m: m.seq)
         # Re-enqueue via the ring-buffer-safe path: the queue is bounded, so a
-        # large replay must not overflow and crash the revival.
+        # large replay must not overflow and crash the revival. Track the
+        # preview peek() surfaces here too, exactly as route() does on a
+        # normal enqueue — otherwise a peer that peeks right after reconnecting
+        # would see a stale (or absent) ``last`` despite a full backlog.
         for msg in replayed:
             self._safe_put(client, msg)
+            client.last_pending = msg
         for msg in pending_during_absence:
             self._safe_put(client, msg)
+            client.last_pending = msg
 
         # Build the reconnect notice for the operator console.
         if downtime is not None:
@@ -849,11 +851,14 @@ class HubState:
 
         The non-blocking counterpart to ``GET /receive``: a cheap "is a turn
         worth it?" check an agent can run before paying for a full receive.
-        Reads :attr:`Client.pending` / :attr:`Client.last_pending` — the
-        parallel bookkeeping :meth:`route` maintains alongside the actual
-        enqueue — rather than touching :attr:`Client.queue` or
-        :attr:`Client.priority_queue` directly, so a peek can never race or
-        interfere with a concurrent ``/receive`` drain.
+        The count is ``queue.qsize() + priority_queue.qsize()`` computed fresh
+        on every call — under asyncio's single-threaded cooperative scheduling
+        that is exact (nothing else can be draining or enqueuing concurrently
+        within one event-loop tick), so there is no parallel counter to keep in
+        sync or let drift. Only :attr:`Client.last_pending` (the preview) is
+        cached, and only read once the live count confirms something is
+        actually there — see :attr:`Client.last_pending` for why it can never
+        surface stale.
 
         Args:
             client: The client to report on (already resolved by the caller,
@@ -865,13 +870,14 @@ class HubState:
             ``preview`` truncates the message content to
             :data:`PEEK_PREVIEW_CHARS` characters.
         """
+        pending = client.queue.qsize() + client.priority_queue.qsize()
         last: dict[str, object] | None = None
-        if client.pending > 0 and client.last_pending is not None:
+        if pending > 0 and client.last_pending is not None:
             last = {
                 "sender": client.last_pending.sender,
                 "preview": client.last_pending.content[:PEEK_PREVIEW_CHARS],
             }
-        return {"pending": client.pending, "last": last}
+        return {"pending": pending, "last": last}
 
     def ping(self, name: str, *, now: float | None = None) -> dict[str, object]:
         """Report a peer's liveness and self-reported status, LLM-free.
@@ -1275,10 +1281,9 @@ class HubState:
                 # overflow (ring buffer) so a stuck recipient can never crash
                 # routing or exhaust memory — see :meth:`_safe_put`.
                 self._safe_put(client, msg)
-            # Mirror the enqueue in the peek counter/reference (see
-            # :meth:`peek`) instead of ever inspecting the queues themselves.
-            # ``GET /receive`` (hub.py) is the matching -len(drained) side.
-            client.pending += 1
+            # Track the preview :meth:`peek` surfaces; the pending *count* is
+            # computed on demand there from the queues' own qsize(), so no
+            # parallel counter needs updating here.
             client.last_pending = msg
         delivered = [c.project for c in targets]
         # Feed the optional disk-log sink last, once routing is settled. The
