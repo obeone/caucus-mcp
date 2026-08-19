@@ -1477,18 +1477,36 @@ def _requeue_front(queue: asyncio.Queue[Message], msg: Message) -> None:
 
     ``asyncio.Queue`` only appends, so restoring a message that was already
     dequeued would otherwise place it behind newer traffic and break the seq
-    ordering the caller relies on. Draining and re-adding is atomic here (one
-    event loop, no await), and the net count is unchanged, so a bounded queue
-    cannot overflow on the way back in.
+    ordering the caller relies on. The drain and re-add themselves are atomic
+    (one event loop, no await in between).
+
+    The queue can nonetheless be **fuller than when the getter took the
+    message**: the getter completed on an earlier scheduling step, and
+    :meth:`~caucus.state.HubState.route` may have refilled the queue to capacity
+    in the window since. The re-add therefore tolerates overflow the same way
+    :meth:`~caucus.state.HubState._safe_put` does, keeping the queue a ring
+    buffer — but dropping from the *tail*, since everything past the capacity
+    line is the newest traffic and the whole point here is to preserve the older,
+    in-order head. Never raises: this runs on the poll's cleanup path, where an
+    exception would strand the live-listener counter.
 
     Args:
         queue: The queue to restore into.
         msg: The message to put back at the head.
     """
-    rest = _drain_now(queue)
-    queue.put_nowait(msg)
-    for item in rest:
-        queue.put_nowait(item)
+    restored = [msg, *_drain_now(queue)]
+    for index, item in enumerate(restored):
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            dropped = len(restored) - index
+            logger.warning(
+                "queue full while restoring an undelivered message (cap=%d) — "
+                "dropped %d newest message(s)",
+                queue.maxsize,
+                dropped,
+            )
+            return
 
 
 def _release_getter(
@@ -1628,24 +1646,30 @@ async def receive(
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
+            # Each completed getter is retired (its slot cleared) *before* its
+            # message is acted on. Clearing it afterwards would let a raise on
+            # the consume path leave a done task in the slot: the next iteration
+            # re-enters this branch on the same task, spinning hot until the
+            # deadline, and the poll after it re-arms nothing.
             messages: list[Message] = []
             if pri_get.done():
-                messages.append(pri_get.result())
-                messages.extend(_drain_now(client.priority_queue))
+                held = pri_get.result()
                 pri_get = None
+                messages.append(held)
+                messages.extend(_drain_now(client.priority_queue))
             # Re-check the gates before consuming chatter: the operator may have
             # paused the room while we were waiting, and a message the getter
             # pulled out must not slip past a gate that has since closed — it
             # goes back to the head of the queue instead, to be delivered when
-            # the gate reopens. Either way the getter is retired, so a closed
-            # gate never leaves a completed task to spin the loop.
+            # the gate reopens.
             if chat_get is not None and chat_get.done():
+                held = chat_get.result()
+                chat_get = None
                 if _chatter_open(client):
-                    messages.append(chat_get.result())
+                    messages.append(held)
                     messages.extend(_drain_now(client.queue))
                 else:
-                    _requeue_front(client.queue, chat_get.result())
-                chat_get = None
+                    _requeue_front(client.queue, held)
 
             if messages:
                 # One response can carry both queues' batches, and they were
@@ -1662,10 +1686,19 @@ async def receive(
                     "mode": state.mode.value,
                 }
     finally:
-        # Hand back anything a getter dequeued but this response never carried.
-        _release_getter(pri_get, client.priority_queue)
-        _release_getter(chat_get, client.queue)
-        client.active_polls -= 1
+        try:
+            # Hand back anything a getter dequeued but this response never
+            # carried.
+            _release_getter(pri_get, client.priority_queue)
+            _release_getter(chat_get, client.queue)
+        finally:
+            # This decrement must never be skipped. A leaked count leaves the
+            # peer looking like it holds a live listener forever, and
+            # HubState.register then refuses every re-join under that name as a
+            # colliding duplicate (CONTESTED) — the project is wedged out of its
+            # own identity for the lifetime of the hub. Cleanup failures still
+            # propagate; they just do not take the counter down with them.
+            client.active_polls -= 1
 
 
 @app.post("/ack")
