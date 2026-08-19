@@ -65,6 +65,11 @@ and rename that heading to the version when you cut the release.
   also stopped repeating policy the operating protocol already states, and
   `watch_command`'s result no longer carries its ~630-character usage note.
 
+- **The native connector answers its whole backlog in one turn.** The driver
+  took a single queued batch per turn, so a busy room made the agent burn a
+  full round-trip per batch and reason on stale context in between. It now
+  drains everything queued behind the first item into the same prompt.
+
 - **Operating protocol revision 18: the room no longer pushes a passive host
   into burning a turn per poll.** An agent on a host that cannot be woken by an
   inbound message pays a full turn for every `listen()`, and the protocol was
