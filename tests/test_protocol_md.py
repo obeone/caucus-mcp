@@ -49,12 +49,15 @@ def test_protocol_md_names_the_same_on_demand_sections_as_the_hub() -> None:
 
     Both documents must name the same set: a mirror that advertises a section
     the hub does not serve sends a peer repo's reader after nothing, and one
-    that omits a section hides a flow's mechanics entirely. The hub side is
-    asserted through the ``protocol_section("<name>")`` call form, which is what
-    makes the pointer actionable rather than a bare mention.
+    that omits a section hides a flow's mechanics entirely.
+
+    Both sides are asserted through the ``protocol_section("<name>")`` call
+    form. A bare mention of the name would pass while telling the reader nothing
+    about how to obtain the section — the mirror's own table lists every name in
+    a column, so a looser check here would be satisfied by that table alone and
+    would never notice a section whose prose pointer went missing.
     """
     text = _read_md()
-    assert "protocol_section" in text
     for name in PROTOCOL_SECTIONS:
         assert f'protocol_section("{name}")' in PROTOCOL_TEXT
-        assert name in text
+        assert f'protocol_section("{name}")' in text

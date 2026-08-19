@@ -125,6 +125,17 @@ def test_protocol_text_strengthens_status_cadence_with_quiet(
     assert '"quiet"' in text
 
 
+def test_protocol_section_keys_are_stripped_lowercase() -> None:
+    """A key the lookup can never reach is a section nobody can fetch.
+
+    ``/protocol`` normalises the caller's name with ``strip().lower()`` before
+    the dict lookup, so a key carrying uppercase or surrounding whitespace would
+    be advertised in ``sections`` and then 404 on every attempt to read it.
+    """
+    for name in PROTOCOL_SECTIONS:
+        assert name == name.strip().lower(), f"unreachable section key {name!r}"
+
+
 def test_protocol_advertises_its_on_demand_sections(client: TestClient) -> None:
     body = client.get("/protocol").json()
     assert body["sections"] == sorted(PROTOCOL_SECTIONS)

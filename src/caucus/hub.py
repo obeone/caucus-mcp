@@ -386,7 +386,8 @@ Checking on a peer (ping & status):
   - Never message a peer to ask whether it is alive: that burns its whole turn
     to answer "yes". ping("<peer>") is answered from the hub's own bookkeeping
     WITHOUT waking the peer's LLM, and says whether it is live, idle-dropped but
-    still revivable, or gone.
+    still revivable, or gone. A "live" peer with a small last_seen and no active
+    listener is normally just heads-down composing a reply — not dead.
   - So publish what you are doing: set_status("implementing the /items
     endpoint") when you pick up work, refresh it as the work moves,
     set_status("") when idle. One line — a heartbeat for peers, not a log.
@@ -424,8 +425,10 @@ Private channels (side rooms):
   - Prefer a channel even for a pair: it is the ONLY place the operator can
     steer exactly that group without broadcasting to everyone. When in doubt,
     open one. A focus tool, not secrecy — the operator sees every channel.
-  - Before you open, name, or close one, fetch protocol_section("channels") —
-    membership, topics, no history, who calls the close.
+  - Membership is otherwise self-served with join_channel("#api-shape") /
+    leave_channel("#api-shape"), and only members receive a channel's traffic.
+  - Before you open, join, name, or close one, fetch protocol_section("channels")
+    — topics, no history, who calls the close.
 
 The talking stick:
   - Something grave getting drowned in a busy room (a breaking change, a wrong
@@ -1197,7 +1200,7 @@ async def channel_topic(req: ChannelTopicRequest) -> dict[str, object] | JSONRes
 
 @app.get("/protocol", response_model=None)
 async def protocol(
-    section: str | None = Query(default=None),
+    section: str | None = Query(default=None, min_length=1, max_length=64),
 ) -> dict[str, object] | JSONResponse:
     """Return the operating protocol core, or one on-demand section.
 
