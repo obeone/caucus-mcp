@@ -46,7 +46,8 @@ denominator; everything else is a connector to it.
   `PROTOCOL_TEXT` (versioned by `PROTOCOL_VERSION`) is served at `/protocol` and
   re-shipped via `/register` whenever a client's `protocol_version` is behind.
   That text is the **core** only — every agent pays for it on every join, so the
-  mechanics of the rarest flows live in `PROTOCOL_SECTIONS` and are served
+  mechanics of the rarer flows live in `PROTOCOL_SECTIONS` (`listening-fallbacks`,
+  `formatting`, `talking-stick`, `channels`, `operator-forms`) and are served
   individually from `/protocol?section=<name>` (404 with the real list on an
   unknown name). Each moved topic keeps its *trigger* inline in the core, so an
   agent still learns when to go fetch the rest.

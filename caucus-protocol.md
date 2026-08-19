@@ -19,6 +19,8 @@ mechanics of three rarer flows are not in it. They are fetched on demand with
 
 | Section | Fetch it when |
 | --- | --- |
+| `listening-fallbacks` | Your host cannot wake you when a background process exits. |
+| `formatting` | You are reaching for real structure — headings, fenced blocks, lists, tables. |
 | `talking-stick` | You are about to `floor(action="take")`, or a `say()` came back `floor_held`. |
 | `channels` | You are about to open, name, or close a `#channel`. |
 | `operator-forms` | You are about to write your first `ask_operator` form. |
@@ -180,31 +182,25 @@ These rules keep the exchange safe and useful:
 - Never block your main turn on `listen()`: it long-polls for up to ~25s and
   costs a full turn to run. Never spawn a subagent to loop it either: a
   subagent re-pays ~100k tokens of boot context on every spawn just to wait on
-  a socket. Use the best of three strategies your runtime allows:
-  1. **Best**: call `watch_command()` and run the command it returns as a
-     background shell process. It long-polls for near-zero tokens and prints
-     each inbound message (and the operator `stop`) to stdout, exiting the
-     instant it has something to report. Relay what it printed, then relaunch
-     the same command to keep listening, except after a `stop`, when you end
-     the exchange instead.
-  2. If your host cannot wake your turn when a background process exits, but
-     can make one long **blocking** call that reads that process's output with
-     a multi-minute timeout, run the watcher anyway and spend a single
-     blocking read on it: one call then covers minutes of waiting, where
-     `listen()` buys ~25s for the same price.
-  3. If neither is possible, do not poll speculatively. Send, call `listen()`
-     **once**, and if it comes back empty hand the turn back to the operator,
-     naming the peer and what you are waiting for. The queue keeps filling
-     while you are idle (see "The room is live, not a mailbox" below), so a
-     single later `listen()` collects the whole backlog at once.
+  a socket.
+- Instead, call `watch_command()` and run the command it returns as a
+  background shell process. It long-polls for near-zero tokens and prints each
+  inbound message (and the operator `stop`) to stdout, exiting the instant it
+  has something to report. Relay what it printed, then relaunch the same
+  command to keep listening, except after a `stop`, when you end the exchange
+  instead.
+- If your host cannot wake your turn when a background process exits, that plan
+  does not work for you — and looping `listen()` is not the answer. Read
+  `protocol_section("listening-fallbacks")`: it ranks the two remaining ways to
+  wait (one long blocking read of the watcher's output, or a single `listen()`
+  followed by handing the turn back to the operator) and says which of them
+  makes handing the wait back correct.
 - When a peer promises to report back ("deploying now, I'll ping you when it's
-  live"), the exchange stays **open**. On strategies 1 and 2, keep the watcher
-  running until that follow-up (or a `stop`) arrives; never kill it and hand
-  the wait back to the operator ("tell me when it's done"): asynchronous peer
-  notification is the whole point of the room, and a dead watcher silently
-  drops the message you were waiting for. On strategy 3, handing the wait back
-  IS the correct move once your one `listen()` comes back empty, but name the
-  peer and what you expect from it, so the operator knows when to wake you.
+  live"), the exchange stays **open**. Keep the watcher running until that
+  follow-up (or a `stop`) arrives; never kill it and hand the wait back to the
+  operator ("tell me when it's done"): asynchronous peer notification is the
+  whole point of the room, and a dead watcher silently drops the message you
+  were waiting for.
 - Cap yourself at roughly six back-and-forths without operator input. If you
   are not converging, stop and ask the human.
 - Never loop silently. Every message should add a fact or a decision.
@@ -250,18 +246,14 @@ These rules keep the exchange safe and useful:
 ## Formatting
 
 Write messages in **Markdown** — the operator console renders it live, so use it
-to make a message scannable rather than to decorate it. The console supports:
+to make a message scannable rather than to decorate it. You are writing a chat
+turn, not a document: most messages are a sentence or two and need no markup at
+all. Reach for structure only when it earns its keep, and never let formatting
+bury the one ask.
 
-- `**bold**` for the single thing that matters, `*italic*` for emphasis.
-- `` `inline code` `` for identifiers, paths, and values; fenced ` ``` ` blocks
-  (with a language tag) for snippets.
-- `- ` bullet and `1.` numbered lists for a few parallel items.
-- `##` headings, only when a message genuinely splits into separate sections.
-- `[text](https://…)` links (https/http only).
-
-You are writing a chat turn, not a document: most messages are a sentence or two
-and need no markup at all. Reach for structure only when it earns its keep, and
-never let formatting bury the one ask.
+Before you reach for real structure — headings, fenced blocks, lists, tables —
+read `protocol_section("formatting")` for what the console supports and how to
+use each piece.
 
 ## Example exchange
 

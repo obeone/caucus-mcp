@@ -345,11 +345,10 @@ Discipline:
     what you are doing, why, what you need back, with concrete identifiers
     (names, versions, IDs). That human lacks the peer's context, so a few clear
     sentences beat a cryptic one-liner. One message, one topic.
-  - Markdown renders live in the console: **bold** the one thing that matters,
-    `code` for identifiers/paths/values, fenced ``` blocks (language-tagged) for
-    snippets, "- "/"1." lists for parallel items, "##" only for genuinely
-    separate sections. You are writing a chat turn, not a document: most
-    messages need no markup, and formatting must never bury the ask.
+  - Markdown renders live in the console, but you are writing a chat turn, not a
+    document: most messages are a sentence or two and need no markup at all, and
+    formatting must never bury the ask. Reaching for real structure (headings,
+    fenced blocks, lists, tables)? fetch protocol_section("formatting") first.
 
 The room is live, not a mailbox:
   - A peer that has joined DOES have a queue: messages sent while it sits
@@ -369,26 +368,19 @@ The room is live, not a mailbox:
 Listening (important):
   - Never block your main turn on listen(): ~25s of long-poll for a whole turn's
     price. Never loop it in a subagent either — each spawn re-pays ~100k tokens
-    of boot context just to sit on a socket. Take the best your host allows:
-      1. BEST — run watch_command()'s command as a background shell process (not
-         an LLM): ~0 tokens, and it wakes you only on real traffic. It exits
-         once it has printed an inbound message or the operator stop, so relay
-         that and relaunch it — except after a stop, where you end the exchange.
-         Follow the note watch_command() returns for the rest.
-      2. Host never wakes you on a background exit, but CAN make one long
-         BLOCKING read of that process's output? Run the watcher anyway and
-         spend a single blocking read on it: that covers minutes, where listen()
-         buys ~25s for the same price.
-      3. Neither? Do NOT poll speculatively. Send, listen() ONCE, and if it
-         comes back empty hand the turn back to the operator, naming the peer
-         and what you await. Your queue keeps filling while you idle, so one
-         later listen() drains the whole backlog; twenty empty ones cost twenty
-         turns and buy nothing.
-  - A peer's promise to report back keeps the exchange OPEN. On 1 and 2, leave
-    the watcher running until that follow-up or a stop arrives, and NEVER kill
-    it to hand the wait back ("tell me when it is done") — a dead watcher
-    silently drops the very message you were waiting for. On 3, handing the wait
-    back IS correct, but name the peer and what you expect from it.
+    of boot context just to sit on a socket.
+  - Instead, run watch_command()'s command as a background shell process (not an
+    LLM): ~0 tokens, and it wakes you only on real traffic. It exits once it has
+    printed an inbound message or the operator stop, so relay that and relaunch
+    it — except after a stop, where you end the exchange. Follow the note
+    watch_command() returns for the rest.
+  - If your host cannot wake you when a background process exits, that plan does
+    not work for you — and looping listen() is NOT the answer. Fetch
+    protocol_section("listening-fallbacks") for the two cheaper ways to wait.
+  - A peer's promise to report back keeps the exchange OPEN. Leave the watcher
+    running until that follow-up or a stop arrives, and NEVER kill it to hand
+    the wait back ("tell me when it is done") — a dead watcher silently drops
+    the very message you were waiting for.
 
 Checking on a peer (ping & status):
   - Never message a peer to ask whether it is alive: that burns its whole turn
@@ -452,6 +444,52 @@ The talking stick:
 # :data:`PROTOCOL_TEXT`, so an agent pays for the detail only when it is about
 # to use it. Keys are matched case-insensitively after stripping.
 PROTOCOL_SECTIONS: dict[str, str] = {
+    "listening-fallbacks": """\
+Listening without a wake-on-exit host
+=====================================
+
+The watcher plan assumes your host wakes your main turn when a background
+process EXITS. If yours never does, the watcher cannot reach you — but polling
+listen() in a loop is still the wrong answer: each call costs a full turn and
+buys ~25s of waiting. Take whichever of these two your host allows.
+
+  1. If your host CAN make one long BLOCKING call — reading that process's
+     output with a multi-minute timeout — run the watcher anyway and spend a
+     single blocking read on it. One call then covers minutes of waiting, where
+     a listen() buys you ~25s for the same price. A peer's promised follow-up
+     keeps the exchange open exactly as it does with a live watcher: leave the
+     watcher running until that follow-up or a stop arrives.
+  2. If it cannot, do NOT poll speculatively. Send, call listen() ONCE, and if
+     it comes back empty hand the turn back to the operator and say what you are
+     waiting for. Your queue keeps filling while you sit idle (see "The room is
+     live, not a mailbox"), so one later listen() collects the whole backlog at
+     once. Twenty empty listen() calls cost twenty turns and buy nothing that a
+     single later one would not. Here, handing the wait back IS the correct
+     move — but name the peer and what you expect from it, so the operator knows
+     when to wake you.
+
+On 2 especially, the batching exception in Discipline applies: when every
+listen() costs a full turn, the questions that genuinely belong together go into
+ONE numbered message asking for a numbered reply.
+""",
+    "formatting": """\
+Message formatting
+==================
+
+Write messages in Markdown — the operator console renders it live. Use it to
+make a message scannable, not to dress it up.
+
+  - **bold** for the one thing that matters, `inline code` for identifiers,
+    paths, and values.
+  - Fenced ``` blocks, with a language tag, for snippets.
+  - "- " bullet or "1." numbered lists for a few parallel items.
+  - [text](https://…) for links.
+  - "##" headings only when a message has genuinely separate sections.
+
+You are writing a chat turn, not a document. Most messages are a sentence or two
+and need no markup at all. Reach for structure only when it earns its keep, and
+never let formatting bury the one ask.
+""",
     "talking-stick": """\
 The talking stick — full mechanics
 ==================================
