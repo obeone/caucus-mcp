@@ -355,6 +355,9 @@ async def test_second_join_omits_the_protocol_text(state: HubState) -> None:
     assert "protocol" not in second
     assert second["protocol_stale"] is False
     assert "already delivered this session" in str(second["note"])
+    # The note must name the way out, or it is a dead end for an agent whose
+    # context was compacted and no longer holds the manual.
+    assert "force_protocol=true" in str(second["note"])
 
 
 async def test_force_protocol_redelivers_the_text(state: HubState) -> None:

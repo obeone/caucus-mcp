@@ -162,6 +162,56 @@ def test_second_join_omits_the_protocol_text(
     assert second["protocol_stale"] is False
     assert second["protocol_version"] == first["protocol_version"]
     assert "already delivered this session" in second["note"]
+    # The note must name the way out, or it is a dead end for an agent whose
+    # context was compacted and no longer holds the manual.
+    assert "force_protocol=true" in second["note"]
+
+
+def test_join_without_a_cached_protocol_does_not_claim_delivery(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undelivered protocol must never be reported as already delivered.
+
+    The note is gated on the delivery flag rather than on "we sent no text this
+    call": an empty cache used to fall through to the reassuring branch, leaving
+    the agent with no manual and no hint that one exists.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "textless-joiner")
+    # Arm normally, then simulate an empty cache with nothing ever delivered.
+    bridge.list_peers()
+    monkeypatch.setattr(bridge, "_protocol_text", None)
+    monkeypatch.setattr(bridge, "_protocol_delivered", False)
+
+    result = bridge.join()
+    assert result["joined"] is True
+    assert "protocol" not in result
+    assert "already delivered" not in result["note"]
+    assert "unavailable" in result["note"]
+    assert "force_protocol=true" in result["note"]
+
+
+def test_stale_join_keeps_the_cached_text_when_the_hub_sends_none(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale join with no ``protocol_text`` must not evict the good cached copy."""
+    monkeypatch.setattr(bridge, "PROJECT", "textless-refresh")
+    first = bridge.join()
+    cached = first["protocol"]
+    assert "Caucus operating protocol" in cached
+
+    # The hub bumps the revision but serves an empty body for it, so the join is
+    # flagged stale and carries no usable text.
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(
+        hub_module, "PROTOCOL_VERSION", hub_module.PROTOCOL_VERSION + 1
+    )
+    monkeypatch.setattr(hub_module, "PROTOCOL_TEXT", "")
+
+    second = bridge.join()
+    assert second["protocol_stale"] is True
+    # The cache survived, so the agent still gets a manual rather than null.
+    assert second["protocol"] == cached
 
 
 def test_force_protocol_redelivers_the_text(
@@ -879,6 +929,66 @@ def test_join_hands_back_the_watch_command(
     with open(path, encoding="utf-8") as fh:
         assert fh.read().strip() == bridge._token
     assert (os.stat(path).st_mode & 0o777) == 0o600
+
+
+def test_watch_command_does_not_invalidate_the_command_join_handed_back(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: calling watch_command() must not kill join()'s watch command.
+
+    ``caucus-watch`` reads ``--token-file`` once at startup and exits on a read
+    failure, so rotating the file on every mint meant the command from join's
+    ``watch`` field pointed at a deleted path the moment watch_command() ran —
+    and running both is precisely the sequence the protocol describes. The live
+    file is reused while the token is unchanged, so both commands stay runnable.
+    """
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watch-file-keeper")
+    from_join = str(bridge.join()["watch"])
+    from_tool = str(bridge.watch_command()["command"])
+
+    assert from_join == from_tool  # same token, same file, one command
+    path = from_join.split("--token-file ", 1)[1]
+    assert os.path.exists(path), "join's watch command lost its token file"
+    with open(path, encoding="utf-8") as fh:
+        assert fh.read().strip() == bridge._token
+
+
+def test_watch_command_mints_a_fresh_file_when_the_token_changes(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reuse is keyed on the token: a new identity must not poll with the old one."""
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watch-rotator")
+    first = str(bridge.join()["watch"])
+    first_path = first.split("--token-file ", 1)[1]
+
+    # Leave and re-join under a different name: a different token, so the file
+    # must be replaced rather than reused.
+    bridge.leave()
+    assert not os.path.exists(first_path)  # leave() cleans up behind itself
+    second = str(bridge.join(project="watch-rotator-2")["watch"])
+    second_path = second.split("--token-file ", 1)[1]
+
+    assert second_path != first_path
+    with open(second_path, encoding="utf-8") as fh:
+        assert fh.read().strip() == bridge._token
+
+
+def test_watch_command_replaces_a_token_file_deleted_underneath_it(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vanished file is re-minted, so the command handed back is always runnable."""
+    import os
+
+    monkeypatch.setattr(bridge, "PROJECT", "watch-file-loser")
+    bridge.join()
+    os.unlink(bridge._token_file)  # something outside the bridge removed it
+
+    path = str(bridge.watch_command()["command"]).split("--token-file ", 1)[1]
+    assert os.path.exists(path)
 
 
 def test_leave_deletes_watcher_token_file(

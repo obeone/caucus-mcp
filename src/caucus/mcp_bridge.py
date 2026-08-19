@@ -76,10 +76,16 @@ mcp = FastMCP(
 _token: str | None = None
 _joined_as: str | None = None
 
-# Path of the 0600 token file written by :func:`watch_command` for the
-# background watcher (an unpredictable mkstemp name), cleaned up by
-# :func:`leave`. ``None`` when none is live.
+# Path of the 0600 token file written for the background watcher (an
+# unpredictable mkstemp name), cleaned up by :func:`leave`. ``None`` when none
+# is live.
 _token_file: str | None = None
+
+# The token :data:`_token_file` currently holds. :func:`_watch_command_for`
+# reuses the live file while this matches, so a command already handed to the
+# agent keeps working: rotating the file under it would leave the watcher to die
+# at startup on an unreadable ``--token-file``.
+_token_file_token: str | None = None
 
 # Flipped by :func:`_ensure_armed` on the first tool call. Once armed, the
 # session has fetched the protocol from the hub, so no explicit setup is needed.
@@ -202,9 +208,10 @@ def _ensure_armed() -> dict[str, object] | None:
 def _write_token_file(token: str) -> str:
     """Write ``token`` to a private (0600) temp file and return its path.
 
-    Used by :func:`watch_command` so the access token reaches the background
-    watcher by path rather than on the command line, keeping it out of the
-    process argv and the launching transcript.
+    Used by :func:`_watch_command_for` so the access token reaches the
+    background watcher by path rather than on the command line, keeping it out
+    of the process argv and the launching transcript. Call it through that
+    helper, never directly: it decides when rotating the file is safe.
 
     The file is created with :func:`tempfile.mkstemp`, which atomically opens a
     brand-new file (``O_EXCL | O_CREAT``) at mode ``0600`` under an
@@ -219,8 +226,8 @@ def _write_token_file(token: str) -> str:
     Returns:
         The absolute path to the token file.
     """
-    # Drop any token file from a prior watch_command() call so we never leak a
-    # stale one when a fresh, unpredictable path replaces it.
+    # Drop any token file from a prior call so we never leak a stale one when a
+    # fresh, unpredictable path replaces it.
     _cleanup_token_file()
     fd, path = tempfile.mkstemp(prefix="caucus-watch-", suffix=".token")
     try:
@@ -231,13 +238,22 @@ def _write_token_file(token: str) -> str:
 
 
 def _watch_command_for(token: str) -> str:
-    """Mint a ready-to-run ``caucus-watch`` command for ``token``.
+    """Return a ready-to-run ``caucus-watch`` command for ``token``.
 
-    Writes ``token`` to a fresh private (0600) file and points the command at
-    it by path, so the secret never rides the process argv or the launching
-    transcript. Any previous token file is replaced. Shared by :func:`join`
-    (which hands the command back up front) and :func:`watch_command`, so the
-    two can never disagree on how the watcher is invoked.
+    The token reaches the watcher through a private (0600) file referenced by
+    path, so the secret never rides the process argv or the launching
+    transcript. Shared by :func:`join` (which hands the command back up front)
+    and :func:`watch_command`, so the two can never disagree on how the watcher
+    is invoked.
+
+    **The live file is reused while the token is unchanged.** Minting a fresh
+    one on every call would unlink the file the *previous* command names, and
+    ``caucus-watch`` reads ``--token-file`` once at startup and exits on a read
+    failure — so the command handed back by ``join`` would die the moment
+    ``watch_command`` was called, which is exactly the sequence the protocol
+    tells agents to run. A fresh file is written only when the token actually
+    changed (a re-join under a new identity) or when the live one has gone
+    missing.
 
     Args:
         token: The hub access token the watcher will poll with.
@@ -245,20 +261,30 @@ def _watch_command_for(token: str) -> str:
     Returns:
         The shell command to run in the background.
     """
-    global _token_file
-    _token_file = _write_token_file(token)
+    global _token_file, _token_file_token
+    stale_file = (
+        _token_file is None
+        or _token_file_token != token
+        or not os.path.exists(_token_file)
+    )
+    if stale_file:
+        _token_file = _write_token_file(token)
+        _token_file_token = token
     return f"caucus-watch --hub {HUB_URL} --token-file {_token_file}"
 
 
 def _cleanup_token_file() -> None:
     """Remove the watcher token file if one is live; ignore if already gone."""
-    global _token_file
+    global _token_file, _token_file_token
     if _token_file is not None:
         try:
             os.unlink(_token_file)
         except OSError:
             pass
         _token_file = None
+    # Clear the ownership tag with the path: leaving it set would let the next
+    # _watch_command_for reuse a token for a file that no longer exists.
+    _token_file_token = None
 
 
 @mcp.tool()
@@ -344,18 +370,33 @@ def join(
         # together. Advancing _known_protocol_version while leaving the old text
         # cached would make the *next* join compute stale=False and hand back the
         # superseded text under the new version label (silent protocol drift).
-        _protocol_text = body.get("protocol_text")
+        # Only overwrite when the hub actually sent text: parking None here would
+        # evict a good cached copy over a malformed response.
+        fresh_text = body.get("protocol_text")
+        if fresh_text:
+            _protocol_text = fresh_text
     notes: list[str] = []
     # With the setup step gone, join is where a lazily-armed agent reads the
     # operating manual — but only when it does not already have it. Re-sending
     # ~4.4k tokens of unchanged text on every join buys the agent nothing.
-    if (stale or force_protocol or not _protocol_delivered) and _protocol_text:
+    wants_text = stale or force_protocol or not _protocol_delivered
+    if wants_text and _protocol_text:
         result["protocol"] = _protocol_text
         _protocol_delivered = True
         if stale:
             notes.append("protocol updated; re-read the protocol below")
+    elif _protocol_delivered:
+        # Gated on the delivery flag, not merely on "we sent nothing": claiming a
+        # delivery that never happened would strand an agent with no manual and
+        # no hint that one exists.
+        notes.append(
+            "protocol unchanged; already delivered this session"
+            " (pass force_protocol=true to re-read it)"
+        )
     else:
-        notes.append("protocol unchanged; already delivered this session")
+        notes.append(
+            "protocol text unavailable; retry with join(force_protocol=true)"
+        )
     if body.get("note"):
         # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
         notes.append(str(body["note"]))
