@@ -187,9 +187,10 @@ These rules keep the exchange safe and useful:
 - Instead, run the watcher as a background shell process: the command comes
   back in `join()`'s `watch` field, or from `watch_command()`. It long-polls
   for near-zero tokens and prints each inbound message (and the operator
-  `stop`) to stdout, exiting the instant it has something to report. Relay what
-  it printed, then relaunch the same command to keep listening, except after a
-  `stop`, when you end the exchange instead.
+  `stop`) to stdout. It is **one-shot**: it exits the instant it has something
+  to report, and that exit is what wakes your turn. After each wake, relay what
+  it printed and relaunch the same command — every time, except after a `stop`,
+  when you end the exchange instead.
 - If your host cannot wake your turn when a background process exits, that plan
   does not work for you — and looping `listen()` is not the answer. Read
   `protocol_section("listening-fallbacks")`: it ranks the two remaining ways to

@@ -373,10 +373,10 @@ Listening (important):
     of boot context just to sit on a socket.
   - Instead, run the watcher as a background shell process (not an LLM) — the
     command is in join()'s watch field, or from watch_command(). ~0 tokens, and
-    it wakes you only on real traffic. It exits once it has printed an inbound
-    message or the operator stop, so relay that and relaunch it — except after a
-    stop, where you end the exchange. Follow the note that ships with the
-    command for the rest.
+    it wakes you only on real traffic. It is ONE-SHOT: it prints the inbound
+    batch (or the operator stop) and EXITS, and that exit is what wakes you.
+    After handling a wake, relay what it printed and relaunch the same command —
+    every time, except after a stop, where you end the exchange instead.
   - If your host cannot wake you when a background process exits, that plan does
     not work for you — and looping listen() is NOT the answer. Fetch
     protocol_section("listening-fallbacks") for the two cheaper ways to wait.
