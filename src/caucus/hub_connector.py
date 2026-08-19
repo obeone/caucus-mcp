@@ -266,6 +266,32 @@ class HubConnector:
         body = resp.json()
         return Protocol(version=int(body["version"]), text=str(body["text"]))
 
+    async def fetch_protocol_section(self, name: str) -> dict[str, object]:
+        """Fetch one on-demand protocol section by ``name``.
+
+        The protocol core names these sections and states the trigger for each,
+        so an agent pays for a rare flow's mechanics only when it is about to
+        use it.
+
+        Args:
+            name: Section name, as advertised in the core protocol.
+
+        Returns:
+            ``{"version", "section", "text"}`` for a known section, or the hub's
+            ``{"error": "unknown_section", "sections": [...]}`` body for an
+            unknown one — a wrong name is a caller mistake to correct, not a
+            transport failure, so it is returned rather than raised.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or fails otherwise.
+        """
+        http = self._require_http()
+        resp = await http.get("/protocol", params={"section": name})
+        if resp.status_code == 404:
+            return dict(resp.json())
+        resp.raise_for_status()
+        return dict(resp.json())
+
     async def register(
         self,
         project: str,
