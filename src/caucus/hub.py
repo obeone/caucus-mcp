@@ -1435,6 +1435,29 @@ async def forms() -> dict[str, list[dict[str, object]]]:
     return {"forms": state.list_forms()}
 
 
+@app.get("/decisions")
+async def decisions(
+    limit: int = Query(default=20, ge=1, le=500),
+) -> dict[str, list[dict[str, object]]]:
+    """List recently settled operator-form decisions, oldest first.
+
+    The answered/cancelled counterpart to ``/forms``: a late-joining agent
+    calls this to catch up on questions the operator already resolved, without
+    replaying the whole transcript. Read-only and unauthenticated, like
+    ``/forms`` — an operator-form answer is no more sensitive than the pending
+    form it resolved, and ``/forms`` already surfaces channel-scoped questions
+    the same way.
+
+    Args:
+        limit: Maximum number of decisions to return (the most recent ones).
+
+    Returns:
+        ``{"decisions": [{"ts", "asker", "title", "status", "answer_summary"},
+        ...]}`` — see :meth:`~caucus.state.HubState.decisions`.
+    """
+    return {"decisions": state.decisions(limit)}
+
+
 def _record_unacked(client: Client, messages: list[Message]) -> None:
     """Buffer delivered messages for replay on reconnect, skipping control.
 
@@ -1716,6 +1739,33 @@ async def receive(
             # own identity for the lifetime of the hub. Cleanup failures still
             # propagate; they just do not take the counter down with them.
             client.active_polls -= 1
+
+
+@app.get("/peek")
+async def peek(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+) -> dict[str, object]:
+    """Report the caller's pending queue depth without draining it.
+
+    The non-blocking counterpart to ``GET /receive``: a cheap "is a turn worth
+    it?" check an agent can run before paying for a full receive. Authenticated
+    exactly like ``/receive`` — the token is read from the ``Authorization:
+    Bearer <token>`` header (preferred) or the deprecated ``?token=`` query
+    fallback, see :func:`_resolve_receive_token` — and resolved through
+    :meth:`~caucus.state.HubState.client_for`, so it touches ``last_seen`` (and
+    can revive a reaped identity) exactly the way every other authenticated
+    endpoint does; no special-cased liveness bookkeeping.
+
+    Returns:
+        ``{"pending": <int>, "last": {"sender", "preview"} | None}`` — see
+        :meth:`~caucus.state.HubState.peek`.
+    """
+    resolved = _resolve_receive_token(authorization, token)
+    client = state.client_for(resolved) if resolved is not None else None
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    return state.peek(client)
 
 
 @app.post("/ack")

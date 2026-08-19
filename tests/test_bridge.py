@@ -62,6 +62,7 @@ def test_readonly_tools_work_before_join(
     assert "peers" in bridge.list_peers()
     assert "channels" in bridge.list_channels()
     assert "forms" in bridge.list_forms()
+    assert "decisions" in bridge.decisions()
     assert bridge.ping("nobody")["state"] == "absent"
     assert "floors" in bridge.floor(action="status")
 
@@ -74,6 +75,7 @@ def test_write_tools_require_join(
     assert bridge.set_status("busy") == not_joined
     assert bridge.listen(timeout=0) == not_joined
     assert bridge.floor(action="take", reason="x") == not_joined
+    assert bridge.peek() == not_joined
 
 
 def test_whoami_is_available_before_arming(
@@ -498,6 +500,38 @@ def test_set_status_blank_clears(bridge, monkeypatch: pytest.MonkeyPatch) -> Non
     bridge.set_status("busy")
     assert bridge.set_status("") == {"status": None}
     assert bridge.ping("clearer")["status"] is None
+
+
+# --- peek ------------------------------------------------------------------
+
+
+def test_peek_without_join_errors(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge, "_token", None)
+    assert bridge.peek() == {"error": "not_joined", "hint": "call join() first"}
+
+
+def test_peek_reports_pending_without_draining(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "PROJECT", "peeker-1")
+    bridge.join()
+
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        sender = http.post("/register", json={"project": "peek-sender"}).json()["token"]
+        http.post(
+            "/send", json={"token": sender, "to": "peeker-1", "content": "yo peeker"}
+        )
+
+    before = bridge.peek()
+    assert before["pending"] == 1
+    assert before["last"] == {"sender": "peek-sender", "preview": "yo peeker"}
+
+    # A peek must not drain the queue: listen() still sees the message.
+    got = bridge.listen(timeout=3)
+    assert any("yo peeker" in m["content"] for m in got["messages"])
+
+    after = bridge.peek()
+    assert after == {"pending": 0, "last": None}
 
 
 # --- say -----------------------------------------------------------------
@@ -945,6 +979,44 @@ def test_list_forms_works_before_join(
         "error": "not_joined",
         "hint": "call join() first",
     }
+
+
+def test_decisions_lists_settled_form(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "form-decider")
+    bridge.join()
+    form_id = bridge.ask_operator("Deploy?", [_radio_field()])["form_id"]
+
+    # Answer it directly against the shared hub state (mirrors how the
+    # operator console's /ui websocket resolves it in production).
+    hub_module.state.answer_form(form_id, {"ok": "yes"})
+
+    entries = bridge.decisions()["decisions"]
+    assert any(
+        e["title"] == "Deploy?" and e["asker"] == "form-decider" for e in entries
+    )
+
+
+def test_decisions_respects_limit(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "form-limiter")
+    bridge.join()
+    for i in range(3):
+        form_id = bridge.ask_operator(f"Q{i}", [_radio_field()])["form_id"]
+        hub_module.state.answer_form(form_id, {"ok": "yes"})
+
+    limited = bridge.decisions(limit=2)["decisions"]
+    # The log is a shared global across the whole test session, so only assert
+    # on what this test controls: exactly 2 entries, most recent (Q2) last.
+    assert len(limited) == 2
+    assert limited[-1]["title"] == "Q2"
+    assert limited[0]["title"] == "Q1"
 
 
 # --- watch_command -------------------------------------------------------

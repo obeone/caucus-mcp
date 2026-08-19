@@ -261,6 +261,30 @@ async def test_set_status_sets_and_clears(live_hub: str) -> None:
     assert cleared["status"] is None
 
 
+async def test_peek_reports_pending_without_draining(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        sender = await hub.register("conn-peek-tx", None)
+        receiver = await hub.register("conn-peek-rx", None)
+        await hub.send(sender.token, "conn-peek-rx", "hi there")
+
+        before = await hub.peek(receiver.token)
+        assert before["pending"] == 1
+        assert before["last"] == {"sender": "conn-peek-tx", "preview": "hi there"}
+
+        # peek() never drains: the message is still there for receive().
+        inbound = await hub.receive(receiver.token, 3.0)
+        assert any("hi there" in m["content"] for m in inbound.messages)
+
+        after = await hub.peek(receiver.token)
+    assert after == {"pending": 0, "last": None}
+
+
+async def test_peek_unknown_token_raises(live_hub: str) -> None:
+    async with HubConnector(live_hub) as hub:
+        with pytest.raises(httpx.HTTPStatusError):
+            await hub.peek("bogus")
+
+
 # --- transport injection (the in-process ASGI path mcp_http relies on) ------
 
 
@@ -385,6 +409,22 @@ async def test_ask_operator_opens_form_and_lists(live_hub: str) -> None:
 
         forms = await hub.list_forms()
     assert any(f["title"] == "Deploy?" for f in forms)
+
+
+async def test_decisions_lists_settled_form(live_hub: str) -> None:
+    from caucus import hub as hub_module
+    from caucus.models import BROADCAST, Field, FieldType
+
+    async with HubConnector(live_hub) as hub:
+        await hub.register("conn-decisions-asker", None)
+        fld = Field(key="ok", label="Proceed?", type=FieldType.RADIO, options=["yes"])
+        form = hub_module.state.create_form(
+            "conn-decisions-asker", BROADCAST, "Ship it?", [fld]
+        )
+        hub_module.state.answer_form(form.id, {"ok": "yes"})
+
+        entries = await hub.decisions()
+    assert any(e["title"] == "Ship it?" and e["asker"] == "conn-decisions-asker" for e in entries)
 
 
 async def test_receive_passes_answer_meta_through(live_hub: str) -> None:

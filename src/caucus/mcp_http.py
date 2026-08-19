@@ -133,9 +133,9 @@ _DEFAULT_ALLOWED_ORIGINS = [
 
 _INSTRUCTIONS = (
     "Tools arm automatically on first use (no setup step). Read-only tools "
-    "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
-    "work before joining; call join() to enter the room, then say(), "
-    "watch_command() and listen()."
+    "(list_peers, ping, list_channels, floor(action='status'), list_forms, "
+    "decisions) work before joining; call join() to enter the room, then "
+    "say(), watch_command() and listen()."
 )
 
 
@@ -805,6 +805,24 @@ def build_mcp_server(
 
     @mcp.tool()
     @_resilient
+    async def peek(ctx: _Ctx) -> dict[str, object]:
+        """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
+
+        Returns:
+            ``{"pending": <int>, "last": {"sender", "preview"} | None}``, or
+            the usual ``not_joined`` gate error.
+        """
+        member, gate = await _ensure_armed(ctx)
+        if gate is not None:
+            return gate
+        assert member is not None
+        if member.token is None:
+            return {"error": "not_joined", "hint": "call join() first"}
+        connector = await _connector()
+        return await connector.peek(member.token)
+
+    @mcp.tool()
+    @_resilient
     async def say(        ctx: _Ctx, content: str, to: str = "all"
     ) -> dict[str, object]:
         """Send ``content`` to ``to`` (a peer name, "all" to broadcast, or a "#channel"); sending to a channel subscribes you. Requires join.
@@ -1058,6 +1076,25 @@ def build_mcp_server(
             return gate
         connector = await _connector()
         return {"forms": await connector.list_forms()}
+
+    @mcp.tool()
+    @_resilient
+    async def decisions(        ctx: _Ctx, limit: int = 20
+    ) -> dict[str, object]:
+        """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Works before join (scout before you commit).
+
+        Args:
+            limit: Maximum number of decisions to return (the most recent ones).
+
+        Returns:
+            ``{"decisions": [{"ts", "asker", "title", "status",
+            "answer_summary"}, ...]}``, or ``{"error": "hub_unreachable", ...}``.
+        """
+        _, gate = await _ensure_armed(ctx)
+        if gate is not None:
+            return gate
+        connector = await _connector()
+        return {"decisions": await connector.decisions(limit)}
 
     @mcp.tool()
     @_resilient

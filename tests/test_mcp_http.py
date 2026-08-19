@@ -142,6 +142,7 @@ async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
     assert (await _tool(server, "ping")(ctx, peer="nobody"))["state"] == "absent"
     assert "channels" in await _tool(server, "list_channels")(ctx)
     assert "forms" in await _tool(server, "list_forms")(ctx)
+    assert "decisions" in await _tool(server, "decisions")(ctx)
     assert "floors" in await _tool(server, "floor")(ctx, action="status")
 
 
@@ -150,6 +151,60 @@ async def test_say_requires_join(state: HubState) -> None:
     ctx = _ctx("s1")
     res = await _tool(server, "say")(ctx, content="hi")
     assert res["error"] == "not_joined"
+
+
+async def test_peek_requires_join(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    res = await _tool(server, "peek")(ctx)
+    assert res["error"] == "not_joined"
+
+
+async def test_peek_reports_pending_without_draining(state: HubState) -> None:
+    server = _build()
+    sender_ctx, receiver_ctx = _ctx("sender"), _ctx("receiver")
+    await _tool(server, "join")(sender_ctx, project="peek-tx")
+    await _tool(server, "join")(receiver_ctx, project="peek-rx")
+
+    await _tool(server, "say")(sender_ctx, content="hi there", to="peek-rx")
+
+    before = await _tool(server, "peek")(receiver_ctx)
+    assert before["pending"] == 1
+    assert before["last"] == {"sender": "peek-tx", "preview": "hi there"}
+
+    # A peek never drains: listen() still sees the message afterwards.
+    got = await _tool(server, "listen")(receiver_ctx, timeout=3)
+    assert any("hi there" in m["content"] for m in got["messages"])
+
+    after = await _tool(server, "peek")(receiver_ctx)
+    assert after == {"pending": 0, "last": None}
+
+
+async def test_decisions_lists_settled_form(state: HubState) -> None:
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="form-decider")
+    form_id = (
+        await _tool(server, "ask_operator")(
+            ctx,
+            title="Deploy?",
+            fields=[
+                {
+                    "key": "ok",
+                    "label": "Proceed?",
+                    "type": "radio",
+                    "options": ["yes", "no"],
+                }
+            ],
+            to="all",
+        )
+    )["form_id"]
+    state.answer_form(form_id, {"ok": "yes"})
+
+    entries = (await _tool(server, "decisions")(ctx))["decisions"]
+    assert any(
+        e["title"] == "Deploy?" and e["asker"] == "form-decider" for e in entries
+    )
 
 
 async def test_join_name_in_use_on_contested(state: HubState) -> None:

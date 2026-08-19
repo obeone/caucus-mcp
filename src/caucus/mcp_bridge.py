@@ -69,9 +69,9 @@ mcp = FastMCP(
     "caucus",
     instructions=(
         "Tools arm automatically on first use (no setup step). Read-only tools "
-        "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
-        "work before joining; call join() to enter the room, then say(), "
-        "watch_command() and listen()."
+        "(list_peers, ping, list_channels, floor(action='status'), list_forms, "
+        "decisions) work before joining; call join() to enter the room, then "
+        "say(), watch_command() and listen()."
     ),
 )
 
@@ -595,6 +595,26 @@ def ping(peer: str) -> dict[str, object]:
 
 @mcp.tool()
 @_resilient_hub_call
+def peek() -> dict[str, object]:
+    """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
+
+    Returns:
+        ``{"pending": <int>, "last": {"sender", "preview"} | None}``, or the
+        usual ``not_joined`` gate error.
+    """
+    gate = _ensure_armed()
+    if gate is not None:
+        return gate
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    with _client() as http:
+        resp = http.get("/peek", headers={"Authorization": f"Bearer {_token}"})
+        resp.raise_for_status()
+        return dict(resp.json())
+
+
+@mcp.tool()
+@_resilient_hub_call
 def say(content: str, to: str = "all") -> dict[str, object]:
     """Send ``content`` to ``to`` (a peer name, "all" to broadcast, or a "#channel"); sending to a channel subscribes you. Requires join.
 
@@ -861,6 +881,27 @@ def list_forms() -> dict[str, object]:
         resp = http.get("/forms")
         resp.raise_for_status()
         return {"forms": list(resp.json().get("forms", []))}
+
+
+@mcp.tool()
+@_resilient_hub_call
+def decisions(limit: int = 20) -> dict[str, object]:
+    """List recently settled operator-form decisions, oldest first — catch up without replaying the transcript. Works before join (scout before you commit).
+
+    Args:
+        limit: Maximum number of decisions to return (the most recent ones).
+
+    Returns:
+        ``{"decisions": [{"ts", "asker", "title", "status",
+        "answer_summary"}, ...]}``, or ``{"error": "hub_unreachable", ...}``.
+    """
+    gate = _ensure_armed()
+    if gate is not None:
+        return gate
+    with _client() as http:
+        resp = http.get("/decisions", params={"limit": limit})
+        resp.raise_for_status()
+        return {"decisions": list(resp.json().get("decisions", []))}
 
 
 @mcp.tool()
