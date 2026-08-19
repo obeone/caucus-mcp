@@ -55,24 +55,35 @@ and rename that heading to the version when you cut the release.
 - **`GET /peek`, plus a `peek()` tool on the bridge and the in-process MCP
   server.** A non-draining "is a turn worth it?" probe: an agent can check
   `{"pending": <int>, "last": {"sender", "preview"} | None}` for its own queue
-  without paying for a full `/receive`. Authenticated exactly like `/receive`;
-  `HubState` tracks `pending`/`last_pending` alongside each `route()` enqueue
-  rather than inspecting the queues themselves, and `/receive` mirrors the
-  drain, so a peek can never race a concurrent receive.
+  without paying for a full `/receive`. Authenticated exactly like `/receive`.
+  The pending count is `queue.qsize() + priority_queue.qsize()`, read fresh on
+  every call rather than tracked by a parallel counter — exact under asyncio's
+  single-threaded scheduling, so there is nothing to drift. Only the preview
+  (`last_pending`) is cached, and `HubState._revive` updates it too, so a peek
+  right after reconnecting still reports the replayed backlog correctly.
 - **`GET /decisions`, plus a `decisions()` tool on the bridge and the
   in-process MCP server.** Lists recently settled operator-form decisions
   (`{"ts", "asker", "title", "status", "answer_summary"}`, oldest first,
   `?limit=` default 20) so a late-joining agent can catch up on questions the
   operator already answered or cancelled without replaying the whole
-  transcript. The routed `answer` message's `meta` now also carries the
-  original form's `asker`.
+  transcript. A settled decision can carry a channel's private answer text, so
+  this requires a token (resolved like `/receive`): a peer token scopes the
+  result to broadcast decisions plus channels the caller belongs to, and — when
+  operator auth is enabled — an operator/observer token gets the unrestricted
+  view, mirroring the escalation `/export` already grants that role over the
+  full transcript. The routed `answer` message's `meta` now also carries the
+  original form's `asker` and `to` (its audience).
 - **The native Claude connector (`claude_agent.py`) now publishes a turn
   heartbeat.** Each turn sets a "composing a reply" status before querying the
   SDK client and clears it again once the response is drained, so a peer's
-  `ping()` sees the agent mid-turn instead of a stale idle status. Best-effort:
-  a status failure is logged and swallowed, never allowed to abort the turn.
-  (`HubConnector.ping`/`set_status` already existed; only the auto-status
-  wiring around `_drive_turn` is new.)
+  `ping()` sees the agent mid-turn instead of a stale idle status. Best-effort
+  and bounded: a status failure or a call taking longer than 2s is logged and
+  swallowed, never allowed to abort or delay the turn; the clearing call is
+  additionally shielded from the turn's own cancellation (an operator
+  interrupt/reset/stop), so a cancelled turn still clears its status instead of
+  leaving "composing a reply" published forever. (`HubConnector.ping`/
+  `set_status` already existed; only the auto-status wiring around
+  `_drive_turn` is new.)
 
 ### Changed
 
