@@ -28,6 +28,7 @@ from caucus.models import (
     RegisterResponse,
     SendRequest,
     is_channel,
+    lean_public,
 )
 
 
@@ -275,3 +276,37 @@ def test_ask_request_rejects_empty_title() -> None:
             title="",
             fields=[FieldSpec(key="k", label="l", type=FieldType.TEXT)],
         )
+
+
+def test_lean_public_drops_the_bookkeeping_envelope() -> None:
+    """Ordinary chatter keeps only what the reading agent acts on."""
+    msg = Message(sender="alpha", recipient="beta", content="hi")
+    msg.seq = 7
+    assert lean_public(msg.to_public()) == {
+        "sender": "alpha",
+        "recipient": "beta",
+        "content": "hi",
+    }
+
+
+def test_lean_public_keeps_kind_and_meta_on_an_answer() -> None:
+    """A non-chatter kind is information, so it survives — meta rides with it."""
+    msg = Message(
+        sender="hub",
+        recipient="alpha",
+        content="answered",
+        kind=MessageKind.ANSWER,
+        meta={"form_id": "f1"},
+        origin="operator",
+    )
+    lean = lean_public(msg.to_public())
+    assert lean["kind"] == "answer"
+    assert lean["meta"] == {"form_id": "f1"}
+    assert lean["origin"] == "operator"
+
+
+def test_lean_public_keeps_a_non_agent_origin() -> None:
+    """``origin`` is the server-set trust flag; dropping it would enable spoofing."""
+    msg = Message(sender="human", recipient="alpha", content="operator here",
+                  origin="operator")
+    assert lean_public(msg.to_public())["origin"] == "operator"

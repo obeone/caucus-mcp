@@ -30,6 +30,16 @@ and rename that heading to the version when you cut the release.
   Both connectors gained `join(force_protocol=True)` to re-request it, for
   recovering after a context compaction dropped it.
 
+- **`listen()` returns lean messages.** Each inbound message was handed to the
+  agent with the full `/receive` envelope — `id`, `ts`, `seq`, plus a `kind` and
+  `origin` that usually just restated the default. None of it is actionable: the
+  connector ACKs the `seq` itself and nothing ever refers back to an id or a
+  timestamp. A message now carries `sender`, `recipient` and `content`, plus
+  `kind` when it is not ordinary chatter (an `answer` still brings its `meta`)
+  and `origin` when the operator or the hub spoke rather than a peer — that one
+  is the server-set trust flag and dropping it would let a peer impersonate the
+  control plane in free text. Applies to both connectors.
+
 - **`join()` now returns the watcher command (stdio bridge).** Launching the
   watcher is the documented next step after joining, so the result carries a
   `watch` field holding exactly what `watch_command()` would mint, token file and

@@ -440,6 +440,87 @@ def test_listen_returns_chatter(
     assert any("ping for you" in m["content"] for m in result["messages"])
 
 
+def test_listen_returns_a_lean_message_shape(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordinary chatter comes back as sender/recipient/content and nothing else.
+
+    The ``/receive`` envelope (``id``, ``ts``, ``seq``, plus a ``kind`` and
+    ``origin`` that only restate the default) is bookkeeping the bridge uses to
+    ACK. Passing it to the agent charged the model for context it never reads,
+    once per message.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "lean-listener")
+    bridge.join()
+
+    peer = _register_peer(live_hub, "lean-peer")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post(
+            "/send",
+            json={"token": peer, "to": "lean-listener", "content": "trimmed"},
+        )
+
+    messages = bridge.listen(timeout=3)["messages"]
+    assert len(messages) == 1
+    assert messages[0] == {
+        "sender": "lean-peer",
+        "recipient": "lean-listener",
+        "content": "trimmed",
+    }
+
+
+def test_listen_keeps_kind_and_meta_on_an_answer(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator-form answer is not ordinary chatter, so it keeps its markers.
+
+    Answering a form is an operator-console gesture, so the answer is submitted
+    straight against the live hub's state rather than over the ``/ui`` socket.
+    """
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "form-asker")
+    bridge.join()
+
+    form_id = bridge.ask_operator(
+        title="Ship it?",
+        fields=[{"key": "go", "label": "Go?", "type": "radio", "options": ["y", "n"]}],
+    )["form_id"]
+    hub_module.state.answer_form(form_id, {"go": "y"})
+
+    answers = [m for m in bridge.listen(timeout=3)["messages"] if m.get("meta")]
+    assert answers, "the form answer never came back"
+    assert answers[0]["kind"] == "answer"
+    # Operator-issued, so the trust flag must survive the trim.
+    assert answers[0]["origin"] == "operator"
+    assert answers[0]["meta"]["form_id"] == form_id
+
+
+def test_listen_keeps_origin_on_an_operator_message(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A human-origin message keeps ``origin``: it is the anti-spoofing signal."""
+    from caucus import hub as hub_module
+    from caucus.models import Message
+
+    monkeypatch.setattr(bridge, "PROJECT", "human-listener")
+    bridge.join()
+
+    hub_module.state.route(
+        Message(
+            sender="human",
+            recipient="human-listener",
+            content="operator here",
+            origin="operator",
+        )
+    )
+
+    messages = bridge.listen(timeout=3)["messages"]
+    spoken = [m for m in messages if m["content"] == "operator here"]
+    assert spoken, "the operator message never arrived"
+    assert spoken[0]["origin"] == "operator"
+
+
 # --- talking stick -------------------------------------------------------
 
 

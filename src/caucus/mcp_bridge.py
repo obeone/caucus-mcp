@@ -40,6 +40,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import __version__, automode, autostart
 from .logging_setup import configure_logging
+from .models import lean_public
 from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.bridge")
@@ -735,7 +736,10 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     listening). If a control ``stop`` arrives, the result contains
     ``{"stop": true}`` and the agent should end the exchange. Each call
     piggybacks an ACK for the previous batch; the bridge tracks the ``seq``
-    automatically.
+    automatically. Each message carries ``sender``, ``recipient`` and
+    ``content``, plus ``kind`` when it is not ordinary chatter (an ``answer``
+    brings the operator's form reply in ``meta``) and ``origin`` when the
+    operator or the hub spoke rather than a peer.
 
     Args:
         timeout: Maximum seconds to wait for inbound traffic.
@@ -768,7 +772,9 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
     if seqs:
         _last_acked_seq = max(max(seqs), _last_acked_seq)
     stop = any(m.get("kind") == "control" and m.get("content") == "stop" for m in messages)
-    chatter = [m for m in messages if m.get("kind") != "control"]
+    # Trim after the seq scan above: the bridge needs the envelope to ACK, the
+    # agent reading the result does not.
+    chatter = [lean_public(m) for m in messages if m.get("kind") != "control"]
     return {"messages": chatter, "mode": payload.get("mode"), "stop": stop}
 
 

@@ -147,6 +147,44 @@ class Message:
         return public
 
 
+def lean_public(public: dict[str, object]) -> dict[str, object]:
+    """Trim a public message dict to the fields a reading agent acts on.
+
+    ``GET /receive`` hands back the full envelope — ``id``, ``ts``, ``seq``,
+    ``kind``, ``origin`` — because the hub, the operator console and the ACK
+    bookkeeping all need it. The agent at the other end needs almost none of it:
+    the connector ACKs the ``seq`` on its behalf, and the ids and timestamps are
+    never referred to again, so they are context the model pays for and cannot
+    use. On a passive host, where every inbound batch costs a turn, that waste
+    is charged per message.
+
+    Kept always: ``sender``, ``recipient``, ``content``. Kept only when they
+    carry information: ``kind`` when the message is not ordinary chatter (an
+    ``answer`` brings an operator form's reply, and its ``meta`` rides along),
+    and ``origin`` when it is not ``"agent"`` — the server-set trust flag
+    saying the operator or the hub itself spoke, which the agent must be able
+    to tell from a peer merely claiming so in free text.
+
+    Args:
+        public: One message as serialised by :meth:`Message.to_public`.
+
+    Returns:
+        The trimmed dict.
+    """
+    lean: dict[str, object] = {
+        "sender": public.get("sender"),
+        "recipient": public.get("recipient"),
+        "content": public.get("content"),
+    }
+    if public.get("kind") != MessageKind.MESSAGE.value:
+        lean["kind"] = public.get("kind")
+    if public.get("origin") != "agent":
+        lean["origin"] = public.get("origin")
+    if public.get("meta") is not None:
+        lean["meta"] = public["meta"]
+    return lean
+
+
 @dataclass(slots=True)
 class Field:
     """One question in an operator :class:`Form`.
@@ -313,17 +351,6 @@ class SendResponse(BaseModel):
     the "nobody heard it" signal, since those targets have no single named
     recipient to report as missed.
     """
-
-
-class ReceivedMessage(BaseModel):
-    """A message as returned by ``GET /receive``."""
-
-    id: str
-    sender: str
-    recipient: str
-    content: str
-    kind: str
-    ts: float
 
 
 class LeaveRequest(BaseModel):
