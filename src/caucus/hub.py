@@ -21,7 +21,7 @@ import webbrowser
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import coloredlogs
 import uvicorn
@@ -1633,18 +1633,35 @@ async def receive(
             if chat_get is None and _chatter_open(client):
                 chat_get = asyncio.ensure_future(client.queue.get())
 
-            # Race the two queues instead of polling one and blocking on the
-            # other: blocking on chatter used to make an operator command wait
-            # out that block (up to a second) before the loop looked at the
-            # priority queue again. The slice below is what keeps the loop
-            # returning to the disconnect / mode / pause-gate checks; a paused
-            # peer still runs to its deadline and re-polls, refreshing
-            # ``last_seen`` so it is NOT reaped, with its queue left undrained.
-            await asyncio.wait(
-                {task for task in (pri_get, chat_get) if task is not None},
-                timeout=min(remaining, _POLL_SLICE_SECONDS),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # While the room is paused no chatter getter is armed, so nothing in
+            # the race would wake the loop when the operator resumes. Race the
+            # gate itself, and held chatter is released the instant the room
+            # reopens instead of up to a slice later. (The per-peer pause is a
+            # plain flag with no event to wait on, so it still resolves on the
+            # slice; that peer is polling to its deadline anyway, which is what
+            # keeps ``last_seen`` fresh so it is NOT reaped.)
+            resumed: asyncio.Task[bool] | None = None
+            if not state.transmit.is_set():
+                resumed = asyncio.ensure_future(state.transmit.wait())
+
+            # Race the queues instead of polling one and blocking on the other:
+            # blocking on chatter used to make an operator command wait out that
+            # block (up to a second) before the loop looked at the priority queue
+            # again. The slice below is what keeps the loop returning to the
+            # disconnect / mode / pause-gate checks.
+            waiters: set[asyncio.Future[Any]] = {
+                task for task in (pri_get, chat_get, resumed) if task is not None
+            }
+            try:
+                await asyncio.wait(
+                    waiters,
+                    timeout=min(remaining, _POLL_SLICE_SECONDS),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # The gate waiter holds nothing, so dropping it loses nothing.
+                if resumed is not None:
+                    resumed.cancel()
 
             # Each completed getter is retired (its slot cleared) *before* its
             # message is acted on. Clearing it afterwards would let a raise on
