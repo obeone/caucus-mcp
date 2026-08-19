@@ -66,6 +66,32 @@ def test_readonly_tools_work_before_join(
     assert "floors" in bridge.floor(action="status")
 
 
+def test_protocol_section_fetches_moved_mechanics_before_join(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core protocol points at sections; the tool must deliver them.
+
+    Read-only and pre-join like the other scouting tools: an agent reads the
+    core on arming and may need a section before it has said anything.
+    """
+    result = bridge.protocol_section("talking-stick")
+    assert result["section"] == "talking-stick"
+    assert 'floor(action="pass", scope=...)' in result["text"]
+
+
+def test_protocol_section_rejects_an_unknown_name_with_the_real_list(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 404 must reach the agent as a readable dict, not a hub_unreachable.
+
+    The tool's ``raise_for_status`` would otherwise turn a caller's typo into a
+    transport error and send it chasing a hub outage that never happened.
+    """
+    result = bridge.protocol_section("nope")
+    assert result["error"] == "unknown_section"
+    assert "talking-stick" in result["sections"]
+
+
 def test_write_tools_require_join(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:

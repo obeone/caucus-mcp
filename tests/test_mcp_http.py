@@ -143,6 +143,23 @@ async def test_readonly_tools_arm_and_work_before_join(state: HubState) -> None:
     assert "channels" in await _tool(server, "list_channels")(ctx)
     assert "forms" in await _tool(server, "list_forms")(ctx)
     assert "floors" in await _tool(server, "floor")(ctx, action="status")
+    section = await _tool(server, "protocol_section")(ctx, name="channels")
+    assert section["section"] == "channels"
+
+
+async def test_protocol_section_unknown_name_returns_the_real_list(
+    state: HubState,
+) -> None:
+    """A caller's typo comes back as a readable dict over this transport too.
+
+    ``HubConnector.fetch_protocol_section`` has to short-circuit the hub's 404
+    before ``raise_for_status``, or ``_resilient`` reports a hub outage for what
+    is really a bad section name.
+    """
+    server = _build()
+    res = await _tool(server, "protocol_section")(_ctx("s1"), name="nope")
+    assert res["error"] == "unknown_section"
+    assert "talking-stick" in res["sections"]
 
 
 async def test_say_requires_join(state: HubState) -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from caucus.hub import PROTOCOL_TEXT
+from caucus.hub import PROTOCOL_SECTIONS, PROTOCOL_TEXT
 
 # tests/ sits at the repo root next to caucus-protocol.md.
 _PROTOCOL_MD = Path(__file__).resolve().parent.parent / "caucus-protocol.md"
@@ -42,3 +42,19 @@ def test_protocol_md_documents_quiet_sign_of_life() -> None:
     text = _read_md()
     assert "signs of life" in text
     assert "quiet" in text
+
+
+def test_protocol_md_names_the_same_on_demand_sections_as_the_hub() -> None:
+    """Revision 19 split the protocol into a core plus fetchable sections.
+
+    Both documents must name the same set: a mirror that advertises a section
+    the hub does not serve sends a peer repo's reader after nothing, and one
+    that omits a section hides a flow's mechanics entirely. The hub side is
+    asserted through the ``protocol_section("<name>")`` call form, which is what
+    makes the pointer actionable rather than a bare mention.
+    """
+    text = _read_md()
+    assert "protocol_section" in text
+    for name in PROTOCOL_SECTIONS:
+        assert f'protocol_section("{name}")' in PROTOCOL_TEXT
+        assert name in text
