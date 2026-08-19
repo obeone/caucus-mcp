@@ -190,6 +190,36 @@ async def test_poll_cleanup_failure_still_releases_the_listener_slot(
     assert client.active_polls == 0
 
 
+async def test_resuming_the_room_releases_held_chatter_at_once(
+    state: HubState, http: httpx.AsyncClient
+) -> None:
+    """A resume wakes the poll immediately instead of waiting out its slice.
+
+    While paused no chatter getter is armed, so without racing the transmit gate
+    itself nothing would wake the loop before its one-second slice expired.
+    """
+    from caucus.models import ControlMode
+
+    token = _join(state, "alpha")
+    state.set_mode(ControlMode.PAUSED)
+    state.route(Message(sender="peer", recipient="alpha", content="held back"))
+
+    poll = asyncio.ensure_future(
+        http.get("/receive", params={"timeout": 5}, headers=_auth(token))
+    )
+    # Settle the poll deep inside a slice before the operator resumes.
+    await asyncio.sleep(0.2)
+
+    started = time.monotonic()
+    state.set_mode(ControlMode.RUNNING)
+    resp = await asyncio.wait_for(poll, timeout=5.0)
+    elapsed = time.monotonic() - started
+
+    assert [m["content"] for m in resp.json()["messages"]] == ["held back"]
+    # Comfortably under the ~0.8s the slice-bound loop would have burnt.
+    assert elapsed < 0.4
+
+
 async def test_one_response_returns_both_queues_in_seq_order(
     state: HubState, http: httpx.AsyncClient
 ) -> None:
