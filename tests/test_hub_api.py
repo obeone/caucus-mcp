@@ -12,7 +12,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 import caucus.hub as hub_module
-from caucus.hub import PROTOCOL_VERSION, AuthConfig
+from caucus.hub import (
+    PROTOCOL_SECTIONS,
+    PROTOCOL_TEXT,
+    PROTOCOL_VERSION,
+    AuthConfig,
+)
 from caucus.state import HubState
 
 
@@ -90,13 +95,13 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_18() -> None:
-    # Revision 18 cuts the cost of the room for a passive host: it corrects the
-    # "room keeps NO history" claim (a joined peer's queue does hold messages
-    # between its polls), relaxes one-ask-per-turn into a batching exception when
-    # every listen() costs a full turn, fixes the ~35s blocking figure to ~25s,
-    # and ranks the three listening strategies instead of assuming a watcher.
-    assert PROTOCOL_VERSION == 18
+def test_protocol_version_is_19() -> None:
+    # Revision 19 puts the protocol on a diet: the text every agent pays for on
+    # join keeps only the rules it needs in the common case, and the mechanics of
+    # the three rarest flows (talking stick, channel etiquette, operator-form
+    # field schema) move into PROTOCOL_SECTIONS, fetched on demand. Each moved
+    # topic leaves its TRIGGER inline, so behaviour does not degrade.
+    assert PROTOCOL_VERSION == 19
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
@@ -113,6 +118,68 @@ def test_protocol_text_strengthens_status_cadence_with_quiet(
     text = client.get("/protocol").json()["text"]
     assert "signs of life" in text
     assert '"quiet"' in text
+
+
+def test_protocol_advertises_its_on_demand_sections(client: TestClient) -> None:
+    body = client.get("/protocol").json()
+    assert body["sections"] == sorted(PROTOCOL_SECTIONS)
+
+
+def test_protocol_serves_a_named_section_the_core_no_longer_carries(
+    client: TestClient,
+) -> None:
+    """The point of the diet: moved mechanics are fetchable but not inlined."""
+    body = client.get("/protocol", params={"section": "talking-stick"}).json()
+    assert body["section"] == "talking-stick"
+    assert body["version"] == PROTOCOL_VERSION
+    # A rule that lives only in the section, never in the core any more.
+    assert 'floor(action="pass", scope=...)' in body["text"]
+    assert 'floor(action="pass", scope=...)' not in client.get("/protocol").json()["text"]
+
+
+def test_protocol_section_name_is_matched_loosely(client: TestClient) -> None:
+    """An agent that shouts or pads the name still gets its section."""
+    body = client.get("/protocol", params={"section": "  Talking-Stick "}).json()
+    assert body["section"] == "talking-stick"
+
+
+def test_unknown_protocol_section_is_404_naming_the_real_ones(
+    client: TestClient,
+) -> None:
+    """A guessed name must teach the caller the real names, not just fail."""
+    resp = client.get("/protocol", params={"section": "no-such-thing"})
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"] == "unknown_section"
+    assert body["requested"] == "no-such-thing"
+    assert body["sections"] == sorted(PROTOCOL_SECTIONS)
+
+
+def test_every_moved_section_keeps_its_trigger_in_the_core(
+    client: TestClient,
+) -> None:
+    """The diet must not degrade behaviour.
+
+    A section an agent never learns to fetch is a rule that has been deleted, so
+    the core has to name every section at the point where it becomes relevant.
+    Naming it via the ``protocol_section("<name>")`` call is what makes the
+    pointer actionable rather than decorative.
+    """
+    text = client.get("/protocol").json()["text"]
+    for name in PROTOCOL_SECTIONS:
+        assert f'protocol_section("{name}")' in text
+
+
+def test_protocol_core_stays_on_its_diet() -> None:
+    """Guard the whole point of revision 19 against slow re-inflation.
+
+    Every agent pays for :data:`PROTOCOL_TEXT` on every join, so the core is a
+    budget, not a scratchpad. Revision 19 cut it from 16,744 to ~8,500
+    characters; this ceiling leaves room to edit a rule without leaving room to
+    quietly move a whole flow back inline. Breaking it is a prompt to move the
+    new material into :data:`PROTOCOL_SECTIONS`, not to raise the number.
+    """
+    assert len(PROTOCOL_TEXT) < 9_500
 
 
 # --- export --------------------------------------------------------------
