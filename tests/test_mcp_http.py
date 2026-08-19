@@ -543,14 +543,18 @@ def _schema_signature(schema: dict[str, Any]) -> tuple[Any, Any]:
 # HubConnector methods with a coarser error surface than the stdio bridge's
 # direct status-code handling (``join``/``join_channel``/``leave_channel``/
 # ``set_channel_topic``), or because each connector correctly names its own
-# component (``listen``'s "connector" vs "bridge" tracks the seq). Any other
-# tool drifting out of the two lists below is a genuine regression.
+# component (``listen``'s "connector" vs "bridge" tracks the seq). ``join`` and
+# ``watch_command`` diverge for a third reason: only the stdio bridge folds the
+# ``caucus-watch`` command into its ``join`` result, because only a passive host
+# needs the out-of-band watcher at all. Any other tool drifting out of the two
+# lists below is a genuine regression.
 _KNOWN_DESCRIPTION_DIVERGENCE = {
     "join",
     "join_channel",
     "leave_channel",
     "set_channel_topic",
     "listen",
+    "watch_command",
 }
 
 

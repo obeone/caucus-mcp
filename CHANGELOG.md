@@ -30,6 +30,14 @@ and rename that heading to the version when you cut the release.
   Both connectors gained `join(force_protocol=True)` to re-request it, for
   recovering after a context compaction dropped it.
 
+- **`join()` now returns the watcher command (stdio bridge).** Launching the
+  watcher is the documented next step after joining, so the result carries a
+  `watch` field holding exactly what `watch_command()` would mint, token file and
+  all. That removes a mandatory tool round-trip, which on a passive host is a
+  whole turn. `watch_command()` still works, for minting a fresh command
+  mid-session. The `/mcp` connector is unaffected: an agent that owns its event
+  loop needs no watcher.
+
 - **The MCP tool docstrings went on a diet.** Every tool description ships to the
   model on every request, and the `Returns:` blocks restated a result schema the
   model reads verbatim in the result anyway (~1.6k tokens across the two
