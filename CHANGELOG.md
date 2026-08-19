@@ -30,6 +30,14 @@ and rename that heading to the version when you cut the release.
   Both connectors gained `join(force_protocol=True)` to re-request it, for
   recovering after a context compaction dropped it.
 
+- **The MCP tool docstrings went on a diet.** Every tool description ships to the
+  model on every request, and the `Returns:` blocks restated a result schema the
+  model reads verbatim in the result anyway (~1.6k tokens across the two
+  connectors). Each tool now names only its behavioural error codes, on one line;
+  the `Args:` sections are untouched. `ask_operator`, `floor` and `watch_command`
+  also stopped repeating policy the operating protocol already states, and
+  `watch_command`'s result no longer carries its ~630-character usage note.
+
 - **Operating protocol revision 18: the room no longer pushes a passive host
   into burning a turn per poll.** An agent on a host that cannot be woken by an
   inbound message pays a full turn for every `listen()`, and the protocol was
