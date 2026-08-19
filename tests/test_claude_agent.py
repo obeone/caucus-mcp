@@ -227,12 +227,16 @@ class _FakeConnector:
     """Replays a scripted sequence of :class:`Inbound` batches, then stops.
 
     Records the ``ack_seq`` piggybacked on each poll in :attr:`acks`, so tests
-    can assert the poller acknowledges the batch it just consumed.
+    can assert the poller acknowledges the batch it just consumed. Also
+    records every :meth:`set_status` call in :attr:`statuses`, so tests can
+    assert on the turn-lifecycle status heartbeat
+    (:func:`claude_agent._drive_turn` sets it on start and clears it on end).
     """
 
     def __init__(self, script: list[Inbound]) -> None:
         self._script = list(script)
         self.acks: list[int | None] = []
+        self.statuses: list[str] = []
 
     async def receive(
         self, token: str, timeout: float, *, ack_seq: int | None = None
@@ -241,6 +245,10 @@ class _FakeConnector:
         if self._script:
             return self._script.pop(0)
         return Inbound(messages=[], mode="running", stop=True)
+
+    async def set_status(self, token: str, status: str) -> dict[str, object]:
+        self.statuses.append(status)
+        return {"status": status or None}
 
 
 async def test_run_loop_injects_inbound_then_ends_on_stop() -> None:
@@ -295,13 +303,22 @@ async def test_run_loop_skips_quiet_polls() -> None:
 
 
 async def test_drive_turns_coalesces_the_queued_backlog_into_one_turn() -> None:
-    """A backlog queued while a turn runs is answered in a single next turn."""
+    """A backlog queued while a turn runs is answered in a single next turn.
+
+    Adapted from main's version: ``_drive_turns`` now also threads a
+    connector/token through for the status heartbeat (see below), so this
+    needs a ``_FakeConnector`` and a token to construct. The coalescing
+    behaviour under test — three queued prompts, one turn — is unchanged.
+    """
     client = _FakeClient()
+    connector = _FakeConnector([])
     turns: asyncio.Queue[str] = asyncio.Queue()
     for text in ("first", "second", "third"):
         turns.put_nowait(text)
 
-    driver = asyncio.ensure_future(claude_agent._drive_turns(client, turns))
+    driver = asyncio.ensure_future(
+        claude_agent._drive_turns(client, turns, connector, "tok")  # type: ignore[arg-type]
+    )
     try:
         # join() returns only once every queued item has been task_done()'d,
         # which is also the accounting _drain_pending relies on at stop time.
@@ -312,6 +329,43 @@ async def test_drive_turns_coalesces_the_queued_backlog_into_one_turn() -> None:
 
     assert len(client.queries) == 1
     assert client.queries[0] == "first\n\nsecond\n\nthird"
+    # The coalesced backlog is one turn, so it must bracket exactly one
+    # set_status/clear pair — not one per coalesced prompt.
+    assert connector.statuses == [claude_agent._COMPOSING_STATUS, ""]
+
+
+# --- turn-lifecycle status heartbeat -------------------------------------
+
+
+async def test_drive_turn_sets_then_clears_composing_status() -> None:
+    """A turn publishes the composing status and clears it once it completes."""
+    client = _FakeClient()
+    connector = _FakeConnector([])
+    await claude_agent._drive_turn(client, "hi", connector, "tok")  # type: ignore[arg-type]
+    assert connector.statuses == [claude_agent._COMPOSING_STATUS, ""]
+
+
+async def test_run_loop_status_heartbeat_brackets_each_turn() -> None:
+    """Every turn driven through the loop sets, then clears, the status."""
+    client = _FakeClient()
+    connector = _FakeConnector(
+        [Inbound([{"sender": "a", "recipient": "all", "content": "hi"}], "running", False)]
+    )
+    await claude_agent._run_loop(
+        _factory(client), connector, "tok", poll_timeout=0.0, mission=None
+    )
+    assert connector.statuses == [claude_agent._COMPOSING_STATUS, ""]
+
+
+async def test_set_status_safe_swallows_errors() -> None:
+    """A connector whose set_status raises never propagates past the helper."""
+
+    class _Boom:
+        async def set_status(self, token: str, status: str) -> dict[str, object]:
+            raise RuntimeError("hub unreachable")
+
+    # Must return without raising — the turn it decorates must never crash.
+    await claude_agent._set_status_safe(_Boom(), "tok", "busy")  # type: ignore[arg-type]
 
 
 # --- operator control: interrupt / reset --------------------------------
