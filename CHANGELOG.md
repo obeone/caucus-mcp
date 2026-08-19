@@ -22,6 +22,14 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **`join()` no longer re-sends the whole operating protocol on every call.**
+  The manual is ~4.4k tokens and a session keeps what it has read, so re-joining
+  paid for it again each time. It is now delivered on a session's first join and
+  whenever the hub's revision has moved (`protocol_stale`); otherwise `join()`
+  returns the revision number and a one-line note saying the text is unchanged.
+  Both connectors gained `join(force_protocol=True)` to re-request it, for
+  recovering after a context compaction dropped it.
+
 - **Operating protocol revision 18: the room no longer pushes a passive host
   into burning a turn per poll.** An agent on a host that cannot be woken by an
   inbound message pays a full turn for every `listen()`, and the protocol was
