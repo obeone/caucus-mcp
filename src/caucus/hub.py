@@ -1648,6 +1648,14 @@ async def receive(
                 chat_get = None
 
             if messages:
+                # One response can carry both queues' batches, and they were
+                # filled independently — so restore the room's real order before
+                # returning. Without this an operator answer routed a moment ago
+                # would be read ahead of peer chatter sent well before it, and
+                # the agent would reason on an inverted transcript. Sorting is
+                # presentation only: CONTROL commands still ride the priority
+                # queue and still pierce the pause gate.
+                messages.sort(key=lambda m: m.seq)
                 _record_unacked(client, messages)
                 return {
                     "messages": [m.to_public() for m in messages],
