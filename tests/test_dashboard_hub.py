@@ -213,7 +213,7 @@ def test_set_rate_with_reserved_peer_key_is_noop(
         # frame was processed first (FIFO) before we assert it changed nothing.
         ws.send_json({"heartbeat": "alpha"})
         _drain_until(ws, "heartbeat_result")
-    assert state.rate_limit() == {"refill_rate": 0.5, "capacity": 5.0}
+    assert state.rate_limit() == {"refill_rate": 2.0, "capacity": 10.0}
 
 
 def test_observer_set_rate_is_forbidden(client: TestClient, with_auth: None) -> None:

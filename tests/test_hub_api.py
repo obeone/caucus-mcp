@@ -369,7 +369,7 @@ def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
         client.post(
             "/send", json={"token": token, "to": "all", "content": f"spam {i}"}
         ).status_code
-        for i in range(12)
+        for i in range(20)
     ]
     assert 429 in codes
     # The 429 body carries a retry hint the bridge surfaces to the agent.
@@ -518,7 +518,7 @@ def test_channel_join_is_rate_limited_under_flood(client: TestClient) -> None:
         client.post(
             "/channels/join", json={"token": token, "channel": f"#c{i}"}
         ).status_code
-        for i in range(12)
+        for i in range(20)
     ]
     assert 429 in codes
 
@@ -1079,9 +1079,34 @@ def test_status_unknown_token_is_401(client: TestClient) -> None:
 
 
 def test_status_is_rate_limited_under_flood(client: TestClient) -> None:
+    """The heartbeat bucket is roomier than the chatter one, but still bounded."""
     token = _register(client, "alpha")
     codes = [
         client.post("/status", json={"token": token, "status": f"s{i}"}).status_code
-        for i in range(12)
+        for i in range(50)
     ]
     assert 429 in codes
+
+
+def test_status_does_not_spend_the_send_budget(client: TestClient) -> None:
+    """A status heartbeat must not throttle the agent's own conversation.
+
+    ``set_status`` used to charge the same bucket as ``/send``, so an agent that
+    dutifully reported its progress lost sends to its own liveness signal.
+    """
+    token = _register(client, "alpha")
+    for i in range(20):
+        assert (
+            client.post(
+                "/status", json={"token": token, "status": f"working on {i}"}
+            ).status_code
+            == 200
+        )
+    # The chatter budget is untouched: a full burst is still available.
+    codes = [
+        client.post(
+            "/send", json={"token": token, "to": "all", "content": f"m{i}"}
+        ).status_code
+        for i in range(10)
+    ]
+    assert codes == [200] * 10

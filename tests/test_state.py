@@ -1241,7 +1241,7 @@ async def test_set_rate_limit_tightening_clamps_live_tokens(
     state = HubState()
     alpha = state.register("alpha").client
     assert alpha is not None and alpha.bucket is not None
-    assert alpha.bucket.tokens == 5.0  # default burst
+    assert alpha.bucket.tokens == 10.0  # default burst
     # The bucket's ``updated`` was stamped with the real monotonic clock at
     # mint time (the field's default_factory captured the unpatched function);
     # realign it with our frozen clock so ``reconfigure`` credits zero elapsed.
@@ -1264,7 +1264,7 @@ async def test_set_rate_limit_loosening_does_not_reseed_live_bucket(
     assert alpha is not None and alpha.bucket is not None
     alpha.bucket.updated = 100.0  # realign with the frozen clock (see above)
     # Drain the bucket dry (clock frozen, so no refill between sends).
-    assert all(alpha.bucket.allow() for _ in range(5))
+    assert all(alpha.bucket.allow() for _ in range(10))
     assert alpha.bucket.allow() is False
 
     state.set_rate_limit(refill_rate=10.0, capacity=20.0)  # loosen hard
@@ -1338,7 +1338,7 @@ async def test_set_rate_limit_retunes_reaped_then_revivable_bucket() -> None:
 async def test_add_ui_snapshot_carries_rate_and_set_rate_pushes_event() -> None:
     state = HubState()
     snapshot = state.add_ui().get_nowait()
-    assert snapshot["rate"] == {"refill_rate": 0.5, "capacity": 5.0}
+    assert snapshot["rate"] == {"refill_rate": 2.0, "capacity": 10.0}
 
     q = state.add_ui()
     q.get_nowait()  # discard this listener's priming snapshot

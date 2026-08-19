@@ -422,7 +422,9 @@ class _ConnectorErrorThenStop:
     def __init__(self) -> None:
         self._call_count = 0
 
-    async def receive(self, token: str, timeout: float) -> Any:
+    async def receive(
+        self, token: str, timeout: float, *, ack_seq: int | None = None
+    ) -> Any:
         self._call_count += 1
         if self._call_count == 1:
             # Simulate a transient connection error on the first poll.

@@ -102,6 +102,22 @@ so the queue behaves like a ring buffer once full.
 OPERATOR_COMMANDS = frozenset({"interrupt", "reset"})
 
 
+# --- heartbeat brake ----------------------------------------------------
+#
+# ``set_status`` is a heartbeat, not chatter: an agent publishes one line when it
+# picks up work and refreshes it as the work moves, precisely so peers can probe
+# it with ``/ping`` without waking its LLM. Charging that to the send bucket made
+# a diligent agent throttle its own conversation, and a hard exemption would hand
+# any peer an unbounded write endpoint. So a status update spends from its own,
+# much roomier bucket, untouched by the operator's chatter rate knob.
+
+STATUS_BUCKET_CAPACITY = 30.0
+"""Burst size of the per-client ``set_status`` bucket."""
+
+STATUS_BUCKET_REFILL = 1.0
+"""Sustained ``set_status`` rate, in updates per second, per client."""
+
+
 @dataclass(slots=True)
 class Client:
     """A connected agent (one MCP client session).
@@ -117,7 +133,14 @@ class Client:
             (``kind == CONTROL``, e.g. ``interrupt``/``reset``). Drained by
             ``GET /receive`` **even while the room is paused**, so the operator
             keeps a live grip on an agent it has frozen.
-        bucket: Per-client send rate limiter.
+        bucket: Per-client send rate limiter, shared by every write endpoint
+            that counts as chatter (``/send``, the channel verbs, ``/ask``).
+            Retuned room-wide by :meth:`HubState.set_rate_limit`.
+        status_bucket: Separate, roomier limiter for ``set_status`` heartbeats
+            (see :data:`STATUS_BUCKET_CAPACITY`). Kept off :attr:`bucket` so a
+            peer that dutifully reports what it is doing does not throttle its
+            own conversation, and off the operator's chatter knob so tightening
+            the room's message rate never silences the liveness signal.
         last_seen: Timestamp of the most recent interaction.
         channels: The private channels this client is subscribed to. A channel
             message reaches a client only if its name is in this set, so
@@ -173,6 +196,14 @@ class Client:
     # peer can grow it — unlike the gated ``queue`` above, which is capped.
     priority_queue: asyncio.Queue[Message] = field(default_factory=asyncio.Queue)
     bucket: TokenBucket | None = None
+    # Always present (unlike ``bucket``, minted at register time with the room's
+    # configured parameters): its limits are fixed constants, so every Client —
+    # including ones built directly in tests — has a usable heartbeat brake.
+    status_bucket: TokenBucket = field(
+        default_factory=lambda: TokenBucket(
+            STATUS_BUCKET_CAPACITY, STATUS_BUCKET_REFILL
+        )
+    )
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
     active_polls: int = 0
@@ -286,8 +317,14 @@ class HubState:
     def __init__(
         self,
         *,
-        bucket_capacity: float = 5.0,
-        bucket_refill: float = 0.5,
+        # Burst 10, sustained 2/s. The old 5 / 0.5-per-second pair was tuned as
+        # a runaway-loop brake, but it also throttled honest exchanges: a peer
+        # that answered two messages and joined a channel was already waiting
+        # two seconds for its next token. These defaults still stop a flood
+        # (a looping pair converges on 2 msg/s, visible and interruptible)
+        # while leaving a normal multi-agent turn unimpeded.
+        bucket_capacity: float = 10.0,
+        bucket_refill: float = 2.0,
         log_size: int = 500,
         client_ttl: float = 300.0,
         reaped_grace: float = 1800.0,
@@ -1878,6 +1915,11 @@ class HubState:
         tokens to a full burst (see :meth:`TokenBucket.reconfigure`). Tightening
         takes effect immediately for all peers (a room-wide clamp); loosening
         recovers at the new rate.
+
+        Only the chatter bucket is retuned. :attr:`Client.status_bucket` is
+        deliberately left alone: it brakes ``set_status`` heartbeats, not
+        conversation, and clamping the room's message rate must never cost the
+        operator the liveness signal that tells them what each agent is doing.
 
         Args:
             refill_rate: New sustained rate in messages per second; must be
