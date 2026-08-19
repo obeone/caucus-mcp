@@ -73,12 +73,12 @@ denominator; everything else is a connector to it.
   `join_channel`, `leave_channel`, `list_channels`, `set_channel_topic`,
   the talking-stick `floor` (a single tool taking `action=take|pass|drop|raise|
   status`), the operator-form pair `ask_operator`/`list_forms`, and `decisions`
-  (the settled-decisions ledger, so a late joiner catches up on resolved
-  operator forms without replaying the transcript).
+  (the settled-decisions ledger — carries private channel-scoped answers, so
+  it requires join, unlike `list_forms`).
   **The session arms lazily** — the first call to any tool fetches the protocol
   from `/protocol` and caches the revision, so there is no separate `setup`
   gesture; read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
-  `decisions`, `floor(action="status")`) work before joining, so an agent can
+  `floor(action="status")`) work before joining, so an agent can
   scout first (`whoami` stays open for diagnosis and never touches the hub). `join`
   (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
   working-directory basename) `POST /register`s with the known protocol version,
@@ -236,18 +236,20 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   `channels()` derives the live map and a channel vanishes once its last member
   leaves or is reaped.
 - **Peek (`GET /peek`, `HubState.peek`).** A non-draining "is a turn worth
-  it?" probe, authenticated exactly like `/receive`. `route()` maintains
-  `Client.pending` (+1) and `Client.last_pending` alongside each enqueue —
-  never by inspecting `Client.queue`/`Client.priority_queue` themselves —
-  and `GET /receive` mirrors the drain (`-len(drained)`) in both its priority
-  and regular-queue branches, so peeking can never race or interfere with a
-  concurrent receive. `peek()` returns `{"pending": int, "last": {"sender",
-  "preview"} | None}`, with `last` truncated to `PEEK_PREVIEW_CHARS` (120)
-  characters and `None` whenever nothing is pending. This is a cheap
-  approximation, not a hard invariant: the rare ring-buffer drop-oldest in
-  `_safe_put` (queue at `MAX_QUEUE_SIZE`) is not specially accounted for, so
-  sustained flooding of one peer could drift the counter a little high until
-  the next drain.
+  it?" probe, authenticated exactly like `/receive`. The pending count is
+  `Client.queue.qsize() + Client.priority_queue.qsize()`, computed fresh on
+  every call rather than tracked by a parallel counter — under asyncio's
+  single-threaded cooperative scheduling that read is exact (nothing else can
+  be draining or enqueuing within one event-loop tick), so there is nothing to
+  keep in sync or let drift, including across the ring-buffer drop-oldest in
+  `_safe_put` (queue at `MAX_QUEUE_SIZE`). Only the preview is cached, in
+  `Client.last_pending`, updated wherever a message actually lands in either
+  queue — `route()`'s normal enqueue and the unacked/backlog replay in
+  `_revive` — so a peek right after reconnecting still reports the replayed
+  backlog instead of a stale or absent `last`. `peek()` returns `{"pending":
+  int, "last": {"sender", "preview"} | None}`, with `last` truncated to
+  `PEEK_PREVIEW_CHARS` (120) characters and `None` whenever nothing is
+  pending.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds the **chatter** queue without draining it (the priority queue still
   flows — see Routing); `STOPPED` floods a `stop` control into every queue and
@@ -331,15 +333,25 @@ operator answers once and the bundle fans back out to the right peers.
   `list_forms()` (`GET /forms`) on both the bridge and the native connector;
   the protocol (revision 14) tells agents to `list_forms()` before pushing so a
   pending form is never duplicated.
-- **Decisions ledger (`GET /decisions`).** `HubState.decisions(limit=20)`
-  filters the bounded `_log` for `ANSWER`-kind messages (already routed there
-  by `answer_form`/`cancel_form`) and reshapes each into `{ts, asker, title,
-  status, answer_summary}`, oldest first, capped at `limit`. It reuses the
-  message's own recap text as `answer_summary` rather than re-rendering the
-  answers, so a late-joining agent can `decisions()` to catch up on questions
-  the operator already settled without replaying the whole transcript. Open
-  and unauthenticated, like `/forms` (an operator-form answer is no more
-  sensitive than the pending form it resolved).
+- **Decisions ledger (`GET /decisions`).** `HubState.decisions(limit=20,
+  channels=...)` filters the bounded `_log` for `ANSWER`-kind messages
+  (already routed there by `answer_form`/`cancel_form`, whose `meta` now also
+  carries the form's `asker` and audience `to`) and reshapes each into `{ts,
+  asker, title, status, answer_summary}`, oldest first, capped at `limit`. It
+  reuses the message's own recap text as `answer_summary` rather than
+  re-rendering the answers, so a late-joining agent can `decisions()` to catch
+  up on questions the operator already settled without replaying the whole
+  transcript. Unlike `/forms` (only ever pending questions), a settled
+  decision can carry a channel's private answer text, so the endpoint requires
+  a token, resolved exactly like `/receive`: a known peer token scopes the
+  result to broadcast decisions plus channels the caller currently belongs to
+  (`channels=<the caller's Client.channels>`), applied *before* the `limit`
+  cut so a scoped caller doesn't lose slots to entries it could never see;
+  when `AuthConfig.enabled`, an operator/observer token instead gets the
+  unrestricted view (`channels=None`), mirroring the escalation `/export`
+  already grants that role over the full transcript. Anything else — no
+  token, an unknown peer token, or (with auth disabled) a token matching
+  neither role — is refused with 401.
 - **Operator surface.** `index.html` renders pending forms as a queue; the
   wizard walks one card per field (radio/checkbox/text/textarea, required
   validation, an `allow_other` "Other…" escape) to a recap card, then sends
