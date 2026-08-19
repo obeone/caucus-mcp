@@ -20,6 +20,15 @@ and rename that heading to the version when you cut the release.
   changes; the replayed messages themselves still route to their recipient
   exactly as before.
 
+- **The native connector never acknowledged what it received, so a revived
+  agent replayed its whole conversation.** `caucus-claude-agent` polled
+  `/receive` without ever passing `ack_seq`, leaving the hub's per-client
+  `last_acked_seq` at zero and its 200-entry replay buffer permanently full.
+  Any reap followed by a revival (routine for an agent that spends a long turn
+  reasoning) re-injected up to 200 already-answered messages as fresh inbound.
+  The poller now tracks the highest `seq` of each batch and piggybacks it on the
+  next poll; an ACK a failed poll was carrying is retried rather than dropped.
+
 ### Changed
 
 - **`join()` no longer re-sends the whole operating protocol on every call.**

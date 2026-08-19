@@ -467,6 +467,28 @@ async def _drive_turns(client: _AgentClient, turns: asyncio.Queue[str]) -> None:
             turns.task_done()
 
 
+def _max_seq(messages: list[dict[str, object]]) -> int:
+    """Return the highest ``seq`` carried by a batch, or ``0`` when none is.
+
+    The hub stamps a monotone ``seq`` on every routed message; the poller feeds
+    the highest one back as the next poll's ``ack_seq`` so the hub can prune its
+    replay buffer. A message without a usable ``seq`` (a hand-built payload in a
+    test, or a future hub that omits it) simply does not contribute.
+
+    Args:
+        messages: Chatter messages in the hub's public shape.
+
+    Returns:
+        The greatest integer ``seq`` present, or ``0`` if the batch carries none.
+    """
+    seqs: list[int] = []
+    for msg in messages:
+        raw = msg.get("seq")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            seqs.append(raw)
+    return max(seqs, default=0)
+
+
 async def _safe_interrupt(client: _AgentClient) -> None:
     """Abort the client's current turn, tolerating "nothing to interrupt".
 
@@ -501,6 +523,11 @@ async def _poll_inbound(
     clean context; ``stop`` ends the session. Returns as soon as ``stop`` or
     ``reset`` is set.
 
+    Each poll piggybacks an ACK for the previous batch (the highest ``seq`` it
+    carried), so the hub prunes its per-client replay buffer instead of holding
+    the whole conversation and re-injecting it if this agent is ever reaped and
+    revived.
+
     Args:
         connector: The hub connector to long-poll on.
         token: The agent's access token.
@@ -511,9 +538,14 @@ async def _poll_inbound(
         reset: Set when the operator resets this agent (rebuild the client).
     """
     backoff = _BACKOFF_MIN
+    # Highest seq received but not yet acknowledged, piggybacked on the next
+    # poll. Without it the hub's per-client unacked ring buffer (200 entries)
+    # never drains, and a reap + revive replays every one of them as brand-new
+    # inbound — the same conversation injected twice.
+    ack_seq: int | None = None
     while True:
         try:
-            inbound = await connector.receive(token, poll_timeout)
+            inbound = await connector.receive(token, poll_timeout, ack_seq=ack_seq)
         except httpx.HTTPError as exc:
             # Transient hub error (restart, 5xx, dropped connection, read
             # timeout): warn, back off, and retry rather than letting the
@@ -524,10 +556,15 @@ async def _poll_inbound(
             continue
         # A clean poll means the hub is healthy again — drop back to the floor.
         backoff = _BACKOFF_MIN
+        # The poll above carried the pending ACK, so the hub has pruned it;
+        # clear the cursor before recording whatever this batch brings. A failed
+        # poll skips this (it `continue`s above), so an unsent ACK is retried.
+        ack_seq = None
         # Enqueue chatter first, so a batch carrying both an injection and a
         # reset still hands the new instruction to the freshly-rebuilt context.
         if inbound.messages:
             turns.put_nowait(format_inbound(inbound.messages))
+            ack_seq = _max_seq(inbound.messages) or None
         if inbound.stop:
             logger.warning("operator stopped the room; ending session")
             stop.set()
