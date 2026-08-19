@@ -1110,3 +1110,134 @@ def test_status_does_not_spend_the_send_budget(client: TestClient) -> None:
         for i in range(10)
     ]
     assert codes == [200] * 10
+
+
+# --- /peek -----------------------------------------------------------------
+
+
+def test_peek_reports_zero_pending_and_no_last_before_anything_arrives(
+    client: TestClient,
+) -> None:
+    token = _register(client, "alpha")
+    body = client.get(
+        "/peek", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert body == {"pending": 0, "last": None}
+
+
+def test_peek_pending_increments_on_route_without_draining(
+    client: TestClient,
+) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "hi beta"})
+
+    body = client.get(
+        "/peek", headers={"Authorization": f"Bearer {beta}"}
+    ).json()
+    assert body["pending"] == 1
+    assert body["last"] == {"sender": "alpha", "preview": "hi beta"}
+
+    # Peeking again does not drain the queue: pending is unaffected.
+    body_again = client.get(
+        "/peek", headers={"Authorization": f"Bearer {beta}"}
+    ).json()
+    assert body_again["pending"] == 1
+
+
+def test_peek_pending_decrements_to_zero_after_receive_drains(
+    client: TestClient,
+) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "hi"})
+    client.post("/send", json={"token": alpha, "to": "beta", "content": "again"})
+    assert (
+        client.get("/peek", headers={"Authorization": f"Bearer {beta}"}).json()[
+            "pending"
+        ]
+        == 2
+    )
+
+    got = client.get(
+        "/receive",
+        params={"timeout": 3},
+        headers={"Authorization": f"Bearer {beta}"},
+    ).json()
+    assert len(got["messages"]) == 2
+
+    body = client.get(
+        "/peek", headers={"Authorization": f"Bearer {beta}"}
+    ).json()
+    assert body == {"pending": 0, "last": None}
+
+
+def test_peek_preview_truncates_long_content(client: TestClient) -> None:
+    alpha = _register(client, "alpha")
+    beta = _register(client, "beta")
+    long_content = "x" * 500
+    client.post("/send", json={"token": alpha, "to": "beta", "content": long_content})
+
+    body = client.get(
+        "/peek", headers={"Authorization": f"Bearer {beta}"}
+    ).json()
+    assert body["last"]["preview"] == "x" * 120
+    assert len(body["last"]["preview"]) == 120
+
+
+def test_peek_unknown_token_is_401(client: TestClient) -> None:
+    resp = client.get("/peek", headers={"Authorization": "Bearer bogus"})
+    assert resp.status_code == 401
+
+
+def test_peek_no_token_anywhere_is_401(client: TestClient) -> None:
+    assert client.get("/peek").status_code == 401
+
+
+# --- /decisions --------------------------------------------------------
+
+
+def test_decisions_empty_when_nothing_answered(client: TestClient) -> None:
+    assert client.get("/decisions").json() == {"decisions": []}
+
+
+def test_decisions_lists_answered_form(client: TestClient) -> None:
+    token = _register(client, "alpha")
+    form_id = client.post(
+        "/ask", json={"token": token, "title": "Deploy?", "fields": [_radio_field()]}
+    ).json()["form_id"]
+
+    with client.websocket_connect("/ui") as ws:
+        assert ws.receive_json()["type"] == "auth_ok"
+        assert ws.receive_json()["type"] == "snapshot"
+        ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
+
+    decisions = client.get("/decisions").json()["decisions"]
+    assert len(decisions) == 1
+    entry = decisions[0]
+    assert entry["asker"] == "alpha"
+    assert entry["title"] == "Deploy?"
+    assert entry["status"] == "answered"
+    assert "Deploy?" in entry["answer_summary"]
+    assert "ts" in entry
+
+
+def test_decisions_respects_limit_and_stays_chronological(
+    client: TestClient,
+) -> None:
+    token = _register(client, "alpha")
+    for i in range(3):
+        form_id = client.post(
+            "/ask",
+            json={"token": token, "title": f"Q{i}", "fields": [_radio_field()]},
+        ).json()["form_id"]
+        with client.websocket_connect("/ui") as ws:
+            assert ws.receive_json()["type"] == "auth_ok"
+            assert ws.receive_json()["type"] == "snapshot"
+            ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
+
+    all_decisions = client.get("/decisions").json()["decisions"]
+    assert [d["title"] for d in all_decisions] == ["Q0", "Q1", "Q2"]
+
+    limited = client.get("/decisions", params={"limit": 2}).json()["decisions"]
+    assert [d["title"] for d in limited] == ["Q1", "Q2"]

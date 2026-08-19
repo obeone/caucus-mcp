@@ -1041,6 +1041,62 @@ async def test_ping_reaped_peer_reports_reaped_state() -> None:
     assert result["status"] == "was mid-task"
 
 
+# --- peek ------------------------------------------------------------------
+
+
+async def test_peek_reports_nothing_pending_before_anything_arrives() -> None:
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    assert state.peek(client) == {"pending": 0, "last": None}
+
+
+async def test_peek_pending_increments_on_route() -> None:
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+
+    state.route(_msg("alpha", "beta", "hello beta"))
+
+    assert beta.pending == 1
+    result = state.peek(beta)
+    assert result["pending"] == 1
+    assert result["last"] == {"sender": "alpha", "preview": "hello beta"}
+
+
+async def test_peek_pending_decrements_to_zero_after_receive_drains() -> None:
+    """Peek mirrors what /receive actually drains, not the raw enqueue count."""
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+    state.route(_msg("alpha", "beta", "one"))
+    state.route(_msg("alpha", "beta", "two"))
+    assert beta.pending == 2
+
+    # Simulate what GET /receive does: drain the whole queue, then account
+    # for exactly what was drained (see hub.py's receive()).
+    drained = []
+    while not beta.queue.empty():
+        drained.append(beta.queue.get_nowait())
+    beta.pending = max(0, beta.pending - len(drained))
+
+    assert len(drained) == 2
+    assert state.peek(beta) == {"pending": 0, "last": None}
+
+
+async def test_peek_preview_truncates_to_120_chars() -> None:
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+    state.route(_msg("alpha", "beta", "x" * 500))
+
+    preview = state.peek(beta)["last"]["preview"]  # type: ignore[index]
+    assert preview == "x" * 120
+
+
 # --- operator forms ------------------------------------------------------
 
 
@@ -1093,6 +1149,7 @@ async def test_answer_form_routes_answer_to_broadcast_audience() -> None:
             "title": "Deploy?",
             "status": "answered",
             "answers": {"ok": "yes"},
+            "asker": "alpha",
         }
 
 
@@ -1169,6 +1226,7 @@ async def test_cancel_form_routes_cancellation_and_keeps_answers_none() -> None:
         "title": "Deploy?",
         "status": "cancelled",
         "answers": None,
+        "asker": "alpha",
     }
 
 
@@ -1209,6 +1267,60 @@ async def test_snapshot_includes_forms() -> None:
     snapshot = state.add_ui().get_nowait()
     assert len(snapshot["forms"]) == 1
     assert snapshot["forms"][0]["title"] == "Deploy?"
+
+
+# --- decisions ledger ------------------------------------------------------
+
+
+async def test_decisions_empty_before_anything_resolved() -> None:
+    state = HubState()
+    assert state.decisions() == []
+
+
+async def test_decisions_lists_answered_form_with_asker_and_summary() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    state.answer_form(form.id, {"ok": "yes"})
+
+    entries = state.decisions()
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["asker"] == "alpha"
+    assert entry["title"] == "Deploy?"
+    assert entry["status"] == "answered"
+    assert "Deploy?" in entry["answer_summary"]  # type: ignore[operator]
+    assert isinstance(entry["ts"], float)
+
+
+async def test_decisions_includes_cancelled_forms() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    state.cancel_form(form.id)
+
+    entries = state.decisions()
+    assert entries[0]["status"] == "cancelled"
+
+
+async def test_decisions_respects_limit_and_returns_most_recent_oldest_first() -> None:
+    state = HubState()
+    state.register("alpha")
+    for i in range(3):
+        form = state.create_form("alpha", BROADCAST, f"Q{i}", [_radio()])
+        state.answer_form(form.id, {"ok": "yes"})
+
+    assert [e["title"] for e in state.decisions()] == ["Q0", "Q1", "Q2"]
+    assert [e["title"] for e in state.decisions(limit=2)] == ["Q1", "Q2"]
+
+
+async def test_decisions_non_positive_limit_is_empty() -> None:
+    state = HubState()
+    state.register("alpha")
+    form = state.create_form("alpha", BROADCAST, "Deploy?", [_radio()])
+    state.answer_form(form.id, {"ok": "yes"})
+    assert state.decisions(limit=0) == []
 
 
 # --- runtime rate-limit control --------------------------------------

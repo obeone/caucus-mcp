@@ -453,6 +453,29 @@ class HubConnector:
         except httpx.HTTPError as exc:
             logger.debug("ack failed (best-effort): %s", exc)
 
+    async def peek(self, token: str) -> dict[str, object]:
+        """Report the pending queue depth for the token holder, without draining it.
+
+        The non-blocking counterpart to :meth:`receive`: lets a caller check
+        whether anything is worth a full receive before paying for one.
+
+        Args:
+            token: The caller's access token.
+
+        Returns:
+            ``{"pending": <int>, "last": {"sender", "preview"} | None}``.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error
+                (e.g. 401 unknown token).
+        """
+        http = self._require_http()
+        # Token in the Authorization header, never the URL query string — same
+        # rationale as receive(): this is a GET.
+        resp = await http.get("/peek", headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+        return dict(resp.json())
+
     async def peers(self) -> list[str]:
         """List the project names currently connected to the hub.
 
@@ -569,6 +592,29 @@ class HubConnector:
         resp = await http.get("/forms")
         resp.raise_for_status()
         return list(resp.json().get("forms", []))
+
+    async def decisions(self, limit: int = 20) -> list[dict[str, object]]:
+        """List recently settled operator-form decisions, oldest first.
+
+        The answered/cancelled counterpart to :meth:`list_forms`: lets a
+        late-joining agent catch up on questions the operator already
+        resolved, without replaying the whole transcript.
+
+        Args:
+            limit: Maximum number of decisions to return (the most recent
+                ones).
+
+        Returns:
+            Up to ``limit`` dicts, oldest first, each ``{"ts", "asker",
+            "title", "status", "answer_summary"}``.
+
+        Raises:
+            httpx.HTTPError: If the hub is unreachable or returns an error.
+        """
+        http = self._require_http()
+        resp = await http.get("/decisions", params={"limit": limit})
+        resp.raise_for_status()
+        return list(resp.json().get("decisions", []))
 
     async def join_channel(self, token: str, channel: str) -> bool:
         """Subscribe the token holder to a private channel (self-join).

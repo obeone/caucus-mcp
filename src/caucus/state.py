@@ -101,6 +101,10 @@ so the queue behaves like a ring buffer once full.
 # paused agent. ``stop`` stays room-wide and is not part of this set.
 OPERATOR_COMMANDS = frozenset({"interrupt", "reset"})
 
+PEEK_PREVIEW_CHARS = 120
+"""How many leading characters of a message's content :meth:`HubState.peek`
+surfaces as the ``preview`` of the caller's most recent pending arrival."""
+
 
 # --- heartbeat brake ----------------------------------------------------
 #
@@ -179,6 +183,20 @@ class Client:
             transmit gate) so delivery is withheld until the operator resumes
             it. The peer keeps polling, so it is not reaped and its queued
             messages survive a reap and are replayed on revival.
+        pending: Running count of messages queued for this client (across both
+            :attr:`queue` and :attr:`priority_queue`) that ``GET /receive``
+            has not yet drained. Maintained in :meth:`HubState.route` (+1 per
+            enqueue) and :func:`~caucus.hub.receive` (-len(drained) per poll),
+            never by inspecting the queues themselves — see :meth:`HubState.peek`.
+            A cheap approximation: the rare ring-buffer drop-oldest in
+            :meth:`HubState._safe_put` (queue at :data:`MAX_QUEUE_SIZE`) is not
+            specially accounted for, so sustained flooding of one peer could
+            drift this a little high until the next drain.
+        last_pending: The most recently enqueued :class:`~caucus.models.Message`
+            still counted in :attr:`pending`, or ``None`` before anything has
+            arrived. Surfaced (sender + a short preview) by
+            :meth:`HubState.peek` so a peer can glance at what is waiting
+            without spending a turn to receive it.
     """
 
     project: str
@@ -215,6 +233,8 @@ class Client:
     first_seen: float = field(default_factory=time.time)
     msg_count: int = 0
     paused: bool = False
+    pending: int = 0
+    last_pending: Message | None = None
 
 
 class RegisterOutcome(str, Enum):
@@ -824,6 +844,35 @@ class HubState:
         client.status_ts = time.time() if cleaned else None
         return True
 
+    def peek(self, client: Client) -> dict[str, object]:
+        """Report ``client``'s pending queue depth without draining it.
+
+        The non-blocking counterpart to ``GET /receive``: a cheap "is a turn
+        worth it?" check an agent can run before paying for a full receive.
+        Reads :attr:`Client.pending` / :attr:`Client.last_pending` — the
+        parallel bookkeeping :meth:`route` maintains alongside the actual
+        enqueue — rather than touching :attr:`Client.queue` or
+        :attr:`Client.priority_queue` directly, so a peek can never race or
+        interfere with a concurrent ``/receive`` drain.
+
+        Args:
+            client: The client to report on (already resolved by the caller,
+                e.g. via :meth:`client_for`).
+
+        Returns:
+            ``{"pending": <int>, "last": {"sender", "preview"} | None}``.
+            ``last`` is ``None`` whenever nothing is currently pending; its
+            ``preview`` truncates the message content to
+            :data:`PEEK_PREVIEW_CHARS` characters.
+        """
+        last: dict[str, object] | None = None
+        if client.pending > 0 and client.last_pending is not None:
+            last = {
+                "sender": client.last_pending.sender,
+                "preview": client.last_pending.content[:PEEK_PREVIEW_CHARS],
+            }
+        return {"pending": client.pending, "last": last}
+
     def ping(self, name: str, *, now: float | None = None) -> dict[str, object]:
         """Report a peer's liveness and self-reported status, LLM-free.
 
@@ -1226,6 +1275,11 @@ class HubState:
                 # overflow (ring buffer) so a stuck recipient can never crash
                 # routing or exhaust memory — see :meth:`_safe_put`.
                 self._safe_put(client, msg)
+            # Mirror the enqueue in the peek counter/reference (see
+            # :meth:`peek`) instead of ever inspecting the queues themselves.
+            # ``GET /receive`` (hub.py) is the matching -len(drained) side.
+            client.pending += 1
+            client.last_pending = msg
         delivered = [c.project for c in targets]
         # Feed the optional disk-log sink last, once routing is settled. The
         # sink only enqueues onto an asyncio.Queue, so this never blocks.
@@ -1701,9 +1755,12 @@ class HubState:
         resolved. Otherwise marks it ANSWERED, stores ``answers``, removes it
         from the pending map, and routes a single :attr:`MessageKind.ANSWER`
         message (``sender="human"``) to the form's audience carrying the answer
-        bundle in ``meta``. Because :meth:`route` excludes the sender, every real
-        agent — including the asker — receives it; a channel form reaches only
-        that channel's members. Finally fans a ``form_resolved`` event to the UI.
+        bundle in ``meta`` (``form_id``, ``title``, ``status``, ``answers``, and
+        the original ``asker`` — see :meth:`decisions`, which reads this same
+        message back out of the log for late joiners). Because :meth:`route`
+        excludes the sender, every real agent — including the asker — receives
+        it; a channel form reaches only that channel's members. Finally fans a
+        ``form_resolved`` event to the UI.
 
         Args:
             form_id: Identifier of the form to resolve.
@@ -1735,6 +1792,7 @@ class HubState:
                     "title": form.title,
                     "status": "answered",
                     "answers": answers,
+                    "asker": form.asker,
                 },
             )
         )
@@ -1781,6 +1839,7 @@ class HubState:
                     "title": form.title,
                     "status": "cancelled",
                     "answers": None,
+                    "asker": form.asker,
                 },
             )
         )
@@ -1796,6 +1855,40 @@ class HubState:
         forms still awaiting the operator.
         """
         return [f.to_public() for f in self._forms.values()]
+
+    def decisions(self, limit: int = 20) -> list[dict[str, object]]:
+        """Return the most recently settled operator-form decisions, oldest first.
+
+        A settled decision is one :attr:`~caucus.models.MessageKind.ANSWER`
+        message already sitting in the bounded log — :meth:`answer_form` and
+        :meth:`cancel_form` both route one, with the form's ``asker``, ``title``,
+        and ``status`` carried in ``meta`` (see their docstrings). This just
+        filters the log for that kind and reuses the message's already-rendered
+        recap as the summary, so a late joiner can catch up on settled questions
+        without replaying the whole transcript.
+
+        Args:
+            limit: Maximum number of decisions to return (the most recent
+                ones); non-positive values yield an empty list.
+
+        Returns:
+            Up to ``limit`` dicts, oldest first, each
+            ``{"ts", "asker", "title", "status", "answer_summary"}``.
+        """
+        if limit <= 0:
+            return []
+        resolved = [m for m in self._log if m.kind is MessageKind.ANSWER]
+        recent = resolved[-limit:]
+        return [
+            {
+                "ts": m.ts,
+                "asker": (m.meta or {}).get("asker"),
+                "title": (m.meta or {}).get("title"),
+                "status": (m.meta or {}).get("status"),
+                "answer_summary": m.content,
+            }
+            for m in recent
+        ]
 
     @staticmethod
     def _render_form_recap(form: Form, answers: dict[str, object]) -> str:
