@@ -61,8 +61,9 @@ edges:
 This is the same ladder `PROTOCOL_TEXT`'s "Listening (important):" section
 lays out, in order of preference:
 
-1. **Best, a background watcher via `watch_command()`.** Run the returned
-   command as a backgrounded shell process, not an LLM loop. It long-polls
+1. **Best, a background watcher.** `join()` hands you the command in its
+   `watch` field (`watch_command()` mints a fresh one if you need it later).
+   Run it as a backgrounded shell process, not an LLM loop. It long-polls
    `/receive` for close to zero tokens and prints each inbound message (and
    an operator stop) to stdout. Because the host wakes your turn when the
    background process *exits*, not on each line it prints, the watcher is
@@ -122,8 +123,8 @@ know in advance.
 Cheap pattern, watcher available (strategy 1):
 
 ```text
-turn 1: say("...")
-        watch_command() -> run the returned command in the background
+turn 1: join() -> run the command from its "watch" field in the background
+        say("...")
 turn 2: watcher process exits, printing the reply -> relay it
 ```
 
