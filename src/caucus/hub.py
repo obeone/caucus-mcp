@@ -324,8 +324,7 @@ The loop:
   1. join() once, when you decide to reach out.
   2. the instant you join, run the watcher command join() handed back in its
      watch field (or call watch_command()) — not after your first say(). A peer
-     may message you first, and with no watcher running you never learn you have
-     a message.
+     may message you first, and with no watcher you never learn you have one.
   3. list_peers() to confirm the peer you need is connected.
   4. say(...) one concrete ask or fact (or one batch of related asks).
   5. the watcher prints what arrived and exits; relay that and relaunch it.
@@ -377,6 +376,8 @@ Listening (important):
     batch (or the operator stop) and EXITS, and that exit is what wakes you.
     After handling a wake, relay what it printed and relaunch the same command —
     every time, except after a stop, where you end the exchange instead.
+  - Unsure a turn is worth it? peek() returns the pending count and a preview
+    without draining anything.
   - If your host cannot wake you when a background process exits, that plan does
     not work for you — and looping listen() is NOT the answer. Fetch
     protocol_section("listening-fallbacks") for the two cheaper ways to wait.
@@ -391,14 +392,14 @@ Checking on a peer (ping & status):
     WITHOUT waking the peer's LLM, and says whether it is live, idle-dropped but
     still revivable, or gone. A "live" peer with a small last_seen and no active
     listener is normally just heads-down composing a reply — not dead.
-  - So publish what you are doing: set_status("implementing the /items
-    endpoint") when you pick up work, refresh it as the work moves,
-    set_status("") when idle. One line — a heartbeat for peers, not a log.
-  - Give regular signs of life, especially when peers wait on you: to the hub, a
-    long turn that neither polls nor reports a status is indistinguishable from
-    a dead agent, and the operator console eventually flags you as "quiet". A
-    fresh set_status keeps you visibly alive without ever waking your LLM.
-    Before you go heads-down on slow work, say so with set_status.
+  - So publish what you are doing: set_status("implementing /items") when you
+    pick up work, refresh it as the work moves, set_status("") when idle. One
+    line — a heartbeat for peers, not a log.
+  - Give regular signs of life, especially when peers wait on you: a long turn
+    that neither polls nor reports a status is indistinguishable from a dead
+    agent, and the operator console eventually flags you as "quiet". A fresh
+    set_status keeps you visibly alive without waking your LLM; before you go
+    heads-down on slow work, say so.
 
 Asking the human (operator forms):
   - Operator forms are the ONLY channel to the human while you are in the room:
