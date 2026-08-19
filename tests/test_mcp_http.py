@@ -344,6 +344,54 @@ async def test_join_protocol_stale(
     assert str(res["note"]).startswith("protocol updated")
 
 
+async def test_second_join_omits_the_protocol_text(state: HubState) -> None:
+    """The ~4.4k-token manual is delivered once per session, not per join."""
+    server = _build()
+    ctx = _ctx("s1")
+    first = await _tool(server, "join")(ctx, project="alpha")
+    assert "Caucus operating protocol" in first["protocol"]
+
+    second = await _tool(server, "join")(ctx, project="alpha")
+    assert "protocol" not in second
+    assert second["protocol_stale"] is False
+    assert "already delivered this session" in str(second["note"])
+
+
+async def test_force_protocol_redelivers_the_text(state: HubState) -> None:
+    """force_protocol is the post-compaction escape hatch: it re-sends the text."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+    forced = await _tool(server, "join")(ctx, project="alpha", force_protocol=True)
+    assert "Caucus operating protocol" in forced["protocol"]
+    assert "already delivered" not in str(forced.get("note", ""))
+
+
+async def test_stale_protocol_redelivers_without_force(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revision bump still pushes the new text on the next join, unasked."""
+    server = _build()
+    ctx = _ctx("s1")
+    assert "protocol" in await _tool(server, "join")(ctx, project="alpha")
+
+    monkeypatch.setattr(
+        hub_module, "PROTOCOL_VERSION", hub_module.PROTOCOL_VERSION + 1
+    )
+    second = await _tool(server, "join")(ctx, project="alpha")
+    assert second["protocol_stale"] is True
+    assert "protocol" in second
+    assert "re-read the protocol" in str(second["note"])
+
+
+async def test_protocol_delivery_is_per_session(state: HubState) -> None:
+    """One session having read the manual must not deprive the next one of it."""
+    server = _build()
+    await _tool(server, "join")(_ctx("s1"), project="alpha")
+    fresh = await _tool(server, "join")(_ctx("s2"), project="beta")
+    assert "Caucus operating protocol" in fresh["protocol"]
+
+
 async def test_watch_command_uses_self_url_and_token_file(state: HubState) -> None:
     """watch_command points at the real hub URL and writes a 0600 token file."""
     import os

@@ -88,9 +88,16 @@ _armed: bool = False
 # hub can flag drift. ``None`` until the session has armed.
 _known_protocol_version: int | None = None
 
-# Protocol text cached when the session armed, re-delivered on :func:`join` so a
+# Protocol text cached when the session armed, delivered on :func:`join` so a
 # lazily-armed agent still reads the operating manual. ``None`` until armed.
 _protocol_text: str | None = None
+
+# Whether :func:`join` has already handed the protocol text to this session.
+# The protocol is ~4.4k tokens and a session's context keeps what it has read,
+# so re-sending it on every join is pure waste; join re-delivers only when the
+# revision moved (``protocol_stale``) or the caller asks for it explicitly
+# (``force_protocol``, for recovering after a context compaction).
+_protocol_delivered: bool = False
 
 # Highest message seq ACKed in this bridge session. Piggybacked on the next
 # :func:`listen` call so the hub can prune the unacked buffer without a
@@ -234,7 +241,9 @@ def _cleanup_token_file() -> None:
 
 
 @mcp.tool()
-def join(project: str | None = None) -> dict[str, object]:
+def join(
+    project: str | None = None, force_protocol: bool = False
+) -> dict[str, object]:
     """Enter the Caucus under ``project`` (defaults to CAUCUS_PROJECT or the connector default); returns the protocol to read now.
 
     Idempotent: re-joining re-sends the cached token to prove identity, so the
@@ -242,9 +251,14 @@ def join(project: str | None = None) -> dict[str, object]:
     duplicate. Arms the session on first use; read-only tools work without
     joining, but ``say``/``listen``/``watch_command`` need it.
 
+    The protocol text comes back on the first join of a session and whenever the
+    hub's revision has moved; a later join says so instead of re-sending it.
+
     Args:
         project: Name to register under. Defaults to ``CAUCUS_PROJECT`` or the
             connector's default identity.
+        force_protocol: Re-send the protocol text even when this session has
+            already read it. Use after a context compaction dropped it.
 
     Returns:
         ``{"joined": true, "project": "<name>", "hub": "<url>",
@@ -258,6 +272,7 @@ def join(project: str | None = None) -> dict[str, object]:
     if gate is not None:
         return gate
     global _token, _joined_as, _known_protocol_version, _protocol_text
+    global _protocol_delivered
     name = project or PROJECT
     payload: dict[str, object] = {
         "project": name,
@@ -304,22 +319,28 @@ def join(project: str | None = None) -> dict[str, object]:
         # see what side rooms exist and what they are about, up front.
         "channels": body.get("channels", {}),
     }
-    # Always deliver the protocol: with the setup step gone, join is where a
-    # lazily-armed agent reads the operating manual. Prefer the hub's fresh copy
-    # when we were behind, else the text cached when the session armed.
     if stale:
         # Refresh the cache alongside the revision counter — they must move
         # together. Advancing _known_protocol_version while leaving the old text
         # cached would make the *next* join compute stale=False and hand back the
         # superseded text under the new version label (silent protocol drift).
         _protocol_text = body.get("protocol_text")
+    notes: list[str] = []
+    # With the setup step gone, join is where a lazily-armed agent reads the
+    # operating manual — but only when it does not already have it. Re-sending
+    # ~4.4k tokens of unchanged text on every join buys the agent nothing.
+    if (stale or force_protocol or not _protocol_delivered) and _protocol_text:
         result["protocol"] = _protocol_text
-        result["note"] = "protocol updated; re-read the protocol below"
+        _protocol_delivered = True
+        if stale:
+            notes.append("protocol updated; re-read the protocol below")
     else:
-        result["protocol"] = _protocol_text
-        if body.get("note"):
-            # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
-            result["note"] = body["note"]
+        notes.append("protocol unchanged; already delivered this session")
+    if body.get("note"):
+        # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
+        notes.append(str(body["note"]))
+    if notes:
+        result["note"] = "; ".join(notes)
     # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
     # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
     # never-fatal probe: does auto mode already know a caucus operator answer is

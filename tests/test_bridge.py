@@ -28,6 +28,7 @@ def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bridge_module, "_armed", False)
     monkeypatch.setattr(bridge_module, "_known_protocol_version", None)
     monkeypatch.setattr(bridge_module, "_protocol_text", None)
+    monkeypatch.setattr(bridge_module, "_protocol_delivered", False)
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "reset"})
     return bridge_module
@@ -118,7 +119,8 @@ def test_rejoin_after_protocol_upgrade_keeps_serving_the_new_text(
     but if it advances ``_known_protocol_version`` without refreshing
     ``_protocol_text``, the *second* join computes ``stale=False`` and serves the
     superseded text under the new version label. The second join below is the one
-    that catches it.
+    that catches it — it asks for the text explicitly, since an unforced re-join
+    no longer re-sends what the session has already read.
     """
     from caucus import hub as hub_module
 
@@ -141,10 +143,58 @@ def test_rejoin_after_protocol_upgrade_keeps_serving_the_new_text(
 
     # Second join: no longer stale, so the bridge answers from its own cache —
     # which must hold the NEW text, not the one cached at arming time.
-    second = bridge.join()
+    second = bridge.join(force_protocol=True)
     assert second["protocol_stale"] is False
     assert second["protocol_version"] == new_version
     assert second["protocol"] == new_text
+
+
+def test_second_join_omits_the_protocol_text(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ~4.4k-token manual is delivered once per session, not per join."""
+    monkeypatch.setattr(bridge, "PROJECT", "thrifty-joiner")
+    first = bridge.join()
+    assert "Caucus operating protocol" in first["protocol"]
+
+    second = bridge.join()
+    assert "protocol" not in second
+    assert second["protocol_stale"] is False
+    assert second["protocol_version"] == first["protocol_version"]
+    assert "already delivered this session" in second["note"]
+
+
+def test_force_protocol_redelivers_the_text(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """force_protocol is the post-compaction escape hatch: it re-sends the text."""
+    monkeypatch.setattr(bridge, "PROJECT", "forceful-joiner")
+    bridge.join()
+    forced = bridge.join(force_protocol=True)
+    assert "Caucus operating protocol" in forced["protocol"]
+    assert "already delivered" not in str(forced.get("note", ""))
+
+
+def test_stale_protocol_redelivers_without_force(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revision bump still pushes the new text on the next join, unasked."""
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "bumped-joiner")
+    first = bridge.join()
+    assert "protocol" in first
+
+    new_text = "Caucus operating protocol (bumped revision)"
+    monkeypatch.setattr(
+        hub_module, "PROTOCOL_VERSION", hub_module.PROTOCOL_VERSION + 1
+    )
+    monkeypatch.setattr(hub_module, "PROTOCOL_TEXT", new_text)
+
+    second = bridge.join()
+    assert second["protocol_stale"] is True
+    assert second["protocol"] == new_text
+    assert "re-read the protocol" in second["note"]
 
 
 def test_tool_reports_hub_unreachable_when_arming_fails(

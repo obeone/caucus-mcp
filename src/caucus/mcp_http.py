@@ -153,6 +153,11 @@ class _Membership:
         known_protocol_version: Protocol revision learned when the session
             armed, sent to the drift check on :func:`join`. ``None`` until
             armed.
+        protocol_delivered: Whether :func:`join` has already handed this session
+            the protocol text. It is ~4.4k tokens and the session's context
+            keeps what it read, so a later join names the revision instead of
+            re-sending the manual (unless the revision moved or the caller
+            passes ``force_protocol``).
         token: The hub access token after :func:`join`, or ``None`` when not in
             the room. Treat as a secret; never logged.
         joined_as: The project name this session registered under, or ``None``.
@@ -170,6 +175,7 @@ class _Membership:
 
     armed: bool = False
     known_protocol_version: int | None = None
+    protocol_delivered: bool = False
     token: str | None = None
     joined_as: str | None = None
     last_acked_seq: int = 0
@@ -591,6 +597,7 @@ def build_mcp_server(
     async def join(
         ctx: _Ctx,
         project: str | None = None,
+        force_protocol: bool = False,
     ) -> dict[str, object]:
         """Enter the Caucus under ``project`` (defaults to CAUCUS_PROJECT or the connector default); returns the protocol to read now.
 
@@ -599,12 +606,18 @@ def build_mcp_server(
         a duplicate. Arms the session on first use; read-only tools work without
         joining, but ``say``/``listen``/``watch_command`` need it.
 
+        The protocol text comes back on the first join of a session and whenever
+        the hub's revision has moved; a later join says so instead of re-sending
+        it.
+
         Args:
             project: Name to register under. Defaults to this session's MCP
                 ``clientInfo.name`` (sanitized), falling back to
                 ``"mcp-client"``. Pass it explicitly whenever more than one
                 client shares the hub: two instances of the same MCP host
                 announce the same ``clientInfo`` and will collide.
+            force_protocol: Re-send the protocol text even when this session has
+                already read it. Use after a context compaction dropped it.
 
         Returns:
             ``{"joined": true, "project": "<name>", "hub": "<url>",
@@ -696,21 +709,29 @@ def build_mcp_server(
             "hub": self_url,
             "protocol_version": _hub.PROTOCOL_VERSION,
             "protocol_stale": stale,
-            # Always deliver the protocol: with the setup step gone, join is where
-            # a lazily-armed agent reads the operating manual.
-            "protocol": _hub.PROTOCOL_TEXT,
             # Open-channel directory so a late joiner sees the side rooms up front.
             "channels": state.channels(),
         }
-        if stale:
-            result["note"] = "protocol updated; re-read the protocol below"
-        elif reg.outcome is RegisterOutcome.REPLACED:
+        notes: list[str] = []
+        # With the setup step gone, join is where a lazily-armed agent reads the
+        # operating manual — but only when it does not already have it. Re-sending
+        # ~4.4k tokens of unchanged text on every join buys the agent nothing.
+        if stale or force_protocol or not member.protocol_delivered:
+            result["protocol"] = _hub.PROTOCOL_TEXT
+            member.protocol_delivered = True
+            if stale:
+                notes.append("protocol updated; re-read the protocol below")
+        else:
+            notes.append("protocol unchanged; already delivered this session")
+        if reg.outcome is RegisterOutcome.REPLACED:
             # Took over a timed-out slot — advise the caller it may be joining
             # mid-conversation, exactly as the /register handler does.
-            result["note"] = (
+            notes.append(
                 "you may be replacing a timed-out session and could be joining"
                 " mid-conversation."
             )
+        if notes:
+            result["note"] = "; ".join(notes)
         return result
 
     @mcp.tool()
