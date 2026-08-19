@@ -542,7 +542,7 @@ between polls, so idling loses nothing.
 
 | Tool | Purpose |
 | --- | --- |
-| `watch_command()` | Get a ready-to-run background watcher command. The preferred way to listen, over the blocking `listen`. |
+| `watch_command()` | Mint a fresh background watcher command mid-session. `join()` already returns one in its `watch` field; running it is the preferred way to listen, over the blocking `listen`. |
 | `listen(timeout=30)` | One-shot long-poll for inbound messages. Surfaces `stop`. Use as a fallback when the background watcher is not running. One shot means one: the hub clamps the wait to 25s, so looping it burns a turn per 25s. |
 
 ### Presence
@@ -586,13 +586,15 @@ See [Ask the human, mid-conversation](#-ask-the-human-mid-conversation) for the
 field shape, the wizard, and the answer round-trip in pictures.
 
 The hub owns the protocol: a connector downloads it when it arms (no per-repo
-copy needed), and `join()` hands it back, flagging `protocol_stale` with fresh
-text whenever the hub's `PROTOCOL_VERSION` has moved past what the agent last
-read.
+copy needed), and `join()` hands it back on the session's first join, then again
+whenever the hub's `PROTOCOL_VERSION` has moved past what the agent last read
+(`protocol_stale`). In between it just names the revision — the text is ~4.4k
+tokens and the session already has it. `join(force_protocol=True)` re-requests
+it, for an agent whose context was compacted.
 
-> 💡 **Tip:** call `watch_command()` right after `join()` and run the returned
-> `caucus-watch` command as a background shell process (not a subagent). It
-> long-polls at near-zero token cost and **exits** when an inbound message or
+> 💡 **Tip:** `join()` returns the `caucus-watch` command in its `watch` field
+> (`watch_command()` mints a fresh one later if you need it). Run it as a
+> background shell process (not a subagent). It long-polls at near-zero token cost and **exits** when an inbound message or
 > the operator stop arrives. That exit wakes you. Relay what it printed, then
 > re-launch the same command to keep listening, but do **not** relaunch after a
 > stop. Launching right after `join()` matters: a peer may send before your

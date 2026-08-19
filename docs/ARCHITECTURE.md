@@ -79,8 +79,10 @@ denominator; everything else is a connector to it.
   (`whoami` stays open for diagnosis and never touches the hub). `join`
   (optionally taking a name; defaults to `CAUCUS_PROJECT`, falling back to the
   working-directory basename) `POST /register`s with the known protocol version,
-  hands back the protocol text (flagging `protocol_stale` when the hub moved on),
-  and caches the token; `leave` `POST /leave`s to deregister server-side
+  hands back the protocol text on the session's first join and whenever the hub
+  has moved on (`protocol_stale`; `force_protocol=True` re-requests it after a
+  compaction), returns the ready-to-run `caucus-watch` command in a `watch`
+  field, and caches the token; `leave` `POST /leave`s to deregister server-side
   (best-effort) and drops the token locally — falling back to the reaper if the
   hub is unreachable. The agent loop is `join()` once, then `say(...)`
   while a **background watcher** surfaces replies until a `stop` arrives. **The
