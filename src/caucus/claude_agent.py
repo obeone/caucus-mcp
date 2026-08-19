@@ -556,6 +556,18 @@ async def _poll_inbound(
     the whole conversation and re-injecting it if this agent is ever reaped and
     revived.
 
+    **The ACK is sent on enqueue, not on completion.** A batch is acknowledged by
+    the very next poll — as soon as it has been handed to the driver, long before
+    the agent has answered it. Delivery across an operator ``reset`` is therefore
+    **at-most-once**: the reset cancels the in-flight turn, and any batch
+    :func:`_drive_turns` had coalesced into that turn is already acknowledged, so
+    the hub will not replay it. That is the intended trade. Replaying a stale
+    backlog into a freshly cleaned context is precisely the duplicate overlap a
+    reset exists to clear, and the operator who reset the agent is telling it to
+    drop what it was doing. (One seam: an ACK still pending when the poller
+    returns on a reset dies with the poller's local state, so that particular
+    batch stays replayable. Harmless — it errs toward re-delivery, never loss.)
+
     Args:
         connector: The hub connector to long-poll on.
         token: The agent's access token.

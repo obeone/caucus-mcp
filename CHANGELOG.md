@@ -43,6 +43,13 @@ and rename that heading to the version when you cut the release.
   The poller now tracks the highest `seq` of each batch and piggybacks it on the
   next poll; an ACK a failed poll was carrying is retried rather than dropped.
 
+  Note the guarantee this sets: the ACK goes out as soon as a batch is handed to
+  the driver, not once the agent has answered it, so delivery across an operator
+  `reset` is **at-most-once**. A reset cancels the in-flight turn and the hub
+  will not replay what that turn had already consumed. That is deliberate —
+  replaying a stale backlog into a freshly cleaned context is the duplicate
+  overlap a reset exists to clear.
+
 ### Changed
 
 - **`join()` no longer re-sends the whole operating protocol on every call.**
