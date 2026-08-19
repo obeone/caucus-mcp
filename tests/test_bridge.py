@@ -109,10 +109,15 @@ def test_tool_calls_share_one_keepalive_http_client(
     assert not first.is_closed  # the borrow must not close the shared client
 
 
-def test_repointing_the_hub_url_rebuilds_the_client(
+def test_repointing_the_hub_url_rebuilds_without_closing_the_old_client(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cached client is never reused against a different hub address."""
+    """A rebind must not close a client another thread may be mid-request on.
+
+    Sync tool bodies run on a thread pool, so closing the displaced client at the
+    point of rebind would fail an in-flight request. It is parked instead and
+    collected at exit.
+    """
     with bridge._client() as original:
         pass
     monkeypatch.setattr(bridge, "HUB_URL", "http://127.0.0.1:1")
@@ -120,7 +125,45 @@ def test_repointing_the_hub_url_rebuilds_the_client(
         pass
 
     assert rebuilt is not original
+    assert not original.is_closed  # still usable by whoever holds it
+    assert original in bridge._retired_http
+
+    # The shutdown path collects the retired client along with the live one.
+    bridge._close_client()
     assert original.is_closed
+    assert rebuilt.is_closed
+    assert bridge._retired_http == []
+
+
+def test_concurrent_first_calls_build_exactly_one_client(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Racing threads must not each build (and orphan) their own client.
+
+    FastMCP dispatches sync tool bodies on a thread pool, so an unguarded
+    check-then-build hands one thread a client that nothing ever closes.
+    """
+    import threading
+
+    monkeypatch.setattr(bridge, "_http", None)
+    monkeypatch.setattr(bridge, "_http_base", None)
+
+    built: list[httpx.Client] = []
+    start = threading.Barrier(8)
+
+    def _grab() -> None:
+        start.wait()  # release all threads into the check-then-build together
+        built.append(bridge._open_client())
+
+    threads = [threading.Thread(target=_grab) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert len(built) == 8
+    assert len({id(client) for client in built}) == 1
+    assert not built[0].is_closed
 
 
 def test_join_flags_stale_protocol_when_behind(

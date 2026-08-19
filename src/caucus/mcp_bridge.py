@@ -34,6 +34,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -124,6 +125,19 @@ _last_acked_seq: int = 0
 _http: httpx.Client | None = None
 _http_base: str | None = None
 
+# Guards the check-then-build of the shared client. FastMCP runs sync tool
+# bodies on a thread pool, so two tools racing their first call would otherwise
+# both see ``_http is None`` and each build a client — one of them promptly
+# orphaned, with its pooled connection never released.
+_http_lock = threading.Lock()
+
+# Clients displaced by a hub-URL rebind. They are NOT closed at the point of
+# rebind: another thread may be mid-request on one, and closing it underneath
+# would fail that request. They are parked here and closed once, at exit.
+# Bounded in practice — HUB_URL is a module constant in production, so this only
+# ever grows under a test that repoints it.
+_retired_http: list[httpx.Client] = []
+
 # Client-side ceiling, deliberately above the hub's LONG_POLL_SECONDS (25) so a
 # server long-poll always returns before httpx gives up — see the long-poll
 # ordering invariant in CLAUDE.md.
@@ -137,15 +151,24 @@ def _open_client() -> httpx.Client:
     bound to, or when the client has been closed, so a repointed bridge never
     keeps talking to the old address.
 
+    The check-then-build runs under :data:`_http_lock`: FastMCP dispatches sync
+    tool bodies on a thread pool, so two tools racing their first call would
+    otherwise each build a client and orphan one of them. A displaced client is
+    parked in :data:`_retired_http` rather than closed here — a caller on another
+    thread may be mid-request on it, and closing it underneath would fail that
+    request; :func:`_close_client` collects them all at exit.
+
     Returns:
         The live client bound to the current ``HUB_URL``.
     """
     global _http, _http_base
-    if _http is None or _http.is_closed or _http_base != HUB_URL:
-        _close_client()
-        _http = httpx.Client(base_url=HUB_URL, timeout=_HTTP_TIMEOUT)
-        _http_base = HUB_URL
-    return _http
+    with _http_lock:
+        if _http is None or _http.is_closed or _http_base != HUB_URL:
+            if _http is not None and not _http.is_closed:
+                _retired_http.append(_http)
+            _http = httpx.Client(base_url=HUB_URL, timeout=_HTTP_TIMEOUT)
+            _http_base = HUB_URL
+        return _http
 
 
 @contextlib.contextmanager
@@ -165,20 +188,26 @@ def _client() -> Iterator[httpx.Client]:
 
 
 def _close_client() -> None:
-    """Close the shared HTTP client if one is live; safe to call repeatedly.
+    """Close the shared HTTP client and any retired ones; safe to call repeatedly.
 
-    Registered with :mod:`atexit` so the pooled connection is released when the
-    MCP host tears the bridge process down, and called internally when the hub
-    URL changes out from under a cached client.
+    Registered with :mod:`atexit` so every pooled connection is released when the
+    MCP host tears the bridge process down — including clients displaced by a
+    hub-URL rebind, which :func:`_open_client` parks rather than closing under a
+    thread that may still be using them.
     """
     global _http, _http_base
-    if _http is not None:
-        try:
-            _http.close()
-        except Exception as exc:  # noqa: BLE001 - shutdown path, nothing to recover
-            logger.debug("closing the shared hub client failed: %s", exc)
+    with _http_lock:
+        doomed = list(_retired_http)
+        if _http is not None:
+            doomed.append(_http)
+        _retired_http.clear()
         _http = None
-    _http_base = None
+        _http_base = None
+    for client in doomed:
+        try:
+            client.close()
+        except Exception as exc:  # noqa: BLE001 - shutdown path, nothing to recover
+            logger.debug("closing a hub client failed: %s", exc)
 
 
 atexit.register(_close_client)
