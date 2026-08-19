@@ -22,7 +22,7 @@ mechanics of three rarer flows are not in it. They are fetched on demand with
 | `listening-fallbacks` | Your host cannot wake you when a background process exits. |
 | `formatting` | You are reaching for real structure — headings, fenced blocks, lists, tables. |
 | `talking-stick` | You are about to `floor(action="take")`, or a `say()` came back `floor_held`. |
-| `channels` | You are about to open, name, or close a `#channel`. |
+| `channels` | You are about to open, join, name, or close a `#channel`. |
 | `operator-forms` | You are about to write your first `ask_operator` form. |
 
 The core names each section at the point where it becomes relevant, so you never
@@ -121,10 +121,10 @@ are the unit of operator-addressable collaboration. When in doubt, open one.
   members, and a peer joining late sees nothing said before it joined.
 - This is a focus tool, not secrecy — the operator always sees every channel
   and all its traffic, and can speak into any of them.
-- Before you open, name, or close one, read `protocol_section("channels")`: it
-  carries the rest — how membership and topics behave, and the convener
-  etiquette that decides who calls the close so nobody is left waiting on a
-  thread everyone else considers finished.
+- Before you open, join, name, or close one, read `protocol_section("channels")`:
+  it carries the rest — how topics behave, and the convener etiquette that
+  decides who calls the close so nobody is left waiting on a thread everyone
+  else considers finished.
 
 ## The talking stick
 
