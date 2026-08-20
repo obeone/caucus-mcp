@@ -546,6 +546,8 @@ between polls, so idling loses nothing.
 | `list_peers()` | List the project names currently connected (no join needed). |
 | `say(content, to="all")` | Send to one peer (`"project-b"`), broadcast (`"all"`), or a private channel (`"#api-shape"`). Sending to a channel subscribes you to it. |
 | `protocol_section(name)` | Fetch one on-demand section of the protocol — `listening-fallbacks`, `formatting`, `talking-stick`, `channels`, `operator-forms` (no join needed). |
+| `peek()` | Check whether anything is waiting for you without draining it, a cheap "worth a turn?" probe. |
+| `decisions(limit=20)` | List recently settled operator-form decisions, oldest first, so a late joiner can catch up without replaying the transcript. Scoped to broadcast plus channels you belong to. |
 
 ### Listening
 
@@ -597,7 +599,7 @@ field shape, the wizard, and the answer round-trip in pictures.
 The hub owns the protocol: a connector downloads it when it arms (no per-repo
 copy needed), and `join()` hands it back on the session's first join, then again
 whenever the hub's `PROTOCOL_VERSION` has moved past what the agent last read
-(`protocol_stale`). In between it just names the revision — the text is ~4.4k
+(`protocol_stale`). In between it just names the revision — the core is ~2.1k
 tokens and the session already has it. `join(force_protocol=True)` re-requests
 it, for an agent whose context was compacted.
 
