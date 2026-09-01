@@ -10,6 +10,23 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A subagent could steal its parent's caucus identity.** Both connectors hold
+  one identity per MCP process (module globals in the stdio bridge, one record
+  per `Mcp-Session-Id` over `/mcp`), and a Claude Code subagent shares both with
+  its parent. A subagent calling `join("other-name")` therefore rebound that
+  slot: the whole process started speaking as the newcomer, the parent's peer
+  was left on the hub with nobody holding its token, and once the idle reaper
+  dropped it the parent could not get its queue or channels back. `join` now
+  refuses when the process already holds a token under a different name, without
+  minting a peer or rotating the watcher token file, returning `already_joined`
+  with the current identity and the hint that subagents inherit it. Re-joining
+  under the same name (the reaffirm / revive / replace path) is untouched, and
+  `leave()` followed by `join()` under a new name still works. A join the hub
+  itself refuses with `name_in_use` now clears the cached identity, so its own
+  "re-join under a different name" advice is not blocked by the new guard.
+
 ## [2.4.0](https://github.com/obeone/caucus-mcp/compare/v2.3.1...v2.4.0) (2026-08-20)
 
 ### Fixed

@@ -620,8 +620,11 @@ def build_mcp_server(
                 already read it. Use after a context compaction dropped it.
 
         Errors: ``name_in_use`` when a live peer already holds the name,
-        ``reserved_name`` for a control-plane identity, ``invalid_name`` outside
-        1-64 characters, ``cap_exceeded`` when the client cap is reached.
+        ``already_joined`` when this session is in the room under another name
+        (subagents share their parent's identity and must not join; call
+        ``leave()`` first if the switch is really intended), ``reserved_name``
+        for a control-plane identity, ``invalid_name`` outside 1-64 characters,
+        ``cap_exceeded`` when the client cap is reached.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
@@ -636,6 +639,32 @@ def build_mcp_server(
                 logger.warning("join refused (bad name) project=%r", project[:80])
                 return bad_name
         name = project or _default_project(ctx)
+        # This session already holds an identity and is now asked for a
+        # different one. A Claude Code subagent inherits its parent's
+        # ``Mcp-Session-Id``, so honouring the request would rebind the shared
+        # membership record: the parent would start speaking as the newcomer
+        # and its own peer would be orphaned on the hub. Refuse before the hub
+        # is touched, so no stray peer is minted. Re-joining under the SAME
+        # name stays allowed (the reaffirm / revive / replace path).
+        if member.token is not None and member.joined_as != name:
+            logger.warning(
+                "join refused: session already holds identity %s (requested %s)",
+                member.joined_as,
+                name,
+            )
+            return {
+                "error": "already_joined",
+                "joined_as": member.joined_as,
+                "requested": name,
+                "hint": (
+                    "this MCP process already holds an identity, most likely"
+                    " because you are a subagent of a joined session. Subagents"
+                    " share the parent's caucus identity and must not switch"
+                    " it: speak, listen and peek under the name already held."
+                    " Do NOT call leave() to get around this, that would drop"
+                    " the parent's peer from the roster."
+                ),
+            }
         # Another *live* session in this process already holding the name is a
         # collision the hub cannot see: its liveness signal is the in-flight
         # /receive long-poll, so between two polls HubState.register reports
@@ -675,6 +704,11 @@ def build_mcp_server(
             # Name held by a live listener and no matching token — refuse. Do
             # NOT dereference reg.client here: it is None on CONTESTED.
             logger.warning("duplicate join refused project=%s", name)
+            # register() rejected the token this session presented, so it holds
+            # no identity any more. Release the slot, or the already_joined
+            # guard would refuse the very re-join the note asks for.
+            member.token = None
+            member.joined_as = None
             return {
                 "error": "name_in_use",
                 "project": name,
@@ -733,6 +767,11 @@ def build_mcp_server(
     @mcp.tool()
     async def leave(ctx: _Ctx) -> dict[str, object]:
         """Leave the Caucus and drop this peer from the roster; stop the watcher when you do.
+
+        Only the agent that joined may call this. Identity is per MCP process, so a
+        subagent shares its parent's: leaving would drop the PARENT's peer from the
+        roster, destroying its queue and channel memberships. If ``join`` refused you
+        with ``already_joined``, ``leave`` is not the way around it.
 
         Best-effort: drops this peer immediately so the operator roster stays
         accurate, then clears the cached token. If the hub is unreachable the local

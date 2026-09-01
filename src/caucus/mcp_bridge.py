@@ -406,7 +406,9 @@ def join(
             already read it. Use after a context compaction dropped it.
 
     Errors: ``name_in_use`` when a live peer already holds the name — re-join
-    under a different one.
+    under a different one. ``already_joined`` when this process is in the room
+    under another name: subagents share their parent's identity and must not
+    join; call ``leave()`` first if the switch is really intended.
     """
     gate = _ensure_armed()
     if gate is not None:
@@ -414,6 +416,33 @@ def join(
     global _token, _joined_as, _known_protocol_version, _protocol_text
     global _protocol_delivered
     name = project or PROJECT
+    # Identity is process-global here (one stdio bridge per MCP host), and a
+    # Claude Code subagent shares its parent's process. A join under a *new*
+    # name would therefore rebind the globals under the parent's feet: every
+    # later tool call in this process would speak as the newcomer, and the
+    # parent's peer would be left on the hub with nobody holding its token.
+    # Refuse locally, before the hub is contacted, so no stray peer is minted.
+    # Re-joining under the SAME name stays allowed: that is the reaffirm /
+    # revive / replace path the protocol tells agents to use.
+    if _token is not None and _joined_as != name:
+        logger.warning(
+            "join refused: this process already holds identity %s (requested %s)",
+            _joined_as,
+            name,
+        )
+        return {
+            "error": "already_joined",
+            "joined_as": _joined_as,
+            "requested": name,
+            "hint": (
+                "this MCP process already holds an identity, most likely"
+                " because you are a subagent of a joined session. Subagents"
+                " share the parent's caucus identity and must not switch it:"
+                " speak, listen and peek under the name already held. Do NOT"
+                " call leave() to get around this, that would drop the parent's"
+                " peer from the roster."
+            ),
+        }
     payload: dict[str, object] = {
         "project": name,
         "protocol_version": _known_protocol_version,
@@ -433,6 +462,13 @@ def join(
                     " peer; re-launch under a different CAUCUS_PROJECT",
                     name,
                 )
+                # The hub rejected the token we presented, so this process holds
+                # no identity any more. Release the slot: the note below tells
+                # the caller to re-join under a different name, and the
+                # already_joined guard would refuse exactly that if a dead token
+                # were left parked in the globals.
+                _token = None
+                _joined_as = None
                 return {
                     "error": "name_in_use",
                     "project": name,
@@ -521,6 +557,11 @@ def join(
 @mcp.tool()
 def leave() -> dict[str, object]:
     """Leave the Caucus and drop this peer from the roster; stop the watcher when you do.
+
+    Only the agent that joined may call this. Identity is per MCP process, so a
+    subagent shares its parent's: leaving would drop the PARENT's peer from the
+    roster, destroying its queue and channel memberships. If ``join`` refused you
+    with ``already_joined``, ``leave`` is not the way around it.
 
     Best-effort: drops this peer immediately so the operator roster stays
     accurate, then clears the cached token. If the hub is unreachable the local

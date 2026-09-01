@@ -454,6 +454,92 @@ def test_join_with_explicit_name_overrides_default(
     assert "explicit-name" in bridge.list_peers()["peers"]
 
 
+def test_join_under_another_name_is_refused_and_mints_no_peer(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subagent's join under a new name must not rebind the shared identity."""
+    monkeypatch.setattr(bridge, "PROJECT", "parent-agent")
+    bridge.join()
+    roster_before = sorted(bridge.list_peers()["peers"])
+
+    result = bridge.join(project="subagent-name")
+
+    assert result["error"] == "already_joined"
+    assert result["joined_as"] == "parent-agent"
+    assert result["requested"] == "subagent-name"
+    hint = str(result["hint"])
+    assert "must not switch it" in hint
+    # Never advise leave(): a subagent following that would deregister the
+    # PARENT's peer, which is the harm this guard exists to prevent.
+    assert "Do NOT call leave()" in hint
+    # The parent keeps the process identity, and the hub never saw the request.
+    assert bridge.whoami()["joined_as"] == "parent-agent"
+    assert sorted(bridge.list_peers()["peers"]) == roster_before
+    assert "subagent-name" not in roster_before
+
+
+def test_rejoin_under_the_same_name_still_works(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-affirming the current identity is the revive path and must keep working."""
+    monkeypatch.setattr(bridge, "PROJECT", "reaffirmer")
+    first = bridge.join()
+    assert first["joined"] is True
+
+    again = bridge.join(project="reaffirmer")
+
+    assert again["joined"] is True
+    assert again["project"] == "reaffirmer"
+    assert bridge.whoami()["joined_as"] == "reaffirmer"
+
+
+def test_leave_then_join_under_a_new_name_works(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is not a one-way door: leave() releases the identity slot."""
+    monkeypatch.setattr(bridge, "PROJECT", "first-identity")
+    bridge.join()
+    bridge.leave()
+
+    result = bridge.join(project="second-identity")
+
+    assert result["joined"] is True
+    assert bridge.whoami()["joined_as"] == "second-identity"
+    assert "second-identity" in bridge.list_peers()["peers"]
+
+
+def test_a_refused_join_releases_the_identity_slot(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 409 leaves no dead token parked in the module globals.
+
+    The hub answers ``name_in_use`` with "re-join under a different name", and
+    the ``already_joined`` guard would refuse exactly that if the rejected token
+    stayed cached. The token is provably not ours any more, so the slot is
+    released and the hub's own advice stays actionable.
+    """
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "contender")
+    assert bridge.join()["joined"] is True
+
+    # Someone else takes the name for real: drop our peer, mint a fresh one
+    # under the same name with an in-flight long-poll. Our cached token no
+    # longer matches a live listener, which is the CONTESTED case.
+    hub_module.state.kick("contender")
+    incumbent = hub_module.state.register("contender")
+    assert incumbent.client is not None
+    incumbent.client.active_polls = 1
+
+    refused = bridge.join(project="contender")
+
+    assert refused["error"] == "name_in_use"
+    assert bridge.whoami()["joined"] is False
+    assert bridge.whoami()["joined_as"] is None
+    # And the advice the hub just gave now works.
+    assert bridge.join(project="contender-2")["joined"] is True
+
+
 def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "leaver")
     bridge.join()
