@@ -303,7 +303,12 @@ async def test_peek_reports_pending_without_draining(live_hub: str) -> None:
 
         before = await hub.peek(receiver.token)
         assert before["pending"] == 1
-        assert before["last"] == {"sender": "conn-peek-tx", "preview": "hi there"}
+        assert before["last"] == {
+            "sender": "conn-peek-tx",
+            "preview": "hi there",
+            "preview_truncated": False,
+            "content_chars": len("hi there"),
+        }
 
         # peek() never drains: the message is still there for receive().
         inbound = await hub.receive(receiver.token, 3.0)
