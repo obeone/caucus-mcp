@@ -18,9 +18,10 @@ Covers eight behaviors introduced in the low-severity pass:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -292,6 +293,106 @@ def test_resilient_hub_call_converts_http_status_error() -> None:
     result = _raises()
     assert result["error"] == "hub_unreachable"
     assert "detail" in result
+
+
+@contextlib.contextmanager
+def _bridge_identity(token: str | None, name: str | None) -> Iterator[None]:
+    """Pin the bridge's module-global identity for the body, then restore it."""
+    from caucus import mcp_bridge
+
+    original = mcp_bridge._token, mcp_bridge._joined_as
+    mcp_bridge._token, mcp_bridge._joined_as = token, name
+    try:
+        yield
+    finally:
+        mcp_bridge._token, mcp_bridge._joined_as = original
+
+
+def _raise_401(request: httpx.Request) -> dict[str, object]:
+    """Raise the ``HTTPStatusError`` a hub 401 on ``request`` would produce."""
+    response = httpx.Response(401, request=request)
+    raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+
+def test_resilient_hub_call_reports_401_on_a_bearer_call_as_session_expired() -> None:
+    """A 401 on a call that presented the token is an expired membership.
+
+    ``hub_unreachable`` sent agents hunting a network outage that never
+    happened; the remedy for a reaped, left or kicked peer is ``join()``.
+    """
+    from caucus import mcp_bridge
+
+    @mcp_bridge._resilient_hub_call
+    def _raises() -> dict[str, object]:
+        return _raise_401(
+            httpx.Request(
+                "GET",
+                "http://127.0.0.1:8765/receive",
+                headers={"Authorization": "Bearer a-stale-token"},
+            )
+        )
+
+    with _bridge_identity("a-stale-token", "peer-x"):
+        result = _raises()
+
+    assert result["error"] == "session_expired"
+    assert result["joined_as"] == "peer-x"
+    assert "join()" in str(result["hint"])
+
+
+def test_resilient_hub_call_reports_401_on_a_token_body_as_session_expired() -> None:
+    """The POST endpoints carry the token in the JSON body, not a header."""
+    from caucus import mcp_bridge
+
+    @mcp_bridge._resilient_hub_call
+    def _raises() -> dict[str, object]:
+        return _raise_401(
+            httpx.Request(
+                "POST",
+                "http://127.0.0.1:8765/send",
+                json={"token": "a-stale-token", "to": "all", "content": "hi"},
+            )
+        )
+
+    with _bridge_identity("a-stale-token", "peer-x"):
+        result = _raises()
+
+    assert result["error"] == "session_expired"
+
+
+def test_resilient_hub_call_401_on_an_unauthenticated_call_stays_hub_unreachable() -> (
+    None
+):
+    """A 401 the session's token never earned must not be called an expiry.
+
+    A joined peer still calls the unauthenticated endpoints, and an auth proxy
+    in front of the hub can reject those. Keying on the cached token merely
+    being set would send the agent to re-join a hub that never let it through.
+    """
+    from caucus import mcp_bridge
+
+    @mcp_bridge._resilient_hub_call
+    def _raises() -> dict[str, object]:
+        return _raise_401(httpx.Request("GET", "http://127.0.0.1:8765/peers"))
+
+    with _bridge_identity("a-live-token", "peer-x"):
+        result = _raises()
+
+    assert result["error"] == "hub_unreachable"
+
+
+def test_resilient_hub_call_401_without_a_token_stays_hub_unreachable() -> None:
+    """With no cached token there is no session that could have expired."""
+    from caucus import mcp_bridge
+
+    @mcp_bridge._resilient_hub_call
+    def _raises() -> dict[str, object]:
+        return _raise_401(httpx.Request("GET", "http://127.0.0.1:8765/peers"))
+
+    with _bridge_identity(None, None):
+        result = _raises()
+
+    assert result["error"] == "hub_unreachable"
 
 
 def test_resilient_hub_call_converts_json_decode_error() -> None:

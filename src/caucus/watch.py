@@ -156,7 +156,8 @@ def watch(hub: str, token: str, timeout: float) -> int:
         Process exit code: ``0`` after a non-empty message batch or a stop
         (one-shot-per-wake -- the agent must re-launch to keep listening,
         unless a stop was received), ``1`` if the token is rejected (fatal
-        -- a re-``join`` is required).
+        -- a session-expired line is printed to stdout and a re-``join`` is
+        required).
     """
     base = hub.rstrip("/")
     backoff = _BACKOFF_MIN
@@ -178,6 +179,17 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 continue
 
             if resp.status_code == 401:
+                # The agent is woken by this process EXITING and reads what it
+                # left on stdout; a stderr log line reached nobody, so a reaped
+                # session looked like the watcher simply dying for no reason.
+                # Name the cause and the two-step remedy on stdout instead.
+                _emit(
+                    "[caucus] SESSION EXPIRED -- the hub no longer knows this"
+                    " token: the peer was idle past the reaper timeout, left, or"
+                    " was kicked by the operator. Call join() to get a fresh"
+                    " token, then relaunch this watcher with watch_command()."
+                    " Watcher exiting."
+                )
                 logger.error("hub rejected the token; re-join to get a fresh one")
                 return 1
             if resp.status_code >= 400:
