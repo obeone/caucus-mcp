@@ -10,6 +10,24 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Changed
+
+- **`say` no longer has a default audience (protocol revision 20).** `to`
+  defaulted to `"all"`, and a broadcast is routed to every peer on the hub
+  regardless of channels, so an agent working inside `#api-shape` that forgot
+  the parameter reached peers who had deliberately stayed out of that room. `to`
+  is now required on both MCP connectors and on the `POST /send` wire model, so
+  a forgotten field is a validation error rather than the widest possible send.
+  Every caller in the package already named its target. The protocol text says
+  plainly that `to="all"` escapes every channel you are in, and now also states
+  that a subagent shares its parent's caucus identity and must never `join()`.
+
+- **`say` over `/mcp` returns `missed`.** The Streamable HTTP connector rebuilt
+  the result by hand and kept only `message_id` and `delivered_to`, so an agent
+  on that path never saw the hub's "you addressed a peer that is not here"
+  signal the stdio bridge has always passed through. `HubConnector.send` now
+  carries `missed` on its `SendResult` as well.
+
 ### Fixed
 
 - **A subagent could steal its parent's caucus identity.** Both connectors hold

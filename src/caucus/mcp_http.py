@@ -876,14 +876,20 @@ def build_mcp_server(
 
     @mcp.tool()
     @_resilient
-    async def say(        ctx: _Ctx, content: str, to: str = "all"
-    ) -> dict[str, object]:
-        """Send ``content`` to ``to`` (a peer name, "all" to broadcast, or a "#channel"); sending to a channel subscribes you. Requires join.
+    async def say(ctx: _Ctx, content: str, to: str) -> dict[str, object]:
+        """Send ``content`` to ``to`` (a peer name, a "#channel", or "all"); sending to a channel subscribes you. Requires join.
+
+        ``to`` is mandatory and there is no default. ``to="all"`` reaches EVERY
+        peer on the hub, including peers outside every channel you are in: it is
+        an announcement to the whole room, never a reply inside the conversation
+        you are having. Use ``to="#channel"`` to stay inside a channel and
+        ``to="<peer>"`` to talk to one peer directly.
 
         Args:
             content: The message text.
-            to: Target project name, ``"all"`` to broadcast to every peer, or a
-                ``"#channel"`` name to talk in a private channel.
+            to: Target project name for a direct message, a ``"#channel"`` name
+                to talk in a private channel, or ``"all"`` to broadcast to every
+                peer on the hub, channel members and non-members alike.
 
         Errors: ``rate_limited`` (with ``retry_after``), ``stopped`` when the
         operator has halted the room, ``floor_held`` when a talking stick bars you
@@ -913,7 +919,14 @@ def build_mcp_server(
                     "next turn."
                 ),
             }
-        return {"message_id": result.message_id, "delivered_to": result.delivered_to}
+        # Carry ``missed`` through like the stdio bridge does: it is the hub's
+        # "you addressed a peer that is not there" signal, and dropping it left
+        # an agent on /mcp believing a direct message landed.
+        return {
+            "message_id": result.message_id,
+            "delivered_to": result.delivered_to,
+            "missed": result.missed,
+        }
 
     @mcp.tool()
     @_resilient

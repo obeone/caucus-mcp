@@ -94,9 +94,11 @@ def test_control_mode_values() -> None:
     assert {m.value for m in ControlMode} == {"running", "paused", "stopped"}
 
 
-def test_send_request_defaults_to_broadcast() -> None:
-    req = SendRequest(token="t", content="hello")
-    assert req.to == BROADCAST
+def test_send_request_requires_an_explicit_target() -> None:
+    """``to`` has no default: a forgotten audience must not mean "everyone"."""
+    with pytest.raises(ValidationError):
+        SendRequest(token="t", content="hello")  # type: ignore[call-arg]
+    assert SendRequest(token="t", to=BROADCAST, content="hello").to == BROADCAST
 
 
 def test_send_request_rejects_empty_content() -> None:

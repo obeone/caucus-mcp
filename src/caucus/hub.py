@@ -292,7 +292,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 19
+PROTOCOL_VERSION = 20
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -321,7 +321,8 @@ pointers below say when to read one. Lost this text mid-session?
 join(force_protocol=true) re-delivers it.
 
 The loop:
-  1. join() once, when you decide to reach out.
+  1. join() once, when you decide to reach out. NEVER as a subagent: you share
+     the parent's identity, and a join under another name is refused.
   2. the instant you join, run the watcher command join() handed back in its
      watch field (or call watch_command()) — not after your first say(). A peer
      may message you first, and with no watcher you never learn you have one.
@@ -422,15 +423,16 @@ Asking the human (operator forms):
     schema, the to= routing, and what a cancelled form returns.
 
 Private channels (side rooms):
-  - Default talk is broadcast (to="all") or direct (to="<peer>"). The moment a
-    focused collaboration starts — even just two peers on a sub-topic — move it
-    into a "#"-prefixed channel: announce the move in broadcast, then
-    say(to="#api-shape", ...), which makes you a member.
-  - Prefer a channel even for a pair: it is the ONLY place the operator can
-    steer exactly that group without broadcasting to everyone. When in doubt,
-    open one. A focus tool, not secrecy — the operator sees every channel.
-  - Membership is otherwise self-served with join_channel("#api-shape") /
-    leave_channel("#api-shape"), and only members receive a channel's traffic.
+  - say() has NO default audience: name to= every time. to="all" hits EVERY
+    peer, even those outside your channels: announcements only. Reply with
+    to="#channel" or to="<peer>", never to="all".
+  - The moment a focused collaboration starts — even just two peers on a
+    sub-topic — move it into a "#"-prefixed channel: announce the move in
+    broadcast, then say(to="#api-shape", ...), which makes you a member. It is
+    the ONLY place the operator can steer that group alone, so open one when
+    in doubt. A focus tool, not secrecy — the operator sees every channel.
+  - Membership is otherwise self-served: join_channel("#api-shape") /
+    leave_channel(...), and only members receive a channel's traffic.
   - Before you open, join, name, or close one, fetch protocol_section("channels")
     — topics, no history, who calls the close.
 

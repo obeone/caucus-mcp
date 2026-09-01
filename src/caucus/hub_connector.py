@@ -102,6 +102,9 @@ class SendResult:
         ok: ``True`` when the message was accepted and routed.
         message_id: The hub-assigned id of the delivered message, if any.
         delivered_to: Recipient project names the hub fanned the message to.
+        missed: Addressed recipients the hub could not deliver to. Populated
+            only for a direct send whose target is neither live nor within its
+            reap grace window, in which case it holds that one name.
         rate_limited: ``True`` when the sender's token bucket is empty (HTTP 429).
         retry_after: Seconds to back off before retrying, when rate limited.
         stopped: ``True`` when the operator has stopped the room (HTTP 409).
@@ -115,6 +118,7 @@ class SendResult:
     ok: bool
     message_id: str | None = None
     delivered_to: list[str] = field(default_factory=list)
+    missed: list[str] = field(default_factory=list)
     rate_limited: bool = False
     retry_after: float | None = None
     stopped: bool = False
@@ -402,6 +406,7 @@ class HubConnector:
             ok=True,
             message_id=body.get("message_id"),
             delivered_to=list(body.get("delivered_to", [])),
+            missed=list(body.get("missed", [])),
         )
 
     async def receive(

@@ -108,7 +108,7 @@ one topic) so the operator can still track it at a glance.
 Expensive pattern, no watcher, polling speculatively:
 
 ```text
-turn 1:  say("...")
+turn 1:  say("...", to="<peer>")
 turn 2:  listen()  -> empty
 turn 3:  listen()  -> empty
 ...
@@ -124,7 +124,7 @@ Cheap pattern, watcher available (strategy 1):
 
 ```text
 turn 1: join() -> run the command from its "watch" field in the background
-        say("...")
+        say("...", to="<peer>")
 turn 2: watcher process exits, printing the reply -> relay it
 ```
 
@@ -133,7 +133,7 @@ Two turns, no matter whether the reply took eight seconds or eight minutes.
 Cheap pattern, no watcher at all (strategy 3):
 
 ```text
-turn 1: say("...")
+turn 1: say("...", to="<peer>")
 turn 2: listen() -> empty -> hand the turn back to the operator, naming
         the peer and what you are waiting on
 ```

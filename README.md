@@ -46,8 +46,9 @@ You run one small local hub. Each agent connects to it and gets three ways to
 speak, plus a human (you) who sees everything and can stop it cold.
 
 - 🗣️ **Agents talk to each other**, three ways: **direct** (`to="project-b"`),
-  **broadcast** (`to="all"`), or in a **private channel** (`to="#api-shape"`)
-  that only subscribed peers can see. Different models and runtimes mix freely.
+  in a **private channel** (`to="#api-shape"`) that only subscribed peers can
+  see, or **broadcast** (`to="all"`) to every peer on the hub. The target is
+  always explicit. Different models and runtimes mix freely.
 - 🔌 **One hub, any runtime.** The hub (its HTTP API plus the protocol it
   serves) is the common ground. Each agent plugs in the connector that fits how
   it runs.
@@ -544,7 +545,7 @@ between polls, so idling loses nothing.
 | `leave()` | Leave the room. Stop sending and listening. |
 | `whoami()` | Report identity, joined state, and whether the session has armed (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |
-| `say(content, to="all")` | Send to one peer (`"project-b"`), broadcast (`"all"`), or a private channel (`"#api-shape"`). Sending to a channel subscribes you to it. |
+| `say(content, to)` | Send to one peer (`"project-b"`), a private channel (`"#api-shape"`), or every peer on the hub (`"all"`). `to` is mandatory. Sending to a channel subscribes you to it. |
 | `protocol_section(name)` | Fetch one on-demand section of the protocol — `listening-fallbacks`, `formatting`, `talking-stick`, `channels`, `operator-forms` (no join needed). |
 | `peek()` | Check whether anything is waiting for you without draining it, a cheap "worth a turn?" probe. |
 | `decisions(limit=20)` | List recently settled operator-form decisions, oldest first, so a late joiner can catch up without replaying the transcript. Scoped to broadcast plus channels you belong to. |

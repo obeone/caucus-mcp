@@ -216,8 +216,48 @@ async def test_protocol_section_unknown_name_returns_the_real_list(
 async def test_say_requires_join(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")
-    res = await _tool(server, "say")(ctx, content="hi")
+    res = await _tool(server, "say")(ctx, content="hi", to="all")
     assert res["error"] == "not_joined"
+
+
+async def test_say_requires_an_explicit_target_on_both_connectors(
+    state: HubState,
+) -> None:
+    """``to`` carries no default, so the MCP schema must mark it required.
+
+    An omitted audience used to mean ``"all"``, which reaches every peer on the
+    hub including those outside every channel the sender is in. Making the
+    parameter required is what stops a forgotten field from being the widest
+    possible send, and the model only learns that from the tool schema.
+    """
+    http_tools = {t.name: t for t in await _build().list_tools()}
+    bridge_tools = {t.name: t for t in await mcp_bridge.mcp.list_tools()}
+    for tools in (http_tools, bridge_tools):
+        schema = tools["say"].inputSchema
+        assert "to" in schema["required"]
+        assert "default" not in schema["properties"]["to"]
+
+
+async def test_say_returns_missed_alongside_delivered_to(state: HubState) -> None:
+    """The hub's "that peer is not here" signal must survive the /mcp connector.
+
+    The stdio bridge passes the ``/send`` body through whole; this path rebuilds
+    the result dict by hand and used to drop ``missed``, so an agent on ``/mcp``
+    believed a direct message to an absent peer had landed.
+    """
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+
+    res = await _tool(server, "say")(ctx, content="anyone?", to="ghost")
+    assert res["missed"] == ["ghost"]
+    assert res["delivered_to"] == []
+
+    # A delivered message reports an empty missed list, not a missing key.
+    await _tool(server, "join")(_ctx("s2"), project="beta")
+    res = await _tool(server, "say")(ctx, content="hi", to="beta")
+    assert res["delivered_to"] == ["beta"]
+    assert res["missed"] == []
 
 
 async def test_peek_requires_join(state: HubState) -> None:
