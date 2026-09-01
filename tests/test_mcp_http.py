@@ -91,6 +91,57 @@ async def test_sessions_are_isolated(state: HubState) -> None:
     assert "beta" in state.peers()
 
 
+async def test_join_under_another_name_is_refused_for_a_joined_session(
+    state: HubState,
+) -> None:
+    """A subagent inherits the parent's session id; its join must not rebind it."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="parent-agent")
+    roster_before = sorted(state.peers())
+
+    res = await _tool(server, "join")(ctx, project="subagent-name")
+
+    assert res["error"] == "already_joined"
+    assert res["joined_as"] == "parent-agent"
+    assert res["requested"] == "subagent-name"
+    hint = str(res["hint"])
+    assert "must not switch it" in hint
+    # Never advise leave(): a subagent following that would deregister the
+    # PARENT's peer, which is the harm this guard exists to prevent.
+    assert "Do NOT call leave()" in hint
+    assert (await _tool(server, "whoami")(ctx))["joined_as"] == "parent-agent"
+    assert sorted(state.peers()) == roster_before
+    assert "subagent-name" not in roster_before
+
+
+async def test_rejoin_under_the_same_name_is_allowed(state: HubState) -> None:
+    """Re-affirming the session's own identity stays the supported revive path."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="reaffirmer")
+
+    res = await _tool(server, "join")(ctx, project="reaffirmer")
+
+    assert res["joined"] is True
+    assert res["project"] == "reaffirmer"
+    assert "reaffirmer" in state.peers()
+
+
+async def test_leave_then_join_under_a_new_name_is_allowed(state: HubState) -> None:
+    """The guard releases with the identity, so an explicit switch still works."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="first-identity")
+    await _tool(server, "leave")(ctx)
+
+    res = await _tool(server, "join")(ctx, project="second-identity")
+
+    assert res["joined"] is True
+    assert (await _tool(server, "whoami")(ctx))["joined_as"] == "second-identity"
+    assert "second-identity" in state.peers()
+
+
 async def test_tools_fail_closed_without_session_id(state: HubState) -> None:
     """A3: with no Mcp-Session-Id, every gated tool fails closed to no_session."""
     server = _build()
@@ -279,6 +330,36 @@ async def test_join_name_in_use_on_contested(state: HubState) -> None:
     assert res["error"] == "name_in_use"
     assert res["project"] == "alpha"
     assert "note" in res
+
+
+async def test_contested_join_releases_the_session_identity_slot(
+    state: HubState,
+) -> None:
+    """CONTESTED must clear the session's token, or its own note is unusable.
+
+    ``register`` rejected the token this session presented, so it holds no
+    identity. Leaving it cached would have the ``already_joined`` guard refuse
+    the "re-join under a different name" the note asks for.
+    """
+    server = _build()
+    ctx = _ctx("s1")
+    assert (await _tool(server, "join")(ctx, project="alpha"))["joined"] is True
+
+    # Someone else takes "alpha" for real: drop our peer, mint a fresh one under
+    # the same name holding an in-flight /receive long-poll. Our cached token no
+    # longer matches, which is exactly the CONTESTED case.
+    state.kick("alpha")
+    incumbent = state.register("alpha")
+    assert incumbent.client is not None
+    incumbent.client.active_polls = 1
+
+    res = await _tool(server, "join")(ctx, project="alpha")
+
+    assert res["error"] == "name_in_use"
+    assert (await _tool(server, "whoami")(ctx))["joined"] is False
+    assert (await _tool(server, "whoami")(ctx))["joined_as"] is None
+    # The note's advice now works.
+    assert (await _tool(server, "join")(ctx, project="gamma"))["joined"] is True
 
 
 async def test_join_replaced_includes_note(state: HubState) -> None:
