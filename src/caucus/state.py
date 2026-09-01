@@ -103,7 +103,20 @@ OPERATOR_COMMANDS = frozenset({"interrupt", "reset"})
 
 PEEK_PREVIEW_CHARS = 120
 """How many leading characters of a message's content :meth:`HubState.peek`
-surfaces as the ``preview`` of the caller's most recent pending arrival."""
+surfaces as the ``preview`` of the caller's most recent pending arrival.
+
+A longer message is cut here and the remainder is announced with
+:data:`PEEK_TRUNCATION_MARKER`, because the cut lands mid-word and a bare
+fragment reads like a message that arrived mangled rather than an excerpt."""
+
+PEEK_TRUNCATION_MARKER = " [+{count} chars]"
+"""Appended to a truncated :meth:`HubState.peek` preview, ``count`` being the
+number of characters left behind.
+
+Carried inside the preview *string* rather than only in the sibling
+``preview_truncated`` flag: the marker then survives any renderer or log line
+that shows the text alone, which is exactly where the fragment was being
+mistaken for the whole message."""
 
 
 # --- heartbeat brake ----------------------------------------------------
@@ -865,17 +878,31 @@ class HubState:
                 e.g. via :meth:`client_for`).
 
         Returns:
-            ``{"pending": <int>, "last": {"sender", "preview"} | None}``.
-            ``last`` is ``None`` whenever nothing is currently pending; its
-            ``preview`` truncates the message content to
-            :data:`PEEK_PREVIEW_CHARS` characters.
+            ``{"pending": <int>, "last": {"sender", "preview",
+            "preview_truncated", "content_chars"} | None}``. ``last`` is
+            ``None`` whenever nothing is currently pending. ``preview`` is a
+            leading excerpt of at most :data:`PEEK_PREVIEW_CHARS` characters,
+            carrying :data:`PEEK_TRUNCATION_MARKER` when there was more;
+            ``preview_truncated`` says whether it was cut and ``content_chars``
+            gives the full length, so a caller can size the real message before
+            spending a ``listen`` on it.
         """
         pending = client.queue.qsize() + client.priority_queue.qsize()
         last: dict[str, object] | None = None
         if pending > 0 and client.last_pending is not None:
+            content = client.last_pending.content
+            dropped = len(content) - PEEK_PREVIEW_CHARS
+            preview = content[:PEEK_PREVIEW_CHARS]
+            if dropped > 0:
+                # The slice lands mid-word by construction, and agents read the
+                # fragment as a delivered message that arrived truncated. Say so
+                # in the string itself; only listen() carries the full text.
+                preview += PEEK_TRUNCATION_MARKER.format(count=dropped)
             last = {
                 "sender": client.last_pending.sender,
-                "preview": client.last_pending.content[:PEEK_PREVIEW_CHARS],
+                "preview": preview,
+                "preview_truncated": dropped > 0,
+                "content_chars": len(content),
             }
         return {"pending": pending, "last": last}
 

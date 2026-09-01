@@ -22,7 +22,12 @@ from caucus.models import (
     Message,
     MessageKind,
 )
-from caucus.state import MAX_QUEUE_SIZE, HubState, RegisterOutcome
+from caucus.state import (
+    MAX_QUEUE_SIZE,
+    PEEK_PREVIEW_CHARS,
+    HubState,
+    RegisterOutcome,
+)
 
 
 def _msg(sender: str, recipient: str, content: str = "x") -> Message:
@@ -1061,7 +1066,13 @@ async def test_peek_pending_increments_on_route() -> None:
 
     result = state.peek(beta)
     assert result["pending"] == 1
-    assert result["last"] == {"sender": "alpha", "preview": "hello beta"}
+    # Short content is delivered whole and must carry no truncation marker.
+    assert result["last"] == {
+        "sender": "alpha",
+        "preview": "hello beta",
+        "preview_truncated": False,
+        "content_chars": len("hello beta"),
+    }
 
 
 async def test_peek_pending_decrements_to_zero_after_receive_drains() -> None:
@@ -1083,15 +1094,58 @@ async def test_peek_pending_decrements_to_zero_after_receive_drains() -> None:
     assert state.peek(beta) == {"pending": 0, "last": None}
 
 
-async def test_peek_preview_truncates_to_120_chars() -> None:
+async def test_peek_preview_truncates_to_120_chars_and_says_so() -> None:
+    """A cut preview must announce itself, in the string and in a flag.
+
+    The bare 120-character slice lands mid-word, and agents read the fragment
+    as a delivered message that had arrived mangled rather than as an excerpt.
+    """
     state = HubState()
     state.register("alpha")
     beta = state.register("beta").client
     assert beta is not None
     state.route(_msg("alpha", "beta", "x" * 500))
 
-    preview = state.peek(beta)["last"]["preview"]  # type: ignore[index]
-    assert preview == "x" * 120
+    last = state.peek(beta)["last"]
+    assert last == {
+        "sender": "alpha",
+        "preview": "x" * 120 + " [+380 chars]",
+        "preview_truncated": True,
+        "content_chars": 500,
+    }
+
+
+async def test_peek_preview_is_unmarked_at_exactly_the_cut() -> None:
+    """Content of exactly PEEK_PREVIEW_CHARS is complete, so nothing is marked."""
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+    content = "y" * PEEK_PREVIEW_CHARS
+    state.route(_msg("alpha", "beta", content))
+
+    last = state.peek(beta)["last"]
+    assert last == {
+        "sender": "alpha",
+        "preview": content,
+        "preview_truncated": False,
+        "content_chars": PEEK_PREVIEW_CHARS,
+    }
+
+
+async def test_peek_content_chars_counts_the_whole_message() -> None:
+    """``content_chars`` sizes the real message, not the excerpt."""
+    state = HubState()
+    state.register("alpha")
+    beta = state.register("beta").client
+    assert beta is not None
+    content = "z" * (PEEK_PREVIEW_CHARS + 1)
+    state.route(_msg("alpha", "beta", content))
+
+    last = state.peek(beta)["last"]
+    assert last["preview_truncated"] is True  # type: ignore[index]
+    assert last["content_chars"] == PEEK_PREVIEW_CHARS + 1  # type: ignore[index]
+    assert last["preview"].endswith(" [+1 chars]")  # type: ignore[index,union-attr]
 
 
 async def test_peek_is_exact_across_ring_buffer_overflow() -> None:
@@ -1114,9 +1168,12 @@ async def test_peek_is_exact_across_ring_buffer_overflow() -> None:
     result = state.peek(beta)
     assert result["pending"] == MAX_QUEUE_SIZE
     # The oldest 25 were dropped; the newest survives and is what's previewed.
+    newest = f"msg-{MAX_QUEUE_SIZE + 24}"
     assert result["last"] == {
         "sender": "alpha",
-        "preview": f"msg-{MAX_QUEUE_SIZE + 24}",
+        "preview": newest,
+        "preview_truncated": False,
+        "content_chars": len(newest),
     }
 
 
