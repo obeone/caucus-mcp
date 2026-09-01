@@ -1219,7 +1219,12 @@ def test_peek_pending_increments_on_route_without_draining(
         "/peek", headers={"Authorization": f"Bearer {beta}"}
     ).json()
     assert body["pending"] == 1
-    assert body["last"] == {"sender": "alpha", "preview": "hi beta"}
+    assert body["last"] == {
+        "sender": "alpha",
+        "preview": "hi beta",
+        "preview_truncated": False,
+        "content_chars": len("hi beta"),
+    }
 
     # Peeking again does not drain the queue: pending is unaffected.
     body_again = client.get(
@@ -1255,7 +1260,10 @@ def test_peek_pending_decrements_to_zero_after_receive_drains(
     assert body == {"pending": 0, "last": None}
 
 
-def test_peek_preview_truncates_long_content(client: TestClient) -> None:
+def test_peek_preview_truncates_long_content_and_marks_the_excerpt(
+    client: TestClient,
+) -> None:
+    """Over the wire too, a cut preview says how much it left behind."""
     alpha = _register(client, "alpha")
     beta = _register(client, "beta")
     long_content = "x" * 500
@@ -1264,8 +1272,9 @@ def test_peek_preview_truncates_long_content(client: TestClient) -> None:
     body = client.get(
         "/peek", headers={"Authorization": f"Bearer {beta}"}
     ).json()
-    assert body["last"]["preview"] == "x" * 120
-    assert len(body["last"]["preview"]) == 120
+    assert body["last"]["preview"] == "x" * 120 + " [+380 chars]"
+    assert body["last"]["preview_truncated"] is True
+    assert body["last"]["content_chars"] == 500
 
 
 def test_peek_unknown_token_is_401(client: TestClient) -> None:

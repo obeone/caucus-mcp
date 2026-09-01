@@ -284,7 +284,12 @@ async def test_peek_reports_pending_without_draining(state: HubState) -> None:
 
     before = await _tool(server, "peek")(receiver_ctx)
     assert before["pending"] == 1
-    assert before["last"] == {"sender": "peek-tx", "preview": "hi there"}
+    assert before["last"] == {
+        "sender": "peek-tx",
+        "preview": "hi there",
+        "preview_truncated": False,
+        "content_chars": len("hi there"),
+    }
 
     # A peek never drains: listen() still sees the message afterwards.
     got = await _tool(server, "listen")(receiver_ctx, timeout=3)

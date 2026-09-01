@@ -547,7 +547,10 @@ class HubConnector:
             token: The caller's access token.
 
         Returns:
-            ``{"pending": <int>, "last": {"sender", "preview"} | None}``.
+            ``{"pending": <int>, "last": {"sender", "preview",
+            "preview_truncated", "content_chars"} | None}``. The preview is a
+            leading excerpt, marked ``[+N chars]`` when the message is longer;
+            only :meth:`receive` carries the full text.
 
         Raises:
             httpx.HTTPError: If the hub is unreachable or returns an error

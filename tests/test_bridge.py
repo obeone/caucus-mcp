@@ -600,7 +600,12 @@ def test_peek_reports_pending_without_draining(
 
     before = bridge.peek()
     assert before["pending"] == 1
-    assert before["last"] == {"sender": "peek-sender", "preview": "yo peeker"}
+    assert before["last"] == {
+        "sender": "peek-sender",
+        "preview": "yo peeker",
+        "preview_truncated": False,
+        "content_chars": len("yo peeker"),
+    }
 
     # A peek must not drain the queue: listen() still sees the message.
     got = bridge.listen(timeout=3)
@@ -608,6 +613,32 @@ def test_peek_reports_pending_without_draining(
 
     after = bridge.peek()
     assert after == {"pending": 0, "last": None}
+
+
+def test_peek_marks_a_long_preview_as_an_excerpt(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker has to survive all the way out to the agent's tool result.
+
+    A bare 120-character slice cut mid-word was being read as a delivered
+    message that had arrived mangled, and the agent asked its peer to resend.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "peeker-long")
+    bridge.join()
+    sender = _register_peer(live_hub, "long-sender")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post(
+            "/send",
+            json={"token": sender, "to": "peeker-long", "content": "w" * 300},
+        )
+
+    last = bridge.peek()["last"]
+    assert last["preview"] == "w" * 120 + " [+180 chars]"
+    assert last["preview_truncated"] is True
+    assert last["content_chars"] == 300
+    # listen() still hands over the whole thing, exactly as the docstring says.
+    got = bridge.listen(timeout=3)
+    assert any(m["content"] == "w" * 300 for m in got["messages"])
 
 
 # --- say -----------------------------------------------------------------

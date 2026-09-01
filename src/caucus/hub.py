@@ -1865,7 +1865,8 @@ async def peek(
     endpoint does; no special-cased liveness bookkeeping.
 
     Returns:
-        ``{"pending": <int>, "last": {"sender", "preview"} | None}`` — see
+        ``{"pending": <int>, "last": {"sender", "preview",
+        "preview_truncated", "content_chars"} | None}``; see
         :meth:`~caucus.state.HubState.peek`.
     """
     resolved = _resolve_receive_token(authorization, token)

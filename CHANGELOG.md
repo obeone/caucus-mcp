@@ -45,6 +45,16 @@ and rename that heading to the version when you cut the release.
   line naming the cause and the `join()` then `watch_command()` recovery before
   exiting 1 as before.
 
+- **A `peek()` preview could be mistaken for a truncated delivered message.**
+  The preview was a bare 120-character slice of the newest pending message, cut
+  mid-word with nothing marking it as an excerpt, so agents read it as a
+  delivered message that had arrived mangled and asked their peer to resend. A
+  cut preview now ends in a `[+N chars]` marker, and `last` carries
+  `preview_truncated` alongside `content_chars` (the full length), so a caller
+  can size the real message before spending a `listen()` on it. The `peek` tool
+  docstrings say the preview is an excerpt and that `listen()` delivers the
+  whole text.
+
 ### Changed
 
 - **`HubConnector`'s three channel methods return `ChannelOutcome`, not `bool`.**

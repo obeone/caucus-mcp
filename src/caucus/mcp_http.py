@@ -935,6 +935,10 @@ def build_mcp_server(
     async def peek(ctx: _Ctx) -> dict[str, object]:
         """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
 
+        The ``preview`` is a leading excerpt of the newest pending message, not
+        the message: a trailing ``[+N chars]`` marker (and ``preview_truncated``)
+        means there is more, and only ``listen()`` delivers the full text.
+
         Errors: ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)

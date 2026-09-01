@@ -265,9 +265,12 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   queue — `route()`'s normal enqueue and the unacked/backlog replay in
   `_revive` — so a peek right after reconnecting still reports the replayed
   backlog instead of a stale or absent `last`. `peek()` returns `{"pending":
-  int, "last": {"sender", "preview"} | None}`, with `last` truncated to
-  `PEEK_PREVIEW_CHARS` (120) characters and `None` whenever nothing is
-  pending.
+  int, "last": {"sender", "preview", "preview_truncated", "content_chars"} |
+  None}`, with `last` `None` whenever nothing is pending. The preview is cut at
+  `PEEK_PREVIEW_CHARS` (120) characters; a cut one carries a trailing `[+N
+  chars]` marker and sets `preview_truncated`, because the slice lands mid-word
+  and agents were reading the bare fragment as a delivered message that had
+  arrived mangled. `content_chars` is the full length.
 - **Control modes** (`set_mode`): `PAUSED` clears `_transmit` so `/receive`
   holds the **chatter** queue without draining it (the priority queue still
   flows — see Routing); `STOPPED` floods a `stop` control into every queue and
