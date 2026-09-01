@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from types import TracebackType
 
 import httpx
@@ -35,6 +36,61 @@ logger = logging.getLogger("caucus.connector")
 # ``/receive`` returns on the server's terms rather than tripping the client
 # timeout (mirrors the bridge's server-poll < client-timeout ordering).
 DEFAULT_TIMEOUT = 35.0
+
+
+class ChannelOutcome(Enum):
+    """How the hub answered a channel call: accepted, or refused and why.
+
+    The three channel methods used to return a bare ``bool``, which flattened
+    every refusal into ``False``. A caller could not tell a dead session from a
+    genuine rejection, and the ``/mcp`` tools duly reported an expired token as
+    ``channel_rejected`` with a hint about the ``#`` prefix, sending agents to
+    fix a channel name that was never wrong. Each refusal the hub expresses as a
+    status code now carries its own member, so the caller names the real cause.
+
+    Attributes:
+        OK: The hub accepted the call.
+        SESSION_EXPIRED: HTTP 401. The hub no longer knows this token (reaped,
+            left, or kicked). The remedy is a fresh ``register``, not a retry.
+        RATE_LIMITED: HTTP 429. The caller's per-sender bucket is empty,
+            retryable after a pause.
+        REJECTED: HTTP 403 or 422. A topic write from a non-member, or a
+            channel name or topic the hub's request model refuses.
+    """
+
+    OK = "ok"
+    SESSION_EXPIRED = "session_expired"
+    RATE_LIMITED = "rate_limited"
+    REJECTED = "rejected"
+
+
+_CHANNEL_REFUSALS: dict[int, ChannelOutcome] = {
+    401: ChannelOutcome.SESSION_EXPIRED,
+    403: ChannelOutcome.REJECTED,
+    422: ChannelOutcome.REJECTED,
+    429: ChannelOutcome.RATE_LIMITED,
+}
+"""Status codes the channel calls answer with a :class:`ChannelOutcome`.
+
+Everything outside this map stays on ``raise_for_status``, so a genuine server
+fault (500) or an unexpected redirect still surfaces as an
+:class:`httpx.HTTPError` instead of being flattened into a refusal the caller
+would then blame on the agent.
+"""
+
+
+def _channel_outcome(status_code: int) -> ChannelOutcome | None:
+    """Map a channel response status onto its refusal, if it is one.
+
+    Args:
+        status_code: The HTTP status the hub answered with.
+
+    Returns:
+        The matching :class:`ChannelOutcome`, or ``None`` when the status is not
+        a known refusal and the caller should fall through to
+        ``raise_for_status``.
+    """
+    return _CHANNEL_REFUSALS.get(status_code)
 
 
 class NameInUseError(RuntimeError):
@@ -176,7 +232,9 @@ class HubConnector:
 
     Network failures surface as :class:`httpx.HTTPError`; the caller decides how
     to retry. The ``/send`` brakes (429/409) are returned as
-    :class:`SendResult` flags rather than raised, so the agent can react.
+    :class:`SendResult` flags rather than raised, so the agent can react, and
+    the channel calls return a :class:`ChannelOutcome` naming which brake fired
+    so a dead session is never reported as a bad channel name.
     """
 
     def __init__(
@@ -489,7 +547,10 @@ class HubConnector:
             token: The caller's access token.
 
         Returns:
-            ``{"pending": <int>, "last": {"sender", "preview"} | None}``.
+            ``{"pending": <int>, "last": {"sender", "preview",
+            "preview_truncated", "content_chars"} | None}``. The preview is a
+            leading excerpt, marked ``[+N chars]`` when the message is longer;
+            only :meth:`receive` carries the full text.
 
         Raises:
             httpx.HTTPError: If the hub is unreachable or returns an error
@@ -652,7 +713,7 @@ class HubConnector:
         resp.raise_for_status()
         return list(resp.json().get("decisions", []))
 
-    async def join_channel(self, token: str, channel: str) -> bool:
+    async def join_channel(self, token: str, channel: str) -> ChannelOutcome:
         """Subscribe the token holder to a private channel (self-join).
 
         Only members receive a channel's traffic, so this is how a native agent
@@ -663,8 +724,9 @@ class HubConnector:
             channel: The ``#``-prefixed channel name to join.
 
         Returns:
-            ``True`` on success, ``False`` if the hub rejected the request — an
-            unknown token (401) or a rate-limit hit (429).
+            :attr:`ChannelOutcome.OK` on success, or the refusal the hub
+            expressed: ``SESSION_EXPIRED`` (401), ``RATE_LIMITED`` (429) or
+            ``REJECTED`` (422, a name the request model refuses).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -673,12 +735,13 @@ class HubConnector:
         resp = await http.post(
             "/channels/join", json={"token": token, "channel": channel}
         )
-        if resp.status_code in (401, 429):
-            return False
+        refusal = _channel_outcome(resp.status_code)
+        if refusal is not None:
+            return refusal
         resp.raise_for_status()
-        return True
+        return ChannelOutcome.OK
 
-    async def leave_channel(self, token: str, channel: str) -> bool:
+    async def leave_channel(self, token: str, channel: str) -> ChannelOutcome:
         """Unsubscribe the token holder from a private channel.
 
         Args:
@@ -686,8 +749,9 @@ class HubConnector:
             channel: The ``#``-prefixed channel name to leave.
 
         Returns:
-            ``True`` on success, ``False`` if the hub rejected the request — an
-            unknown token (401) or a rate-limit hit (429).
+            :attr:`ChannelOutcome.OK` on success, or the refusal the hub
+            expressed: ``SESSION_EXPIRED`` (401), ``RATE_LIMITED`` (429) or
+            ``REJECTED`` (422, a name the request model refuses).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -696,10 +760,11 @@ class HubConnector:
         resp = await http.post(
             "/channels/leave", json={"token": token, "channel": channel}
         )
-        if resp.status_code in (401, 429):
-            return False
+        refusal = _channel_outcome(resp.status_code)
+        if refusal is not None:
+            return refusal
         resp.raise_for_status()
-        return True
+        return ChannelOutcome.OK
 
     async def channels(self) -> dict[str, dict[str, object]]:
         """List active private channels with their topic and members.
@@ -716,7 +781,9 @@ class HubConnector:
         resp.raise_for_status()
         return dict(resp.json().get("channels", {}))
 
-    async def set_channel_topic(self, token: str, channel: str, topic: str) -> bool:
+    async def set_channel_topic(
+        self, token: str, channel: str, topic: str
+    ) -> ChannelOutcome:
         """Set (or clear) a channel's topic; the caller must be a member.
 
         A blank ``topic`` clears it. Topics let a late-joining peer learn what a
@@ -728,8 +795,10 @@ class HubConnector:
             topic: The one-line topic; blank clears it.
 
         Returns:
-            ``True`` on success, ``False`` if the hub rejected the request — an
-            unknown token (401), a non-member (403), or a rate-limit hit (429).
+            :attr:`ChannelOutcome.OK` on success, or the refusal the hub
+            expressed: ``SESSION_EXPIRED`` (401), ``RATE_LIMITED`` (429) or
+            ``REJECTED`` (403 for a non-member, 422 for a name or topic the
+            request model refuses).
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -739,10 +808,11 @@ class HubConnector:
             "/channels/topic",
             json={"token": token, "channel": channel, "topic": topic},
         )
-        if resp.status_code in (401, 403, 429):
-            return False
+        refusal = _channel_outcome(resp.status_code)
+        if refusal is not None:
+            return refusal
         resp.raise_for_status()
-        return True
+        return ChannelOutcome.OK
 
     async def take_floor(
         self, token: str, scope: str, reason: str

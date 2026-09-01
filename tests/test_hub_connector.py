@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from caucus.hub_connector import HubConnector, NameInUseError
+from caucus.hub_connector import ChannelOutcome, HubConnector, NameInUseError
 from caucus.state import HubState
 
 
@@ -164,7 +164,7 @@ async def test_channel_join_send_and_receive(live_hub: str) -> None:
     async with HubConnector(live_hub) as hub:
         rx = await hub.register("conn-ch-rx", None)
         tx = await hub.register("conn-ch-tx", None)
-        assert await hub.join_channel(rx.token, "#conn-room") is True
+        assert await hub.join_channel(rx.token, "#conn-room") is ChannelOutcome.OK
 
         result = await hub.send(tx.token, "#conn-room", "channel hello")
         assert result.ok is True
@@ -189,18 +189,23 @@ async def test_set_channel_topic_reflected_in_directory(live_hub: str) -> None:
         me = await hub.register("conn-topic", None)
         await hub.join_channel(me.token, "#conn-topic-room")
         ok = await hub.set_channel_topic(me.token, "#conn-topic-room", "the topic")
-        assert ok is True
+        assert ok is ChannelOutcome.OK
         chans = await hub.channels()
     assert chans["#conn-topic-room"]["topic"] == "the topic"
 
 
-async def test_set_channel_topic_non_member_is_false(live_hub: str) -> None:
+async def test_set_channel_topic_non_member_is_rejected(live_hub: str) -> None:
+    """A non-member topic write is a REJECTED, distinct from an expired session.
+
+    The hub answers 403 here. Under the old bool return that was the same
+    ``False`` an unknown token produced, so the caller could only guess.
+    """
     async with HubConnector(live_hub) as hub:
         opener = await hub.register("conn-topic-owner", None)
         await hub.join_channel(opener.token, "#conn-owned-room")
         outsider = await hub.register("conn-outsider", None)
         ok = await hub.set_channel_topic(outsider.token, "#conn-owned-room", "nope")
-    assert ok is False
+    assert ok is ChannelOutcome.REJECTED
 
 
 async def test_register_membership_carries_channel_directory(live_hub: str) -> None:
@@ -217,26 +222,55 @@ async def test_leave_channel_stops_delivery(live_hub: str) -> None:
         rx = await hub.register("conn-ch-leaver", None)
         tx = await hub.register("conn-ch-sender", None)
         await hub.join_channel(rx.token, "#conn-leave-room")
-        assert await hub.leave_channel(rx.token, "#conn-leave-room") is True
+        left = await hub.leave_channel(rx.token, "#conn-leave-room")
+        assert left is ChannelOutcome.OK
 
         result = await hub.send(tx.token, "#conn-leave-room", "should miss")
     assert "conn-ch-leaver" not in result.delivered_to
 
 
-async def test_join_channel_unknown_token_is_false(live_hub: str) -> None:
+async def test_join_channel_unknown_token_reports_session_expired(
+    live_hub: str,
+) -> None:
+    """A token the hub does not know is SESSION_EXPIRED, not a plain rejection.
+
+    This is the case an agent actually hits after the reaper, a ``leave`` or an
+    operator kick, and the one the ``/mcp`` tools used to report as
+    ``channel_rejected`` with a hint about the ``#`` prefix.
+    """
     async with HubConnector(live_hub) as hub:
-        assert await hub.join_channel("bogus-token", "#x") is False
-        assert await hub.leave_channel("bogus-token", "#x") is False
+        joined = await hub.join_channel("bogus-token", "#x")
+        left = await hub.leave_channel("bogus-token", "#x")
+        topic = await hub.set_channel_topic("bogus-token", "#x", "t")
+    assert joined is ChannelOutcome.SESSION_EXPIRED
+    assert left is ChannelOutcome.SESSION_EXPIRED
+    assert topic is ChannelOutcome.SESSION_EXPIRED
 
 
-async def test_join_channel_rate_limited_returns_false(live_hub: str) -> None:
+async def test_join_channel_rate_limited_is_its_own_outcome(live_hub: str) -> None:
+    """An emptied send bucket is RATE_LIMITED: retryable, unlike an expiry."""
     async with HubConnector(live_hub) as hub:
         me = await hub.register("conn-ch-flood", None)
         results = [
             await hub.join_channel(me.token, f"#c{i}") for i in range(12)
         ]
-    # The hub's per-sender bucket trips 429, which the connector maps to False.
-    assert results.count(False) >= 1
+    # The hub's per-sender bucket trips 429; the connector must not fold that
+    # into the same answer it gives for a dead session.
+    assert results.count(ChannelOutcome.RATE_LIMITED) >= 1
+    assert ChannelOutcome.SESSION_EXPIRED not in results
+
+
+async def test_join_channel_bad_name_is_rejected(live_hub: str) -> None:
+    """A name the request model refuses comes back as REJECTED, not an exception.
+
+    422 used to fall through to ``raise_for_status``, so the ``/mcp`` tool that
+    promised ``channel_rejected`` for an invalid name in fact answered
+    ``hub_unreachable``.
+    """
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-ch-badname", None)
+        outcome = await hub.join_channel(me.token, "no-hash-prefix")
+    assert outcome is ChannelOutcome.REJECTED
 
 
 async def test_use_outside_context_raises() -> None:
@@ -269,7 +303,12 @@ async def test_peek_reports_pending_without_draining(live_hub: str) -> None:
 
         before = await hub.peek(receiver.token)
         assert before["pending"] == 1
-        assert before["last"] == {"sender": "conn-peek-tx", "preview": "hi there"}
+        assert before["last"] == {
+            "sender": "conn-peek-tx",
+            "preview": "hi there",
+            "preview_truncated": False,
+            "content_chars": len("hi there"),
+        }
 
         # peek() never drains: the message is still there for receive().
         inbound = await hub.receive(receiver.token, 3.0)

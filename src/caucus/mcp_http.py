@@ -74,8 +74,13 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 
 from . import hub as _hub
-from .hub_connector import HubConnector
-from .models import RESERVED_NAMES, lean_public
+from .hub_connector import ChannelOutcome, HubConnector
+from .models import (
+    RESERVED_NAMES,
+    lean_public,
+    request_carried_token,
+    session_expired_error,
+)
 from .state import CapExceeded, RegisterOutcome
 
 logger = logging.getLogger("caucus.mcp_http")
@@ -181,6 +186,53 @@ class _Membership:
     last_acked_seq: int = 0
     token_file: str | None = None
     last_active: float = field(default_factory=time.time)
+
+
+def _channel_failure(
+    outcome: ChannelOutcome,
+    *,
+    channel: str,
+    member: _Membership,
+    hub: str,
+    rejected_error: str,
+    rejected_hint: str,
+) -> dict[str, object]:
+    """Turn a non-OK :class:`ChannelOutcome` into the agent-facing error dict.
+
+    The connector used to collapse 401, 403 and 429 into one ``False``, so every
+    channel failure came back as ``channel_rejected`` with a hint about the
+    ``#`` prefix, including a token the hub had reaped, which no amount of
+    renaming the channel would fix. Each outcome now gets the error code and the
+    remedy that actually match it, and ``channel_rejected`` keeps its original
+    meaning: the hub refused *this channel operation*.
+
+    The session's cached token is left in place on an expiry, exactly as the
+    stdio bridge leaves its own: ``join`` presents it again and the hub's
+    revival path matches on it inside the reap grace window.
+
+    Args:
+        outcome: The refusal the connector reported; never
+            :attr:`ChannelOutcome.OK`.
+        channel: The channel the call targeted, echoed back to the agent.
+        member: The calling session's membership, read for its joined name.
+        hub: The hub URL to report alongside an expired session.
+        rejected_error: Error code for the plain-rejection case
+            (``channel_rejected`` for join/leave, ``topic_rejected`` for a
+            topic write).
+        rejected_hint: Remedy line for that same plain-rejection case.
+
+    Returns:
+        The error dict to hand back from the tool.
+    """
+    if outcome is ChannelOutcome.SESSION_EXPIRED:
+        return session_expired_error(member.joined_as, hub)
+    if outcome is ChannelOutcome.RATE_LIMITED:
+        return {
+            "error": "rate_limited",
+            "channel": channel,
+            "hint": "you are talking faster than the hub allows; pause and retry",
+        }
+    return {"error": rejected_error, "channel": channel, "hint": rejected_hint}
 
 
 # Type of an async MCP tool body: takes any args, returns the result dict.
@@ -516,6 +568,31 @@ def build_mcp_server(
                 conn_holder["connector"] = existing
             return existing
 
+    def _calling_member(
+        args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> _Membership | None:
+        """Recover the calling session's membership from a tool's arguments.
+
+        Every tool takes the FastMCP ``Context`` first, so the session id (and
+        through it the membership) is reachable from inside the decorator
+        without threading anything extra through each tool body.
+
+        Args:
+            args: Positional arguments the tool was called with.
+            kwargs: Keyword arguments the tool was called with.
+
+        Returns:
+            The membership for this MCP session, or ``None`` when the context is
+            missing, unusable, or the session has no record yet.
+        """
+        ctx = args[0] if args else kwargs.get("ctx")
+        if ctx is None:
+            return None
+        try:
+            return _session(cast(_Ctx, ctx))
+        except AttributeError:  # pragma: no cover - a context without a request
+            return None
+
     def _resilient(func: _AsyncToolFn) -> _AsyncToolFn:
         """Turn a hub blip into the structured ``hub_unreachable`` contract.
 
@@ -523,12 +600,42 @@ def build_mcp_server(
         failure (``httpx.HTTPError``) or a truncated/non-JSON body
         (``json.JSONDecodeError``) becomes a tidy error dict instead of aborting
         the agent's tool turn. The success path is untouched.
+
+        And, as in the bridge, one status code is split out: a ``401`` on a call
+        that actually presented this session's token is an expired membership,
+        not an unreachable hub, so it returns ``session_expired`` with the name
+        to re-join under. Without it a kicked or reaped ``/mcp`` session read
+        ``hub_unreachable`` from ``say``, ``peek``, ``listen`` and the rest, then
+        ``not_joined`` once the next sweep cleared its record, and never learned
+        what had actually happened. The test is on the failed request rather than
+        on the session merely holding a token, so a ``401`` from an auth proxy in
+        front of an unauthenticated endpoint is not mislabelled.
         """
 
         @functools.wraps(func)
         async def wrapper(*args: object, **kwargs: object) -> dict[str, object]:
             try:
                 return await func(*args, **kwargs)
+            except httpx.HTTPStatusError as exc:
+                # Caught before the broader HTTPError arm below, which this
+                # class inherits from.
+                member = _calling_member(args, kwargs)
+                token = member.token if member is not None else None
+                if exc.response.status_code == 401 and request_carried_token(
+                    exc.request, token
+                ):
+                    assert member is not None  # implied by a non-None token
+                    logger.warning(
+                        "%s: the hub disowned this session's token; it has expired",
+                        func.__name__,
+                    )
+                    return session_expired_error(member.joined_as, self_url)
+                logger.error("%s failed: %s", func.__name__, exc)
+                return {
+                    "error": "hub_unreachable",
+                    "detail": str(exc),
+                    "hub": self_url,
+                }
             except (httpx.HTTPError, json.JSONDecodeError) as exc:
                 logger.error("%s failed: %s", func.__name__, exc)
                 return {
@@ -760,6 +867,10 @@ def build_mcp_server(
 
         Diagnoses why the other tools may be refusing: reports whether the session
         has armed and the known protocol revision alongside the joined state.
+
+        All of it is local state, never a probe of the hub, so a ``session_expired``
+        from any other tool outranks a ``joined: true`` reported here: the hub has
+        forgotten a membership this session still believes in.
         """
         member = _session(ctx)
         return {
@@ -823,6 +934,10 @@ def build_mcp_server(
     @_resilient
     async def peek(ctx: _Ctx) -> dict[str, object]:
         """Check whether anything is waiting for you without draining it — a cheap "worth a turn?" probe. Requires join.
+
+        The ``preview`` is a leading excerpt of the newest pending message, not
+        the message: a trailing ``[+N chars]`` marker (and ``preview_truncated``)
+        means there is more, and only ``listen()`` delivers the full text.
 
         Errors: ``not_joined``.
         """
@@ -905,8 +1020,9 @@ def build_mcp_server(
         Args:
             channel: The ``#``-prefixed channel name to join.
 
-        Errors: ``channel_rejected`` when the hub refused it (invalid name,
-        unknown token, or rate limited), ``not_joined``.
+        Errors: ``channel_rejected`` when the hub refused the name,
+        ``session_expired`` when it no longer knows your token,
+        ``rate_limited``, ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
@@ -915,14 +1031,17 @@ def build_mcp_server(
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
-        ok = await connector.join_channel(member.token, channel)
-        if ok:
+        outcome = await connector.join_channel(member.token, channel)
+        if outcome is ChannelOutcome.OK:
             return {"joined": True, "channel": channel}
-        return {
-            "error": "channel_rejected",
-            "channel": channel,
-            "hint": "channel must start with '#', or you were rate limited",
-        }
+        return _channel_failure(
+            outcome,
+            channel=channel,
+            member=member,
+            hub=self_url,
+            rejected_error="channel_rejected",
+            rejected_hint="channel must start with '#'",
+        )
 
     @mcp.tool()
     @_resilient
@@ -933,7 +1052,9 @@ def build_mcp_server(
         Args:
             channel: The ``#``-prefixed channel name to leave.
 
-        Errors: ``channel_rejected`` when the hub refused it, ``not_joined``.
+        Errors: ``channel_rejected`` when the hub refused the name,
+        ``session_expired`` when it no longer knows your token,
+        ``rate_limited``, ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
@@ -942,14 +1063,17 @@ def build_mcp_server(
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
-        ok = await connector.leave_channel(member.token, channel)
-        if ok:
+        outcome = await connector.leave_channel(member.token, channel)
+        if outcome is ChannelOutcome.OK:
             return {"left": True, "channel": channel}
-        return {
-            "error": "channel_rejected",
-            "channel": channel,
-            "hint": "channel must start with '#', or you were rate limited",
-        }
+        return _channel_failure(
+            outcome,
+            channel=channel,
+            member=member,
+            hub=self_url,
+            rejected_error="channel_rejected",
+            rejected_hint="channel must start with '#'",
+        )
 
     @mcp.tool()
     @_resilient
@@ -971,8 +1095,9 @@ def build_mcp_server(
             channel: The ``#``-prefixed channel name.
             topic: The one-line topic to set; empty clears it.
 
-        Errors: ``topic_rejected`` when the hub refused it (bad name, not a
-        member, or rate limited), ``not_joined``.
+        Errors: ``topic_rejected`` when the hub refused it (bad name, or you
+        are not a member), ``session_expired`` when it no longer knows your
+        token, ``rate_limited``, ``not_joined``.
         """
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
@@ -981,14 +1106,17 @@ def build_mcp_server(
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
-        ok = await connector.set_channel_topic(member.token, channel, topic)
-        if ok:
+        outcome = await connector.set_channel_topic(member.token, channel, topic)
+        if outcome is ChannelOutcome.OK:
             return {"channel": channel, "topic": topic.strip() or None}
-        return {
-            "error": "topic_rejected",
-            "channel": channel,
-            "hint": "bad channel name, not a member, or rate limited",
-        }
+        return _channel_failure(
+            outcome,
+            channel=channel,
+            member=member,
+            hub=self_url,
+            rejected_error="topic_rejected",
+            rejected_hint="bad channel name, or you are not a member",
+        )
 
     @mcp.tool()
     @_resilient

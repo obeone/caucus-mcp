@@ -10,6 +10,59 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An expired session was reported as an unreachable hub.** When the hub no
+  longer knew a peer's token, because the idle reaper had dropped it past the
+  grace window, because it had left, or because the operator kicked it, both
+  connectors folded the resulting `401` into `hub_unreachable` carrying httpx's
+  raw `Client error '401 Unauthorized'` text. The agent learned neither the
+  cause nor the remedy and went looking for a network fault that never
+  happened. On the `/mcp` path it then turned into `not_joined` after the next
+  reaper sweep, which was no more informative. Every token-bearing tool on
+  *both* the stdio bridge and the in-process `/mcp` server now returns
+  `{"error": "session_expired", "joined_as": …, "hint": …}` naming the three
+  causes and the two-step recovery. The translation is keyed on the failed
+  request having actually presented the session's token, so a `401` from an
+  auth proxy sitting in front of an unauthenticated endpoint is not mislabelled
+  as a lost membership. The cached token is deliberately kept, so the `join()`
+  the hint points at can still be matched by the hub's revival path.
+
+- **The `/mcp` path blamed the channel name for a dead session.**
+  `HubConnector.join_channel` / `leave_channel` / `set_channel_topic` collapsed
+  `401`, `403` and `429` into a single `False`, so an expired token surfaced as
+  `channel_rejected` with a hint about the `#` prefix and no rename would ever
+  fix it. The three calls now return a `ChannelOutcome`, and the tools map it to
+  `session_expired`, `rate_limited`, or a `channel_rejected` / `topic_rejected`
+  that once again means what it says. A `422` on a malformed channel name is
+  part of that mapping too, so the invalid-name case the tool docstrings always
+  promised no longer arrives as `hub_unreachable`.
+
+- **`caucus-watch` died silently on an expired token.** The watcher logged the
+  rejection to stderr and exited 1, but the agent is woken by the process
+  *exiting* and reads only its stdout, so a reaped session looked like the
+  watcher quitting for no reason. It now prints a `[caucus] SESSION EXPIRED`
+  line naming the cause and the `join()` then `watch_command()` recovery before
+  exiting 1 as before.
+
+- **A `peek()` preview could be mistaken for a truncated delivered message.**
+  The preview was a bare 120-character slice of the newest pending message, cut
+  mid-word with nothing marking it as an excerpt, so agents read it as a
+  delivered message that had arrived mangled and asked their peer to resend. A
+  cut preview now ends in a `[+N chars]` marker, and `last` carries
+  `preview_truncated` alongside `content_chars` (the full length), so a caller
+  can size the real message before spending a `listen()` on it. The `peek` tool
+  docstrings say the preview is an excerpt and that `listen()` delivers the
+  whole text.
+
+### Changed
+
+- **`HubConnector`'s three channel methods return `ChannelOutcome`, not `bool`.**
+  A breaking change for anything building a native connector on the library:
+  test success with `is ChannelOutcome.OK` instead of `is True`. The bare
+  boolean could not express which brake had fired, which is what made an expired
+  session indistinguishable from a bad channel name.
+
 ## [2.4.0](https://github.com/obeone/caucus-mcp/compare/v2.3.1...v2.4.0) (2026-08-20)
 
 ### Fixed
