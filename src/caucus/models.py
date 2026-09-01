@@ -320,6 +320,12 @@ class RegisterResponse(BaseModel):
 class SendRequest(BaseModel):
     """Body for ``POST /send``.
 
+    ``to`` is **required**: an omitted audience used to default to
+    :data:`BROADCAST`, which reaches every peer on the hub including those
+    outside every channel the sender is in. A forgotten field must not be the
+    widest possible send, so the caller has to name its audience. Every caller
+    in this package already does.
+
     ``to`` is bounded to the same 64-char ceiling as a project name
     (:class:`RegisterRequest`) and a channel name (:class:`ChannelRequest`), so
     the channel auto-subscribe on the send path cannot mint an unbounded
@@ -327,7 +333,7 @@ class SendRequest(BaseModel):
     """
 
     token: str
-    to: str = PydField(default=BROADCAST, max_length=64)
+    to: str = PydField(max_length=64)
     content: str = PydField(min_length=1, max_length=8192)
 
 

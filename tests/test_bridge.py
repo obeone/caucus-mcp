@@ -96,7 +96,7 @@ def test_write_tools_require_join(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     not_joined = {"error": "not_joined", "hint": "call join() first"}
-    assert bridge.say("hi") == not_joined
+    assert bridge.say("hi", to="all") == not_joined
     assert bridge.set_status("busy") == not_joined
     assert bridge.listen(timeout=0) == not_joined
     assert bridge.floor(action="take", reason="x") == not_joined
@@ -547,7 +547,10 @@ def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> Non
     result = bridge.leave()
     assert result["left"] is True
     assert bridge.whoami()["joined"] is False
-    assert bridge.say("nope") == {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.say("nope", to="all") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
 
 
 def test_leave_deregisters_from_hub_roster(
@@ -655,7 +658,10 @@ def test_say_without_join_errors(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "noauth")
-    assert bridge.say("hi") == {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.say("hi", to="all") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
 
 
 def test_say_direct_is_delivered(
@@ -681,7 +687,7 @@ def test_say_is_rate_limited_under_flood(
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "flooder")
     bridge.join()
-    results = [bridge.say(f"spam {i}") for i in range(20)]
+    results = [bridge.say(f"spam {i}", to="all") for i in range(20)]
     assert any(r.get("error") == "rate_limited" for r in results)
     rate_limited = next(r for r in results if r.get("error") == "rate_limited")
     assert "retry_after" in rate_limited
@@ -694,7 +700,7 @@ def test_say_when_stopped_reports_stopped(
     bridge.join()
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "stop"})
-    result = bridge.say("should not pass")
+    result = bridge.say("should not pass", to="all")
     assert result.get("stopped") is True
 
 
@@ -829,7 +835,7 @@ def test_say_is_blocked_while_another_holds_the_floor(
     monkeypatch.setattr(bridge, "PROJECT", "barred")
     bridge.join()
     try:
-        result = bridge.say("let me in")
+        result = bridge.say("let me in", to="all")
         assert result["error"] == "floor_held"
         assert result["held_by"] == "floor-holder"
         # The barred peer can still queue for the next turn.

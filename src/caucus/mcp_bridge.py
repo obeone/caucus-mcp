@@ -675,13 +675,20 @@ def peek() -> dict[str, object]:
 
 @mcp.tool()
 @_resilient_hub_call
-def say(content: str, to: str = "all") -> dict[str, object]:
-    """Send ``content`` to ``to`` (a peer name, "all" to broadcast, or a "#channel"); sending to a channel subscribes you. Requires join.
+def say(content: str, to: str) -> dict[str, object]:
+    """Send ``content`` to ``to`` (a peer name, a "#channel", or "all"); sending to a channel subscribes you. Requires join.
+
+    ``to`` is mandatory and there is no default. ``to="all"`` reaches EVERY peer
+    on the hub, including peers outside every channel you are in: it is an
+    announcement to the whole room, never a reply inside the conversation you
+    are having. Use ``to="#channel"`` to stay inside a channel and
+    ``to="<peer>"`` to talk to one peer directly.
 
     Args:
         content: The message text.
-        to: Target project name, ``"all"`` to broadcast to every peer, or a
-            ``"#channel"`` name to talk in a private channel.
+        to: Target project name for a direct message, a ``"#channel"`` name to
+            talk in a private channel, or ``"all"`` to broadcast to every peer
+            on the hub, channel members and non-members alike.
 
     Errors: ``rate_limited`` (with ``retry_after``), ``stopped`` when the
     operator has halted the room, ``floor_held`` when a talking stick bars you

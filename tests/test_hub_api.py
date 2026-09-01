@@ -95,7 +95,7 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_19() -> None:
+def test_protocol_version_is_20() -> None:
     # Revision 19 puts the protocol on a diet: the text every agent pays for on
     # join keeps only the rules it needs in the common case, and the mechanics of
     # the rarer flows (talking stick, channel etiquette, operator-form field
@@ -106,7 +106,11 @@ def test_protocol_version_is_19() -> None:
     # The counter moves once per released text, not once per edit: this branch
     # slimmed the core in several passes but ships one v18 -> v19 change, so a
     # bridge that re-reads on 19 gets the final text.
-    assert PROTOCOL_VERSION == 19
+    #
+    # v20 states two rules the core cannot delegate to a fetchable section: a
+    # subagent shares its parent's identity and must not join, and say() has no
+    # default audience (to="all" escapes every channel).
+    assert PROTOCOL_VERSION == 20
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
@@ -115,6 +119,25 @@ def test_protocol_text_requires_forms_only_and_signal_before_private(
     text = client.get("/protocol").json()["text"]
     assert "ONLY channel to the human" in text
     assert "taking this to the operator privately" in text
+
+
+def test_protocol_text_requires_an_explicit_say_target(
+    client: TestClient,
+) -> None:
+    """Revision 20: no default audience, and broadcast escapes every channel."""
+    text = client.get("/protocol").json()["text"]
+    assert "say() has NO default audience" in text
+    assert 'to="all" hits EVERY' in text
+    assert "even those outside your channels" in text
+    # The superseded wording must be gone, not merely outvoted by the new rule.
+    assert "Default talk is broadcast" not in text
+
+
+def test_protocol_text_forbids_a_subagent_join(client: TestClient) -> None:
+    """Revision 20: identity is per process, so a subagent must never join."""
+    text = client.get("/protocol").json()["text"]
+    assert "NEVER as a subagent" in text
+    assert "the parent's identity" in text
 
 
 def test_protocol_text_strengthens_status_cadence_with_quiet(
@@ -194,8 +217,16 @@ def test_protocol_core_stays_on_its_diet() -> None:
     characters; this ceiling leaves room to edit a rule without leaving room to
     quietly move a whole flow back inline. Breaking it is a prompt to move the
     new material into :data:`PROTOCOL_SECTIONS`, not to raise the number.
+
+    Raised once, from 8,500 to 8,700, for revision 20's two addressing and
+    identity rules. Neither can live in a fetchable section: an agent that never
+    fetches it would go on broadcasting out of its channel and joining as a
+    subagent, which is precisely the failure the rules exist to stop. Revision
+    20 also paid part of its own way, folding two channel bullets that had said
+    "move a pair into a channel" twice into one. That is the bar for moving this
+    number again: state a rule the core cannot delegate, and trim first.
     """
-    assert len(PROTOCOL_TEXT) < 8_500
+    assert len(PROTOCOL_TEXT) < 8_700
 
 
 # --- export --------------------------------------------------------------
