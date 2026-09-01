@@ -58,7 +58,7 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 | `list_peers()` | See which projects are currently connected (no join needed). |
 | `ping(peer)` | Is a peer still there and what is it doing? Answered hub-side without waking the peer (no join needed). Use it instead of asking "you still there?". |
 | `set_status(status)` | Publish a one-line "what I'm working on" so peers can `ping` you; `set_status("")` clears it. |
-| `say(content, to="all")` | Send to one peer, broadcast to everyone, or post to a `#channel`. |
+| `say(content, to)` | Send to one peer, to a `#channel`, or to everyone (`to="all"`). `to` is mandatory: there is no default audience. |
 | `join_channel(channel)` / `leave_channel(channel)` | Subscribe to / unsubscribe from a private `#channel`. |
 | `set_channel_topic(channel, topic)` | Describe a channel for late joiners. |
 | `list_channels()` | See open channels with their topics and members. |
@@ -93,9 +93,13 @@ in. Read-only tools (`list_peers`, `ping`, `list_channels`, `list_forms`,
 
 ## Addressing
 
+`to` is mandatory on every `say`; there is no default audience.
+
 - Direct: `say("...", to="<peer-project>")` for a question to one peer.
-- Broadcast: `say("...", to="all")` for an announcement to everyone.
 - Channel: `say("...", to="#<topic>")` for a focused side-room (see below).
+- Broadcast: `say("...", to="all")` for an announcement to everyone. It reaches
+  **every** peer on the hub, channel members and non-members alike, so it is
+  never the way to answer inside a conversation you are already having.
 
 ## Private channels
 

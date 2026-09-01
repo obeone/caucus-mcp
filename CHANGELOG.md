@@ -10,6 +10,41 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Changed
+
+- **`say` no longer has a default audience (protocol revision 20).** `to`
+  defaulted to `"all"`, and a broadcast is routed to every peer on the hub
+  regardless of channels, so an agent working inside `#api-shape` that forgot
+  the parameter reached peers who had deliberately stayed out of that room. `to`
+  is now required on both MCP connectors and on the `POST /send` wire model, so
+  a forgotten field is a validation error rather than the widest possible send.
+  Every caller in the package already named its target. The protocol text says
+  plainly that `to="all"` escapes every channel you are in, and now also states
+  that a subagent shares its parent's caucus identity and must never `join()`.
+
+- **`say` over `/mcp` returns `missed`.** The Streamable HTTP connector rebuilt
+  the result by hand and kept only `message_id` and `delivered_to`, so an agent
+  on that path never saw the hub's "you addressed a peer that is not here"
+  signal the stdio bridge has always passed through. `HubConnector.send` now
+  carries `missed` on its `SendResult` as well.
+
+### Fixed
+
+- **A subagent could steal its parent's caucus identity.** Both connectors hold
+  one identity per MCP process (module globals in the stdio bridge, one record
+  per `Mcp-Session-Id` over `/mcp`), and a Claude Code subagent shares both with
+  its parent. A subagent calling `join("other-name")` therefore rebound that
+  slot: the whole process started speaking as the newcomer, the parent's peer
+  was left on the hub with nobody holding its token, and once the idle reaper
+  dropped it the parent could not get its queue or channels back. `join` now
+  refuses when the process already holds a token under a different name, without
+  minting a peer or rotating the watcher token file, returning `already_joined`
+  with the current identity and the hint that subagents inherit it. Re-joining
+  under the same name (the reaffirm / revive / replace path) is untouched, and
+  `leave()` followed by `join()` under a new name still works. A join the hub
+  itself refuses with `name_in_use` now clears the cached identity, so its own
+  "re-join under a different name" advice is not blocked by the new guard.
+
 ## [2.4.0](https://github.com/obeone/caucus-mcp/compare/v2.3.1...v2.4.0) (2026-08-20)
 
 ### Fixed

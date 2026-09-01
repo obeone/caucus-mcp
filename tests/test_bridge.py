@@ -96,7 +96,7 @@ def test_write_tools_require_join(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     not_joined = {"error": "not_joined", "hint": "call join() first"}
-    assert bridge.say("hi") == not_joined
+    assert bridge.say("hi", to="all") == not_joined
     assert bridge.set_status("busy") == not_joined
     assert bridge.listen(timeout=0) == not_joined
     assert bridge.floor(action="take", reason="x") == not_joined
@@ -454,6 +454,92 @@ def test_join_with_explicit_name_overrides_default(
     assert "explicit-name" in bridge.list_peers()["peers"]
 
 
+def test_join_under_another_name_is_refused_and_mints_no_peer(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subagent's join under a new name must not rebind the shared identity."""
+    monkeypatch.setattr(bridge, "PROJECT", "parent-agent")
+    bridge.join()
+    roster_before = sorted(bridge.list_peers()["peers"])
+
+    result = bridge.join(project="subagent-name")
+
+    assert result["error"] == "already_joined"
+    assert result["joined_as"] == "parent-agent"
+    assert result["requested"] == "subagent-name"
+    hint = str(result["hint"])
+    assert "must not switch it" in hint
+    # Never advise leave(): a subagent following that would deregister the
+    # PARENT's peer, which is the harm this guard exists to prevent.
+    assert "Do NOT call leave()" in hint
+    # The parent keeps the process identity, and the hub never saw the request.
+    assert bridge.whoami()["joined_as"] == "parent-agent"
+    assert sorted(bridge.list_peers()["peers"]) == roster_before
+    assert "subagent-name" not in roster_before
+
+
+def test_rejoin_under_the_same_name_still_works(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-affirming the current identity is the revive path and must keep working."""
+    monkeypatch.setattr(bridge, "PROJECT", "reaffirmer")
+    first = bridge.join()
+    assert first["joined"] is True
+
+    again = bridge.join(project="reaffirmer")
+
+    assert again["joined"] is True
+    assert again["project"] == "reaffirmer"
+    assert bridge.whoami()["joined_as"] == "reaffirmer"
+
+
+def test_leave_then_join_under_a_new_name_works(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is not a one-way door: leave() releases the identity slot."""
+    monkeypatch.setattr(bridge, "PROJECT", "first-identity")
+    bridge.join()
+    bridge.leave()
+
+    result = bridge.join(project="second-identity")
+
+    assert result["joined"] is True
+    assert bridge.whoami()["joined_as"] == "second-identity"
+    assert "second-identity" in bridge.list_peers()["peers"]
+
+
+def test_a_refused_join_releases_the_identity_slot(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 409 leaves no dead token parked in the module globals.
+
+    The hub answers ``name_in_use`` with "re-join under a different name", and
+    the ``already_joined`` guard would refuse exactly that if the rejected token
+    stayed cached. The token is provably not ours any more, so the slot is
+    released and the hub's own advice stays actionable.
+    """
+    from caucus import hub as hub_module
+
+    monkeypatch.setattr(bridge, "PROJECT", "contender")
+    assert bridge.join()["joined"] is True
+
+    # Someone else takes the name for real: drop our peer, mint a fresh one
+    # under the same name with an in-flight long-poll. Our cached token no
+    # longer matches a live listener, which is the CONTESTED case.
+    hub_module.state.kick("contender")
+    incumbent = hub_module.state.register("contender")
+    assert incumbent.client is not None
+    incumbent.client.active_polls = 1
+
+    refused = bridge.join(project="contender")
+
+    assert refused["error"] == "name_in_use"
+    assert bridge.whoami()["joined"] is False
+    assert bridge.whoami()["joined_as"] is None
+    # And the advice the hub just gave now works.
+    assert bridge.join(project="contender-2")["joined"] is True
+
+
 def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "leaver")
     bridge.join()
@@ -461,7 +547,10 @@ def test_leave_clears_membership(bridge, monkeypatch: pytest.MonkeyPatch) -> Non
     result = bridge.leave()
     assert result["left"] is True
     assert bridge.whoami()["joined"] is False
-    assert bridge.say("nope") == {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.say("nope", to="all") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
 
 
 def test_leave_deregisters_from_hub_roster(
@@ -569,7 +658,10 @@ def test_say_without_join_errors(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "noauth")
-    assert bridge.say("hi") == {"error": "not_joined", "hint": "call join() first"}
+    assert bridge.say("hi", to="all") == {
+        "error": "not_joined",
+        "hint": "call join() first",
+    }
 
 
 def test_say_direct_is_delivered(
@@ -595,7 +687,7 @@ def test_say_is_rate_limited_under_flood(
 ) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "flooder")
     bridge.join()
-    results = [bridge.say(f"spam {i}") for i in range(20)]
+    results = [bridge.say(f"spam {i}", to="all") for i in range(20)]
     assert any(r.get("error") == "rate_limited" for r in results)
     rate_limited = next(r for r in results if r.get("error") == "rate_limited")
     assert "retry_after" in rate_limited
@@ -608,7 +700,7 @@ def test_say_when_stopped_reports_stopped(
     bridge.join()
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "stop"})
-    result = bridge.say("should not pass")
+    result = bridge.say("should not pass", to="all")
     assert result.get("stopped") is True
 
 
@@ -743,7 +835,7 @@ def test_say_is_blocked_while_another_holds_the_floor(
     monkeypatch.setattr(bridge, "PROJECT", "barred")
     bridge.join()
     try:
-        result = bridge.say("let me in")
+        result = bridge.say("let me in", to="all")
         assert result["error"] == "floor_held"
         assert result["held_by"] == "floor-holder"
         # The barred peer can still queue for the next turn.
