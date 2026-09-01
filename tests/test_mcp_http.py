@@ -91,6 +91,104 @@ async def test_sessions_are_isolated(state: HubState) -> None:
     assert "beta" in state.peers()
 
 
+async def test_channel_tool_after_a_kick_reports_session_expired(
+    state: HubState,
+) -> None:
+    """The ``/mcp`` path must name a dead session, not blame the channel name.
+
+    ``HubConnector`` folded 401, 403 and 429 into one ``False``, so a kicked
+    peer was told ``channel_rejected`` with a hint about the ``#`` prefix, and
+    every retry with a "better" name failed the same way.
+    """
+    server = _build()
+    ctx = _ctx("s-kicked")
+    await _tool(server, "join")(ctx, project="gamma")
+    await _tool(server, "join_channel")(ctx, channel="#gamma-room")
+    assert state.kick("gamma") is True
+
+    for tool_name, kwargs in (
+        ("join_channel", {"channel": "#gamma-room"}),
+        ("leave_channel", {"channel": "#gamma-room"}),
+        ("set_channel_topic", {"channel": "#gamma-room", "topic": "t"}),
+    ):
+        res = await _tool(server, tool_name)(ctx, **kwargs)
+        assert res["error"] == "session_expired", tool_name
+        assert res["joined_as"] == "gamma"
+        assert "join()" in str(res["hint"])
+
+
+async def test_any_tool_after_a_kick_reports_session_expired(state: HubState) -> None:
+    """Not just the channel tools: every token-bearing ``/mcp`` tool must say it.
+
+    A kicked session used to read ``hub_unreachable`` from ``say`` and ``peek``,
+    then ``not_joined`` once the next reaper sweep cleared its record, and never
+    learned that its membership was what had gone.
+    """
+    server = _build()
+    ctx = _ctx("s-kicked-any")
+    await _tool(server, "join")(ctx, project="epsilon")
+    assert state.kick("epsilon") is True
+
+    said = await _tool(server, "say")(ctx, content="still here?")
+    assert said["error"] == "session_expired"
+    assert said["joined_as"] == "epsilon"
+    assert "join()" in str(said["hint"])
+
+    peeked = await _tool(server, "peek")(ctx)
+    assert peeked["error"] == "session_expired"
+    assert peeked["joined_as"] == "epsilon"
+
+
+async def test_unauthenticated_tool_401_is_not_called_a_session_expiry(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 401 the session's token never earned keeps the hub_unreachable contract.
+
+    Stands in for an auth proxy in front of the hub: ``list_peers`` carries no
+    token, so a joined session must not read its rejection as a lost membership
+    and go re-joining a hub that never let it through.
+    """
+    server = _build()
+    ctx = _ctx("s-proxy")
+    await _tool(server, "join")(ctx, project="zeta")
+
+    async def _unauthorized(self: HubConnector) -> list[str]:
+        request = httpx.Request("GET", "http://proxy.invalid/peers")
+        response = httpx.Response(401, request=request)
+        raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+    monkeypatch.setattr(HubConnector, "peers", _unauthorized)
+    result = await _tool(server, "list_peers")(ctx)
+    assert result["error"] == "hub_unreachable"
+
+
+async def test_channel_tool_keeps_channel_rejected_for_a_bad_name(
+    state: HubState,
+) -> None:
+    """A genuine rejection keeps its own code, so the two stay distinguishable."""
+    server = _build()
+    ctx = _ctx("s-badname")
+    await _tool(server, "join")(ctx, project="delta")
+    res = await _tool(server, "join_channel")(ctx, channel="no-hash-prefix")
+    assert res["error"] == "channel_rejected"
+    assert "#" in str(res["hint"])
+
+
+async def test_set_channel_topic_non_member_is_topic_rejected(
+    state: HubState,
+) -> None:
+    """A live session refused for non-membership is not a session expiry."""
+    server = _build()
+    owner, outsider = _ctx("s-owner"), _ctx("s-outsider")
+    await _tool(server, "join")(owner, project="owner")
+    await _tool(server, "join_channel")(owner, channel="#owned")
+    await _tool(server, "join")(outsider, project="outsider")
+    res = await _tool(server, "set_channel_topic")(
+        outsider, channel="#owned", topic="nope"
+    )
+    assert res["error"] == "topic_rejected"
+
+
 async def test_tools_fail_closed_without_session_id(state: HubState) -> None:
     """A3: with no Mcp-Session-Id, every gated tool fails closed to no_session."""
     server = _build()

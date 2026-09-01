@@ -10,10 +10,13 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ValidationInfo, field_validator
 from pydantic import Field as PydField
+
+if TYPE_CHECKING:  # pragma: no cover - imported only for the type checker
+    import httpx
 
 BROADCAST = "all"
 """Recipient value meaning "send to every connected peer except the sender"."""
@@ -30,6 +33,85 @@ canonical sender label, "hub" is used for system-level routing, and "system"
 is used for authoritative hub announcements. Allowing any peer to claim one of
 these names would let it impersonate the trusted control plane to other agents.
 """
+
+
+SESSION_EXPIRED_HINT = (
+    "the hub no longer knows this token: the peer was idle past the reaper"
+    " timeout, left, or was kicked by the operator. Call join() again to resume"
+    " (same name), then relaunch the watcher with watch_command()."
+)
+"""Remedy line served with every ``session_expired`` error.
+
+Lives here rather than in one connector because both the stdio bridge and the
+in-process ``/mcp`` server hand it to agents verbatim, and two copies of a
+recovery instruction is one copy too many: an agent that reads a different
+remedy depending on which connector it happens to be plugged into cannot build
+a habit out of it.
+"""
+
+
+def session_expired_error(joined_as: str | None, hub: str) -> dict[str, object]:
+    """Build the agent-facing error for a token the hub no longer recognises.
+
+    The hub answers ``401 unknown token`` for a membership it has forgotten,
+    which happens three ways: the idle reaper dropped the peer past its grace
+    window, the peer called ``leave``, or the operator kicked it. None of those
+    is a hub outage, and reporting them as one sent agents hunting a network
+    fault that never happened.
+
+    Shared by both connectors so an agent reads the same diagnosis and the same
+    remedy whichever one it is plugged into.
+
+    Args:
+        joined_as: The project name the session last joined under, which is the
+            name to re-join with. ``None`` when it never joined.
+        hub: The hub URL to report.
+
+    Returns:
+        ``{"error": "session_expired", "joined_as": ..., "hub": ...,
+        "hint": ...}``.
+    """
+    return {
+        "error": "session_expired",
+        "joined_as": joined_as,
+        "hub": hub,
+        "hint": SESSION_EXPIRED_HINT,
+    }
+
+
+def request_carried_token(request: httpx.Request, token: str | None) -> bool:
+    """Report whether ``request`` presented ``token`` to the hub.
+
+    A hub ``401`` means "your session died" only when the call that earned it
+    actually carried this session's token. The read-only endpoints
+    (``/protocol``, ``/peers``, ``/channels``, ``/ping``, ``/forms``) are
+    unauthenticated and can still answer ``401`` when an auth proxy sits in
+    front of the hub; calling that a lost membership would send the agent off
+    to re-``join`` a hub that never let it through in the first place.
+
+    Both places a token can ride are checked: the ``Authorization: Bearer``
+    header the GET endpoints use, and the JSON body the POSTs use.
+
+    Args:
+        request: The request that drew the ``401``.
+        token: The session's cached token, or ``None`` when it has never
+            joined, in which case no request of its could have carried one.
+
+    Returns:
+        ``True`` when the request presented ``token``.
+    """
+    if not token:
+        return False
+    if request.headers.get("authorization") == f"Bearer {token}":
+        return True
+    try:
+        body = request.content
+    except Exception:  # noqa: BLE001 - error path; must never raise again
+        # Only a streaming request body cannot be replayed, and no caucus call
+        # streams one. Guarded anyway, because this runs inside the handler
+        # whose whole job is to stop a hub failure aborting the agent's turn.
+        return False
+    return token.encode() in body
 
 
 def is_channel(recipient: str) -> bool:

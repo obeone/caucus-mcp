@@ -155,9 +155,23 @@ def test_watch_surfaces_message_and_exits_zero(
     assert any("knock knock" in line for line in emitted)
 
 
-def test_watch_returns_one_on_unknown_token(live_hub: str) -> None:
+def test_watch_returns_one_on_unknown_token(
+    live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected token is fatal, and the exit must say so on stdout.
+
+    The agent is woken by this process exiting and reads only what it left on
+    stdout, so the old stderr-only log made a reaped session look like the
+    watcher dying for no reason at all.
+    """
+    emitted: list[str] = []
+    monkeypatch.setattr(watch_module, "_emit", emitted.append)
     # A rejected token is fatal: the watcher exits 1 rather than spinning.
     assert watch_module.watch(live_hub, "not-a-real-token", 1.0) == 1
+    assert len(emitted) == 1
+    assert emitted[0].startswith("[caucus] SESSION EXPIRED")
+    assert "join()" in emitted[0]
+    assert "watch_command()" in emitted[0]
 
 
 # --- token resolution ----------------------------------------------------

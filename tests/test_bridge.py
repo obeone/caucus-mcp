@@ -377,6 +377,54 @@ def test_tool_reports_hub_unreachable_when_arming_fails(
     assert bridge.whoami()["armed"] is False
 
 
+def test_tool_after_the_hub_forgot_the_token_reports_session_expired(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reaped, kicked or dropped peer must learn its session died.
+
+    The hub answers 401 for a token it no longer knows. That used to reach the
+    agent as ``hub_unreachable`` carrying httpx's raw "Client error \'401
+    Unauthorized\'" text, which names neither the cause nor the remedy, so the
+    agent went looking for a hub outage that never happened.
+
+    The peer is dropped here through the hub's own ``/leave`` (a terminal drop,
+    like an operator kick) rather than by reaching into ``HubState`` from this
+    thread: the hub runs its event loop in another one.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "forgotten-peer")
+    assert bridge.join()["joined"] is True
+    stale_token = bridge._token
+    assert stale_token is not None
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/leave", json={"token": stale_token})
+
+    result = bridge.say("anyone still there?")
+    assert result["error"] == "session_expired"
+    assert result["joined_as"] == "forgotten-peer"
+    assert "join()" in str(result["hint"])
+    assert "watch_command()" in str(result["hint"])
+    # The token is deliberately kept: join() re-presents it so the hub can match
+    # a reaped-but-revivable record and hand the same queue and channels back.
+    assert bridge._token == stale_token
+    # A second, differently-shaped tool must reach the same verdict, proving the
+    # branch lives in the shared decorator and not in one tool body.
+    assert bridge.peek()["error"] == "session_expired"
+
+
+def test_join_after_a_session_expiry_restores_the_peer(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The advertised remedy has to actually work: join() puts the peer back."""
+    monkeypatch.setattr(bridge, "PROJECT", "revived-peer")
+    bridge.join()
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/leave", json={"token": bridge._token})
+    assert bridge.say("hello?")["error"] == "session_expired"
+
+    assert bridge.join()["joined"] is True
+    assert "message_id" in bridge.say("back on the air")
+
+
 def test_join_surfaces_automode_under_claude_code(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:

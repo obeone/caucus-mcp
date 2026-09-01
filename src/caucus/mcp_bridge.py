@@ -43,7 +43,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import __version__, automode, autostart
 from .logging_setup import configure_logging
-from .models import lean_public
+from .models import lean_public, request_carried_token, session_expired_error
 from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.bridge")
@@ -217,6 +217,28 @@ atexit.register(_close_client)
 _ToolFn = Callable[..., dict[str, object]]
 
 
+def _session_expired() -> dict[str, object]:
+    """Build the error for a token the hub no longer recognises.
+
+    The hub answers ``401 unknown token`` for a membership it has forgotten,
+    which happens three ways: the idle reaper dropped the peer past its grace
+    window, the peer called ``leave``, or the operator kicked it. None of those
+    is a hub outage, yet all three used to reach the agent as
+    ``hub_unreachable`` carrying the raw ``"Client error \'401 Unauthorized\'"``
+    text, which says nothing about the cause and nothing about the remedy.
+
+    The cached token is deliberately *not* cleared here. :func:`join` re-sends
+    it, and the hub matches it against its revival graveyard: inside the reap
+    grace window that hands back the same identity, queue and channel
+    memberships. Forgetting it locally would throw that recovery away.
+
+    Returns:
+        ``{"error": "session_expired", "joined_as": ..., "hub": ...,
+        "hint": ...}``, where ``joined_as`` is the name to re-join under.
+    """
+    return session_expired_error(_joined_as, HUB_URL)
+
+
 def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
     """Wrap a tool so a hub blip yields a structured error instead of crashing.
 
@@ -229,6 +251,20 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
     ``{"error": "hub_unreachable", "detail": ..., "hub": HUB_URL}`` contract the
     hand-written handlers in :func:`_ensure_armed` / :func:`join` already use.
 
+    One status code is split out of that contract: a ``401`` raised on a call
+    that actually presented this session's cached token means the membership
+    died, not the hub, so it returns :func:`_session_expired` instead. Every
+    token-bearing tool goes through this decorator, which is why the branch
+    lives here rather than being copy-pasted into each of them.
+
+    The test is on the failed *request*, via
+    :func:`~caucus.models.request_carried_token`, not on ``_token`` being set.
+    A joined session still calls unauthenticated endpoints (``protocol_section``,
+    ``list_peers``, ``ping``, ``list_channels``, ``list_forms``), and behind an
+    auth proxy those can answer ``401`` too. Keying on the global would label
+    that a lost membership and send the agent to re-``join`` a hub that never
+    let it through.
+
     The success path is untouched: on no error the wrapped function's return
     value is passed straight through. Only the failure path changes — a network
     hiccup becomes a tidy error dict the agent can read and retry, never an
@@ -239,14 +275,30 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
         func: The tool body to protect.
 
     Returns:
-        The wrapped tool, identical on success and returning a structured
-        ``hub_unreachable`` dict on a transport or JSON-decode failure.
+        The wrapped tool, identical on success, returning ``session_expired``
+        when the hub disowned the cached token and a structured
+        ``hub_unreachable`` dict on any other transport or JSON-decode failure.
     """
 
     @functools.wraps(func)
     def wrapper(*args: object, **kwargs: object) -> dict[str, object]:
         try:
             return func(*args, **kwargs)
+        except httpx.HTTPStatusError as exc:
+            # Caught before the broader HTTPError arm below, which this class
+            # inherits from. Only a request that actually presented the cached
+            # token can have lost a membership; anything else keeps the old
+            # contract.
+            if exc.response.status_code == 401 and request_carried_token(
+                exc.request, _token
+            ):
+                logger.warning(
+                    "%s: the hub disowned this session's token; it has expired",
+                    func.__name__,
+                )
+                return _session_expired()
+            logger.error("%s failed: %s", func.__name__, exc)
+            return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
             logger.error("%s failed: %s", func.__name__, exc)
             return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
@@ -548,6 +600,10 @@ def whoami() -> dict[str, object]:
 
     Diagnoses why the other tools may be refusing: reports whether the session
     has armed and the known protocol revision alongside the joined state.
+
+    All of it is local state, never a probe of the hub, so a ``session_expired``
+    from any other tool outranks a ``joined: true`` reported here: the hub has
+    forgotten a membership this session still believes in.
     """
     return {
         "default_project": PROJECT,
