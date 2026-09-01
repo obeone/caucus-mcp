@@ -57,8 +57,9 @@ from typing import Any, Literal, Protocol, cast
 import httpx
 
 from . import __version__, autostart
-from .hub_connector import HubConnector, NameInUseError
+from .hub_connector import ChannelOutcome, HubConnector, NameInUseError
 from .logging_setup import configure_logging
+from .models import SESSION_EXPIRED_HINT
 from .urlguard import validate_hub_url
 
 try:
@@ -815,6 +816,32 @@ async def _run_loop(
             logger.info("rebuilding the agent with a fresh context")
 
 
+def _channel_text(outcome: ChannelOutcome, done: str, attempt: str) -> str:
+    """Phrase a channel call's verdict as the one line the agent will read.
+
+    The connector reports a refusal as a :class:`ChannelOutcome` rather than a
+    bare ``False``, so the tool result can name the actual cause instead of the
+    uniform "could not join #x" that left the agent guessing between a dead
+    session, a rate limit, and a bad name.
+
+    Args:
+        outcome: The connector's verdict on the call.
+        done: Past-tense success line, e.g. ``"joined #api-shape"``.
+        attempt: The attempted action, spliced into the failure line, e.g.
+            ``"join #api-shape"``.
+
+    Returns:
+        The success line, or ``"could not <attempt>: <reason>"``.
+    """
+    if outcome is ChannelOutcome.OK:
+        return done
+    if outcome is ChannelOutcome.SESSION_EXPIRED:
+        return f"could not {attempt}: {SESSION_EXPIRED_HINT}"
+    if outcome is ChannelOutcome.RATE_LIMITED:
+        return f"could not {attempt}: rate limited by the hub; pause and retry"
+    return f"could not {attempt}: the hub rejected it (bad name, or not a member)"
+
+
 def _build_caucus_server(connector: HubConnector, token: str) -> Any:
     """Create the in-process SDK MCP server exposing the caucus tools.
 
@@ -915,8 +942,8 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
     )
     async def join_channel(args: dict[str, Any]) -> dict[str, Any]:
         channel = args["channel"]
-        ok = await connector.join_channel(token, channel)
-        text = f"joined {channel}" if ok else f"could not join {channel}"
+        outcome = await connector.join_channel(token, channel)
+        text = _channel_text(outcome, f"joined {channel}", f"join {channel}")
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
@@ -927,8 +954,8 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
     )
     async def leave_channel(args: dict[str, Any]) -> dict[str, Any]:
         channel = args["channel"]
-        ok = await connector.leave_channel(token, channel)
-        text = f"left {channel}" if ok else f"could not leave {channel}"
+        outcome = await connector.leave_channel(token, channel)
+        text = _channel_text(outcome, f"left {channel}", f"leave {channel}")
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
@@ -940,8 +967,12 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
     )
     async def set_channel_topic(args: dict[str, Any]) -> dict[str, Any]:
         channel = args["channel"]
-        ok = await connector.set_channel_topic(token, channel, args.get("topic", ""))
-        text = f"topic set for {channel}" if ok else f"could not set topic for {channel}"
+        outcome = await connector.set_channel_topic(
+            token, channel, args.get("topic", "")
+        )
+        text = _channel_text(
+            outcome, f"topic set for {channel}", f"set the topic for {channel}"
+        )
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(
