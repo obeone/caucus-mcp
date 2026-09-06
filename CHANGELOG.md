@@ -10,6 +10,17 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A contested join no longer floods the operator feed.** When a newcomer
+  claimed a name a live listener still held, every refused `/register` pushed
+  its own warning into the operator console and the bounded message log, and
+  nothing rate-limited that path (the caller has no token, so no send bucket
+  applies). A client retrying in a loop could wipe the recent history by
+  hammering `/register`. The hub now reports at most one contested-join notice
+  per name every 5 seconds, still refuses every attempt, and forgets the
+  throttle when the name's holder leaves. Closes #14.
+
 ## [3.0.0](https://github.com/obeone/caucus-mcp/compare/v2.4.0...v3.0.0) (2026-09-06)
 
 ### Changed
