@@ -95,7 +95,7 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_20() -> None:
+def test_protocol_version_is_21() -> None:
     # Revision 19 puts the protocol on a diet: the text every agent pays for on
     # join keeps only the rules it needs in the common case, and the mechanics of
     # the rarer flows (talking stick, channel etiquette, operator-form field
@@ -110,7 +110,13 @@ def test_protocol_version_is_20() -> None:
     # v20 states two rules the core cannot delegate to a fetchable section: a
     # subagent shares its parent's identity and must not join, and say() has no
     # default audience (to="all" escapes every channel).
-    assert PROTOCOL_VERSION == 20
+    #
+    # v21 adds two more of the same kind: session_expired names a lost membership
+    # and its join()-then-watch_command() recovery, and peek()'s preview is a
+    # truncated excerpt rather than the message. Both describe what an agent
+    # reads on a normal turn, so a section it might never fetch is the wrong
+    # home for either.
+    assert PROTOCOL_VERSION == 21
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
@@ -225,6 +231,11 @@ def test_protocol_core_stays_on_its_diet() -> None:
     20 also paid part of its own way, folding two channel bullets that had said
     "move a pair into a channel" twice into one. That is the bar for moving this
     number again: state a rule the core cannot delegate, and trim first.
+
+    Revision 21 met that bar without moving it: its two rules paid for
+    themselves by folding the watcher-command duplication (the Listening bullet
+    repeated where the command comes from, which step 2 of the loop already
+    says) and a two-sentence queue bullet into one.
     """
     assert len(PROTOCOL_TEXT) < 8_700
 
