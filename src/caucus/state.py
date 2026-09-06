@@ -134,6 +134,16 @@ STATUS_BUCKET_CAPACITY = 30.0
 STATUS_BUCKET_REFILL = 1.0
 """Sustained ``set_status`` rate, in updates per second, per client."""
 
+# A CONTESTED join (a newcomer claiming a name a live listener still holds)
+# raises an operator notice. That path is not rate-limited by the sender's
+# bucket (the caller has no token yet), and the hub-level per-host brake on
+# ``/register`` still lets a steady trickle through, so a client retrying in a
+# loop would flood the operator feed and evict real history from the bounded
+# message log. Collapse repeats per contested name into one notice per window.
+
+CONTESTED_NOTICE_WINDOW = 5.0
+"""Minimum seconds between two contested-join notices for the same name."""
+
 
 @dataclass(slots=True)
 class Client:
@@ -377,6 +387,11 @@ class HubState:
         # send to that scope (see :meth:`floor_blocks`). In-memory only.
         self._floors: dict[str, Floor] = {}  # scope -> Floor
         self._forms: dict[str, Form] = {}  # form id -> pending Form
+        # Last time a contested-join notice fired, per contested project name.
+        # Repeats inside CONTESTED_NOTICE_WINDOW are silently swallowed so a
+        # register retry loop cannot flood the operator feed. Entries are
+        # cleared in :meth:`_drop` once the holder of the name is gone.
+        self._contested_notice_at: dict[str, float] = {}
         self._ui: set[asyncio.Queue[dict[str, object]]] = set()
         self._log: deque[Message] = deque(maxlen=log_size)
         # Hub start time — basis for the dashboard's hub-uptime figure.
@@ -512,7 +527,9 @@ class HubState:
         * **CONTESTED** — name exists, no valid token presented, AND the
           existing client has ``active_polls > 0`` (a live listener is
           present). The caller is refused; state is not mutated. An operator
-          warning is broadcast via :meth:`_announce_system`.
+          warning is broadcast via :meth:`_announce_system`, at most once per
+          :data:`CONTESTED_NOTICE_WINDOW` for a given name so a retry loop
+          cannot flood the feed.
 
         Args:
             project: The human-readable project name to register.
@@ -531,11 +548,19 @@ class HubState:
                 existing.last_seen = time.time()
                 return Registration(RegisterOutcome.REAFFIRMED, existing)
             if existing.active_polls > 0:
-                # A live listener holds the name — refuse the newcomer.
-                self._announce_system(
-                    f"⚠️ {project} re-registered while a live listener held"
-                    " the name — duplicate refused"
-                )
+                # A live listener holds the name — refuse the newcomer. The
+                # notice is throttled per name: a client retrying in a tight
+                # loop would otherwise push one notice per attempt into the
+                # bounded log and wipe the recent history the operator relies
+                # on. The refusal itself is never throttled, only its echo.
+                now = time.time()
+                last = self._contested_notice_at.get(project)
+                if last is None or now - last >= CONTESTED_NOTICE_WINDOW:
+                    self._contested_notice_at[project] = now
+                    self._announce_system(
+                        f"⚠️ {project} re-registered while a live listener held"
+                        " the name — duplicate refused"
+                    )
                 return Registration(RegisterOutcome.CONTESTED, None)
             # Dead/timed-out record: hand the slot to the newcomer.
             existing.last_seen = time.time()
@@ -648,6 +673,9 @@ class HubState:
         had_channels = bool(client.channels)
         self._clients.pop(client.project, None)
         self._by_token.pop(client.token, None)
+        # The name is free again: forget its contested-notice throttle so the
+        # map cannot grow with every name that was ever fought over.
+        self._contested_notice_at.pop(client.project, None)
         if revivable:
             client.reaped_at = time.time()
             self._reaped[client.token] = client
