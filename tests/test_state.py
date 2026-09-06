@@ -23,6 +23,7 @@ from caucus.models import (
     MessageKind,
 )
 from caucus.state import (
+    CONTESTED_NOTICE_WINDOW,
     MAX_QUEUE_SIZE,
     PEEK_PREVIEW_CHARS,
     HubState,
@@ -669,6 +670,64 @@ async def test_register_contested_when_live_listener() -> None:
     # Original client must be untouched.
     assert state.peers() == ["alpha"]
     assert state.client_for(reg.client.token) is reg.client
+
+
+def _contested_notices(state: HubState) -> list[dict[str, object]]:
+    """Return the operator notices the hub logged for a contested join."""
+    return [m for m in state.recent() if "duplicate refused" in str(m["content"])]
+
+
+async def test_contested_notice_fires_once_per_window_for_a_name() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.client is not None
+    reg.client.active_polls = 1
+
+    for _ in range(50):
+        assert state.register("alpha").outcome is RegisterOutcome.CONTESTED
+
+    # Every attempt is refused, but only the first one reaches the operator.
+    assert len(_contested_notices(state)) == 1
+
+    # Once the window has elapsed the next collision is reported again.
+    state._contested_notice_at["alpha"] -= CONTESTED_NOTICE_WINDOW
+    assert state.register("alpha").outcome is RegisterOutcome.CONTESTED
+    assert len(_contested_notices(state)) == 2
+
+
+async def test_contested_register_loop_cannot_evict_recent_log() -> None:
+    state = HubState(log_size=5)
+    reg = state.register("alpha")
+    assert reg.client is not None
+    reg.client.active_polls = 1
+    state.route(_msg("alpha", "all", "real history"))
+
+    for _ in range(20):
+        state.register("alpha")
+
+    contents = [m["content"] for m in state.recent()]
+    assert "alpha joined" in contents
+    assert "real history" in contents
+
+
+async def test_contested_notice_throttle_is_cleared_on_drop() -> None:
+    state = HubState()
+    reg = state.register("alpha")
+    assert reg.client is not None
+    reg.client.active_polls = 1
+    state.register("alpha")
+    assert "alpha" in state._contested_notice_at
+
+    assert state.kick("alpha")
+
+    assert "alpha" not in state._contested_notice_at
+    # The freed name registers afresh and a later collision is reported anew.
+    fresh = state.register("alpha")
+    assert fresh.outcome is RegisterOutcome.FRESH
+    assert fresh.client is not None
+    fresh.client.active_polls = 1
+    state.register("alpha")
+    assert len(_contested_notices(state)) == 2
 
 
 async def test_register_replaced_when_no_live_listener() -> None:
