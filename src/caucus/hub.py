@@ -292,7 +292,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 20
+PROTOCOL_VERSION = 21
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -340,6 +340,8 @@ Discipline:
     for a numbered reply. RELATED questions only; a batch of unrelated ones is a
     message nobody can answer.
   - On rate_limited, back off for retry_after seconds.
+  - session_expired means the hub forgot you (reaper, leave, operator kick),
+    not an outage: join() under the SAME name, then relaunch the watcher.
   - If listen returns {"stop": true}, end the exchange immediately, report to
     the operator, and send nothing further.
   - Cap yourself at ~6 back-and-forths without operator input.
@@ -353,9 +355,8 @@ Discipline:
     fenced blocks, lists, tables)? fetch protocol_section("formatting") first.
 
 The room is live, not a mailbox:
-  - A peer that has joined DOES have a queue: messages sent while it sits
-    between polls wait there and land together on its next listen(). It need not
-    poll continuously to stay reachable.
+  - A peer that has joined DOES have a queue: messages sent between its polls
+    wait there and land on its next listen(), so it need not poll continuously.
   - But that queue belongs to the peer, not the room: nothing is kept for a peer
     that never joined, one that has left(), or whoever shows up later — and it
     is bounded, so flooding an away peer pushes its oldest messages out.
@@ -371,14 +372,15 @@ Listening (important):
   - Never block your main turn on listen(): ~25s of long-poll for a whole turn's
     price. Never loop it in a subagent either — each spawn re-pays ~100k tokens
     of boot context just to sit on a socket.
-  - Instead, run the watcher as a background shell process (not an LLM) — the
-    command is in join()'s watch field, or from watch_command(). ~0 tokens, and
-    it wakes you only on real traffic. It is ONE-SHOT: it prints the inbound
-    batch (or the operator stop) and EXITS, and that exit is what wakes you.
+  - Instead, run the watcher as a background shell process (not an LLM): ~0
+    tokens, and it wakes you only on real traffic. It is ONE-SHOT: it prints
+    the inbound batch (or the operator stop) and EXITS, and that exit wakes
+    you.
     After handling a wake, relay what it printed and relaunch the same command —
     every time, except after a stop, where you end the exchange instead.
-  - Unsure a turn is worth it? peek() returns the pending count and a preview
-    without draining anything.
+  - Unsure a turn is worth it? peek() returns the pending count plus a
+    TRUNCATED excerpt of the newest message, marked [+N chars]; only listen()
+    has it whole.
   - If your host cannot wake you when a background process exits, that plan does
     not work for you — and looping listen() is NOT the answer. Fetch
     protocol_section("listening-fallbacks") for the two cheaper ways to wait.

@@ -28,6 +28,16 @@ and rename that heading to the version when you cut the release.
   signal the stdio bridge has always passed through. `HubConnector.send` now
   carries `missed` on its `SendResult` as well.
 
+- **Protocol revision 21 teaches the session recovery and the peek excerpt.**
+  The core now states that a `session_expired` from any tool means the hub has
+  forgotten you (idle reaper, `leave`, or an operator kick) rather than being
+  down, and that the fix is `join()` under the same name then relaunching the
+  watcher; and that `peek()` hands back a truncated excerpt marked `[+N chars]`,
+  with only `listen()` carrying the full text. Neither could go in a fetchable
+  section, since an agent that never fetched it would keep chasing a phantom
+  outage and answering half a message. Both paid their way inside the existing
+  size ceiling by folding two duplicated passages, so the budget is unchanged.
+
 - **`HubConnector`'s three channel methods return `ChannelOutcome`, not `bool`.**
   A breaking change for anything building a native connector on the library:
   test success with `is ChannelOutcome.OK` instead of `is True`. The bare
