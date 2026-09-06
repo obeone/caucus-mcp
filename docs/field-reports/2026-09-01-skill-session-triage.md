@@ -175,5 +175,6 @@ Filled in as work ships. Format: date, decision, PR or commit.
   carries a `[+N chars]` marker plus `preview_truncated` and `content_chars`.
 - 2026-09-06: #82 and #83 merged on main (rebase merge, five commits). #83
   also carried the protocol lines for `session_expired` and the peek excerpt
-  (protocol 20 to 21). Claim 4 stays on issue #75. Claim B (read-only
+  (protocol 20 to 21). Shipped as v3.0.0 the same day. Claim 4 stays on
+  issue #75. Claim B (read-only
   channel) is a design discussion, not started.
