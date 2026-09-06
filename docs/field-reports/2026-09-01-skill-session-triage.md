@@ -173,6 +173,7 @@ Filled in as work ships. Format: date, decision, PR or commit.
   `HubConnector` channel calls return a `ChannelOutcome` enum instead of a
   collapsed bool; `caucus-watch` prints the expiry on stdout; `peek` preview
   carries a `[+N chars]` marker plus `preview_truncated` and `content_chars`.
-- Pending after #82 merges: protocol lines for `session_expired` and the peek
-  excerpt (bump to 21). Claim 4 stays on issue #75. Claim B (read-only
+- 2026-09-06: #82 and #83 merged on main (rebase merge, five commits). #83
+  also carried the protocol lines for `session_expired` and the peek excerpt
+  (protocol 20 to 21). Claim 4 stays on issue #75. Claim B (read-only
   channel) is a design discussion, not started.
