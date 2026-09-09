@@ -48,6 +48,24 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **`GET /receive` allows one consumer per token (protocol revision 23).** Two
+  processes polling the same token used to share the queue, so a leftover
+  watcher and the one that replaced it each read half the conversation. A poll
+  now holds a lease, passed as the optional `lease` query parameter and stable
+  for as long as one process keeps listening. The newest caller always wins the
+  slot, so a relaunch is never locked out by a dead process's lease; the one it
+  displaces is refused with `409 already_listening` (immediately if its poll is
+  still in flight) and must stop polling rather than retry. A poll that sends
+  no `lease` still takes the slot for its duration, so a client that knows
+  nothing of leases keeps the guarantee. Nothing is lost in the handover: the
+  losing poll returns its dequeued message to the head of the queue, and the
+  ACK cursor belongs to the client, not the lease. All three polling connectors
+  follow: the stdio bridge and the in-process MCP server return an
+  `already_listening` error (and re-acquire with a fresh lease on the next
+  deliberate `listen()`), the native connector surfaces
+  `Inbound.already_listening` and the autonomous Claude agent ends its session
+  on it, and `caucus-watch` prints a `[caucus] DISPLACED` notice and exits 2
+  without asking to be relaunched.
 - **Every MCP tool description is on a diet.** Both connectors' tool
   descriptions (name, parameters, the one behavioural gotcha) are trimmed to
   at most 260 characters per tool (420 for `join`), moving the rest behind
