@@ -25,6 +25,8 @@ import type {
   RawMessage,
   ConnectionState,
   UserRole,
+  AgentInfo,
+  SpawnAgentSpec,
 } from "./types";
 
 // Maximum messages kept in memory (client-side ring buffer).
@@ -96,6 +98,46 @@ function wsUrl(): string {
   return `${proto}//${window.location.host}/ui`;
 }
 
+/**
+ * Build headers for an `/agents` HTTP mutation, reusing the operator token
+ * captured from the `/ui` auth handshake.
+ *
+ * Mirrors the hub's own gate (`_gate_operator_request`): a request carries a
+ * bearer token whenever one is known, and no `Authorization` header at all
+ * when auth is disabled (the token is `null` in that case, and the hub
+ * accepts unauthenticated operator requests on that path).
+ *
+ * @param token - The operator token from `_authToken`, or `null`.
+ * @param withJson - Whether to set `Content-Type: application/json` (omitted
+ *   for the body-less `DELETE`).
+ */
+function agentApiHeaders(token: string | null, withJson: boolean): HeadersInit {
+  const headers: Record<string, string> = {};
+  if (withJson) headers["Content-Type"] = "application/json";
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+
+/**
+ * Extract a human-readable error from a failed `/agents` response.
+ *
+ * FastAPI's `HTTPException` bodies are `{"detail": "<message>"}`; fall back to
+ * the raw HTTP status when the body isn't JSON or carries no `detail`.
+ *
+ * @param res - The failed `Response`.
+ */
+async function agentApiErrorDetail(res: Response): Promise<string> {
+  try {
+    const body: unknown = await res.json();
+    if (body && typeof body === "object" && typeof (body as { detail?: unknown }).detail === "string") {
+      return (body as { detail: string }).detail;
+    }
+  } catch {
+    // Not JSON (or no body) — fall through to the status line below.
+  }
+  return `HTTP ${res.status}`;
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -104,6 +146,13 @@ interface InternalState extends DashboardState {
   _ws: WebSocket | null;
   _backoff: number;
   _reconnectTimer: ReturnType<typeof setTimeout> | null;
+  /** Token sent in the in-flight `/ui` auth handshake, staged until `auth_ok`
+   *  confirms it and it is promoted to `_authToken`. */
+  _pendingToken: string | null;
+  /** Operator token from the last successful `/ui` auth handshake; reused as
+   *  the `Authorization: Bearer` credential for `/agents` HTTP mutations.
+   *  `null` when auth is disabled or no handshake has succeeded yet. */
+  _authToken: string | null;
   _initWs: () => void;
   _handleEvent: (evt: HubEvent) => void;
   _send: (payload: unknown) => void;
@@ -120,6 +169,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   forms: [],
   health: null as HealthInfo | null,
   rate: null as RateInfo | null,
+  agents: [] as AgentInfo[],
   messages: [],
   selectedPeer: null,
   selectedChannel: null as string | null,
@@ -138,6 +188,8 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   _ws: null,
   _backoff: BACKOFF_INITIAL,
   _reconnectTimer: null,
+  _pendingToken: null,
+  _authToken: null,
 
   // ---- UI setters ---------------------------------------------------------
 
@@ -174,7 +226,15 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   _handleEvent: (evt: HubEvent) => {
     switch (evt.type) {
       case "auth_ok":
-        set({ role: evt.role, connectionState: "connected", _backoff: BACKOFF_INITIAL });
+        // Promote the token staged at handshake time: it is now confirmed
+        // valid, so /agents HTTP mutations can reuse it as the bearer
+        // credential instead of re-prompting the operator for one.
+        set({
+          role: evt.role,
+          connectionState: "connected",
+          _backoff: BACKOFF_INITIAL,
+          _authToken: get()._pendingToken,
+        });
         break;
 
       case "auth_error":
@@ -192,6 +252,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
           forms: (evt.forms ?? []) as FormObj[],
           health: evt.health ?? null,
           rate: evt.rate ?? null,
+          agents: evt.agents ?? [],
           messages: msgs.slice(-MAX_MESSAGES),
         });
         break;
@@ -273,6 +334,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
         set({ rate: evt.rate });
         break;
 
+      case "agents":
+        set({ agents: evt.agents ?? [] });
+        break;
+
       case "error":
         console.warn("[caucus] server error", evt);
         break;
@@ -294,8 +359,10 @@ export const useDashStore = create<InternalState>()((set, get) => ({
     (window as any).__CAUCUS_WS__ = ws;
 
     ws.onopen = () => {
-      // Send auth frame if a token is configured.
+      // Send auth frame if a token is configured. Stage it so the auth_ok
+      // handler can promote it to _authToken once the hub confirms it.
       const token = getToken();
+      set({ _pendingToken: token });
       if (token) {
         ws.send(JSON.stringify({ auth: token }));
       }
@@ -373,6 +440,65 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   // Wire format: {"set_rate":{"refill_rate":<number>,"capacity":<number>}}
   sendSetRate: (refillRate, capacity) =>
     get()._send({ set_rate: { refill_rate: refillRate, capacity } }),
+
+  // Spawning is an HTTP mutation, not a /ui frame: POST /agents with the
+  // operator bearer token (hub.py `spawn_agent`). Undefined optional fields
+  // (mission/model) are dropped by JSON.stringify. A failed request surfaces
+  // a toast instead of failing silently; the caller learns the outcome via
+  // the resolved boolean.
+  sendSpawnAgent: async (spec: SpawnAgentSpec) => {
+    try {
+      const res = await fetch("/agents", {
+        method: "POST",
+        headers: agentApiHeaders(get()._authToken, true),
+        body: JSON.stringify(spec),
+      });
+      if (!res.ok) {
+        const detail = await agentApiErrorDetail(res);
+        fireToast({
+          title: `Spawn failed: ${spec.name}`,
+          description: detail,
+          variant: "error",
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      fireToast({
+        title: `Spawn failed: ${spec.name}`,
+        description: err instanceof Error ? err.message : String(err),
+        variant: "error",
+      });
+      return false;
+    }
+  },
+
+  // DELETE /agents/{name} with the same bearer token (hub.py `kill_agent`).
+  sendKillAgent: async (name: string) => {
+    try {
+      const res = await fetch(`/agents/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        headers: agentApiHeaders(get()._authToken, false),
+      });
+      if (!res.ok) {
+        const detail = await agentApiErrorDetail(res);
+        fireToast({
+          title: `Kill failed: ${name}`,
+          description: detail,
+          variant: "error",
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      fireToast({
+        title: `Kill failed: ${name}`,
+        description: err instanceof Error ? err.message : String(err),
+        variant: "error",
+      });
+      return false;
+    }
+  },
 }));
 
 // ---------------------------------------------------------------------------
