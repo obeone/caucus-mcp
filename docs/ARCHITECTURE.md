@@ -529,8 +529,12 @@ enable the launcher without a token is what makes the request-time check real.
 - **Reconciliation is one-directional and read-only.** Process facts are never
   written into `HubState`: tests swap that state wholesale and `/control reset`
   wipes it, so an OS side effect keyed on either would orphan a real process.
-  Each roster row carries `peer_known`, computed at read time, and that is the
-  only link between a process and the room.
+  Each roster row carries `peer_known` and `msg_count`, both computed at read
+  time, and those two are the only link between a process and the room. They are
+  also what makes a phantom visible: a wedged child keeps long-polling, so its
+  peer's `last_seen` stays fresh and the row otherwise reads healthy, but running
+  plus `peer_known` true plus `msg_count` zero plus a climbing uptime is an agent
+  that joined and never spoke.
 
 ## Operator dashboard
 

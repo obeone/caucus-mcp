@@ -440,6 +440,12 @@ class AgentSupervisor:
         name". Used to fail a colliding spawn fast with a clear message, instead
         of launching a child that dies two seconds later on a name clash and
         leaves an opaque stderr fragment behind.
+    peer_msg_count:
+        Optional probe answering "how many messages has the peer of this name
+        sent", or ``None`` when the hub knows no such peer. Read at render time,
+        exactly like ``peer_exists``, and for the same reason: it is a fact
+        about the room, not about the process, so it is looked up rather than
+        stored.
     """
 
     def __init__(
@@ -449,11 +455,13 @@ class AgentSupervisor:
         on_change: Callable[[], None] | None = None,
         *,
         peer_exists: Callable[[str], bool] | None = None,
+        peer_msg_count: Callable[[str], int | None] | None = None,
     ) -> None:
         self._config = config
         self._hub_url = hub_url
         self._on_change = on_change
         self._peer_exists = peer_exists
+        self._peer_msg_count = peer_msg_count
         self._agents: dict[str, AgentProcess] = {}
         self._readers: dict[str, asyncio.Task[None]] = {}
         # One exit waiter per child, so an exit is recorded the moment asyncio
@@ -487,10 +495,18 @@ class AgentSupervisor:
     def roster(self, *, include_output: bool = False) -> AgentRowList:
         """Render the whole roster for transport.
 
-        Each row carries ``peer_known``: whether the hub currently has a peer
-        registered under that name. That annotation is the *only* link between a
-        process and hub state, it is read at render time, and it never writes
-        anything back.
+        Each row carries two annotations read from the room: ``peer_known``
+        (whether the hub currently has a peer registered under that name) and
+        ``msg_count`` (how many messages that peer has *sent*, or ``None`` when
+        there is no such peer). They are the *only* link between a process and
+        hub state, they are read at render time, and they never write anything
+        back.
+
+        ``msg_count`` is what makes a phantom visible. A wedged child keeps
+        long-polling, so ``last_seen`` stays fresh and every other field in the
+        row looks healthy. A row that says running, ``peer_known`` true,
+        ``msg_count`` zero and a climbing uptime is an agent that joined and has
+        never spoken, and that is the row worth looking at.
 
         Parameters
         ----------
@@ -507,6 +523,7 @@ class AgentSupervisor:
         for record in self.list():
             row = record.to_public(include_output=include_output)
             row["peer_known"] = self._peer_known(record.spec.name)
+            row["msg_count"] = self._peer_sent_count(record.spec.name)
             rows.append(row)
         return rows
 
@@ -519,6 +536,29 @@ class AgentSupervisor:
         except Exception:  # pragma: no cover - a broken probe must not break /agents
             logger.exception("peer_exists probe failed for %r", name)
             return False
+
+    def _peer_sent_count(self, name: str) -> int | None:
+        """How many messages the peer called ``name`` has sent, if it exists.
+
+        Parameters
+        ----------
+        name:
+            The peer name to look up.
+
+        Returns
+        -------
+        int or None
+            The count, or ``None`` when no probe is wired, the hub knows no such
+            peer, or the probe itself failed. A broken probe must degrade the
+            annotation, never the roster.
+        """
+        if self._peer_msg_count is None:
+            return None
+        try:
+            return self._peer_msg_count(name)
+        except Exception:  # pragma: no cover - a broken probe must not break /agents
+            logger.exception("peer_msg_count probe failed for %r", name)
+            return None
 
     # --- launching -------------------------------------------------------
 

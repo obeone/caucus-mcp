@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from caucus import hub as hub_module
+from caucus.models import BROADCAST, Message
 from caucus.state import HubState
 from caucus.supervisor import AgentSupervisor, LauncherConfig
 
@@ -70,10 +71,11 @@ class _FakeSupervisor(AgentSupervisor):
             config,
             hub_url,
             hub_module._broadcast_agents,
-            # Mirrors what the hub's lifespan wires up: a read-time probe into
+            # Mirrors what the hub's lifespan wires up: read-time probes into
             # the live HubState, resolved through the module global so the
             # per-test state swap is honoured.
             peer_exists=lambda name: hub_module.state.peer_info(name) is not None,
+            peer_msg_count=hub_module._peer_msg_count,
         )
         self.signals = []
         self._next_pid = 30000
@@ -222,6 +224,7 @@ def test_spawn_then_list_then_kill(
     listed = client.get("/agents").json()["agents"]
     assert [item["name"] for item in listed] == ["alpha"]
     assert listed[0]["peer_known"] is False
+    assert listed[0]["msg_count"] is None
 
     killed = client.delete("/agents/alpha")
     assert killed.status_code == 200
@@ -334,6 +337,28 @@ def test_roster_annotates_a_known_peer(
     # Reading the roster left the room untouched beyond that registration.
     assert state.peer_info("alpha") is not None
     assert len(state.peers_info()) == 1
+
+
+def test_roster_tells_a_phantom_from_a_talking_agent(
+    client: TestClient, launcher: _FakeSupervisor, state: HubState
+) -> None:
+    """``msg_count`` separates an agent that joined from one that speaks.
+
+    A wedged child keeps its peer's ``last_seen`` fresh by long-polling, so the
+    row reads healthy on every other field. The send count is the one that moves
+    only when the agent actually says something.
+    """
+    client.post("/agents", json={"name": "alpha"})
+    state.register("alpha")
+
+    joined = client.get("/agents").json()["agents"][0]
+    assert joined["state"] == "running"
+    assert joined["peer_known"] is True
+    assert joined["msg_count"] == 0  # a phantom: present, healthy, silent
+
+    state.route(Message(sender="alpha", recipient=BROADCAST, content="hello"))
+    spoke = client.get("/agents").json()["agents"][0]
+    assert spoke["msg_count"] == 1
 
 
 # --- console fan-out ---------------------------------------------------------
