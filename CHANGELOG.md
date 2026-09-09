@@ -92,6 +92,18 @@ and rename that heading to the version when you cut the release.
   is treated as proof the pid is stale, which narrows the remaining race to the
   window between the check and the syscall.
 
+- **The launcher refuses a permission mode the child cannot speak in.**
+  Spawning an agent in `plan` or `default` produced a peer that joined the room,
+  showed up healthy in the roster, and never said a word: neither mode permits
+  the `mcp__caucus__*` tools up front, so `say` is unreachable, and a supervised
+  child is started with `stdin` closed, so the approval that would unlock it can
+  never arrive. Confirmed for both `talker` and `worker`. Both modes are now
+  refused with a message naming what the operator loses. Allow-listing the
+  caucus tools to make `plan` work was considered and rejected: plan mode's
+  guarantee is that the agent takes no action, and `say` launders straight
+  through it, since an agent that may not write a file can ask a peer in `auto`
+  to write one.
+
 - **A contested join no longer floods the operator feed.** When a newcomer
   claimed a name a live listener still held, every refused `/register` pushed
   its own warning into the operator console and the bounded message log, and
