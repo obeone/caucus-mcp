@@ -15,6 +15,7 @@ never gain a stray peer because a test ran.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -789,10 +790,64 @@ async def test_shutdown_leaves_no_child_running(tmp_path: Path, workdir: Path) -
     assert all(not rec.running for rec in sup.list())
 
 
+async def test_a_cancelled_kill_leaves_the_child_watched(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """Cancelling a kill mid-flight must not orphan the record's observer.
+
+    ``kill`` runs inside an HTTP handler, and the server cancels that handler
+    when the operator's browser drops the connection. An earlier shape retired
+    the exit waiter before signalling and wrote ``exit_code`` itself, so a
+    cancellation landing between the two left a child nobody was watching and a
+    roster row stuck on running with nothing able to correct it.
+
+    The stand-in ignores ``SIGTERM``, which parks ``_terminate`` in its grace
+    window and makes the cancellation land at a known point.
+    """
+    script = tmp_path / "stubborn_agent.py"
+    script.write_text(
+        "import signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, lambda *a: None)\n"
+        "sys.stderr.write('ready\\n')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(120)\n"
+    )
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(lambda: bool(record.stderr_tail))
+
+        task = asyncio.create_task(sup.kill("alpha"))
+        await asyncio.sleep(0.2)  # inside the SIGTERM grace window
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        # The child ignored SIGTERM and is genuinely still alive, so "running"
+        # is the truth here. What matters is that something is still watching.
+        assert record.exit_code is None
+        waiter = sup._waiters.get("alpha")
+        assert waiter is not None
+        assert not waiter.done()
+
+        # And the record corrects itself once the child really dies.
+        await sup.shutdown()
+        assert record.exit_code is not None
+    finally:
+        await sup.shutdown()
+
+
 async def test_on_change_fires_on_spawn_and_kill(
     tmp_path: Path, workdir: Path
 ) -> None:
-    """The roster-changed callback fires on both ends of a child's life."""
+    """The roster-changed callback fires on both ends of a child's life.
+
+    Three fires, not two, and the third is not spurious. A kill changes the
+    roster twice: the child exits (announced by its waiter, the single authority
+    for that) and the operator's request completes. ``_terminate`` no longer
+    silences the waiter to make the count prettier, because silencing it is what
+    let a cancelled request leave a dead child marked running.
+    """
     fired: list[int] = []
     script = _write_fake_agent(tmp_path, tmp_path / "grandchild.pid")
 
@@ -812,29 +867,55 @@ async def test_on_change_fires_on_spawn_and_kill(
         await sup.spawn(AgentSpec(name="alpha"))
         assert len(fired) == 1
         await sup.kill("alpha")
-        assert len(fired) == 2
+        assert len(fired) == 3
     finally:
         await sup.shutdown()
 
 
-def test_signal_group_tolerates_a_dead_child(
+def test_signal_group_reaches_the_child_and_its_group_when_alive(
     spy: _SpySupervisor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Signalling an already-exited child is not an error, and skips the group.
+    """A live child gets the direct signal *and* the process-group sweep.
 
-    The stub handle raises ``ProcessLookupError`` from ``send_signal``, which is
-    what a real :class:`asyncio.subprocess.Process` does once asyncio has torn
-    the transport down. That refusal is proof the pid no longer names our child,
-    so the process-group sweep must not run at all.
+    Half of the contract, and the half a test asserting only absence would let
+    somebody delete. Without the group sweep the ``claude`` CLI the Agent SDK
+    spawns underneath the child survives the kill, which is the whole reason the
+    child is started with ``start_new_session=True``.
     """
-    signalled: list[int] = []
+    swept: list[tuple[int, int]] = []
     monkeypatch.setattr(
-        os, "killpg", lambda pgid, sig: signalled.append(pgid), raising=False
+        os, "killpg", lambda pgid, sig: swept.append((pgid, int(sig))), raising=False
     )
-    record = _fake_record("alpha")
+    record = _fake_record("alpha", alive=True)
+
+    spy._signal_group(record, signal.SIGTERM)
+
+    assert record.process.signals == [int(signal.SIGTERM)]  # type: ignore[attr-defined]
+    assert swept == [(record.pid, int(signal.SIGTERM))]
+
+
+def test_signal_group_reaches_neither_when_the_child_has_exited(
+    spy: _SpySupervisor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An already-exited child gets nothing, and the refusal is not an error.
+
+    The stub raises ``ProcessLookupError`` from ``send_signal``, which is what a
+    real :class:`asyncio.subprocess.Process` does once asyncio has torn the
+    transport down. That refusal is proof the pid no longer names our child, so
+    the group sweep must not run: by then the number may belong to an unrelated
+    process group.
+    """
+    swept: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        os, "killpg", lambda pgid, sig: swept.append((pgid, int(sig))), raising=False
+    )
+    record = _fake_record("alpha")  # not alive
     record.pid = 2**30  # a pid that cannot exist
+
     spy._signal_group(record, signal.SIGTERM)  # must not raise
-    assert signalled == []
+
+    assert record.process.signals == []  # type: ignore[attr-defined]
+    assert swept == []
 
 
 async def test_kill_does_not_signal_a_child_that_already_exited(
@@ -846,12 +927,16 @@ async def test_kill_does_not_signal_a_child_that_already_exited(
     learn about an exit only from a 15-second hub sweep, so between the death
     and the next sweep ``kill`` still believed the record was running and sent
     ``SIGTERM`` to a process-group id the kernel was already free to reuse.
-    Nothing is swept here on purpose, so the only way the assertions hold is if
+    Nothing is swept here on purpose, so the only way the assertion holds is if
     the supervisor noticed the exit by itself.
+
+    The assertion is on the *syscall*, not on what ``kill`` returns. Which
+    syscall gets issued is the entire bug; a return value can be right for the
+    wrong reason.
     """
-    signalled: list[int] = []
+    swept: list[tuple[int, int]] = []
     monkeypatch.setattr(
-        os, "killpg", lambda pgid, sig: signalled.append(pgid), raising=False
+        os, "killpg", lambda pgid, sig: swept.append((pgid, int(sig))), raising=False
     )
     sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
     try:
@@ -862,9 +947,76 @@ async def test_kill_does_not_signal_a_child_that_already_exited(
         assert await _wait_for(lambda: record.process.returncode is not None)
         await asyncio.sleep(0.05)  # one scheduling turn for the exit waiter
 
-        assert await sup.kill("alpha") is False
-        assert signalled == []
+        await sup.kill("alpha")
+
+        assert swept == []
     finally:
+        await sup.shutdown()
+
+
+async def test_kill_signals_the_group_of_a_live_child(
+    tmp_path: Path, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other direction, end to end: a live child's whole group is swept.
+
+    Paired with the test above on purpose. Absence alone would also be satisfied
+    by a ``_signal_group`` that never calls ``killpg`` at all, which would look
+    correct and quietly orphan the Agent SDK's ``claude`` grandchild on every
+    kill. The spy delegates to the real syscall so the child actually dies.
+    """
+    swept: list[tuple[int, int]] = []
+    real_killpg = os.killpg
+
+    def _spy_killpg(pgid: int, sig: int) -> None:
+        """Record the group signal, then deliver it for real."""
+        swept.append((pgid, int(sig)))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", _spy_killpg, raising=False)
+    pid_file = tmp_path / "grandchild.pid"
+    sup = _make_supervisor(_write_fake_agent(tmp_path, pid_file), workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(pid_file.exists)
+        grandchild = int(pid_file.read_text())
+        assert _alive(grandchild)
+
+        assert await sup.kill("alpha") is True
+
+        assert swept[0] == (record.pid, int(signal.SIGTERM))
+        assert await _wait_for(lambda: not _alive(grandchild))
+    finally:
+        await sup.shutdown()
+
+
+async def test_a_raise_after_registration_still_leaves_the_child_watched(
+    tmp_path: Path, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing fallible may run between the record existing and its watcher.
+
+    ``spawn`` registers the record, then starts the exit waiter, then does its
+    housekeeping. Putting the housekeeping first would be worse than the bug
+    being fixed: a raise there leaves a live child nobody is watching, marked
+    running in the roster forever, with no way for the operator to learn
+    otherwise. The waiter here has to survive a ``_prune_exited`` that explodes.
+    """
+    sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
+
+    def _boom(_self: AgentSupervisor) -> None:
+        """Stand in for any future housekeeping that can fail."""
+        raise RuntimeError("housekeeping blew up")
+
+    monkeypatch.setattr(type(sup), "_prune_exited", _boom)
+    try:
+        with pytest.raises(RuntimeError, match="housekeeping"):
+            await sup.spawn(AgentSpec(name="alpha"))
+
+        record = sup.get("alpha")
+        assert record is not None
+        assert await _wait_for(lambda: record.exit_code is not None)
+        assert record.exit_code == 3
+    finally:
+        monkeypatch.undo()
         await sup.shutdown()
 
 
@@ -949,35 +1101,54 @@ async def test_pruning_past_the_cap_never_cancels_the_running_waiter(
 # --- helpers -----------------------------------------------------------------
 
 
-def _fake_record(name: str) -> AgentProcess:
+class _StubHandle:
+    """Minimal stand-in for an :mod:`asyncio` process handle.
+
+    Attributes
+    ----------
+    alive:
+        When ``False``, ``send_signal`` raises :class:`ProcessLookupError`, the
+        way a real handle does once asyncio has torn its transport down.
+    signals:
+        Every signal number the handle accepted, in order.
+    """
+
+    pid = 424242
+    returncode: int | None = None
+    stdout = None
+    stderr = None
+
+    def __init__(self, *, alive: bool = False) -> None:
+        self.alive = alive
+        self.signals: list[int] = []
+
+    def send_signal(self, sig: signal.Signals) -> None:
+        """Accept the signal while alive, refuse like a torn-down handle after."""
+        if not self.alive:
+            raise ProcessLookupError()
+        self.signals.append(int(sig))
+
+
+def _fake_record(name: str, *, alive: bool = False) -> AgentProcess:
     """Build an :class:`AgentProcess` with a stub handle, for pure-logic tests.
 
     Parameters
     ----------
     name:
         The agent name to record.
+    alive:
+        Whether the stub handle should accept signals (a live child) or refuse
+        them with :class:`ProcessLookupError` (a child asyncio already reaped).
 
     Returns
     -------
     AgentProcess
         A record that looks running but owns no real process.
     """
-    class _StubProcess:
-        """Minimal stand-in for an asyncio process handle."""
-
-        pid = 424242
-        returncode: int | None = None
-        stdout = None
-        stderr = None
-
-        def send_signal(self, sig: signal.Signals) -> None:
-            """Refuse like a real handle whose transport asyncio already closed."""
-            raise ProcessLookupError()
-
     return AgentProcess(
         spec=AgentSpec(name=name),
         pid=424242,
         started_at=0.0,
         started_monotonic=0.0,
-        process=_StubProcess(),  # type: ignore[arg-type]
+        process=_StubHandle(alive=alive),  # type: ignore[arg-type]
     )
