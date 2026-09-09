@@ -476,6 +476,11 @@ enable the launcher without a token is what makes the request-time check real.
   refused before the fork. `claude_agent.main()` refuses it too, but relying on
   the child would turn a clean 400 into a process that dies with an opaque
   status.
+- **No mute agent.** `plan` and `default` are refused for either agent type.
+  Neither permits the `mcp__caucus__*` tools up front, so `say` is unreachable,
+  and a supervised child has `stdin` closed, so no approval can arrive to unlock
+  it. The child would join, look healthy in the roster and never speak. Nothing
+  downstream refuses this, which is why the refusal lives in the supervisor.
 - **Bounded.** Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and may not
   collide with a running child or a name the room already knows; missions are
   capped at 4000 characters and rejected on a NUL byte; at most `--agent-max`

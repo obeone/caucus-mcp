@@ -30,6 +30,7 @@ from caucus.supervisor import (
     CHILD_ENV_ALLOWLIST,
     MAX_EXITED_RECORDS,
     MAX_MISSION_CHARS,
+    MUTE_PERMISSION_MODES,
     PERMISSION_MODES,
     STDERR_RING_LINES,
     AgentProcess,
@@ -266,6 +267,37 @@ async def test_talker_with_unguarded_mode_is_allowed(
 ) -> None:
     """The refusal is scoped to workers; a toolless talker is unaffected."""
     spec = AgentSpec(name="alpha", agent_type="talker", permission_mode=mode)
+    # The spy raises from the launch step, which means validation let it through.
+    with pytest.raises(AssertionError):
+        await spy.spawn(spec)
+    assert len(spy.calls) == 1
+
+
+@pytest.mark.parametrize("mode", sorted(MUTE_PERMISSION_MODES))
+@pytest.mark.parametrize("agent_type", AGENT_TYPES)
+async def test_mute_permission_modes_are_refused(
+    spy: _SpySupervisor, mode: str, agent_type: str
+) -> None:
+    """A mode the child cannot speak in is refused, for either agent type.
+
+    In ``plan`` and ``default`` the ``mcp__caucus__*`` tools are not permitted,
+    so ``say`` is unreachable, and a supervised child has no stdin an approval
+    could arrive on. The operator would get a peer that joins, looks healthy and
+    never talks, which is the one failure shape a roster cannot show.
+    """
+    with pytest.raises(LauncherRefused, match="cannot speak in the room"):
+        await spy.spawn(
+            AgentSpec(name="alpha", agent_type=agent_type, permission_mode=mode)
+        )
+    assert spy.calls == []
+
+
+@pytest.mark.parametrize("mode", ["auto", "acceptEdits"])
+async def test_speaking_permission_modes_are_allowed(
+    spy: _SpySupervisor, mode: str
+) -> None:
+    """The refusal is scoped: the modes an agent can actually speak in pass."""
+    spec = AgentSpec(name="alpha", permission_mode=mode)
     # The spy raises from the launch step, which means validation let it through.
     with pytest.raises(AssertionError):
         await spy.spawn(spec)

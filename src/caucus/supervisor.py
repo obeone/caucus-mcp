@@ -20,6 +20,10 @@ guard here is load-bearing and the module is deliberately paranoid:
 * **No unguarded worker.** A ``worker`` agent wields Bash/Read/Edit/Write on the
   host, so this module refuses to combine it with a permission mode that removes
   the approval classifier, *before* spawning anything.
+* **No mute agent.** The opposite failure is just as bad for the operator: in
+  ``plan`` and ``default`` the caucus tools are not permitted and, with
+  ``stdin`` closed, no approval can ever arrive, so the child would join the
+  room, look healthy in the roster, and never speak. Both modes are refused.
 * **Its own process group.** ``start_new_session=True`` gives the child a fresh
   process group, so a kill takes the group down. The Claude Agent SDK spawns its
   own ``claude`` CLI child, and signalling only the direct child would leave that
@@ -115,6 +119,20 @@ DEFAULT_PERMISSION_MODE = "auto"
 #: Combined with a tool-wielding ``worker`` they leave nothing between an
 #: inbound peer message and real host tool execution.
 UNGUARDED_PERMISSION_MODES = frozenset({"bypassPermissions", "dontAsk"})
+
+#: Permission modes in which a *supervised* child can never say a word.
+#:
+#: Neither mode permits the ``mcp__caucus__*`` tools up front, so ``say`` is
+#: unreachable until an approval arrives, and a supervised child is spawned with
+#: ``stdin=DEVNULL``, so no approval can ever arrive. Verified for both agent
+#: types. The result is the worst possible failure shape: the child joins, the
+#: roster shows it healthy, and it never speaks.
+#:
+#: Allow-listing the caucus tools would "fix" ``plan`` and is deliberately not
+#: done. Plan mode's guarantee is that the agent takes no action, and ``say``
+#: launders straight through it: an agent that may not write a file can ask a
+#: peer running in ``auto`` to write it.
+MUTE_PERMISSION_MODES = frozenset({"plan", "default"})
 
 #: Environment variables copied from the hub process into a spawned child.
 #:
@@ -607,6 +625,16 @@ class AgentSupervisor:
             raise LauncherRefused(
                 "worker agents may not run with bypassPermissions/dontAsk: these "
                 "remove the only guardrail against peer-injected tool use"
+            )
+        # The other end of the same problem: a mode so tight the agent cannot
+        # reach the room at all. Nothing downstream refuses this, and the
+        # failure is silent by construction, so the refusal has to live here.
+        if spec.permission_mode in MUTE_PERMISSION_MODES:
+            raise LauncherRefused(
+                f"an agent started in {spec.permission_mode!r} cannot speak in the "
+                "room: the caucus tools are not permitted to it and no approval "
+                "can reach it, so it would sit in the roster looking healthy and "
+                "stay silent forever"
             )
         if spec.model is not None and (
             len(spec.model) > 100 or not re.fullmatch(r"[A-Za-z0-9._:-]+", spec.model)
