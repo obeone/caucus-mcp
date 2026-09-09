@@ -484,7 +484,8 @@ enable the launcher without a token is what makes the request-time check real.
 - **Bounded.** Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and may not
   collide with a running child or a name the room already knows; missions are
   capped at 4000 characters and rejected on a NUL byte; at most `--agent-max`
-  (default 8) children run at once; each child keeps a 20-line stderr ring.
+  (default 8) children run at once; each child keeps a 20-line ring per output
+  stream, lines truncated at 500 characters.
 - **Own process group.** `start_new_session=True`, and a kill sends `SIGTERM`
   to the group then `SIGKILL` after 5 seconds. The Agent SDK spawns its own
   `claude` CLI child, so signalling only the direct child would orphan it. The
@@ -520,8 +521,10 @@ enable the launcher without a token is what makes the request-time check real.
   window than process creation deserves.
 - Outbound only on `/ui`: an `{"type": "agents", "agents": [...]}` event on every
   roster change, and the same roster inside `snapshot`. Observers see these, so
-  they never carry child stderr; the stderr tail is served from the
-  operator-gated `GET /agents` alone, and no payload ever carries the working
+  they never carry child output; the `stdout` and `stderr` tails are served from
+  the operator-gated `GET /agents` alone, under separate keys so a wedged child's
+  own account of itself stays readable apart from its diagnostics, and no payload
+  ever carries the working
   directory or the child environment.
 - **Reconciliation is one-directional and read-only.** Process facts are never
   written into `HubState`: tests swap that state wholesale and `/control reset`

@@ -68,12 +68,17 @@ DEFAULT_MAX_AGENTS = 8
 #: Seconds a child gets to honour ``SIGTERM`` before the group is ``SIGKILL``ed.
 TERM_GRACE_SECONDS = 5.0
 
-#: How many trailing stderr lines are kept per child (bounded ring buffer).
-STDERR_RING_LINES = 20
+#: How many trailing lines are kept per child, per stream (bounded ring buffer).
+OUTPUT_RING_LINES = 20
 
-#: Longest stderr line retained; anything past this is truncated, so a child
+#: Longest output line retained; anything past this is truncated, so a child
 #: dumping a megabyte on one line cannot pin hub memory.
-STDERR_LINE_CHARS = 500
+OUTPUT_LINE_CHARS = 500
+
+#: Names kept from when stderr was the only captured stream. Same bounds: both
+#: rings are sized identically, so one chatty stream cannot squeeze the other.
+STDERR_RING_LINES = OUTPUT_RING_LINES
+STDERR_LINE_CHARS = OUTPUT_LINE_CHARS
 
 #: Upper bound on the free-text mission handed to a child.
 MAX_MISSION_CHARS = 4000
@@ -338,10 +343,14 @@ class AgentProcess:
         produce a negative age.
     process:
         The live :mod:`asyncio` process handle.
+    stdout_tail:
+        Bounded ring of the child's most recent stdout lines. This is where an
+        agent's own account of itself lands, so a wedged child can be read
+        rather than guessed at.
     stderr_tail:
         Bounded ring of the child's most recent stderr lines.
     exit_code:
-        ``None`` while running, the wait status once reaped.
+        ``None`` while running, the wait status once the child exits.
     """
 
     spec: AgentSpec
@@ -349,8 +358,11 @@ class AgentProcess:
     started_at: float
     started_monotonic: float
     process: asyncio.subprocess.Process
+    stdout_tail: deque[str] = field(
+        default_factory=lambda: deque(maxlen=OUTPUT_RING_LINES)
+    )
     stderr_tail: deque[str] = field(
-        default_factory=lambda: deque(maxlen=STDERR_RING_LINES)
+        default_factory=lambda: deque(maxlen=OUTPUT_RING_LINES)
     )
     exit_code: int | None = None
 
@@ -359,7 +371,7 @@ class AgentProcess:
         """Whether the child has not been reaped yet."""
         return self.exit_code is None
 
-    def to_public(self, *, include_stderr: bool = False) -> dict[str, object]:
+    def to_public(self, *, include_output: bool = False) -> dict[str, object]:
         """Render a JSON-safe row for the operator console.
 
         The working directory and the child environment are **never** included.
@@ -369,18 +381,20 @@ class AgentProcess:
 
         Parameters
         ----------
-        include_stderr:
-            When ``True``, append the retained stderr tail. Only the
-            operator-gated ``GET /agents`` sets this: stderr is child output,
-            which can quote file contents or secrets, so it must not ride the
-            roster event that observers also receive.
+        include_output:
+            When ``True``, append the retained ``stdout`` and ``stderr`` tails,
+            kept as two separate keys so the operator can tell the agent's own
+            account of itself from its diagnostics. Only the operator-gated
+            ``GET /agents`` sets this: both are child output, which can quote
+            file contents or secrets, so neither may ride the roster event that
+            observers also receive.
 
         Returns
         -------
         dict
             Keys: ``name``, ``type``, ``permission_mode``, ``model``, ``pid``,
             ``started_at``, ``uptime_seconds``, ``state``, ``exit_code``, and
-            (optionally) ``stderr``.
+            (optionally) ``stdout`` and ``stderr``.
         """
         row: dict[str, object] = {
             "name": self.spec.name,
@@ -393,7 +407,8 @@ class AgentProcess:
             "state": "running" if self.running else "exited",
             "exit_code": self.exit_code,
         }
-        if include_stderr:
+        if include_output:
+            row["stdout"] = list(self.stdout_tail)
             row["stderr"] = list(self.stderr_tail)
         return row
 
@@ -469,7 +484,7 @@ class AgentSupervisor:
         """Return every known record, newest launch last."""
         return sorted(self._agents.values(), key=lambda rec: rec.started_monotonic)
 
-    def roster(self, *, include_stderr: bool = False) -> AgentRowList:
+    def roster(self, *, include_output: bool = False) -> AgentRowList:
         """Render the whole roster for transport.
 
         Each row carries ``peer_known``: whether the hub currently has a peer
@@ -479,7 +494,7 @@ class AgentSupervisor:
 
         Parameters
         ----------
-        include_stderr:
+        include_output:
             Forwarded to :meth:`AgentProcess.to_public`. Leave ``False`` for
             anything an observer can see.
 
@@ -490,7 +505,7 @@ class AgentSupervisor:
         """
         rows: AgentRowList = []
         for record in self.list():
-            row = record.to_public(include_stderr=include_stderr)
+            row = record.to_public(include_output=include_output)
             row["peer_known"] = self._peer_known(record.spec.name)
             rows.append(row)
         return rows
@@ -571,8 +586,10 @@ class AgentSupervisor:
         # and the validated spec, not from the hub's own environment.
         env["CAUCUS_HUB_URL"] = self._hub_url
         env["CAUCUS_PROJECT"] = spec.name
-        # Unbuffered stderr so the ring buffer fills as the child speaks, not
-        # only when it dies and its buffer is flushed.
+        # Unbuffered stdout and stderr so the ring buffers fill as the child
+        # speaks, not only when it dies and its buffers are flushed. It matters
+        # more for stdout: a pipe makes stdout block-buffered by default, so a
+        # wedged child would hold back the very lines explaining why.
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
@@ -683,7 +700,10 @@ class AgentSupervisor:
             cwd=str(cwd),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
+            # Both streams are piped and drained into bounded rings. stdout used
+            # to go to /dev/null, which threw away exactly the thing an operator
+            # needs when a child is wedged: the agent's own account of why.
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             # Own process group, so kill() can take down the SDK's own `claude`
             # grandchild rather than orphaning it.
@@ -731,7 +751,7 @@ class AgentSupervisor:
             self._agents[spec.name] = record
             self._prune_exited()
             self._readers[spec.name] = asyncio.create_task(
-                self._drain_stderr(record), name=f"caucus-agent-stderr-{spec.name}"
+                self._drain_output(record), name=f"caucus-agent-output-{spec.name}"
             )
             # The exit waiter is what keeps ``record.running`` honest. Created
             # here, next to the reader, so no child can ever exist without one.
@@ -750,16 +770,46 @@ class AgentSupervisor:
 
     # --- lifecycle -------------------------------------------------------
 
-    async def _drain_stderr(self, record: AgentProcess) -> None:
-        """Copy a child's stderr into its bounded ring until end of stream.
+    async def _drain_output(self, record: AgentProcess) -> None:
+        """Drain both of a child's output pipes into their bounded rings.
+
+        One task per child covers both streams, so cancelling the reader (in
+        :meth:`_stop_reader`) still stops everything the child is writing into.
+        The two rings stay separate: an operator reading a wedged child needs to
+        tell the agent's own account of itself from its diagnostics.
+
+        Draining is not, and must not become, the exit signal. That job belongs
+        to :meth:`_await_exit`. End of stream on a pipe does not mean the process
+        exited, and a drain that gave up early would mark a live child dead.
 
         Parameters
         ----------
         record:
-            The child whose stderr is being drained.
+            The child whose output is being drained.
         """
-        stream = record.process.stderr
-        if stream is None:  # pragma: no cover - stderr is always a pipe here
+        await asyncio.gather(
+            self._drain_stream(record, record.process.stdout, record.stdout_tail),
+            self._drain_stream(record, record.process.stderr, record.stderr_tail),
+        )
+
+    @staticmethod
+    async def _drain_stream(
+        record: AgentProcess,
+        stream: asyncio.StreamReader | None,
+        sink: deque[str],
+    ) -> None:
+        """Copy one stream into a bounded ring until end of stream.
+
+        Parameters
+        ----------
+        record:
+            The child being drained; used only for log context.
+        stream:
+            The pipe to read, or ``None`` when the handle has none.
+        sink:
+            The bounded ring the lines land in.
+        """
+        if stream is None:  # pragma: no cover - both are pipes here
             return
         try:
             while True:
@@ -767,11 +817,11 @@ class AgentSupervisor:
                 if not raw:
                     return
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                record.stderr_tail.append(line[:STDERR_LINE_CHARS])
+                sink.append(line[:OUTPUT_LINE_CHARS])
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover - a broken pipe must not kill the hub
-            logger.exception("stderr reader failed for agent %s", record.spec.name)
+            logger.exception("output reader failed for agent %s", record.spec.name)
 
     async def _await_exit(self, record: AgentProcess) -> None:
         """Record one child's exit the instant asyncio observes it.

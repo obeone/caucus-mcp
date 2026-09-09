@@ -674,7 +674,7 @@ def _agent_hub_url() -> str:
 
 
 def _agent_roster() -> list[dict[str, object]]:
-    """Return the agent roster for transport, without any child stderr.
+    """Return the agent roster for transport, without any child output.
 
     Returns
     -------
@@ -683,10 +683,10 @@ def _agent_roster() -> list[dict[str, object]]:
     """
     if supervisor is None:
         return []
-    # include_stderr stays False: this roster reaches the `agents` event, which
-    # every /ui listener sees, observers included. Child stderr can quote file
-    # contents or credentials, so it is served only from the operator-gated
-    # GET /agents.
+    # include_output stays False: this roster reaches the `agents` event, which
+    # every /ui listener sees, observers included. Child stdout and stderr can
+    # quote file contents or credentials, so they are served only from the
+    # operator-gated GET /agents.
     return supervisor.roster()
 
 
@@ -2176,9 +2176,11 @@ async def list_agents(
 ) -> dict[str, object]:
     """List the agent processes this hub launched.
 
-    Operator-gated, and the only place child stderr is served: a stderr tail can
-    quote file contents or credentials, so it must not ride the ``agents`` event
-    that read-only observers also receive.
+    Operator-gated, and the only place child output is served: the ``stdout``
+    and ``stderr`` tails can quote file contents or credentials, so they must
+    not ride the ``agents`` event that read-only observers also receive. The two
+    stay separate keys, so a wedged child's own account of itself is readable
+    apart from its diagnostics.
 
     Each row carries ``peer_known``, saying whether the room currently has a
     peer registered under that name. That annotation is the only link between a
@@ -2195,7 +2197,7 @@ async def list_agents(
     """
     _gate_operator_request(authorization, origin)
     sup = _require_launcher()
-    return {"agents": sup.roster(include_stderr=True)}
+    return {"agents": sup.roster(include_output=True)}
 
 
 @app.post("/agents")
@@ -2489,7 +2491,7 @@ async def ui_socket(ws: WebSocket) -> None:
             if event.get("type") == "snapshot":
                 # Prime the console with the agent roster too. Added here rather
                 # than in HubState.add_ui because the roster is a process fact,
-                # and the stderr-free projection is what observers may see.
+                # and the output-free projection is what observers may see.
                 event = {**event, "agents": _agent_roster()}
             await ws.send_json(event)
 
