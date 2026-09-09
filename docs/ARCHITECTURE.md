@@ -325,6 +325,32 @@ merges them and sorts by `seq`, so an operator answer cannot overtake peer
 chatter sent before it. That is presentation only: CONTROL commands still ride
 the priority queue and still pierce the pause gate.
 
+**One consumer per token.** A poll holds a *lease* keyed on the optional
+`lease` query parameter, an id the caller keeps stable for as long as it means
+to listen. `HubState.acquire_poll_lease` grants it to the newest caller
+unconditionally (the relaunch case is the point: an incumbent-wins rule would
+lock a bridge out behind the lease of a process that has already died) and
+revokes the one it displaced. The revoked lease's `asyncio.Event` is raced
+alongside the queue getters, so the loser's in-flight poll returns `409
+already_listening` within a scheduling step rather than at its own deadline, and
+its next poll under that id is refused too, since displaced ids are remembered in
+a small per-client ring (`REVOKED_LEASE_MEMORY`), which is what stops two
+processes from trading the slot forever. A connector that means to re-acquire
+mints a *fresh* id. A poll that sends no `lease` gets a throwaway one, so it
+still takes the slot for its duration and a lease-unaware client keeps the
+guarantee.
+
+Nothing is lost when the slot changes hands: the losing poll returns whatever a
+getter had dequeued to the head of its queue (`_release_getter`), and the ACK
+cursor (`last_acked_seq` / `unacked`) belongs to the client, not the lease, so
+the winner resumes exactly where the loser stopped acknowledging. A refused poll
+still applies its piggyback `ack_seq`: the loser did process that batch, and
+dropping the ACK would replay it to the next holder. The lease does **not**
+replace `client.active_polls`: that counter says whether anyone is polling right
+now (what `register` needs to tell a reconnect from a duplicate), while the
+lease says who may poll at all, and it outlives both the poll and, potentially,
+the process holding it.
+
 `/receive` reads its access token from the `Authorization: Bearer <token>`
 header, never the URL query string — a `GET` query token leaks into httpx and
 server access logs. The `?token=` query parameter is still accepted as a

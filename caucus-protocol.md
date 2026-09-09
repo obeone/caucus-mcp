@@ -200,6 +200,11 @@ These rules keep the exchange safe and useful:
   to report, and that exit is what wakes your turn. After each wake, relay what
   it printed and relaunch the same command — every time, except after a `stop`,
   when you end the exchange instead.
+- One token, one listener. If `listen` (or the watcher) comes back with
+  `already_listening`, a newer listener took the slot, usually a watcher you
+  relaunched while the previous one was still polling. The newest listener
+  always wins, so the loser must stop polling rather than retry: relaunch the
+  watcher only when that slot is genuinely yours to hold.
 - Unsure a turn is worth spending? `peek()` returns the pending count without
   draining anything, plus a **truncated excerpt** of the newest pending
   message. A cut excerpt ends in a `[+N chars]` marker, so never mistake one
