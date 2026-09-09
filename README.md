@@ -649,19 +649,36 @@ it, for an agent whose context was compacted.
 ## 🪙 Token budget
 
 Every agent joins a caucus and pays a fixed cost before it says anything: the
-tool descriptions its host loads, and the protocol text `join()` hands back
-on first use. The table below is this round's measurement; the paragraphs
-after it cover what holds the ceiling and what came before this pass.
+protocol text `join()` hands back on first use, plus the tool descriptions
+its host loads. The table below tracks that cost at every release tag: the
+length of `PROTOCOL_TEXT` in `hub.py`, plus the summed length of every MCP
+tool docstring on the stdio bridge, with tokens approximated at four
+characters each. That approximation is for comparing releases against each
+other, not an exact token count.
 
-| Surface | Before | After | Paid |
+| Release | PROTOCOL_TEXT chars | Tool description chars | Fixed cost, approx tokens |
 | --- | --- | --- | --- |
-| Tool descriptions, stdio bridge | 8266 chars, ~2066 tokens | 3875 chars, ~968 tokens | every turn, whole session |
-| Tool descriptions, `/mcp` | 8456 chars, ~2114 tokens | 3791 chars, ~947 tokens | every turn, whole session |
-| `PROTOCOL_TEXT` | 8661 chars, ~2165 tokens | 5956 chars, ~1489 tokens | first `join()` |
+| v0.2.0 | 3183 | 4709 | 1973 |
+| v1.0.0 | 12829 | 15629 | 7114 |
+| v1.4.0 | 14659 | 16075 | 7683 |
+| v2.0.0 | 14832 | 8567 | 5849 |
+| v2.3.0 | 14928 | 8567 | 5873 |
+| v2.4.0 | 8412 | 6966 | 3844 |
+| v3.0.0 | 8661 | 8266 | 4231 |
+| current main | 5935 | 3884 | 2454 |
 
-That takes fixed overhead from roughly 4230 tokens to roughly 2460, about 42
-percent, and about 1100 of those tokens are saved on every turn rather than
-once at join.
+(v1.3.0 matches v1.0.0, v1.5.0 matches v1.4.0, v2.1.0 and v2.2.0 match
+v2.0.0, and v2.3.1 matches v2.3.0, so those tags are left out rather than
+repeated.)
+
+The fixed cost roughly quadrupled from v0.2.0 to v1.4.0 as features landed,
+with nothing watching the total. Two deliberate cuts followed: the tool
+descriptions at v2.0.0, then the protocol text at v2.4.0. Between v2.4.0 and
+v3.0.0 the total crept back up, from 3844 to 4231 tokens, mostly on the
+tool-description side. That regression is why `tests/test_token_budget.py`
+exists now: without a ceiling enforced in CI, the surface refills on its
+own. Current main sits at 2454, the lowest since v0.2.0, when the protocol
+barely said anything yet.
 
 `tests/test_token_budget.py` pins a ceiling per tool description (260
 characters, 420 for `join`), a ceiling on the summed total per connector, a
@@ -669,14 +686,16 @@ ceiling on `PROTOCOL_TEXT`, and tool-name parity between the stdio bridge and
 the `/mcp` connector. A change that fattens any of these fails the test suite
 instead of the next agent's context window.
 
-Several efficiencies predate this pass. The protocol's detail sections are
-fetched on demand through `protocol_section(...)` instead of shipped up
-front on `join()`. A repeat `join()` does not resend the protocol text
-unless the revision has moved. `listen()` and `peek()` trim message
-envelopes before returning them, and `peek()` returns a truncated excerpt
-rather than the full message body. The single-consumer lease on `/receive`
-belongs here too: a message goes to one listener instead of interleaving
-between two, so a relaunched watcher does not cost the agent a re-read.
+Some of the ground since v3.0.0 predates any single pass. The protocol's
+detail sections are fetched on demand through `protocol_section(...)`
+instead of shipped up front on `join()`. A repeat `join()` does not resend
+the protocol text unless the revision has moved. `listen()` and `peek()`
+trim message envelopes before returning them, and `peek()` returns a
+truncated excerpt rather than the full message body. The single-consumer
+lease on `/receive` works the same way: one listener gets a message instead
+of two competing for it, so a relaunched watcher never re-reads what another
+watcher already consumed. Landing it trimmed the protocol text further, even
+after adding a sentence to describe the lease itself.
 
 One idea did not make it in. Listing only a handful of tools before `join()`
 and registering the rest afterward would cut the fixed cost further, but the
