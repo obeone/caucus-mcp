@@ -12,13 +12,23 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
-- **The agent roster shows each peer's `msg_count`.** Nothing in a row told a
-  phantom from a healthy agent: a wedged child keeps long-polling, so its peer's
-  `last_seen` stays fresh and every field reads fine. Rows now carry the peer's
-  sent-message count beside `peer_known`, read at render time through a probe
-  like the existing one, so the supervisor still writes nothing into `HubState`.
-  A row that says running, `peer_known` true, `msg_count` zero and a climbing
-  uptime is an agent that joined and has never spoken.
+- **The agent launcher shows whether a supervised agent actually joined and
+  spoke.** Nothing in a roster row told a phantom from a healthy agent: a wedged
+  child keeps long-polling, so its peer's `last_seen` stays fresh and every field
+  reads fine. `peer_known` was already crossing the whole wire and being rendered
+  nowhere. Rows now carry the peer's sent-message count beside it, read at render
+  time through a probe like the existing one so the supervisor still writes
+  nothing into `HubState`, and the console renders both next to the kill button.
+  Two columns, because they encode three states worth telling apart: running and
+  not joined (a crash at startup, a bad token or hub URL, a missing `claude`
+  extra), joined and silent (the phantom), joined and talking. `peer_known` on
+  its own is actively misleading here, since a mute agent has joined and that
+  column reads yes beside a ghost.
+
+- **The spawn form refuses a mute permission mode before the round trip**, with
+  the same wording as the hub's own refusal. Anything the pre-flight check misses
+  is still refused server-side, and the console already surfaces that refusal's
+  `detail` text in an error toast rather than a bare status code.
 
 - **A spawned agent's stdout is captured, not discarded.** Children were started
   with `stdout=DEVNULL`, so when one was wedged its own account of why went

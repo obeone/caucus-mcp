@@ -143,9 +143,9 @@ export type AgentState = "running" | "exited";
  * Public view of a supervised `caucus-claude-agent` process, as reported by
  * the hub's `AgentSupervisor.to_public()`. Deliberately excludes the working
  * directory and environment. The roster carried by the `agents` event and the
- * `snapshot.agents` field never include `stderr` (see `to_public`'s
- * `include_stderr` guard) — that tail is served only by the operator-gated
- * `GET /agents`, which this console does not call.
+ * `snapshot.agents` field never include `stdout` or `stderr` (see
+ * `to_public`'s `include_output` guard) — those tails are served only by the
+ * operator-gated `GET /agents`, which this console does not call.
  */
 export interface AgentInfo {
   name: string;
@@ -159,6 +159,17 @@ export interface AgentInfo {
   exit_code: number | null;
   /** Whether the hub currently has a live peer registered under this name. */
   peer_known: boolean;
+  /**
+   * How many messages that peer has *sent*, or `null` when the hub knows no
+   * peer under this name.
+   *
+   * Read together with `peer_known`, this is what separates a healthy agent
+   * from a phantom. A wedged child keeps long-polling, so its peer stays fresh
+   * and every other field in the row looks fine; only the send count stays at
+   * zero. See `AgentLauncher`'s roster row for the three states these two
+   * fields encode.
+   */
+  msg_count: number | null;
 }
 
 /**

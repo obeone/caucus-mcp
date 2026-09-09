@@ -26,6 +26,20 @@ export const UNSAFE_WORKER_PERMISSION_MODES: readonly PermissionMode[] = [
   "dontAsk",
 ];
 
+/**
+ * Permission modes in which a supervised child can never say a word, mirroring
+ * `MUTE_PERMISSION_MODES`.
+ *
+ * Neither permits the `mcp__caucus__*` tools up front, so `say` is out of reach
+ * until an approval arrives, and the hub spawns children with stdin closed, so
+ * no approval ever can. The agent would join, look healthy in the roster, and
+ * stay silent. Refused for both agent types.
+ */
+export const MUTE_PERMISSION_MODES: readonly PermissionMode[] = [
+  "plan",
+  "default",
+];
+
 /** Values the spawn form's fields carry, ahead of submission. */
 export interface SpawnFormValues {
   name: string;
@@ -57,9 +71,19 @@ export function isUnsafeWorkerCombo(
   );
 }
 
+/** Whether `permissionMode` is one the agent could never speak in. */
+export function isMutePermissionMode(permissionMode: PermissionMode): boolean {
+  return MUTE_PERMISSION_MODES.includes(permissionMode);
+}
+
 /**
  * Validate the spawn form, returning the first human-readable error found,
  * or `null` when the form is ready to submit.
+ *
+ * These checks are a pre-flight mirror, not a gate. Anything they miss is still
+ * refused by the hub, and the store surfaces that refusal's own `detail` text in
+ * an error toast, so the operator reads the server's reason rather than a bare
+ * status code.
  *
  * @param values - The current form field values.
  * @returns A user-facing error string, or `null` when valid.
@@ -76,6 +100,9 @@ export function spawnFormError(values: SpawnFormValues): string | null {
   }
   if (isUnsafeWorkerCombo(values.type, values.permissionMode)) {
     return "A worker agent cannot use bypassPermissions or dontAsk: those modes remove the only guardrail around its shell and filesystem tools.";
+  }
+  if (isMutePermissionMode(values.permissionMode)) {
+    return `An agent started in ${values.permissionMode} cannot speak in the room: the caucus tools are not permitted to it and no approval can reach it, so it would sit in the roster looking healthy and stay silent.`;
   }
   return null;
 }

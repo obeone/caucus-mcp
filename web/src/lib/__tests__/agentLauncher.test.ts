@@ -12,8 +12,10 @@ import {
   isValidAgentName,
   isMissionTooLong,
   isUnsafeWorkerCombo,
+  isMutePermissionMode,
   spawnFormError,
   MAX_MISSION_CHARS,
+  MUTE_PERMISSION_MODES,
   type SpawnFormValues,
 } from "../agentLauncher";
 
@@ -113,5 +115,46 @@ describe("spawnFormError", () => {
     expect(
       spawnFormError({ ...base, type: "worker", permissionMode: "bypassPermissions" })
     ).toMatch(/guardrail/);
+  });
+});
+
+describe("isMutePermissionMode", () => {
+  it.each(MUTE_PERMISSION_MODES)("rejects %s", (mode) => {
+    expect(isMutePermissionMode(mode)).toBe(true);
+  });
+
+  it.each(["auto", "acceptEdits", "bypassPermissions", "dontAsk"] as const)(
+    "accepts %s",
+    (mode) => {
+      expect(isMutePermissionMode(mode)).toBe(false);
+    }
+  );
+});
+
+describe("spawnFormError — mute permission modes", () => {
+  // Both agent types: the refusal is about reaching the room, not about tools.
+  it.each([
+    ["talker", "plan"],
+    ["talker", "default"],
+    ["worker", "plan"],
+    ["worker", "default"],
+  ] as const)("refuses a %s in %s", (type, permissionMode) => {
+    const values: SpawnFormValues = {
+      name: "alpha",
+      mission: "",
+      type,
+      permissionMode,
+    };
+    expect(spawnFormError(values)).toContain("cannot speak in the room");
+  });
+
+  it("still accepts a mode the agent can speak in", () => {
+    const values: SpawnFormValues = {
+      name: "alpha",
+      mission: "",
+      type: "talker",
+      permissionMode: "auto",
+    };
+    expect(spawnFormError(values)).toBeNull();
   });
 });

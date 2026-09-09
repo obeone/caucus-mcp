@@ -9,8 +9,13 @@
  *     trip rather than after a rejected request. There is no working-directory
  *     field: the hub fixes it at startup and rejects an unknown `cwd` in the
  *     request body.
- *   - A live roster below it: one row per supervised agent with its state,
- *     uptime, pid, and a kill button.
+ *   - A live roster below it: one row per supervised agent with its state, how
+ *     it relates to the room (`peer_known` + `msg_count`), uptime, pid, and a
+ *     kill button. Those two room fields sit here rather than in the Health
+ *     panel because this is where the operator decides whether to kill
+ *     something, and they are what distinguishes a healthy agent from a
+ *     phantom: a wedged child keeps long-polling, so nothing else in the row
+ *     gives it away.
  *
  * Spawning and killing go over HTTP (`POST /agents`, `DELETE /agents/{name}`),
  * not the `/ui` socket, so both are awaited and a failed request surfaces its
@@ -29,7 +34,16 @@ import { fmtDuration } from "../lib/colors";
 import { spawnFormError, type SpawnFormValues } from "../lib/agentLauncher";
 import { useToast } from "./ToastProvider";
 import type { AgentInfo, AgentType, PermissionMode } from "../store/types";
-import { Bot, Rocket, X, Hash, Clock } from "lucide-react";
+import {
+  Bot,
+  Rocket,
+  X,
+  Hash,
+  Clock,
+  Link2,
+  Link2Off,
+  MessageSquare,
+} from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,9 +77,56 @@ function stateColor(agent: AgentInfo): string {
   return "text-green";
 }
 
-/** Single roster row: state, uptime, pid, kill button. */
+/**
+ * How a running child relates to the room, read off `peer_known` + `msg_count`.
+ *
+ * The process being alive says almost nothing: a wedged agent keeps long-polling,
+ * so its peer never goes stale and every other field in the row reads healthy.
+ * These two fields are the only ones that separate the three cases the operator
+ * actually has to tell apart before deciding whether to kill something.
+ *
+ * - `absent`  — the process runs but never joined. A crash during startup, a bad
+ *   hub URL or token, or a missing `claude` extra.
+ * - `silent`  — it joined and has said nothing. A mute permission mode, a dead
+ *   SDK loop, a model that refused. This is the phantom, and it is the case
+ *   `peer_known` alone gets actively wrong: the column reads "yes" beside a ghost.
+ * - `talking` — it joined and has spoken. Healthy.
+ */
+type RoomLink = "absent" | "silent" | "talking";
+
+/** Classify a running agent's relationship to the room. */
+function roomLink(agent: AgentInfo): RoomLink {
+  if (!agent.peer_known) return "absent";
+  return (agent.msg_count ?? 0) > 0 ? "talking" : "silent";
+}
+
+/** Presentation for each {@link RoomLink} state: label, tooltip, colour. */
+const ROOM_LINK_UI: Record<
+  RoomLink,
+  { label: string; title: string; className: string }
+> = {
+  absent: {
+    label: "not joined",
+    title: "The process is running but never registered with the hub",
+    className: "text-red",
+  },
+  silent: {
+    label: "joined, silent",
+    title: "Joined the room and has not sent a single message",
+    className: "text-amber",
+  },
+  talking: {
+    label: "joined",
+    title: "Joined the room and is sending messages",
+    className: "text-green",
+  },
+};
+
+/** Single roster row: state, room link, send count, uptime, pid, kill button. */
 function AgentRow({ agent, onKill }: AgentRowProps) {
   const running = agent.state === "running";
+  const link = ROOM_LINK_UI[roomLink(agent)];
+  const sent = agent.msg_count ?? 0;
 
   return (
     <div
@@ -103,6 +164,37 @@ function AgentRow({ agent, onKill }: AgentRowProps) {
           </button>
         )}
       </div>
+
+      {/* Room link and send count, on the same line as the kill button's row
+          block on purpose: this is where the operator decides, and making him
+          cross-reference the Health panel by name is the work we claim to save
+          him. Both facts are shown, never one: either alone leaves the three
+          states ambiguous. */}
+      {running && (
+        <div className="flex items-center gap-3 text-[10px] font-mono pl-3.5">
+          <span
+            className={cn("flex items-center gap-1", link.className)}
+            title={link.title}
+          >
+            {agent.peer_known ? <Link2 size={9} /> : <Link2Off size={9} />}
+            {link.label}
+          </span>
+          <span
+            className={cn(
+              "flex items-center gap-1",
+              sent > 0 ? "text-dim" : "text-amber"
+            )}
+            title={
+              agent.peer_known
+                ? "Messages this agent has sent to the room"
+                : "No peer under this name, so nothing has been sent"
+            }
+          >
+            <MessageSquare size={9} />
+            {agent.peer_known ? `${sent} sent` : "—"}
+          </span>
+        </div>
+      )}
 
       <div className="flex items-center gap-3 text-[10px] font-mono text-dim pl-3.5">
         <span className="flex items-center gap-1" title="Uptime">
