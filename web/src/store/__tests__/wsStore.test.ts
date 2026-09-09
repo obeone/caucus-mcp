@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import { useDashStore } from "../wsStore";
+import { useDashStore, getStoredToken } from "../wsStore";
 import type { SnapshotEvent, PeerInfo } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -387,3 +387,17 @@ describe("wsStore — getToken() strips token from URL", () => {
     });
   });
 });
+
+describe("wsStore — getStoredToken()", () => {
+  it("returns null when no token has been persisted", () => {
+    localStorage.removeItem("caucus_token");
+    expect(getStoredToken()).toBeNull();
+  });
+
+  it("returns the persisted caucus_token value", () => {
+    localStorage.setItem("caucus_token", "secret123");
+    expect(getStoredToken()).toBe("secret123");
+    localStorage.removeItem("caucus_token");
+  });
+});
+
