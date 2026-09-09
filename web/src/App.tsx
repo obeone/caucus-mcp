@@ -19,7 +19,7 @@
  * clicking it opens a dialog list → FormModal workflow.
  */
 
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { useDashStore } from "./store/wsStore";
 import { cn } from "./lib/utils";
 import { fmtDuration } from "./lib/colors";
@@ -52,6 +52,47 @@ export default function App() {
     },
     [role, sendMode]
   );
+
+  /**
+   * Keyboard shortcuts for the operator brakes: Shift+P pause, Shift+R
+   * resume, Shift+S stop. Operator-only (mirrors handleModeAction's own
+   * guard) and disabled while focus is inside an input, textarea, select, or
+   * any contenteditable element, so typing in the composer or a filter box
+   * never triggers a brake by accident.
+   */
+  useEffect(() => {
+    function handleShortcut(e: KeyboardEvent) {
+      if (role !== "operator" || !e.shiftKey) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      switch (e.key.toLowerCase()) {
+        case "p":
+          e.preventDefault();
+          handleModeAction("pause");
+          break;
+        case "r":
+          e.preventDefault();
+          handleModeAction("resume");
+          break;
+        case "s":
+          e.preventDefault();
+          handleModeAction("stop");
+          break;
+        default:
+          break;
+      }
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [role, handleModeAction]);
 
   return (
     <ToastProvider>
@@ -158,11 +199,12 @@ export default function App() {
 
           {/* Mode controls (operator only) */}
           {role === "operator" && (
-            <div className="flex gap-2" role="group" aria-label="Hub mode controls">
+            <div className="flex items-center gap-2" role="group" aria-label="Hub mode controls">
               <button
                 onClick={() => handleModeAction("pause")}
                 className="font-chrome font-bold tracking-widest text-xs px-3 py-1.5 border border-line rounded-sm bg-panel-2 text-ink hover:border-amber hover:text-amber transition-all uppercase"
                 aria-label="Pause all agents"
+                title="Pause all agents (Shift+P)"
               >
                 Pause
               </button>
@@ -170,6 +212,7 @@ export default function App() {
                 onClick={() => handleModeAction("resume")}
                 className="font-chrome font-bold tracking-widest text-xs px-3 py-1.5 border border-line rounded-sm bg-panel-2 text-ink hover:border-cyan hover:text-ink transition-all uppercase"
                 aria-label="Resume all agents"
+                title="Resume all agents (Shift+R)"
               >
                 Resume
               </button>
@@ -177,6 +220,7 @@ export default function App() {
                 onClick={() => handleModeAction("stop")}
                 className="font-chrome font-bold tracking-widest text-xs px-3 py-1.5 border border-red rounded-sm bg-panel-2 text-red hover:bg-red hover:text-bg transition-all uppercase"
                 aria-label="Stop all agents"
+                title="Stop all agents (Shift+S)"
               >
                 Stop All
               </button>
@@ -186,6 +230,22 @@ export default function App() {
                 aria-label="Reset hub"
               >
                 Reset
+              </button>
+              {/* Visible legend for the brake shortcuts — always on, not just
+                  a hover title, so the operator can find the keys at a glance. */}
+              <span
+                className="hidden xl:inline text-[9px] font-mono text-dim/50 tracking-wide whitespace-nowrap"
+                aria-label="Keyboard shortcuts: Shift+P pause, Shift+R resume, Shift+S stop"
+              >
+                ⇧P pause · ⇧R resume · ⇧S stop
+              </span>
+              <button
+                title="Keyboard shortcuts: Shift+P pause, Shift+R resume, Shift+S stop"
+                className="xl:hidden text-dim/40 hover:text-dim transition-colors"
+                tabIndex={0}
+                aria-label="Operator brake keyboard shortcuts"
+              >
+                <HelpCircle size={11} aria-hidden="true" />
               </button>
             </div>
           )}
