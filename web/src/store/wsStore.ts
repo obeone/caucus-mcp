@@ -54,6 +54,18 @@ function rawToMessage(raw: RawMessage): Message {
 }
 
 /**
+ * Read the persisted auth token from localStorage.
+ *
+ * Exposed (unlike {@link getToken}) so other modules that need to authenticate
+ * a plain `fetch` against the hub -- e.g. the transcript export download in
+ * FlowPanel -- can attach the same bearer token the WebSocket connection uses,
+ * without duplicating the `caucus_token` key name.
+ */
+export function getStoredToken(): string | null {
+  return localStorage.getItem("caucus_token");
+}
+
+/**
  * Read the auth token from ?token= URL param or localStorage.
  *
  * Security: when the token is supplied in the URL we immediately strip it from
@@ -75,7 +87,7 @@ function getToken(): string | null {
     );
     return fromUrl;
   }
-  return localStorage.getItem("caucus_token");
+  return getStoredToken();
 }
 
 /** Build the WebSocket URL for the /ui endpoint (same-origin). */

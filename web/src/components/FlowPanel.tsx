@@ -10,12 +10,13 @@
  * Every row shows its full content — there is no expand/collapse toggle.
  *
  * Supports:
- * - Peer filter (cross-linked from HealthPanel selection)
+ * - Peer filter (dropdown, two-way cross-linked with HealthPanel selection)
  * - Channel filter (synced from left-rail selectedChannel)
  * - Type filter (broadcast / direct / channel)
  * - Client-side search (Cmd/Ctrl+F, Esc to close)
  * - Arrow-key row navigation (↑↓ select, Esc clears focus)
- * - Export transcript as JSON blob download
+ * - Transcript export (operator-only) via the hub's /export endpoint,
+ *   in JSON, Markdown, or plain-text format
  * - Colour by peer
  * - UTC / local time toggle
  */
@@ -33,9 +34,10 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
-import { useDashStore } from "../store/wsStore";
+import { useDashStore, getStoredToken } from "../store/wsStore";
 import { colorFor, fmtTime, fmtTimeUTC } from "../lib/colors";
 import { cn } from "../lib/utils";
+import { useToast } from "./ToastProvider";
 import type { Message } from "../store/types";
 import { Search, X, Download, ArrowDown } from "lucide-react";
 
@@ -271,10 +273,16 @@ export function MessageRow({ msg, showUTC, focused, onSelect }: RowProps) {
 
 // ── Filters ───────────────────────────────────────────────────────────────────
 
-type TypeFilter = "all" | "broadcast" | "direct" | "channel";
+export type TypeFilter = "all" | "broadcast" | "direct" | "channel";
 
-/** Returns true if the message passes all active filters. */
-function passesFilters(
+/**
+ * Returns true if the message passes all active filters.
+ *
+ * Exported (alongside {@link TypeFilter}) so the filter logic can be unit
+ * tested directly, without mounting FlowPanel's virtualizer (which needs a
+ * real layout engine jsdom doesn't provide).
+ */
+export function passesFilters(
   msg: Message,
   peerFilter: string | null,
   channelFilter: string,
@@ -301,23 +309,57 @@ function passesFilters(
   return true;
 }
 
-// ── Export helper ─────────────────────────────────────────────────────────────
+// ── Export helper ────────────────────────────────────────────────────────
+
+/** Transcript format offered by the hub's `/export` endpoint. */
+export type ExportFormat = "json" | "markdown" | "text";
+
+/** File extension for a given {@link ExportFormat}, used as a download fallback. */
+function extensionFor(format: ExportFormat): string {
+  return format === "markdown" ? "md" : format === "text" ? "txt" : "json";
+}
 
 /**
- * Download the provided messages as a prettified JSON blob.
- * Pure client-side — no server round-trip needed.
+ * Download the room's current transcript from the hub's `/export` endpoint.
+ *
+ * Reuses the server-side renderer (`caucus.export`) rather than re-serialising
+ * whatever this client happens to hold in memory, so the download reflects the
+ * hub's own bounded log (see `HubState.recent`) and supports the same
+ * JSON/Markdown/text formats the endpoint does. Attaches the same bearer token
+ * the WebSocket connection uses, matching `/export`'s auth gate.
+ *
+ * @param format  - Transcript shape to request.
+ * @param onError - Called with a human-readable message if the download fails.
  */
-function exportMessages(msgs: Message[]) {
-  const blob = new Blob([JSON.stringify(msgs, null, 2)], {
-    type: "application/json",
-  });
+async function downloadTranscript(
+  format: ExportFormat,
+  onError: (message: string) => void
+): Promise<void> {
+  const token = getStoredToken();
+  const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
+
+  let res: Response;
+  try {
+    res = await fetch(`/export?format=${format}`, { headers });
+  } catch {
+    onError("Could not reach the hub to export the transcript.");
+    return;
+  }
+  if (!res.ok) {
+    onError(`Export failed (HTTP ${res.status}).`);
+    return;
+  }
+
+  const blob = await res.blob();
+  // Prefer the filename the hub suggests via Content-Disposition; fall back to
+  // a locally-built one if the header is missing or unparsable.
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `caucus-transcript-${new Date()
-    .toISOString()
-    .slice(0, 19)
-    .replace(/:/g, "-")}.json`;
+  a.download = match?.[1] ?? `caucus-chat.${extensionFor(format)}`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -328,12 +370,17 @@ function exportMessages(msgs: Message[]) {
 export default function FlowPanel() {
   const messages = useDashStore((s) => s.messages);
   const showUTC = useDashStore((s) => s.showUTC);
+  const role = useDashStore((s) => s.role);
+  const peers = useDashStore((s) => s.peers);
   const selectedPeer = useDashStore((s) => s.selectedPeer);
+  const setSelectedPeer = useDashStore((s) => s.setSelectedPeer);
   const selectedChannel = useDashStore((s) => s.selectedChannel);
   const channels = useDashStore((s) => s.channels);
+  const { toast } = useToast();
 
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
   const [channelFilter, setChannelFilter] = useState("all");
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("json");
 
   // Sync channelFilter when the left-rail channel selection changes.
   useEffect(() => {
@@ -347,6 +394,19 @@ export default function FlowPanel() {
 
   const searchRef = useRef<HTMLInputElement>(null);
   const parentRef = useRef<HTMLDivElement>(null);
+
+  // Distinct, sorted peer names for the peer filter dropdown.
+  const peerNames = useMemo(
+    () => Array.from(new Set(peers.map((p) => p.name))).sort(),
+    [peers]
+  );
+
+  /** Trigger a server-backed transcript download in the selected format. */
+  const handleExport = useCallback(() => {
+    void downloadTranscript(exportFormat, (message) =>
+      toast({ title: "Transcript export failed", description: message, variant: "error" })
+    );
+  }, [exportFormat, toast]);
 
   const filtered = useMemo(
     () =>
@@ -504,10 +564,27 @@ export default function FlowPanel() {
           </>
         )}
 
-        {selectedPeer && (
-          <span className="text-[10px] font-mono text-cyan border border-cyan/40 px-2 py-0.5 rounded-sm">
-            peer: {selectedPeer}
-          </span>
+        {peerNames.length > 0 && (
+          <>
+            <label className="text-[10px] font-mono text-dim tracking-widest uppercase">
+              peer
+            </label>
+            <select
+              value={selectedPeer ?? "all"}
+              onChange={(e) =>
+                setSelectedPeer(e.target.value === "all" ? null : e.target.value)
+              }
+              className="bg-bg text-ink border border-line rounded-sm text-xs font-mono px-2 py-1 focus:outline-none focus:border-cyan"
+              aria-label="Filter by peer"
+            >
+              <option value="all">All</option>
+              {peerNames.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </>
         )}
 
         {focusedIndex >= 0 && (
@@ -520,14 +597,30 @@ export default function FlowPanel() {
           {filtered.length} / {messages.length}
         </span>
 
-        <button
-          onClick={() => exportMessages(messages)}
-          className="text-dim hover:text-cyan transition-colors"
-          aria-label="Export transcript as JSON"
-          title="Download transcript (all 500 messages) as JSON"
-        >
-          <Download size={14} />
-        </button>
+        {/* Transcript export — operator-only, like RateControl and the mode
+            controls, since the download can carry private-channel traffic. */}
+        {role === "operator" && (
+          <div className="flex items-center gap-1" role="group" aria-label="Transcript export">
+            <select
+              value={exportFormat}
+              onChange={(e) => setExportFormat(e.target.value as ExportFormat)}
+              className="bg-bg text-ink border border-line rounded-sm text-[10px] font-mono px-1.5 py-1 focus:outline-none focus:border-cyan"
+              aria-label="Transcript export format"
+            >
+              <option value="json">JSON</option>
+              <option value="markdown">Markdown</option>
+              <option value="text">Text</option>
+            </select>
+            <button
+              onClick={handleExport}
+              className="text-dim hover:text-cyan transition-colors"
+              aria-label="Export transcript from hub"
+              title="Download the hub's current transcript"
+            >
+              <Download size={14} />
+            </button>
+          </div>
+        )}
 
         <button
           onClick={() => {
