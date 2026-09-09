@@ -41,7 +41,10 @@ and rename that heading to the version when you cut the release.
   **What it is not:** `--agent-cwd` is where a child starts, not a boundary it
   is held inside. A spawned agent runs with the operator's own privileges, a
   `worker` reaches shell and filesystem tools and walks out of that directory
-  with one `cd ..`, and a `SIGKILL`ed hub orphans its children.
+  with one `cd ..`, and a `SIGKILL`ed hub orphans its children. The operator
+  console gained a matching Agent Launcher panel in the left rail: a spawn
+  form with client-side validation mirroring the hub's own refusals, and a
+  live roster with state, uptime, and a kill button per agent.
 
 ### Changed
 
