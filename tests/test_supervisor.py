@@ -28,6 +28,7 @@ from caucus.supervisor import (
     AGENT_NAME_RE,
     AGENT_TYPES,
     CHILD_ENV_ALLOWLIST,
+    MAX_EXITED_RECORDS,
     MAX_MISSION_CHARS,
     PERMISSION_MODES,
     STDERR_RING_LINES,
@@ -495,9 +496,30 @@ def _write_quick_exit_agent(tmp_path: Path) -> Path:
 
 
 def _make_supervisor(
-    script: Path, workdir: Path, *, max_agents: int = 4
+    script: Path,
+    workdir: Path,
+    *,
+    max_agents: int = 4,
+    on_change: Callable[[], None] | None = None,
 ) -> AgentSupervisor:
-    """Build a supervisor whose launch prefix points at a harmless script."""
+    """Build a supervisor whose launch prefix points at a harmless script.
+
+    Parameters
+    ----------
+    script:
+        Stand-in agent the children run instead of ``caucus.claude_agent``.
+    workdir:
+        Fixed working directory handed to the launcher policy.
+    max_agents:
+        Ceiling on concurrently running children.
+    on_change:
+        Optional roster-changed callback, for tests that count notifications.
+
+    Returns
+    -------
+    AgentSupervisor
+        An enabled supervisor that launches ``script``.
+    """
 
     class _FakeLaunchSupervisor(AgentSupervisor):
         """Supervisor launching ``script`` instead of the real agent module."""
@@ -509,6 +531,7 @@ def _make_supervisor(
     return _FakeLaunchSupervisor(
         LauncherConfig(enabled=True, cwd=workdir, max_agents=max_agents),
         "http://127.0.0.1:9/",
+        on_change,
     )
 
 
@@ -564,28 +587,12 @@ async def test_spawn_lists_and_kill_takes_down_the_process_group(
         await sup.shutdown()
 
 
-async def test_reap_records_the_exit_code(tmp_path: Path, workdir: Path) -> None:
-    """A child that dies on its own is collected with its status and stderr."""
-    sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
-    try:
-        record = await sup.spawn(AgentSpec(name="alpha"))
-        assert await _wait_for(lambda: record.process.returncode is not None)
-        await sup.reap()
-        assert record.exit_code == 3
-        assert not record.running
-        assert record.to_public()["state"] == "exited"
-        assert "fatal: nope" in " ".join(record.stderr_tail)
-    finally:
-        await sup.shutdown()
-
-
 async def test_exited_name_can_be_reused(tmp_path: Path, workdir: Path) -> None:
     """A name freed by an exited child accepts a fresh spawn."""
     sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
     try:
         first = await sup.spawn(AgentSpec(name="alpha"))
-        assert await _wait_for(lambda: first.process.returncode is not None)
-        await sup.reap()
+        assert await _wait_for(lambda: first.exit_code is not None)
         second = await sup.spawn(AgentSpec(name="alpha"))
         assert second.pid != first.pid
     finally:
@@ -605,10 +612,13 @@ async def test_stderr_ring_is_bounded(tmp_path: Path, workdir: Path) -> None:
     sup = _make_supervisor(script, workdir)
     try:
         record = await sup.spawn(AgentSpec(name="alpha"))
-        assert await _wait_for(lambda: record.process.returncode is not None)
-        await sup.reap()
+        assert await _wait_for(lambda: record.exit_code is not None)
+        # The reader drains to end of stream on its own; the exit only says the
+        # writer stopped, not that the pipe has been emptied.
+        assert await _wait_for(
+            lambda: bool(record.stderr_tail) and record.stderr_tail[-1] == "line 199"
+        )
         assert len(record.stderr_tail) == STDERR_RING_LINES
-        assert record.stderr_tail[-1] == "line 199"
     finally:
         await sup.shutdown()
 
@@ -658,11 +668,132 @@ async def test_on_change_fires_on_spawn_and_kill(
         await sup.shutdown()
 
 
-def test_signal_group_tolerates_a_dead_child(spy: _SpySupervisor) -> None:
-    """Signalling an already-reaped child is not an error."""
+def test_signal_group_tolerates_a_dead_child(
+    spy: _SpySupervisor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signalling an already-exited child is not an error, and skips the group.
+
+    The stub handle raises ``ProcessLookupError`` from ``send_signal``, which is
+    what a real :class:`asyncio.subprocess.Process` does once asyncio has torn
+    the transport down. That refusal is proof the pid no longer names our child,
+    so the process-group sweep must not run at all.
+    """
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        os, "killpg", lambda pgid, sig: signalled.append(pgid), raising=False
+    )
     record = _fake_record("alpha")
     record.pid = 2**30  # a pid that cannot exist
     spy._signal_group(record, signal.SIGTERM)  # must not raise
+    assert signalled == []
+
+
+async def test_kill_does_not_signal_a_child_that_already_exited(
+    tmp_path: Path, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that died on its own is never signalled by ``kill``.
+
+    This is the regression test for the recycled-pid bug: the supervisor used to
+    learn about an exit only from a 15-second hub sweep, so between the death
+    and the next sweep ``kill`` still believed the record was running and sent
+    ``SIGTERM`` to a process-group id the kernel was already free to reuse.
+    Nothing is swept here on purpose, so the only way the assertions hold is if
+    the supervisor noticed the exit by itself.
+    """
+    signalled: list[int] = []
+    monkeypatch.setattr(
+        os, "killpg", lambda pgid, sig: signalled.append(pgid), raising=False
+    )
+    sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        # Poll the process handle, not the record: the handle tells the truth in
+        # both the broken and the fixed supervisor, so this wait cannot mask the
+        # very difference the test is here to catch.
+        assert await _wait_for(lambda: record.process.returncode is not None)
+        await asyncio.sleep(0.05)  # one scheduling turn for the exit waiter
+
+        assert await sup.kill("alpha") is False
+        assert signalled == []
+    finally:
+        await sup.shutdown()
+
+
+async def test_exit_code_is_recorded_without_any_sweep(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """A child that dies on its own is collected with its status and stderr.
+
+    No sweep is called anywhere in this test. The per-child exit waiter records
+    the status on the same event-loop wake-up that resolves the process handle,
+    so the roster is right within a scheduling turn rather than within a sweep
+    interval.
+    """
+    sup = _make_supervisor(_write_quick_exit_agent(tmp_path), workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(lambda: record.process.returncode is not None)
+        await asyncio.sleep(0.05)
+
+        assert record.exit_code == 3
+        assert not record.running
+        assert record.to_public()["state"] == "exited"
+        assert "fatal: nope" in " ".join(record.stderr_tail)
+    finally:
+        await sup.shutdown()
+
+
+async def test_shutdown_leaves_no_reader_or_waiter_task(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """Teardown drops every per-child task, so nothing leaks past a hub's life.
+
+    One reader and one waiter are created per spawn. Left behind, they would
+    accumulate for as long as the hub runs.
+    """
+    sup = _make_supervisor(_write_fake_agent(tmp_path, tmp_path / "gc.pid"), workdir)
+    one = await sup.spawn(AgentSpec(name="one"))
+    two = await sup.spawn(AgentSpec(name="two"))
+    tasks = [sup._readers["one"], sup._readers["two"]]
+    tasks += [sup._waiters["one"], sup._waiters["two"]]
+
+    await sup.shutdown()
+
+    assert sup._readers == {}
+    assert sup._waiters == {}
+    assert all(task.done() for task in tasks)
+    assert one.exit_code is not None
+    assert two.exit_code is not None
+
+
+async def test_pruning_past_the_cap_never_cancels_the_running_waiter(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """Crossing the exited-record cap does not abort a waiter from inside itself.
+
+    An exit waiter calls ``_prune_exited`` on its own record's behalf, so once
+    enough children have died the prune can reach the very record whose waiter
+    is running. If that cancelled the current task, the bookkeeping after the
+    prune would silently stop happening. The roster-change count is the probe:
+    two notifications per child (one spawn, one exit) only add up if every
+    waiter ran to its end.
+    """
+    fired: list[int] = []
+    total = MAX_EXITED_RECORDS + 3
+    sup = _make_supervisor(
+        _write_quick_exit_agent(tmp_path), workdir, on_change=lambda: fired.append(1)
+    )
+    try:
+        for index in range(total):
+            record = await sup.spawn(AgentSpec(name=f"agent{index}"))
+            assert await _wait_for(lambda rec=record: rec.exit_code is not None)
+        await asyncio.sleep(0.05)
+
+        assert len(sup.list()) == MAX_EXITED_RECORDS
+        assert sup._waiters == {}
+        assert len(fired) == 2 * total
+    finally:
+        await sup.shutdown()
 
 
 # --- helpers -----------------------------------------------------------------
@@ -686,7 +817,12 @@ def _fake_record(name: str) -> AgentProcess:
 
         pid = 424242
         returncode: int | None = None
+        stdout = None
         stderr = None
+
+        def send_signal(self, sig: signal.Signals) -> None:
+            """Refuse like a real handle whose transport asyncio already closed."""
+            raise ProcessLookupError()
 
     return AgentProcess(
         spec=AgentSpec(name=name),

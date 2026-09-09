@@ -29,16 +29,30 @@ OBSERVER_TOKEN = "obs-secret"
 
 
 class _StubProcess:
-    """Stand-in for an :mod:`asyncio` process handle that owns no process."""
+    """Stand-in for an :mod:`asyncio` process handle that owns no process.
+
+    It models a child that stays alive until something signals it, because the
+    supervisor now watches every child with a per-record exit waiter: a handle
+    whose ``wait`` returned straight away would be marked exited the instant it
+    was spawned, and no endpoint test could ever kill one.
+    """
 
     def __init__(self, pid: int) -> None:
         self.pid = pid
         self.returncode: int | None = None
+        self.stdout = None
         self.stderr = None
+        self._exited = asyncio.Event()
+
+    def expire(self) -> None:
+        """Mark the fabricated child dead and release everyone waiting on it."""
+        if self.returncode is None:
+            self.returncode = 0
+        self._exited.set()
 
     async def wait(self) -> int:
-        """Report an immediate clean exit."""
-        self.returncode = 0
+        """Block until :meth:`expire` is called, then report a clean exit."""
+        await self._exited.wait()
         return 0
 
 
@@ -72,8 +86,11 @@ class _FakeSupervisor(AgentSupervisor):
         return _StubProcess(self._next_pid)  # type: ignore[return-value]
 
     def _signal_group(self, record: object, sig: object) -> None:  # type: ignore[override]
-        """Record the signal instead of delivering it to a process group."""
+        """Record the signal, then let the fabricated child die from it."""
         self.signals.append((getattr(record, "pid", 0), int(sig)))  # type: ignore[arg-type]
+        process = getattr(record, "process", None)
+        if isinstance(process, _StubProcess):
+            process.expire()
 
 
 @pytest.fixture

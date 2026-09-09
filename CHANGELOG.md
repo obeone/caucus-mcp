@@ -79,6 +79,19 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- **Killing an agent can no longer signal a process the kernel recycled.** The
+  supervisor learned about a child's death only from the hub's 15-second sweep,
+  so for up to that long a record still claimed to be running while the pid had
+  already been reaped and was free to be handed to an unrelated process. `DELETE
+  /agents/{name}` in that window sent `SIGTERM`, then `SIGKILL`, to whatever now
+  owned the number, with the hub user's privileges and no log line. Every child
+  now carries its own exit waiter, so the roster is right within a scheduling
+  turn instead of within a sweep, the periodic `reap()` is gone (it was a second
+  writer of the same field on a timer), and the group signal runs only after the
+  standard-library aliveness check has passed. That check's `ProcessLookupError`
+  is treated as proof the pid is stale, which narrows the remaining race to the
+  window between the check and the syscall.
+
 - **A contested join no longer floods the operator feed.** When a newcomer
   claimed a name a live listener still held, every refused `/register` pushed
   its own warning into the operator console and the bounded message log, and
