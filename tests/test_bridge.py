@@ -9,6 +9,8 @@ so stop-mode tests don't leak into their neighbours.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 
@@ -29,6 +31,7 @@ def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bridge_module, "_known_protocol_version", None)
     monkeypatch.setattr(bridge_module, "_protocol_text", None)
     monkeypatch.setattr(bridge_module, "_protocol_delivered", False)
+    monkeypatch.setattr(bridge_module, "_last_auto_rejoin_attempt", None)
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "reset"})
     return bridge_module
@@ -377,19 +380,24 @@ def test_tool_reports_hub_unreachable_when_arming_fails(
     assert bridge.whoami()["armed"] is False
 
 
-def test_tool_after_the_hub_forgot_the_token_reports_session_expired(
+def test_tool_after_the_hub_forgot_the_token_auto_rejoins_transparently(
     bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reaped, kicked or dropped peer must learn its session died.
+    """A reaped, kicked or dropped peer recovers without bothering the agent.
 
     The hub answers 401 for a token it no longer knows. That used to reach the
     agent as ``hub_unreachable`` carrying httpx's raw "Client error \'401
-    Unauthorized\'" text, which names neither the cause nor the remedy, so the
-    agent went looking for a hub outage that never happened.
+    Unauthorized\'" text, then later as a clean ``session_expired`` the agent
+    had to notice and fix by hand. Now the bridge tries one silent
+    :func:`~caucus.mcp_bridge._attempt_auto_rejoin` first: the call the agent
+    made just succeeds, exactly as if the session had never dropped.
 
     The peer is dropped here through the hub's own ``/leave`` (a terminal drop,
     like an operator kick) rather than by reaching into ``HubState`` from this
-    thread: the hub runs its event loop in another one.
+    thread: the hub runs its event loop in another one. ``/leave`` fully erases
+    the record, so the hub cannot revive the old identity — the auto-rejoin
+    lands as FRESH, minting a brand-new token, which is exactly the case where
+    the watcher (still holding the old one) needs a fresh command.
     """
     monkeypatch.setattr(bridge, "PROJECT", "forgotten-peer")
     assert bridge.join()["joined"] is True
@@ -399,26 +407,66 @@ def test_tool_after_the_hub_forgot_the_token_reports_session_expired(
         http.post("/leave", json={"token": stale_token})
 
     result = bridge.say("anyone still there?", to="all")
+    assert "error" not in result
+    assert result["message_id"]
+    # FRESH, not REAFFIRMED: /leave erased the record, so the hub minted a new
+    # identity rather than reviving the old one — the bridge must have noticed
+    # and swapped in the new token for this and every later call.
+    assert bridge._token is not None
+    assert bridge._token != stale_token
+    assert "watch" in result
+    assert "note" in result
+
+    # A second, differently-shaped tool must see the SAME recovered identity,
+    # proving the branch lives in the shared decorator and not in one tool
+    # body, and that the swapped-in token actually took.
+    assert "error" not in bridge.peek()
+
+
+def test_auto_rejoin_falls_back_to_session_expired_in_cooldown(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second recovery within the cooldown window must not hit the hub again.
+
+    One silent auto-rejoin per :data:`~caucus.mcp_bridge._AUTO_REJOIN_COOLDOWN_SECONDS`
+    is the point: a hub that keeps refusing this identity (or a genuinely
+    dead hub) must never turn into a retry loop. Forcing the cooldown clock to
+    "just fired" simulates the second 401 arriving right behind the first.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "forgotten-peer-2")
+    assert bridge.join()["joined"] is True
+    stale_token = bridge._token
+    assert stale_token is not None
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/leave", json={"token": stale_token})
+    # Pretend an auto-rejoin just happened, so the next one is in cooldown.
+    monkeypatch.setattr(bridge, "_last_auto_rejoin_attempt", time.monotonic())
+
+    result = bridge.say("anyone still there?", to="all")
     assert result["error"] == "session_expired"
-    assert result["joined_as"] == "forgotten-peer"
+    assert result["joined_as"] == "forgotten-peer-2"
     assert "join()" in str(result["hint"])
     assert "watch_command()" in str(result["hint"])
-    # The token is deliberately kept: join() re-presents it so the hub can match
-    # a reaped-but-revivable record and hand the same queue and channels back.
+    # No recovery attempted: the stale token is left exactly as join() leaves
+    # it, so a manual join() can still re-present it inside the grace window.
     assert bridge._token == stale_token
-    # A second, differently-shaped tool must reach the same verdict, proving the
-    # branch lives in the shared decorator and not in one tool body.
-    assert bridge.peek()["error"] == "session_expired"
 
 
 def test_join_after_a_session_expiry_restores_the_peer(
     bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The advertised remedy has to actually work: join() puts the peer back."""
+    """The advertised manual remedy still works when auto-rejoin does not fire.
+
+    The auto-rejoin cooldown is forced here so ``say()`` reports the classic
+    ``session_expired`` (see the dedicated auto-rejoin tests above for the
+    now-more-common transparent-recovery path); the manual ``join()`` remedy
+    the error's own ``hint`` advertises has to actually work regardless.
+    """
     monkeypatch.setattr(bridge, "PROJECT", "revived-peer")
     bridge.join()
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/leave", json={"token": bridge._token})
+    monkeypatch.setattr(bridge, "_last_auto_rejoin_attempt", time.monotonic())
     assert bridge.say("hello?", to="all")["error"] == "session_expired"
 
     assert bridge.join()["joined"] is True
