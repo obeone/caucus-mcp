@@ -9,6 +9,7 @@ captured by stubbing :func:`caucus.watch._emit`.
 from __future__ import annotations
 
 import threading
+import time
 
 import httpx
 import pytest
@@ -153,6 +154,51 @@ def test_watch_surfaces_message_and_exits_zero(
     assert not thread.is_alive()
     assert rc.get("code") == 0
     assert any("knock knock" in line for line in emitted)
+
+
+def test_watch_exits_when_another_listener_takes_the_slot(
+    live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A displaced watcher exits with a notice instead of spinning on refusals.
+
+    This is the leftover-watcher half of the single-consumer lease: the stale
+    process must go away by itself once its replacement is listening, and it
+    must say why on stdout, because the exit is what wakes the agent.
+    """
+    emitted: list[str] = []
+    lock = threading.Lock()
+
+    def _record(line: str) -> None:
+        with lock:
+            emitted.append(line)
+
+    monkeypatch.setattr(watch_module, "_emit", _record)
+
+    token = _register_peer(live_hub, "displaced-watcher")
+    rc: dict[str, int] = {}
+    thread = threading.Thread(
+        target=lambda: rc.setdefault("code", watch_module.watch(live_hub, token, 20.0)),
+        daemon=True,
+    )
+    thread.start()
+    # Let the watcher's first poll reach the hub and claim the slot.
+    time.sleep(0.5)
+
+    # A second listener (a relaunched watcher, say) takes the slot over.
+    with httpx.Client(base_url=live_hub, timeout=10.0) as http:
+        http.get(
+            "/receive",
+            params={"timeout": 0.2, "lease": "the-replacement"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    thread.join(timeout=10.0)
+    assert not thread.is_alive(), "displaced watch() did not exit"
+    assert rc.get("code") == 2
+    with lock:
+        assert len(emitted) == 1
+        assert emitted[0].startswith("[caucus] DISPLACED")
+        assert "do NOT relaunch" in emitted[0]
 
 
 def test_watch_returns_one_on_unknown_token(

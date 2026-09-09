@@ -201,12 +201,17 @@ class Inbound:
             CONTROL messages the operator aimed at this agent (distinct from the
             room-wide ``stop``); a connector that owns its event loop acts on
             them out of band (interrupt the current turn, reset the context).
+        already_listening: ``True`` when the hub refused the poll because
+            another consumer holds this token's single ``/receive`` slot (HTTP
+            409). The batch is empty and re-polling under the same lease will
+            be refused again, so the caller must stop rather than retry.
     """
 
     messages: list[dict[str, object]]
     mode: str | None
     stop: bool
     commands: list[str] = field(default_factory=list)
+    already_listening: bool = False
 
 
 @dataclass(slots=True)
@@ -468,7 +473,12 @@ class HubConnector:
         )
 
     async def receive(
-        self, token: str, timeout: float, *, ack_seq: int | None = None
+        self,
+        token: str,
+        timeout: float,
+        *,
+        ack_seq: int | None = None,
+        lease: str | None = None,
     ) -> Inbound:
         """Long-poll for inbound messages addressed to the token holder.
 
@@ -483,14 +493,26 @@ class HubConnector:
         pass it here on the next call; the hub then prunes its replay buffer and
         will not re-deliver those messages on reconnect.
 
+        A token has exactly one listener. Pass ``lease``, an id the caller
+        keeps stable for as long as it means to listen, and the hub hands the
+        slot to the newest lease it sees: a relaunched watcher takes over from
+        the process it replaced instead of splitting the queue with it. The
+        displaced caller's poll comes back with
+        :attr:`Inbound.already_listening` set (HTTP 409) and must stop polling;
+        deliberately re-acquiring the slot later means presenting a *fresh*
+        lease id, because a displaced one stays refused.
+
         Args:
             token: The access token to poll with.
             timeout: Per-poll long-poll ceiling in seconds (the hub caps it).
             ack_seq: Optional highest sequence number already processed by the
                 caller. Equivalent to calling :meth:`ack` before polling.
+            lease: Optional listening-session id. Omitted, the hub treats the
+                poll as a one-off consumer that takes the slot for its duration.
 
         Returns:
-            An :class:`Inbound` batch; ``messages`` is empty on a quiet poll.
+            An :class:`Inbound` batch; ``messages`` is empty on a quiet poll and
+            on a refused one (``already_listening``).
 
         Raises:
             httpx.HTTPError: If the hub is unreachable or returns an error.
@@ -501,11 +523,21 @@ class HubConnector:
         params: dict[str, str | int | float | bool | None] = {"timeout": timeout}
         if ack_seq is not None:
             params["ack_seq"] = ack_seq
+        if lease is not None:
+            params["lease"] = lease
         resp = await http.get(
             "/receive",
             params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
+        if resp.status_code == 409:
+            # Another consumer holds the slot. Surfaced as a flag rather than an
+            # exception so the caller can shut its poll loop down cleanly, the
+            # way it does for a room-wide stop.
+            logger.warning("receive refused: another listener holds this token")
+            return Inbound(
+                messages=[], mode=None, stop=False, already_listening=True
+            )
         resp.raise_for_status()
         payload = resp.json()
         raw = payload.get("messages", [])

@@ -32,6 +32,7 @@ import functools
 import json
 import logging
 import os
+import secrets
 import sys
 import tempfile
 import threading
@@ -115,6 +116,14 @@ _protocol_delivered: bool = False
 # separate round-trip. Resets to 0 when the process starts; the hub handles
 # cross-session replay via the token-keyed unacked buffer.
 _last_acked_seq: int = 0
+
+# Lease id this session polls ``/receive`` under, minted lazily on the first
+# :func:`listen` and kept while it keeps working: the hub allows one consumer
+# per token, and re-presenting the same id says "same listener" rather than
+# "second consumer". Cleared on a refusal and on :func:`leave`, so the next
+# listen deliberately re-acquires the slot with a fresh id (a displaced id stays
+# refused, which is what stops two processes trading the slot forever).
+_listen_lease: str | None = None
 
 
 # The process-wide HTTP client, created on first use. One client per bridge
@@ -709,8 +718,11 @@ def leave() -> dict[str, object]:
     gate = _ensure_armed()
     if gate is not None:
         return gate
-    global _token, _joined_as
+    global _token, _joined_as, _listen_lease
     token, name, _joined_as, _token = _token, _joined_as, None, None
+    # The identity is gone, so the lease minted under it is meaningless; a later
+    # re-join listens under a fresh one.
+    _listen_lease = None
     if token is not None:
         try:
             with _client() as http:
@@ -1019,13 +1031,15 @@ def decisions(limit: int = 20) -> dict[str, object]:
 @mcp.tool()
 @_resilient_hub_call
 def listen(timeout: float = 30.0) -> dict[str, object]:
-    """Long-poll up to `timeout` (optional, default 30.0)s for messages to this agent or broadcast. Requires join. Empty `messages`: poll again. `stop:true`: operator halted the room, end the exchange. Auto-ACKs the previous batch. Errors: not_joined."""
+    """Long-poll up to `timeout` (default 30.0s) for messages to this agent or broadcast. Requires join. Empty `messages`: poll again. `stop:true`: operator halted the room, end the exchange. Auto-ACKs the previous batch. Errors: not_joined, already_listening."""
     gate = _ensure_armed()
     if gate is not None:
         return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
-    global _last_acked_seq
+    global _last_acked_seq, _listen_lease
+    if _listen_lease is None:
+        _listen_lease = secrets.token_urlsafe(8)
     with _client() as http:
         # Token in the Authorization header, not the URL query string: a query
         # token on this GET leaks into httpx and server access logs.
@@ -1033,11 +1047,31 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
         params: dict[str, str | int | float | bool | None] = {"timeout": timeout}
         if _last_acked_seq:
             params["ack_seq"] = _last_acked_seq
+        # The lease keeps this session's successive listens looking like one
+        # consumer to the hub, which allows exactly one per token.
+        params["lease"] = _listen_lease
         resp = http.get(
             "/receive",
             params=params,
             headers={"Authorization": f"Bearer {_token}"},
         )
+        if resp.status_code == 409:
+            # A watcher (or another process on this token) holds the slot. Drop
+            # the lease so a deliberate later listen() re-acquires with a fresh
+            # id, and hand the agent a plain instruction instead of an
+            # exception: retrying this call is refused, the fix is to decide
+            # which listener should own the slot.
+            _listen_lease = None
+            logger.warning("listen refused: another listener holds this token")
+            return {
+                "error": "already_listening",
+                "hint": (
+                    "another listener holds this session's inbound slot"
+                    " (usually your background watcher). Read what it prints"
+                    " instead of polling here; stop it first if you really"
+                    " want to listen() yourself."
+                ),
+            }
         resp.raise_for_status()
         payload = resp.json()
     messages = payload.get("messages", [])
