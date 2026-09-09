@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 from pydantic import Field as PydField
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for the type checker
@@ -491,6 +491,30 @@ class ControlRequest(BaseModel):
     """Body for ``POST /control``."""
 
     action: str  # pause | resume | stop | reset
+
+
+class SpawnAgentRequest(BaseModel):
+    """Body for ``POST /agents`` — the operator launches one native agent.
+
+    Deliberately small. There is no working-directory field and no free-form
+    argument list: the working directory is hub policy fixed at startup, and
+    raw argv would hand an operator flags the supervisor has never reviewed.
+    Unknown keys are rejected rather than ignored, so a console sending a field
+    this hub does not implement gets a clear ``422`` instead of a silently
+    dropped setting.
+
+    Every value here is re-validated by
+    :meth:`caucus.supervisor.AgentSupervisor.spawn`; the bounds below only keep
+    an oversized body from reaching it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = PydField(min_length=1, max_length=64)
+    mission: str | None = PydField(default=None, max_length=4000)
+    type: str = "talker"
+    permission_mode: str = "auto"
+    model: str | None = PydField(default=None, max_length=100)
 
 
 class AckRequest(BaseModel):
