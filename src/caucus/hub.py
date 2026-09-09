@@ -673,6 +673,32 @@ def _agent_hub_url() -> str:
     return f"http://{host}:{server_config.port}"
 
 
+def _peer_msg_count(name: str) -> int | None:
+    """Return how many messages the peer called ``name`` has sent.
+
+    Read-time probe handed to :class:`~caucus.supervisor.AgentSupervisor`, which
+    must not hold any hub state of its own. The module global ``state`` is
+    resolved on each call so a swapped-in instance (tests, ``/control reset``)
+    is honoured.
+
+    Parameters
+    ----------
+    name:
+        The project name to look up.
+
+    Returns
+    -------
+    int or None
+        The peer's sent-message count, or ``None`` when the room has no peer
+        under that name.
+    """
+    info = state.peer_info(name)
+    if info is None:
+        return None
+    count = info.get("msg_count")
+    return count if isinstance(count, int) else None
+
+
 def _agent_roster() -> list[dict[str, object]]:
     """Return the agent roster for transport, without any child output.
 
@@ -727,8 +753,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             _agent_hub_url(),
             _broadcast_agents,
             # One-directional and read-only: the roster asks the room whether a
-            # peer of that name exists, and never writes anything back.
+            # peer of that name exists and how much it has said, and never
+            # writes anything back.
             peer_exists=lambda name: state.peer_info(name) is not None,
+            peer_msg_count=_peer_msg_count,
         )
     try:
         async with contextlib.AsyncExitStack() as stack:
@@ -2183,9 +2211,14 @@ async def list_agents(
     apart from its diagnostics.
 
     Each row carries ``peer_known``, saying whether the room currently has a
-    peer registered under that name. That annotation is the only link between a
-    process and hub state, it is computed at read time, and nothing is written
-    back: reconciliation here is one-directional and read-only by design.
+    peer registered under that name, and ``msg_count``, how many messages that
+    peer has sent. Those two annotations are the only link between a process and
+    hub state, they are computed at read time, and nothing is written back:
+    reconciliation here is one-directional and read-only by design. Together
+    they are what exposes a phantom: a wedged child keeps long-polling, so its
+    ``last_seen`` stays fresh and nothing else in the row looks wrong, but a
+    running agent the room knows with a ``msg_count`` of zero and a climbing
+    uptime has never said a word.
 
     Args:
         authorization: ``Authorization: Bearer <token>`` header, required (and

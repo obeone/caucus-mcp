@@ -12,6 +12,14 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **The agent roster shows each peer's `msg_count`.** Nothing in a row told a
+  phantom from a healthy agent: a wedged child keeps long-polling, so its peer's
+  `last_seen` stays fresh and every field reads fine. Rows now carry the peer's
+  sent-message count beside `peer_known`, read at render time through a probe
+  like the existing one, so the supervisor still writes nothing into `HubState`.
+  A row that says running, `peer_known` true, `msg_count` zero and a climbing
+  uptime is an agent that joined and has never spoken.
+
 - **A spawned agent's stdout is captured, not discarded.** Children were started
   with `stdout=DEVNULL`, so when one was wedged its own account of why went
   straight to the bit bucket; the diagnosis of the `plan` mode failure above came

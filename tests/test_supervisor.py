@@ -64,8 +64,15 @@ class _SpySupervisor(AgentSupervisor):
         on_change: Callable[[], None] | None = None,
         *,
         peer_exists: Callable[[str], bool] | None = None,
+        peer_msg_count: Callable[[str], int | None] | None = None,
     ) -> None:
-        super().__init__(config, hub_url, on_change, peer_exists=peer_exists)
+        super().__init__(
+            config,
+            hub_url,
+            on_change,
+            peer_exists=peer_exists,
+            peer_msg_count=peer_msg_count,
+        )
         self.calls = []
 
     async def _spawn_process(
@@ -471,22 +478,63 @@ def test_to_public_includes_output_only_on_request() -> None:
     assert row["stderr"] == ["secret-looking stderr line"]
 
 
-def test_roster_annotates_peer_known(workdir: Path) -> None:
-    """The roster reports whether the hub knows a peer of that name.
+def test_roster_annotates_peer_known_and_msg_count(workdir: Path) -> None:
+    """The roster reports what the room knows about each child's peer.
 
-    That annotation is the only link between a process and hub state, and it is
-    computed at read time; nothing is ever written back into the hub.
+    Those two annotations are the only link between a process and hub state, and
+    both are computed at read time; nothing is ever written back into the hub.
     """
+    counts = {"alpha": 7}
     sup = _SpySupervisor(
         LauncherConfig(enabled=True, cwd=workdir),
         "http://127.0.0.1:9/",
         peer_exists=lambda name: name == "alpha",
+        peer_msg_count=counts.get,
     )
     sup._agents["alpha"] = _fake_record("alpha")
     sup._agents["beta"] = _fake_record("beta")
     rows = {str(row["name"]): row for row in sup.roster()}
     assert rows["alpha"]["peer_known"] is True
+    assert rows["alpha"]["msg_count"] == 7
     assert rows["beta"]["peer_known"] is False
+    assert rows["beta"]["msg_count"] is None
+
+
+def test_roster_shows_a_phantom_as_known_but_silent(workdir: Path) -> None:
+    """A child that joined and never spoke is legible from the row alone.
+
+    A wedged agent keeps long-polling, so ``last_seen`` stays fresh and every
+    other field reads healthy. Running plus known plus a zero send count is the
+    only combination that gives it away.
+    """
+    sup = _SpySupervisor(
+        LauncherConfig(enabled=True, cwd=workdir),
+        "http://127.0.0.1:9/",
+        peer_exists=lambda name: True,
+        peer_msg_count=lambda name: 0,
+    )
+    sup._agents["alpha"] = _fake_record("alpha")
+    row = sup.roster()[0]
+    assert row["state"] == "running"
+    assert row["peer_known"] is True
+    assert row["msg_count"] == 0
+
+
+def test_roster_survives_a_broken_msg_count_probe(workdir: Path) -> None:
+    """A probe that raises costs the annotation, never the roster."""
+
+    def _boom(name: str) -> int | None:
+        raise RuntimeError("hub state is mid-swap")
+
+    sup = _SpySupervisor(
+        LauncherConfig(enabled=True, cwd=workdir),
+        "http://127.0.0.1:9/",
+        peer_msg_count=_boom,
+    )
+    sup._agents["alpha"] = _fake_record("alpha")
+    row = sup.roster()[0]
+    assert row["name"] == "alpha"
+    assert row["msg_count"] is None
 
 
 # --- real process lifecycle --------------------------------------------------
