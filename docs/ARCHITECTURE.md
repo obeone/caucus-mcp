@@ -482,7 +482,13 @@ enable the launcher without a token is what makes the request-time check real.
   (default 8) children run at once; each child keeps a 20-line stderr ring.
 - **Own process group.** `start_new_session=True`, and a kill sends `SIGTERM`
   to the group then `SIGKILL` after 5 seconds. The Agent SDK spawns its own
-  `claude` CLI child, so signalling only the direct child would orphan it.
+  `claude` CLI child, so signalling only the direct child would orphan it. The
+  group signal is preceded by the standard library's own `send_signal`, whose
+  `ProcessLookupError` is taken as proof the pid is stale and stops the group
+  sweep from running at all. That narrows the recycled-pid race rather than
+  closing it: there is no portable way to signal a process group by handle
+  (`pidfd_send_signal` targets a process, and its process-group flag needs
+  Linux 6.9).
 
 ### What it deliberately is not
 
@@ -497,8 +503,11 @@ enable the launcher without a token is what makes the request-time check real.
 
 ### Wiring
 
-- Built in the hub `lifespan` and shut down in its teardown; the reap folds into
-  the existing reaper sweep rather than adding a task.
+- Built in the hub `lifespan` and shut down in its teardown. Each child carries
+  two tasks of its own, an output reader and an exit waiter, and no periodic
+  sweep: an exit must be recorded the moment asyncio observes it, because once a
+  child is reaped its pid can be reused and a stale "running" record is a record
+  a kill would signal at somebody else's process.
 - REST only: `GET /agents`, `POST /agents`, `DELETE /agents/{name}`, each gated
   exactly like `POST /control` (Origin, bearer token, `operator` role). There is
   no inbound `/ui` command, because a socket authenticates once at handshake

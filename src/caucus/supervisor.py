@@ -423,6 +423,10 @@ class AgentSupervisor:
         self._peer_exists = peer_exists
         self._agents: dict[str, AgentProcess] = {}
         self._readers: dict[str, asyncio.Task[None]] = {}
+        # One exit waiter per child, so an exit is recorded the moment asyncio
+        # sees it rather than whenever something next happens to sweep. Owned
+        # exactly like ``_readers``: created in spawn, dropped with the record.
+        self._waiters: dict[str, asyncio.Task[None]] = {}
         # Serialises the check-then-launch window so two concurrent operator
         # requests cannot both pass the max_agents test and overshoot it.
         self._lock = asyncio.Lock()
@@ -701,6 +705,11 @@ class AgentSupervisor:
             self._readers[spec.name] = asyncio.create_task(
                 self._drain_stderr(record), name=f"caucus-agent-stderr-{spec.name}"
             )
+            # The exit waiter is what keeps ``record.running`` honest. Created
+            # here, next to the reader, so no child can ever exist without one.
+            self._waiters[spec.name] = asyncio.create_task(
+                self._await_exit(record), name=f"caucus-agent-exit-{spec.name}"
+            )
         logger.warning(
             "spawned agent name=%s pid=%d type=%s permission_mode=%s",
             spec.name,
@@ -736,34 +745,53 @@ class AgentSupervisor:
         except Exception:  # pragma: no cover - a broken pipe must not kill the hub
             logger.exception("stderr reader failed for agent %s", record.spec.name)
 
-    async def reap(self) -> None:
-        """Collect children that have exited and refresh the roster.
+    async def _await_exit(self, record: AgentProcess) -> None:
+        """Record one child's exit the instant asyncio observes it.
 
-        Called from the hub's existing reaper loop rather than from a task of
-        its own, so the launcher adds no background work to a hub that never
-        spawns anything.
+        This is the *only* thing that keeps :attr:`AgentProcess.running` honest
+        outside a deliberate kill. It replaced a periodic sweep, and the reason
+        is a real hazard rather than latency: once a child dies, asyncio's child
+        watcher reaps it, and the kernel is immediately free to hand that pid to
+        an unrelated process. A record that still claims to be running is a
+        record :meth:`kill` will happily signal, with the hub user's privileges,
+        at whatever now owns the number.
+
+        The statement order below is load-bearing:
+
+        1. ``record.exit_code`` is assigned first, with nothing fallible before
+           it. Anything that could raise in front of the assignment would, on
+           that raise, leave the record marked running forever, which is exactly
+           the bug this method exists to remove.
+        2. The waiter drops itself from ``_waiters`` *before* pruning, because
+           :meth:`_prune_exited` may drop this very record once the exited-record
+           cap is crossed, and a waiter must never cancel the task it is running
+           in.
+        3. The remaining bookkeeping is wrapped, so a failing roster callback
+           costs a log line rather than the record's accuracy.
+
+        Concurrent waiting is safe: :meth:`asyncio.subprocess.Process.wait`
+        keeps a list of exit waiters, so :meth:`_terminate` awaiting the same
+        handle is not a conflict.
+
+        Parameters
+        ----------
+        record:
+            The child to watch until it exits.
         """
-        changed = False
-        for record in list(self._agents.values()):
-            if not record.running:
-                continue
-            if record.process.returncode is None:
-                continue
-            # returncode is already set, so wait() returns immediately; call it
-            # anyway so asyncio releases the transport rather than leaving a
-            # zombie behind.
-            record.exit_code = await record.process.wait()
-            await self._stop_reader(record.spec.name)
+        code = await record.process.wait()
+        record.exit_code = code
+        self._waiters.pop(record.spec.name, None)
+        try:
             logger.warning(
                 "agent exited name=%s pid=%d exit_code=%s",
                 record.spec.name,
                 record.pid,
-                record.exit_code,
+                code,
             )
-            changed = True
-        if changed:
             self._prune_exited()
             self._notify()
+        except Exception:  # pragma: no cover - bookkeeping must not lose the code
+            logger.exception("post-exit bookkeeping failed for %s", record.spec.name)
 
     async def kill(self, name: str) -> bool:
         """Terminate a running child and its process group.
@@ -810,6 +838,10 @@ class AgentSupervisor:
         record:
             The running child to take down.
         """
+        # Retire the exit waiter before signalling. This method records the exit
+        # code itself, and a waiter woken by the same death would fire a second
+        # roster notification for one operator action.
+        await self._stop_waiter(record.spec.name)
         self._signal_group(record, signal.SIGTERM)
         try:
             record.exit_code = await asyncio.wait_for(
@@ -833,11 +865,25 @@ class AgentSupervisor:
 
     @staticmethod
     def _signal_group(record: AgentProcess, sig: signal.Signals) -> None:
-        """Send ``sig`` to a child's whole process group, tolerating a race.
+        """Send ``sig`` to a child's whole process group, checking liveness first.
 
         ``start_new_session=True`` makes the child a session leader, so its
         process-group id equals its pid; that identity is used directly rather
         than calling ``os.getpgid``, which would race a child that just exited.
+
+        The order of the two calls is the point. ``send_signal`` on an
+        :class:`asyncio.subprocess.Process` refuses, with
+        :class:`ProcessLookupError`, once asyncio has finished with the child,
+        and **that refusal is treated as proof the pid is stale**, not merely as
+        a nicer error path: the group sweep below is skipped entirely. Doing it
+        the other way round is what let a ``killpg`` land on a pid the kernel had
+        already recycled, since ``killpg`` on a recycled pid reaches a live and
+        entirely unrelated process group and reports nothing wrong.
+
+        Honesty about what this does not do: it narrows the race to the window
+        between the check and the ``killpg`` syscall, it does not close it. There
+        is no portable way to close it. ``pidfd_send_signal`` targets a process
+        rather than a group, and its process-group flag needs Linux 6.9 or newer.
 
         Parameters
         ----------
@@ -846,16 +892,24 @@ class AgentSupervisor:
         sig:
             The signal to deliver.
         """
-        killpg = getattr(os, "killpg", None)
         try:
-            if killpg is None:  # pragma: no cover - Windows has no process groups
-                record.process.send_signal(sig)
-            else:
-                killpg(record.pid, sig)
+            record.process.send_signal(sig)
+        except ProcessLookupError:
+            # Known dead. Do not fall through to killpg: the pid may already
+            # belong to somebody else's process group.
+            return
         except OSError as exc:
-            # Already gone, or reaped between the check and the signal. Not an
-            # error: the goal (no such process) is met.
             logger.debug("signal %s to agent %s: %s", sig, record.spec.name, exc)
+            return
+        killpg = getattr(os, "killpg", None)
+        if killpg is None:  # pragma: no cover - Windows has no process groups
+            return
+        try:
+            # Group sweep, so the ``claude`` CLI the Agent SDK spawns underneath
+            # the child goes down with it instead of being orphaned.
+            killpg(record.pid, sig)
+        except OSError as exc:
+            logger.debug("group signal %s to agent %s: %s", sig, record.spec.name, exc)
 
     async def _stop_reader(self, name: str) -> None:
         """Cancel and await the stderr reader task for ``name``, if any."""
@@ -866,15 +920,45 @@ class AgentSupervisor:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    async def _stop_waiter(self, name: str) -> None:
+        """Cancel and await the exit waiter task for ``name``, if any.
+
+        Mirrors :meth:`_stop_reader`. Never call this from inside
+        :meth:`_await_exit`: a task that awaits its own cancellation hangs.
+        """
+        task = self._waiters.pop(name, None)
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
     def _prune_exited(self) -> None:
         """Drop the oldest exited records past :data:`MAX_EXITED_RECORDS`.
 
         Exited records stay visible so the operator can read why a child died,
-        but they must not accumulate for the life of the hub.
+        but they must not accumulate for the life of the hub. The per-child
+        reader and waiter tasks are dropped with the record they describe, so
+        neither registry outlives its roster entry.
+
+        The ``current_task`` comparison is not defensive padding. This method is
+        called from inside :meth:`_await_exit`, on behalf of the record that just
+        exited, so the record being pruned can be the one whose waiter is running
+        right now. Cancelling that task would abort the caller mid-way through
+        its own bookkeeping.
         """
+        try:
+            current: asyncio.Task[object] | None = asyncio.current_task()
+        except RuntimeError:  # pragma: no cover - only outside a running loop
+            current = None
         exited = [rec for rec in self.list() if not rec.running]
         for record in exited[: max(0, len(exited) - MAX_EXITED_RECORDS)]:
-            self._agents.pop(record.spec.name, None)
+            name = record.spec.name
+            self._agents.pop(name, None)
+            for registry in (self._readers, self._waiters):
+                task = registry.pop(name, None)
+                if task is not None and task is not current:
+                    task.cancel()
 
     async def shutdown(self) -> None:
         """Kill every running child. Called from the hub's lifespan teardown.
@@ -893,6 +977,11 @@ class AgentSupervisor:
                 logger.exception("failed to stop agent %s", record.spec.name)
         for name in list(self._readers):
             await self._stop_reader(name)
+        # Waiters outlive their records only on the exit path (a waiter drops
+        # itself), so this sweep is what stops a hub from leaking one task per
+        # spawn when children are still alive at teardown.
+        for name in list(self._waiters):
+            await self._stop_waiter(name)
         self._notify()
 
     def _notify(self) -> None:

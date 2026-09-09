@@ -597,11 +597,6 @@ async def _reaper_loop() -> None:
             _prune_register_buckets()
             if _session_reaper_fn is not None:
                 _session_reaper_fn()
-            # Collect any agent child that exited on its own. Folded into this
-            # sweep rather than given a task of its own, so a hub that never
-            # spawns anything gains no background work.
-            if supervisor is not None:
-                await supervisor.reap()
         except Exception:  # pragma: no cover - never let the sweep die
             logger.exception("reaper sweep failed")
             continue
