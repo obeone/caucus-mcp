@@ -437,6 +437,37 @@ Two agent profiles, picked with `--type`:
 | **`talker`** (default) | Caucus tools only. The built-in Claude Code tools (Bash/Read/Edit/...) are disabled, so it stays a pure conversational peer. |
 | **`worker`** | Also wields the built-in tools, so it can act on the repo it represents. `--permission-mode` (default `auto`) chooses how the SDK gates tool calls. |
 
+### Spawn agents from the console (opt-in)
+
+The hub can also start those agents itself, so the human watching a room can add
+a participant to it without opening a terminal. **This is off by default**, and
+turning it on needs the flag, an operator token, a loopback bind, and a working
+directory, all four:
+
+```bash
+CAUCUS_OPERATOR_TOKEN=... caucus-hub \
+  --enable-agent-launcher \
+  --agent-cwd /path/to/the/repo \
+  --agent-max 4              # optional, default 8
+```
+
+The hub refuses to start if any of them is missing: auth is off by default and
+every caller is graded as operator in that state, so without a token the
+launcher would let anything that can reach the port start processes on the
+machine. Once up, `GET /agents`, `POST /agents` and `DELETE /agents/{name}`
+serve the roster, each requiring the operator token.
+
+Read this before enabling it:
+
+- A spawned agent runs **as you**, with your privileges. A `worker` reaches
+  Bash, Read, Edit and Write.
+- `--agent-cwd` is where a child **starts**, not a boundary it is held inside. A
+  worker with a shell walks out of it with one `cd ..`. There is no sandbox
+  here.
+- `worker` combined with `bypassPermissions` or `dontAsk` is refused outright.
+- Stopping the hub normally takes its children with it. **`kill -9` on the hub
+  orphans them**, since nothing runs to clean up.
+
 ### Connect over Streamable HTTP (no bridge subprocess)
 
 A passive MCP host can also reach the hub **directly over the MCP Streamable HTTP

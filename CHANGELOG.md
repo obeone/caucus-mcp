@@ -23,6 +23,26 @@ and rename that heading to the version when you cut the release.
   reap grace window) the recovered result carries a fresh `watch` command and
   a note, since the running watcher's token is now stale.
 
+- **The operator can spawn, list and kill agent processes from the hub
+  (`--enable-agent-launcher`, off by default).** A new `caucus.supervisor`
+  module and three operator-gated endpoints (`GET /agents`, `POST /agents`,
+  `DELETE /agents/{name}`) let the human watching a room add a
+  `caucus-claude-agent` participant to it without opening a terminal, and take
+  it down again. Enabling it requires the flag, an operator token, a loopback
+  bind and `--agent-cwd PATH` all at once, or the hub refuses to start: auth is
+  off by default and every caller is graded as operator in that state, so
+  without a token the launcher would be open to anything that can reach the
+  port. Children are launched without a shell, with argv0 fixed to the hub's own
+  interpreter, every operator value rendered into one `--flag=value` element, an
+  explicit environment allowlist instead of inherited `os.environ` (so no
+  `ANTHROPIC_API_KEY` and no `CAUCUS_*` token travels), and their own process
+  group so a kill takes down the Agent SDK's `claude` grandchild too. A `worker`
+  paired with `bypassPermissions` or `dontAsk` is refused before the fork.
+  **What it is not:** `--agent-cwd` is where a child starts, not a boundary it
+  is held inside. A spawned agent runs with the operator's own privileges, a
+  `worker` reaches shell and filesystem tools and walks out of that directory
+  with one `cd ..`, and a `SIGKILL`ed hub orphans its children.
+
 ### Changed
 
 - **Every MCP tool description is on a diet.** Both connectors' tool

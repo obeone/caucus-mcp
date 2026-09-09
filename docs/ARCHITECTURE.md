@@ -176,6 +176,14 @@ denominator; everything else is a connector to it.
   real reachable URL. Opt-in, localhost by default, with `transport_security`
   guarding against DNS-rebinding. The MCP session manager runs inside the hub
   lifespan, mirroring the disk-log wiring.
+- **`supervisor.py`** (no script): the operator agent launcher, off unless the
+  hub is started for it. `AgentSupervisor` spawns, lists and kills
+  `caucus-claude-agent` child processes on behalf of an authenticated operator,
+  behind a deliberately narrow envelope (no shell, no caller-supplied argv0, an
+  environment allowlist rather than inheritance, its own process group). It owns
+  nothing in `HubState`. Full detail, including what it explicitly does *not*
+  guarantee, in [Agent launcher](#agent-launcher-supervisorpy-off-by-default)
+  below.
 
 ## Data flow
 
@@ -401,6 +409,85 @@ scope: while held, every non-holder's send to that scope is refused with 423.
 Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
 (`floor(action="raise")` → handed the floor) rather than backing off or stopping.
+
+## Agent launcher (`supervisor.py`), off by default
+
+`AgentSupervisor` lets an authenticated operator spawn, list and kill
+`caucus-claude-agent` processes from the console, so the human watching a room
+can add a participant to it. It is the only place in the package that turns a
+click into an operating-system process, and it is disabled unless a hub is
+explicitly started for it.
+
+### Boot gate
+
+Three conditions, all required, checked once in `main()`:
+
+- `--enable-agent-launcher`
+- `--operator-token` (or `CAUCUS_OPERATOR_TOKEN`)
+- a loopback `--host`
+
+Plus `--agent-cwd PATH`, the single directory every child starts in.
+Any violation exits with a plain message rather than starting a degraded hub.
+
+The operator token is not optional paranoia. Hub auth is off by default, and
+`AuthConfig.role_for` grades *every* caller as `operator` in that state, so a
+per-request "operator only" check gates nothing on a default hub. Refusing to
+enable the launcher without a token is what makes the request-time check real.
+
+### Safety envelope
+
+- **No shell, no caller-supplied argv0.** The child is always
+  `sys.executable -m caucus.claude_agent`, launched with
+  `create_subprocess_exec`.
+- **No caller-controlled flags.** Each operator value is rendered into one
+  `--flag=value` argv element, so a value starting with a dash can never be read
+  as an option, and a trailing `--` terminates option parsing.
+- **No inherited environment.** The child environment is rebuilt from
+  `CHILD_ENV_ALLOWLIST`. `ANTHROPIC_API_KEY` and every `CAUCUS_*` variable the
+  hub holds are deliberately excluded; a child authenticates through the Claude
+  CLI's own on-disk credentials under `HOME`.
+- **No unguarded worker.** `worker` plus `bypassPermissions` or `dontAsk` is
+  refused before the fork. `claude_agent.main()` refuses it too, but relying on
+  the child would turn a clean 400 into a process that dies with an opaque
+  status.
+- **Bounded.** Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and may not
+  collide with a running child or a name the room already knows; missions are
+  capped at 4000 characters and rejected on a NUL byte; at most `--agent-max`
+  (default 8) children run at once; each child keeps a 20-line stderr ring.
+- **Own process group.** `start_new_session=True`, and a kill sends `SIGTERM`
+  to the group then `SIGKILL` after 5 seconds. The Agent SDK spawns its own
+  `claude` CLI child, so signalling only the direct child would orphan it.
+
+### What it deliberately is not
+
+- **The working directory is a starting point, not a containment boundary.** A
+  `worker` reaches Bash, Read, Edit and Write, and can walk anywhere the hub's
+  own user can with a single `cd ..`. That is why the cwd is one fixed value
+  rather than an allowlist: an allowlist would advertise a guarantee that does
+  not exist. A spawned agent runs with the operator's own privileges.
+- **A `SIGKILL`ed hub orphans its children.** Teardown runs from the lifespan
+  `finally`, so `SIGINT`/`SIGTERM` take the children down; there is no signal
+  handler, and nothing survives `kill -9` to clean up.
+
+### Wiring
+
+- Built in the hub `lifespan` and shut down in its teardown; the reap folds into
+  the existing reaper sweep rather than adding a task.
+- REST only: `GET /agents`, `POST /agents`, `DELETE /agents/{name}`, each gated
+  exactly like `POST /control` (Origin, bearer token, `operator` role). There is
+  no inbound `/ui` command, because a socket authenticates once at handshake
+  time and then accepts frames for as long as it stays open, which is a wider
+  window than process creation deserves.
+- Outbound only on `/ui`: an `{"type": "agents", "agents": [...]}` event on every
+  roster change, and the same roster inside `snapshot`. Observers see these, so
+  they never carry child stderr; the stderr tail is served from the
+  operator-gated `GET /agents` alone, and no payload ever carries the working
+  directory or the child environment.
+- **Reconciliation is one-directional and read-only.** Process facts are never
+  written into `HubState`: tests swap that state wholesale and `/control reset`
+  wipes it, so an OS side effect keyed on either would orphan a real process.
+  Each roster row carries `peer_known`, computed at read time, and that is the
+  only link between a process and the room.
 
 ## Operator dashboard
 
