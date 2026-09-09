@@ -789,15 +789,20 @@ class AgentSupervisor:
                 process=process,
             )
             self._agents[spec.name] = record
-            self._prune_exited()
-            self._readers[spec.name] = asyncio.create_task(
-                self._drain_output(record), name=f"caucus-agent-output-{spec.name}"
-            )
-            # The exit waiter is what keeps ``record.running`` honest. Created
-            # here, next to the reader, so no child can ever exist without one.
+            # Order here is load-bearing, do not tidy it. Nothing fallible may
+            # run between the record existing and the task that watches it: the
+            # waiter is the only thing that keeps ``record.running`` honest, and
+            # a raise before it is created (``_prune_exited`` below is a real
+            # candidate) would leave a live child with no observer, permanently
+            # marked running in a roster nobody can correct. Watch first, then
+            # do the housekeeping.
             self._waiters[spec.name] = asyncio.create_task(
                 self._await_exit(record), name=f"caucus-agent-exit-{spec.name}"
             )
+            self._readers[spec.name] = asyncio.create_task(
+                self._drain_output(record), name=f"caucus-agent-output-{spec.name}"
+            )
+            self._prune_exited()
         logger.warning(
             "spawned agent name=%s pid=%d type=%s permission_mode=%s",
             spec.name,
@@ -951,20 +956,25 @@ class AgentSupervisor:
     async def _terminate(self, record: AgentProcess) -> None:
         """Signal one child's process group and wait for it to die.
 
+        This method deliberately does **not** write ``exit_code``. The waiter is
+        the single authority for that field, on the kill path as much as on the
+        natural-exit one, and the reason is cancellation: this coroutine runs
+        inside an HTTP handler, which the server cancels when the operator's
+        browser drops the connection. An earlier shape retired the waiter first
+        and assigned the field itself, so a cancellation landing between the two
+        left a child that was signalled, died, and stayed marked running in the
+        roster forever, with nothing to correct it. Leaving the waiter alone
+        makes that impossible: whatever happens to this coroutine, something is
+        still watching the process.
+
         Parameters
         ----------
         record:
             The running child to take down.
         """
-        # Retire the exit waiter before signalling. This method records the exit
-        # code itself, and a waiter woken by the same death would fire a second
-        # roster notification for one operator action.
-        await self._stop_waiter(record.spec.name)
         self._signal_group(record, signal.SIGTERM)
         try:
-            record.exit_code = await asyncio.wait_for(
-                record.process.wait(), TERM_GRACE_SECONDS
-            )
+            await asyncio.wait_for(record.process.wait(), TERM_GRACE_SECONDS)
         except asyncio.TimeoutError:
             logger.warning(
                 "agent %s ignored SIGTERM after %.1fs; sending SIGKILL",
@@ -972,7 +982,21 @@ class AgentSupervisor:
                 TERM_GRACE_SECONDS,
             )
             self._signal_group(record, signal.SIGKILL)
-            record.exit_code = await record.process.wait()
+            await record.process.wait()
+        # Both this coroutine and the waiter were woken by the same exit, in an
+        # order asyncio does not promise. Wait for the waiter so the record is
+        # already correct when the caller renders it. ``asyncio.wait`` rather
+        # than a bare ``await``: it does not re-raise the waiter's own
+        # cancellation, while still honouring a cancellation of *this* task.
+        waiter = self._waiters.get(record.spec.name)
+        if waiter is not None and not waiter.done():
+            await asyncio.wait({waiter})
+        if record.exit_code is None:  # pragma: no cover - needs a waiter-less record
+            # Only reachable if the record was registered and the waiter never
+            # started. A dead child must not be left reading as running, so
+            # record it here; this is a fallback for a missing authority, not a
+            # second one.
+            record.exit_code = record.process.returncode
         await self._stop_reader(record.spec.name)
         logger.warning(
             "killed agent name=%s pid=%d exit_code=%s",
