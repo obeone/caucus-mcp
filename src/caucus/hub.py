@@ -41,6 +41,7 @@ from starlette.types import Message as ASGIMessage
 
 from . import __version__
 from . import export as export_mod
+from .disklog import DiskLog
 from .models import (
     BROADCAST,
     AckRequest,
@@ -59,12 +60,22 @@ from .models import (
     RegisterResponse,
     SendRequest,
     SendResponse,
+    SpawnAgentRequest,
     StatusRequest,
     is_channel,
 )
-from .disklog import DiskLog
 from .ratelimit import TokenBucket
 from .state import CapExceeded, Client, HubState, RegisterOutcome
+from .supervisor import (
+    AGENT_NAME_RE,
+    DEFAULT_MAX_AGENTS,
+    AgentSpec,
+    AgentSupervisor,
+    LauncherConfig,
+    LauncherDisabled,
+    LauncherRefused,
+    validate_agent_cwd,
+)
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -587,6 +598,11 @@ async def _reaper_loop() -> None:
             _prune_register_buckets()
             if _session_reaper_fn is not None:
                 _session_reaper_fn()
+            # Collect any agent child that exited on its own. Folded into this
+            # sweep rather than given a task of its own, so a hub that never
+            # spawns anything gains no background work.
+            if supervisor is not None:
+                await supervisor.reap()
         except Exception:  # pragma: no cover - never let the sweep die
             logger.exception("reaper sweep failed")
             continue
@@ -625,6 +641,67 @@ _mcp_server: FastMCP | None = None
 # sessions whose hub client has died.  None when --mcp-http is not active.
 _session_reaper_fn: Callable[[], None] | None = None
 
+# Agent-launcher policy, populated from the CLI in main(). Disabled by default:
+# a hub nobody asked to spawn processes never will (see LauncherConfig).
+launcher_config = LauncherConfig()
+
+# The live process supervisor, built in the lifespan when the launcher is on and
+# shut down in its teardown, else None. Every /agents endpoint treats None as
+# "launcher disabled".
+supervisor: AgentSupervisor | None = None
+
+# Every connected /ui listener queue, tracked here rather than in HubState.
+#
+# The agent roster is a process fact, and process facts must never be written
+# into hub state: tests swap that state wholesale and `/control reset` wipes it,
+# so an OS side effect keyed on either would orphan real processes. Keeping the
+# fan-out set in the hub module means the launcher can push a roster event to
+# the console while owning nothing in the room's state machine.
+_ui_queues: set[asyncio.Queue[dict[str, object]]] = set()
+
+
+def _agent_hub_url() -> str:
+    """Return the base URL a spawned agent should connect back to.
+
+    Built from the hub's own bind address, never from operator input, so a
+    child can only ever be pointed at the hub that launched it. The launcher
+    only runs on a loopback bind, so this is always a local address; an IPv6
+    literal is bracketed so the result is a valid URL.
+
+    Returns
+    -------
+    str
+        A ``http://host:port`` base URL.
+    """
+    host = server_config.host
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{server_config.port}"
+
+
+def _agent_roster() -> list[dict[str, object]]:
+    """Return the agent roster for transport, without any child stderr.
+
+    Returns
+    -------
+    list of dict
+        One row per known child, or an empty list when the launcher is off.
+    """
+    if supervisor is None:
+        return []
+    # include_stderr stays False: this roster reaches the `agents` event, which
+    # every /ui listener sees, observers included. Child stderr can quote file
+    # contents or credentials, so it is served only from the operator-gated
+    # GET /agents.
+    return supervisor.roster()
+
+
+def _broadcast_agents() -> None:
+    """Push the current agent roster to every connected operator console."""
+    event: dict[str, object] = {"type": "agents", "agents": _agent_roster()}
+    for queue in list(_ui_queues):
+        queue.put_nowait(event)
+
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -635,7 +712,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     and tests that swap a fresh state are unaffected. A mounted MCP sub-app's own
     lifespan is not run by the parent app, so when ``_mcp_server`` is set its
     session manager must be entered here for the ``/mcp`` endpoint to serve.
+
+    The agent supervisor is built here for the same reason and, more
+    importantly, torn down here: a child agent must not outlive the hub that
+    launched it. This is best effort by construction, since a ``SIGKILL``ed hub
+    never runs the teardown and orphans its children.
     """
+    global supervisor
     tasks = [
         asyncio.create_task(_reaper_loop()),
         asyncio.create_task(_health_loop()),
@@ -644,6 +727,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         state.set_log_sink(disk_log.enqueue)
         tasks.append(asyncio.create_task(disk_log.run()))
         tasks.append(asyncio.create_task(disk_log.retention_loop()))
+    if launcher_config.enabled:
+        supervisor = AgentSupervisor(
+            launcher_config,
+            _agent_hub_url(),
+            _broadcast_agents,
+            # One-directional and read-only: the roster asks the room whether a
+            # peer of that name exists, and never writes anything back.
+            peer_exists=lambda name: state.peer_info(name) is not None,
+        )
     try:
         async with contextlib.AsyncExitStack() as stack:
             # Run the MCP session manager (created lazily by streamable_http_app()
@@ -652,6 +744,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 await stack.enter_async_context(_mcp_server.session_manager.run())
             yield
     finally:
+        if supervisor is not None:
+            with contextlib.suppress(Exception):
+                await supervisor.shutdown()
+            supervisor = None
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -1959,19 +2055,11 @@ async def control(
     Returns:
         ``{"mode": "<mode>"}`` for the applied control action.
     """
-    # CSRF defense-in-depth: a browser always tags a cross-site POST with an
-    # Origin; a disallowed one means the request came from a page we don't
-    # trust, so refuse before mutating room state. (A raw client sends none.)
-    if origin and not _origin_allowed(
-        origin, server_config.host, server_config.port, server_config.allowed_origins
-    ):
-        raise HTTPException(status_code=403, detail="origin not allowed")
-    # Kill-switch must not be bypassable when auth is on: require the operator
-    # token. _resolve_receive_token reuses the existing bearer-parsing rule.
-    if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
-        if auth_config.role_for(token) != "operator":
-            raise HTTPException(status_code=401, detail="operator token required")
+    # CSRF defense-in-depth plus the operator-token requirement, in that order:
+    # a browser always tags a cross-site POST with an Origin, and the kill-switch
+    # must not be bypassable when auth is on. See _gate_operator_request, which
+    # the /agents endpoints share so the two gates cannot drift apart.
+    _gate_operator_request(authorization, origin)
     mapping = {
         "pause": ControlMode.PAUSED,
         "resume": ControlMode.RUNNING,
@@ -1986,9 +2074,170 @@ async def control(
     return {"mode": mode.value}
 
 
+def _gate_operator_request(authorization: str | None, origin: str | None) -> None:
+    """Apply the ``POST /control`` gate to an operator-only REST request.
+
+    The same three checks in the same order: a present-but-disallowed browser
+    ``Origin`` first (CSRF defense-in-depth, refused before anything happens),
+    then the bearer token parsed exactly as ``/receive`` parses it, then the
+    ``operator`` role. Factored out so ``/control`` and the ``/agents``
+    endpoints cannot drift apart.
+
+    Args:
+        authorization: ``Authorization: Bearer <token>`` header, if any.
+        origin: Handshake-style ``Origin`` header, if any.
+
+    Raises:
+        HTTPException: 403 on a disallowed origin, 401 without the operator
+            token when auth is enabled.
+    """
+    if origin and not _origin_allowed(
+        origin, server_config.host, server_config.port, server_config.allowed_origins
+    ):
+        raise HTTPException(status_code=403, detail="origin not allowed")
+    if auth_config.enabled:
+        token = _resolve_receive_token(authorization, None)
+        if auth_config.role_for(token) != "operator":
+            raise HTTPException(status_code=401, detail="operator token required")
+
+
+def _require_launcher() -> AgentSupervisor:
+    """Return the live supervisor, or refuse when the launcher is off.
+
+    Returns:
+        The process supervisor built by the lifespan.
+
+    Raises:
+        HTTPException: 403 when the launcher was never enabled on this hub.
+    """
+    if supervisor is None or not supervisor.enabled:
+        raise HTTPException(status_code=403, detail="agent launcher is disabled")
+    return supervisor
+
+
+@app.get("/agents")
+async def list_agents(
+    authorization: str | None = Header(default=None),
+    origin: str | None = Header(default=None),
+) -> dict[str, object]:
+    """List the agent processes this hub launched.
+
+    Operator-gated, and the only place child stderr is served: a stderr tail can
+    quote file contents or credentials, so it must not ride the ``agents`` event
+    that read-only observers also receive.
+
+    Each row carries ``peer_known``, saying whether the room currently has a
+    peer registered under that name. That annotation is the only link between a
+    process and hub state, it is computed at read time, and nothing is written
+    back: reconciliation here is one-directional and read-only by design.
+
+    Args:
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator) when :attr:`AuthConfig.enabled`.
+        origin: Optional handshake-style ``Origin`` header.
+
+    Returns:
+        ``{"agents": [...]}`` with one row per known child.
+    """
+    _gate_operator_request(authorization, origin)
+    sup = _require_launcher()
+    return {"agents": sup.roster(include_stderr=True)}
+
+
+@app.post("/agents")
+async def spawn_agent(
+    req: SpawnAgentRequest,
+    authorization: str | None = Header(default=None),
+    origin: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Launch one native Claude agent and register it in the roster.
+
+    This is the hub's only process-creating endpoint, so it is gated exactly
+    like the ``/control`` kill-switch. The body carries values only; the
+    supervisor renders them into flags, and refuses anything it does not
+    recognise before a process exists (see :mod:`caucus.supervisor`).
+
+    Args:
+        req: The validated spawn body.
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator) when :attr:`AuthConfig.enabled`.
+        origin: Optional handshake-style ``Origin`` header.
+
+    Returns:
+        ``{"agent": {...}}`` describing the freshly started child.
+
+    Raises:
+        HTTPException: 403 when the launcher is disabled, 400 when the
+            supervisor refuses the request.
+    """
+    _gate_operator_request(authorization, origin)
+    sup = _require_launcher()
+    spec = AgentSpec(
+        name=req.name,
+        mission=req.mission,
+        agent_type=req.type,
+        permission_mode=req.permission_mode,
+        model=req.model,
+    )
+    try:
+        record = await sup.spawn(spec)
+    except LauncherDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LauncherRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"agent": record.to_public()}
+
+
+@app.delete("/agents/{name}")
+async def kill_agent(
+    name: str,
+    authorization: str | None = Header(default=None),
+    origin: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Terminate one agent process and its process group.
+
+    The name is matched against the supervisor's own pattern before any lookup,
+    so a traversal-flavoured path segment can never reach a record. A slash
+    never gets this far (the route would not match), and ``..`` is refused here.
+
+    Args:
+        name: The agent to kill.
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator) when :attr:`AuthConfig.enabled`.
+        origin: Optional handshake-style ``Origin`` header.
+
+    Returns:
+        ``{"name": ..., "killed": bool}``; ``killed`` is ``False`` when the
+        record was already exited.
+
+    Raises:
+        HTTPException: 403 when the launcher is disabled, 404 when the name is
+            malformed or unknown.
+    """
+    _gate_operator_request(authorization, origin)
+    sup = _require_launcher()
+    if not AGENT_NAME_RE.match(name):
+        raise HTTPException(status_code=404, detail="no such agent")
+    try:
+        killed = await sup.kill(name)
+    except LauncherDisabled as exc:  # pragma: no cover - _require_launcher first
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LauncherRefused as exc:
+        # kill() refuses for exactly one reason: no record under that name.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"name": name, "killed": killed}
+
+
 # Inbound ``/ui`` command keys that mutate hub state. An observer connection
 # may read the live feed but never apply any of these — each is refused with a
 # ``{"type":"error","reason":"forbidden"}`` and left unapplied.
+#
+# Deliberately absent: anything that spawns or kills an agent process. The
+# launcher's only mutation surface is HTTP, where the bearer token is checked on
+# every single request; a WebSocket authenticates once at handshake time and
+# then accepts frames for as long as it stays open, which is a wider window than
+# process creation deserves. The socket stays read-only for the launcher and
+# only carries the outbound ``agents`` event.
 _MUTATING_COMMANDS = frozenset(
     {
         "action",
@@ -2176,10 +2425,18 @@ async def ui_socket(ws: WebSocket) -> None:
     if role is None:
         return  # handshake failed; socket already closed
     queue = state.add_ui()
+    # Also track the queue here so the agent launcher can fan a roster event out
+    # without HubState knowing anything about processes.
+    _ui_queues.add(queue)
 
     async def pump() -> None:
         while True:
             event = await queue.get()
+            if event.get("type") == "snapshot":
+                # Prime the console with the agent roster too. Added here rather
+                # than in HubState.add_ui because the roster is a process fact,
+                # and the stderr-free projection is what observers may see.
+                event = {**event, "agents": _agent_roster()}
             await ws.send_json(event)
 
     pump_task = asyncio.create_task(pump())
@@ -2205,6 +2462,7 @@ async def ui_socket(ws: WebSocket) -> None:
         pass
     finally:
         pump_task.cancel()
+        _ui_queues.discard(queue)
         state.remove_ui(queue)
 
 
@@ -2416,6 +2674,39 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--enable-agent-launcher",
+        action="store_true",
+        help=(
+            "let an authenticated operator spawn, list and kill "
+            "caucus-claude-agent processes from the console. OFF by default. "
+            "Requires --operator-token, --agent-cwd, and a loopback bind; the "
+            "hub refuses to start if any of the three is missing. A spawned "
+            "'worker' reaches shell and filesystem tools as the hub's own user, "
+            "and the working directory is a starting point, not a sandbox"
+        ),
+    )
+    parser.add_argument(
+        "--agent-cwd",
+        default=os.environ.get("CAUCUS_AGENT_CWD"),
+        metavar="PATH",
+        help=(
+            "absolute directory every spawned agent starts in (required with "
+            "--enable-agent-launcher). Not an allowlist and not per-spawn: it "
+            "is a starting point, not a containment boundary. "
+            "Env: CAUCUS_AGENT_CWD"
+        ),
+    )
+    parser.add_argument(
+        "--agent-max",
+        type=int,
+        default=int(os.environ.get("CAUCUS_AGENT_MAX", str(DEFAULT_MAX_AGENTS))),
+        metavar="N",
+        help=(
+            "most agent processes that may run at once (default: %(default)s). "
+            "Env: CAUCUS_AGENT_MAX"
+        ),
+    )
+    parser.add_argument(
         "--mcp-path",
         default=os.environ.get("CAUCUS_MCP_PATH", "/mcp"),
         help=(
@@ -2425,9 +2716,41 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global disk_log
+    global disk_log, launcher_config
     auth_config.operator = args.operator_token
     auth_config.observer = args.observer_token
+
+    # Fail closed at boot, not per request. AuthConfig.role_for grades every
+    # caller as "operator" when no operator token is set, so "operator token
+    # required" gates nothing in the hub's default configuration: the launcher
+    # would be wide open to anything that can reach the port. Demand all three
+    # preconditions here, once, and refuse to start otherwise.
+    if args.enable_agent_launcher:
+        if not args.operator_token:
+            parser.error(
+                "--enable-agent-launcher requires --operator-token: without it "
+                "every caller is graded as operator and the launcher would let "
+                "anyone who can reach this hub start processes on this machine"
+            )
+        if args.host not in _LOOPBACK_HOSTS:
+            parser.error(
+                f"--enable-agent-launcher requires a loopback bind, got "
+                f"--host {args.host}: process creation must not be reachable "
+                "from the network"
+            )
+        if not args.agent_cwd:
+            parser.error(
+                "--enable-agent-launcher requires --agent-cwd: every spawned "
+                "agent starts in that one directory"
+            )
+        try:
+            launcher_config = LauncherConfig(
+                enabled=True,
+                cwd=validate_agent_cwd(args.agent_cwd),
+                max_agents=args.agent_max,
+            )
+        except LauncherRefused as exc:
+            parser.error(str(exc))
 
     # CSWSH allowlist: merge CLI --allowed-origin entries with the comma-split
     # CAUCUS_ALLOWED_ORIGINS env var. Loopback origins are always allowed by
@@ -2462,6 +2785,15 @@ def main() -> None:
             )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
+    if launcher_config.enabled:
+        # Loud on purpose: this hub can now start processes on this machine.
+        logger.warning(
+            "agent launcher ENABLED: operator-spawned agents will run as this "
+            "user, starting in %s (a starting point, not a sandbox), up to %d "
+            "at a time",
+            launcher_config.cwd,
+            launcher_config.max_agents,
+        )
     if not args.no_browser:
         _open_browser(_browser_url(args.host, args.port))
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
