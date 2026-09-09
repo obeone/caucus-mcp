@@ -200,6 +200,7 @@ describe("wsStore — agents event", () => {
           state: "running",
           exit_code: null,
           peer_known: true,
+          msg_count: 4,
         },
       ],
     });
@@ -207,5 +208,6 @@ describe("wsStore — agents event", () => {
     expect(agents).toHaveLength(1);
     expect(agents[0].name).toBe("agent-a");
     expect(agents[0].peer_known).toBe(true);
+    expect(agents[0].msg_count).toBe(4);
   });
 });
