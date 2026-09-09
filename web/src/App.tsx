@@ -13,6 +13,8 @@
  *   │  ─ peer rows          │ │ FlowPanel  (flex-1)                         │
  *   ├── CHANNELS (compact) ─┤ │ OperatorComposer (pinned bottom)            │
  *   │  ─ channel rows       │ └─────────────────────────────────────────────┘
+ *   ├── AGENT LAUNCHER ─────┤ (operator-only, hidden entirely for observers)
+ *   │  ─ spawn form + roster│
  *   └──────────────────────┘
  *
  * FormsAlert renders as an amber badge in the header when pending forms exist;
@@ -26,6 +28,7 @@ import { fmtDuration } from "./lib/colors";
 import HealthPanel from "./components/HealthPanel";
 import FlowPanel from "./components/FlowPanel";
 import ChannelsPanel from "./components/ChannelsPanel";
+import AgentLauncher from "./components/AgentLauncher";
 import FormsAlert from "./components/FormsAlert";
 import DisconnectedBanner from "./components/DisconnectedBanner";
 import FloorStrip from "./components/FloorStrip";
@@ -301,6 +304,15 @@ export default function App() {
               </div>
               <ChannelsPanel compact />
             </div>
+
+            {/* Agent launcher — operator-only, self-guards internally like
+                RateControl; skipped entirely for observers rather than left
+                as an empty section. */}
+            {role === "operator" && (
+              <div className="flex-shrink-0 overflow-y-auto max-h-64 border-t border-line/30 p-2">
+                <AgentLauncher />
+              </div>
+            )}
           </aside>
 
           {/* ── Main area ───────────────────────────────────────────────────── */}
