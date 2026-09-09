@@ -229,11 +229,12 @@ def test_spawn_then_list_then_kill(
     assert launcher.signals  # a signal was aimed at the group, not the child
 
 
-def test_spawn_response_hides_cwd_and_stderr(
+def test_spawn_response_hides_cwd_and_output(
     client: TestClient, launcher: _FakeSupervisor, workdir: Path
 ) -> None:
     """A spawn reply never leaks the working directory or child output."""
     body = client.post("/agents", json={"name": "alpha"}).json()["agent"]
+    assert "stdout" not in body
     assert "stderr" not in body
     assert "cwd" not in body
     assert str(workdir) not in resp_text(body)
@@ -244,15 +245,21 @@ def resp_text(payload: object) -> str:
     return repr(payload)
 
 
-def test_get_agents_serves_stderr_to_the_operator(
+def test_get_agents_serves_both_output_streams_to_the_operator(
     client: TestClient, launcher: _FakeSupervisor
 ) -> None:
-    """The operator-gated listing is the one place stderr is exposed."""
+    """The operator-gated listing is the one place child output is exposed.
+
+    Both streams are served, under separate keys: a wedged child's own account of
+    itself lands on stdout, and merging it into the diagnostics would lose it.
+    """
     client.post("/agents", json={"name": "alpha"})
     record = launcher.get("alpha")
     assert record is not None
+    record.stdout_tail.append("waiting for approval")
     record.stderr_tail.append("traceback line")
     listed = client.get("/agents").json()["agents"]
+    assert listed[0]["stdout"] == ["waiting for approval"]
     assert listed[0]["stderr"] == ["traceback line"]
 
 
@@ -332,7 +339,7 @@ def test_roster_annotates_a_known_peer(
 # --- console fan-out ---------------------------------------------------------
 
 
-def test_observer_receives_the_roster_without_stderr(
+def test_observer_receives_the_roster_without_output(
     client: TestClient, launcher: _FakeSupervisor, auth_on: None
 ) -> None:
     """The broadcast roster reaches observers and carries no child output."""
@@ -349,6 +356,7 @@ def test_observer_receives_the_roster_without_stderr(
         event = _next_event(ws, "agents")
 
     assert [row["name"] for row in event["agents"]] == ["alpha"]
+    assert all("stdout" not in row for row in event["agents"])
     assert all("stderr" not in row for row in event["agents"])
 
 
@@ -361,6 +369,7 @@ def test_snapshot_carries_the_running_roster(
         assert ws.receive_json()["type"] == "auth_ok"
         snapshot = ws.receive_json()
     assert [row["name"] for row in snapshot["agents"]] == ["alpha"]
+    assert all("stdout" not in row for row in snapshot["agents"])
     assert all("stderr" not in row for row in snapshot["agents"])
 
 

@@ -31,6 +31,8 @@ from caucus.supervisor import (
     MAX_EXITED_RECORDS,
     MAX_MISSION_CHARS,
     MUTE_PERMISSION_MODES,
+    OUTPUT_LINE_CHARS,
+    OUTPUT_RING_LINES,
     PERMISSION_MODES,
     STDERR_RING_LINES,
     AgentProcess,
@@ -455,12 +457,18 @@ def test_to_public_hides_cwd_and_environment(spy: _SpySupervisor) -> None:
     }
 
 
-def test_to_public_includes_stderr_only_on_request() -> None:
-    """The stderr tail is opt-in, so it never rides a broadcast payload."""
+def test_to_public_includes_output_only_on_request() -> None:
+    """Both output tails are opt-in, so neither rides a broadcast payload."""
     record = _fake_record("alpha")
-    record.stderr_tail.append("secret-looking line")
+    record.stdout_tail.append("secret-looking stdout line")
+    record.stderr_tail.append("secret-looking stderr line")
+    assert "stdout" not in record.to_public()
     assert "stderr" not in record.to_public()
-    assert record.to_public(include_stderr=True)["stderr"] == ["secret-looking line"]
+    row = record.to_public(include_output=True)
+    # Two keys, not one merged blob: the agent's own account of itself has to
+    # stay readable apart from its diagnostics.
+    assert row["stdout"] == ["secret-looking stdout line"]
+    assert row["stderr"] == ["secret-looking stderr line"]
 
 
 def test_roster_annotates_peer_known(workdir: Path) -> None:
@@ -520,6 +528,8 @@ def _write_quick_exit_agent(tmp_path: Path) -> Path:
     script = tmp_path / "quick_exit_agent.py"
     script.write_text(
         "import sys\n"
+        "sys.stdout.write('agent says why\\n')\n"
+        "sys.stdout.flush()\n"
         "sys.stderr.write('fatal: nope\\n')\n"
         "sys.stderr.flush()\n"
         "sys.exit(3)\n"
@@ -627,6 +637,65 @@ async def test_exited_name_can_be_reused(tmp_path: Path, workdir: Path) -> None:
         assert await _wait_for(lambda: first.exit_code is not None)
         second = await sup.spawn(AgentSpec(name="alpha"))
         assert second.pid != first.pid
+    finally:
+        await sup.shutdown()
+
+
+async def test_stdout_is_captured_and_bounded(tmp_path: Path, workdir: Path) -> None:
+    """A child's own account of itself is kept, separately and within bounds.
+
+    stdout used to go to ``/dev/null``, which discarded exactly what an operator
+    needs when a child is wedged. It is now drained into its own ring, sized like
+    the stderr one so a chatty stream cannot pin hub memory or crowd the other.
+    """
+    script = tmp_path / "two_stream_agent.py"
+    script.write_text(
+        "import sys\n"
+        "for i in range(200):\n"
+        "    sys.stdout.write('out %d\\n' % i)\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('err last\\n')\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(0)\n"
+    )
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(lambda: record.exit_code is not None)
+        assert await _wait_for(
+            lambda: bool(record.stdout_tail) and record.stdout_tail[-1] == "out 199"
+        )
+        assert len(record.stdout_tail) == OUTPUT_RING_LINES
+        # The two rings stay distinct; stderr did not absorb the stdout flood.
+        assert await _wait_for(lambda: list(record.stderr_tail) == ["err last"])
+
+        row = record.to_public(include_output=True)
+        assert row["stdout"] == list(record.stdout_tail)
+        assert row["stderr"] == ["err last"]
+    finally:
+        await sup.shutdown()
+
+
+async def test_long_output_lines_are_truncated(tmp_path: Path, workdir: Path) -> None:
+    """One enormous line on either stream cannot pin hub memory."""
+    script = tmp_path / "shouty_agent.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.write('o' * 5000 + '\\n')\n"
+        "sys.stderr.write('e' * 5000 + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(0)\n"
+    )
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(lambda: record.exit_code is not None)
+        assert await _wait_for(
+            lambda: bool(record.stdout_tail) and bool(record.stderr_tail)
+        )
+        assert len(record.stdout_tail[-1]) == OUTPUT_LINE_CHARS
+        assert len(record.stderr_tail[-1]) == OUTPUT_LINE_CHARS
     finally:
         await sup.shutdown()
 
@@ -771,6 +840,7 @@ async def test_exit_code_is_recorded_without_any_sweep(
         assert not record.running
         assert record.to_public()["state"] == "exited"
         assert "fatal: nope" in " ".join(record.stderr_tail)
+        assert await _wait_for(lambda: "agent says why" in " ".join(record.stdout_tail))
     finally:
         await sup.shutdown()
 

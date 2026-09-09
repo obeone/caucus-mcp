@@ -12,6 +12,16 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **A spawned agent's stdout is captured, not discarded.** Children were started
+  with `stdout=DEVNULL`, so when one was wedged its own account of why went
+  straight to the bit bucket; the diagnosis of the `plan` mode failure above came
+  from a hand-run agent's stdout, which a supervised child would have thrown
+  away. It is now piped and drained into its own bounded ring, sized like the
+  stderr one, and surfaced as a separate `stdout` key on the operator-gated
+  `GET /agents` beside `stderr`. Neither rides the `agents` event that read-only
+  observers see. `AgentProcess.to_public` and `AgentSupervisor.roster` take
+  `include_output` where they took `include_stderr`.
+
 - **The stdio bridge auto-rejoins once after a `session_expired`.** A peer the
   idle reaper dropped (or that was cleanly `leave`d/kicked) used to surface
   `session_expired` straight to the agent, costing a full turn to notice and
