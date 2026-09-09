@@ -121,6 +121,64 @@ export interface RateInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Agent launcher
+// ---------------------------------------------------------------------------
+
+/** Agent tool profile: `talker` is caucus-only, `worker` also gets shell/filesystem tools. */
+export type AgentType = "talker" | "worker";
+
+/** Claude Code permission mode the spawned agent runs under. */
+export type PermissionMode =
+  | "auto"
+  | "default"
+  | "acceptEdits"
+  | "plan"
+  | "bypassPermissions"
+  | "dontAsk";
+
+/** Lifecycle state of a supervised agent process. */
+export type AgentState = "running" | "exited";
+
+/**
+ * Public view of a supervised `caucus-claude-agent` process, as reported by
+ * the hub's `AgentSupervisor.to_public()`. Deliberately excludes the working
+ * directory and environment. The roster carried by the `agents` event and the
+ * `snapshot.agents` field never include `stderr` (see `to_public`'s
+ * `include_stderr` guard) — that tail is served only by the operator-gated
+ * `GET /agents`, which this console does not call.
+ */
+export interface AgentInfo {
+  name: string;
+  type: AgentType;
+  permission_mode: PermissionMode;
+  model: string | null;
+  pid: number;
+  started_at: number;
+  uptime_seconds: number;
+  state: AgentState;
+  exit_code: number | null;
+  /** Whether the hub currently has a live peer registered under this name. */
+  peer_known: boolean;
+}
+
+/**
+ * Body for `POST /agents` — the operator launches one native agent.
+ *
+ * There is no `cwd` field: the working directory is fixed hub policy set at
+ * startup (`--agent-cwd`), and the endpoint rejects an unrecognised field with
+ * a 422. `mission` and `model` are omitted from the JSON body when unset
+ * (rather than sent as `null`), matching `JSON.stringify`'s handling of
+ * `undefined` object fields.
+ */
+export interface SpawnAgentSpec {
+  name: string;
+  mission?: string;
+  type: AgentType;
+  permission_mode: PermissionMode;
+  model?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 
@@ -157,6 +215,8 @@ export interface SnapshotEvent {
   health: HealthInfo;
   /** Current rate-limit config; present when the hub has one configured. */
   rate?: RateInfo;
+  /** Supervised agent roster; present when the agent launcher is enabled. */
+  agents?: AgentInfo[];
 }
 
 export interface RawMessage {
@@ -239,6 +299,12 @@ export interface ErrorEvent {
   command?: string;
 }
 
+/** Broadcast whenever the supervised agent roster changes. */
+export interface AgentsEvent {
+  type: "agents";
+  agents: AgentInfo[];
+}
+
 export type HubEvent =
   | AuthOkEvent
   | AuthErrorEvent
@@ -253,6 +319,7 @@ export type HubEvent =
   | HealthEvent
   | HeartbeatResultEvent
   | RateEvent
+  | AgentsEvent
   | ErrorEvent;
 
 // ---------------------------------------------------------------------------
@@ -281,6 +348,8 @@ export interface DashboardState {
   health: HealthInfo | null;
   /** Current token-bucket rate-limit config; null until hub sends one. */
   rate: RateInfo | null;
+  /** Supervised agent-launcher roster; empty when the launcher is disabled. */
+  agents: AgentInfo[];
   messages: Message[];
 
   // UI cross-link
@@ -326,4 +395,23 @@ export interface DashboardState {
    * @param capacity   - Burst size; must be >= 1.
    */
   sendSetRate: (refillRate: number, capacity: number) => void;
+  /**
+   * Ask the hub to spawn a supervised `caucus-claude-agent` process.
+   *
+   * Unlike the other `send*` commands this is an HTTP mutation, not a `/ui`
+   * frame: `POST /agents` with an `Authorization: Bearer <operator token>`
+   * header (the token captured from the `/ui` auth handshake). Resolves to
+   * `true` on success; on failure a toast surfaces the hub's error and the
+   * promise resolves to `false`.
+   */
+  sendSpawnAgent: (spec: SpawnAgentSpec) => Promise<boolean>;
+  /**
+   * Ask the hub to kill a supervised agent by name.
+   *
+   * `DELETE /agents/{name}` with the same bearer token as
+   * {@link DashboardState.sendSpawnAgent}. Resolves to `true` on success;
+   * on failure a toast surfaces the hub's error and the promise resolves to
+   * `false`.
+   */
+  sendKillAgent: (name: string) => Promise<boolean>;
 }
