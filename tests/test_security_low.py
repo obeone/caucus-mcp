@@ -314,13 +314,23 @@ def _raise_401(request: httpx.Request) -> dict[str, object]:
     raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
 
 
-def test_resilient_hub_call_reports_401_on_a_bearer_call_as_session_expired() -> None:
+def test_resilient_hub_call_reports_401_on_a_bearer_call_as_session_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A 401 on a call that presented the token is an expired membership.
 
     ``hub_unreachable`` sent agents hunting a network outage that never
-    happened; the remedy for a reaped, left or kicked peer is ``join()``.
+    happened; the remedy for a reaped, left or kicked peer is ``join()`` (or,
+    since the auto-rejoin feature, the bridge trying that on its own first).
+    This is a pure unit test of the *classification* logic, so the recovery
+    attempt itself is stubbed out: a real one would fire an actual
+    ``POST /register`` against whatever ``HUB_URL`` happens to resolve to,
+    which is exactly the kind of accidental network I/O a unit test must
+    never risk (it has, in the past, hit a developer's real local hub).
     """
     from caucus import mcp_bridge
+
+    monkeypatch.setattr(mcp_bridge, "_attempt_auto_rejoin", lambda: None)
 
     @mcp_bridge._resilient_hub_call
     def _raises() -> dict[str, object]:
@@ -340,9 +350,18 @@ def test_resilient_hub_call_reports_401_on_a_bearer_call_as_session_expired() ->
     assert "join()" in str(result["hint"])
 
 
-def test_resilient_hub_call_reports_401_on_a_token_body_as_session_expired() -> None:
-    """The POST endpoints carry the token in the JSON body, not a header."""
+def test_resilient_hub_call_reports_401_on_a_token_body_as_session_expired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The POST endpoints carry the token in the JSON body, not a header.
+
+    The auto-rejoin attempt is stubbed out for the same reason as the sibling
+    test above: this checks classification, not recovery, and must never
+    reach a real network call.
+    """
     from caucus import mcp_bridge
+
+    monkeypatch.setattr(mcp_bridge, "_attempt_auto_rejoin", lambda: None)
 
     @mcp_bridge._resilient_hub_call
     def _raises() -> dict[str, object]:

@@ -35,6 +35,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -239,6 +240,84 @@ def _session_expired() -> dict[str, object]:
     return session_expired_error(_joined_as, HUB_URL)
 
 
+# Minimum interval between automatic session_expired recoveries, in seconds,
+# regardless of outcome. Guards :func:`_attempt_auto_rejoin` against turning
+# into a retry loop when the hub keeps refusing this identity (genuinely down,
+# or the name was taken over by another live peer): one attempt per window,
+# never a tight loop of 401s each minting another /register call.
+_AUTO_REJOIN_COOLDOWN_SECONDS = 60.0
+
+# Monotonic timestamp of the last automatic rejoin attempt, win or lose.
+# ``None`` until the first one fires. Monotonic (not wall-clock) so a system
+# clock adjustment cannot shorten or extend the cooldown.
+_last_auto_rejoin_attempt: float | None = None
+
+
+def _attempt_auto_rejoin() -> str | None:
+    """Silently re-register this process's identity after a ``session_expired``.
+
+    A joined peer can fall out of the hub's bookkeeping for reasons that are
+    not the agent's fault: the idle reaper dropped it while it sat quietly
+    composing a reply, or the hub restarted. Making the agent notice
+    ``session_expired``, call ``join()`` again, and relaunch the watcher is
+    three wasted turns for what is usually a one-line fix. This re-sends the
+    cached ``_joined_as``/``_token`` exactly as a manual ``join()`` would, so
+    :func:`_resilient_hub_call` can retry the failed call transparently.
+
+    Rate-limited to :data:`_AUTO_REJOIN_COOLDOWN_SECONDS` between attempts,
+    independent of outcome, so a hub that keeps refusing this identity never
+    turns into a retry loop — the caller falls back to the ordinary
+    ``session_expired`` error once the cooldown is in effect.
+
+    Returns:
+        The live token on success — unchanged from the cached one when the
+        hub revived the same identity inside its reap grace window, or a
+        brand-new one when the graveyard entry itself had already expired
+        (in which case the watcher's ``--token-file`` is now stale and must
+        be relaunched). ``None`` when no attempt was made (cooldown, or this
+        process never joined) or the hub refused the re-registration.
+    """
+    global _token, _known_protocol_version, _last_auto_rejoin_attempt
+    if _joined_as is None:
+        return None  # never joined; nothing to recover
+    now = time.monotonic()
+    if (
+        _last_auto_rejoin_attempt is not None
+        and now - _last_auto_rejoin_attempt < _AUTO_REJOIN_COOLDOWN_SECONDS
+    ):
+        logger.warning(
+            "session_expired: skipping auto-rejoin for project=%s (cooldown)",
+            _joined_as,
+        )
+        return None
+    _last_auto_rejoin_attempt = now
+    payload: dict[str, object] = {
+        "project": _joined_as,
+        "protocol_version": _known_protocol_version,
+    }
+    if _token is not None:
+        payload["token"] = _token
+    try:
+        with _client() as http:
+            resp = http.post("/register", json=payload)
+            if resp.status_code == 409:
+                logger.warning(
+                    "auto-rejoin refused for project=%s: name is held by"
+                    " another live peer",
+                    _joined_as,
+                )
+                return None
+            resp.raise_for_status()
+            body = resp.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        logger.warning("auto-rejoin failed for project=%s: %s", _joined_as, exc)
+        return None
+    _token = str(body["token"])
+    _known_protocol_version = int(body["protocol_version"])
+    logger.info("auto-rejoined Caucus as project=%s after session_expired", _joined_as)
+    return _token
+
+
 def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
     """Wrap a tool so a hub blip yields a structured error instead of crashing.
 
@@ -253,9 +332,16 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
 
     One status code is split out of that contract: a ``401`` raised on a call
     that actually presented this session's cached token means the membership
-    died, not the hub, so it returns :func:`_session_expired` instead. Every
-    token-bearing tool goes through this decorator, which is why the branch
-    lives here rather than being copy-pasted into each of them.
+    died, not the hub. Rather than surfacing that to the agent immediately,
+    the wrapper first tries :func:`_attempt_auto_rejoin` once and, on success,
+    retries ``func`` with the refreshed token transparently — most
+    ``session_expired`` cases are a peer the idle reaper dropped while it sat
+    quietly, and re-registering under the same name is a one-line fix the
+    agent should never have to spend a turn on. Only when the auto-rejoin
+    itself is skipped (cooldown, or the hub refuses it) does the wrapper fall
+    back to :func:`_session_expired`. Every token-bearing tool goes through
+    this decorator, which is why the branch lives here rather than being
+    copy-pasted into each of them.
 
     The test is on the failed *request*, via
     :func:`~caucus.models.request_carried_token`, not on ``_token`` being set.
@@ -275,9 +361,12 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
         func: The tool body to protect.
 
     Returns:
-        The wrapped tool, identical on success, returning ``session_expired``
-        when the hub disowned the cached token and a structured
-        ``hub_unreachable`` dict on any other transport or JSON-decode failure.
+        The wrapped tool, identical on success (a successful auto-rejoin is
+        invisible to the caller unless the identity itself changed, in which
+        case the result gains ``watch``/``note`` telling the agent to
+        relaunch the watcher), ``session_expired`` when the token was lost
+        and no auto-rejoin recovered it, and a structured ``hub_unreachable``
+        dict on any other transport or JSON-decode failure.
     """
 
     @functools.wraps(func)
@@ -293,10 +382,41 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
                 exc.request, _token
             ):
                 logger.warning(
-                    "%s: the hub disowned this session's token; it has expired",
+                    "%s: the hub disowned this session's token; attempting a"
+                    " silent auto-rejoin",
                     func.__name__,
                 )
-                return _session_expired()
+                stale_token = _token
+                fresh_token = _attempt_auto_rejoin()
+                if fresh_token is None:
+                    return _session_expired()
+                try:
+                    result = func(*args, **kwargs)
+                except (httpx.HTTPError, json.JSONDecodeError) as retry_exc:
+                    logger.error(
+                        "%s failed even after auto-rejoin: %s",
+                        func.__name__,
+                        retry_exc,
+                    )
+                    return {
+                        "error": "hub_unreachable",
+                        "detail": str(retry_exc),
+                        "hub": HUB_URL,
+                    }
+                if fresh_token != stale_token and isinstance(result, dict):
+                    # Past the reap grace window the hub mints a brand-new
+                    # identity rather than reviving the old one: the watcher
+                    # (still holding the stale token in its --token-file) is
+                    # now polling with a token the hub no longer honours and
+                    # must be relaunched with a fresh one.
+                    result = dict(result)
+                    result["watch"] = _watch_command_for(fresh_token)
+                    result["note"] = (
+                        "session recovered automatically after session_expired"
+                        " (new identity); relaunch the watcher with the"
+                        " command in 'watch'"
+                    )
+                return result
             logger.error("%s failed: %s", func.__name__, exc)
             return {"error": "hub_unreachable", "detail": str(exc), "hub": HUB_URL}
         except (httpx.HTTPError, json.JSONDecodeError) as exc:
