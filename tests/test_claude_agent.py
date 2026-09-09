@@ -227,21 +227,30 @@ class _FakeConnector:
     """Replays a scripted sequence of :class:`Inbound` batches, then stops.
 
     Records the ``ack_seq`` piggybacked on each poll in :attr:`acks`, so tests
-    can assert the poller acknowledges the batch it just consumed. Also
-    records every :meth:`set_status` call in :attr:`statuses`, so tests can
-    assert on the turn-lifecycle status heartbeat
-    (:func:`claude_agent._drive_turn` sets it on start and clears it on end).
+    can assert the poller acknowledges the batch it just consumed, and the
+    ``lease`` it polls under in :attr:`leases`, so they can assert the poller
+    keeps one listening-session id across its polls. Also records every
+    :meth:`set_status` call in :attr:`statuses`, so tests can assert on the
+    turn-lifecycle status heartbeat (:func:`claude_agent._drive_turn` sets it on
+    start and clears it on end).
     """
 
     def __init__(self, script: list[Inbound]) -> None:
         self._script = list(script)
         self.acks: list[int | None] = []
+        self.leases: list[str | None] = []
         self.statuses: list[str] = []
 
     async def receive(
-        self, token: str, timeout: float, *, ack_seq: int | None = None
+        self,
+        token: str,
+        timeout: float,
+        *,
+        ack_seq: int | None = None,
+        lease: str | None = None,
     ) -> Inbound:
         self.acks.append(ack_seq)
+        self.leases.append(lease)
         if self._script:
             return self._script.pop(0)
         return Inbound(messages=[], mode="running", stop=True)
@@ -526,6 +535,54 @@ async def test_poll_inbound_reset_interrupts_and_signals_rebuild() -> None:
     assert not stop.is_set()
 
 
+async def test_poll_inbound_ends_the_session_when_it_loses_the_listener_slot() -> None:
+    """``already_listening`` ends the poller instead of re-polling into a refusal.
+
+    Another process now holds this token's single ``/receive`` consumer slot.
+    Fighting for it would trade the slot back and forth and split the
+    conversation, so the agent shuts down and leaves one listener behind.
+    """
+    client = _FakeClient()
+    connector = _FakeConnector([Inbound([], None, False, already_listening=True)])
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+
+    await claude_agent._poll_inbound(
+        connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+    )
+
+    assert stop.is_set()
+    assert not reset.is_set()
+    assert turns.empty()
+    # Exactly one poll: it did not hammer the endpoint after the refusal.
+    assert len(connector.acks) == 1
+
+
+async def test_poll_inbound_keeps_one_lease_across_polls() -> None:
+    """Every poll presents the same listening-session id, so it is one consumer.
+
+    A fresh id per poll would look like a new consumer each time and displace
+    the poller's own lease, which is exactly the churn the lease prevents.
+    """
+    client = _FakeClient()
+    connector = _FakeConnector(
+        [
+            Inbound([], "running", False),
+            Inbound([{"sender": "a", "recipient": "all", "content": "hi"}], "running", False),
+        ]
+    )
+    stop, reset = asyncio.Event(), asyncio.Event()
+    turns: asyncio.Queue[str] = asyncio.Queue()
+
+    await claude_agent._poll_inbound(
+        connector, "tok", client, turns, 0.0, stop, reset  # type: ignore[arg-type]
+    )
+
+    assert len(connector.leases) >= 2
+    assert all(lease == connector.leases[0] for lease in connector.leases)
+    assert connector.leases[0]
+
+
 async def test_run_loop_reset_rebuilds_client_with_fresh_context() -> None:
     """An operator reset tears down the first client and builds a second one."""
     first, second = _FakeClient(), _FakeClient()
@@ -589,13 +646,18 @@ async def test_poll_inbound_retries_an_unsent_ack_after_a_hub_error() -> None:
             self._boom = True
 
         async def receive(
-            self, token: str, timeout: float, *, ack_seq: int | None = None
+            self,
+            token: str,
+            timeout: float,
+            *,
+            ack_seq: int | None = None,
+            lease: str | None = None,
         ) -> Inbound:
             if ack_seq is not None and self._boom:
                 self._boom = False
                 self.acks.append(ack_seq)
                 raise httpx.ConnectError("hub went away")
-            return await super().receive(token, timeout, ack_seq=ack_seq)
+            return await super().receive(token, timeout, ack_seq=ack_seq, lease=lease)
 
     client = _FakeClient()
     connector = _FlakyConnector(

@@ -83,6 +83,29 @@ async def test_receive_quiet_poll_is_empty(live_hub: str) -> None:
     assert inbound.stop is False
 
 
+async def test_receive_reports_a_lost_listener_slot_instead_of_raising(
+    live_hub: str,
+) -> None:
+    """A refused poll comes back as a flag, not an exception or an empty batch.
+
+    The caller must be able to tell "nobody said anything" from "you are no
+    longer the listener": the first means poll again, the second means stop.
+    """
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-lease", None)
+        # Hold the slot under one id, then take it over with another, exactly as
+        # a relaunched watcher would.
+        first = await hub.receive(me.token, 0.0, lease="listener-a")
+        assert first.already_listening is False
+        await hub.receive(me.token, 0.0, lease="listener-b")
+
+        refused = await hub.receive(me.token, 5.0, lease="listener-a")
+
+    assert refused.already_listening is True
+    assert refused.messages == []
+    assert refused.stop is False
+
+
 async def test_receive_surfaces_stop_without_control_chatter(live_hub: str) -> None:
     async with HubConnector(live_hub) as hub:
         me = await hub.register("conn-stop-rx", None)

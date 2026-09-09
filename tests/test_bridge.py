@@ -32,6 +32,7 @@ def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(bridge_module, "_protocol_text", None)
     monkeypatch.setattr(bridge_module, "_protocol_delivered", False)
     monkeypatch.setattr(bridge_module, "_last_auto_rejoin_attempt", None)
+    monkeypatch.setattr(bridge_module, "_listen_lease", None)
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
         http.post("/control", json={"action": "reset"})
     return bridge_module
@@ -1044,6 +1045,53 @@ def test_listen_quiet_poll_is_empty(
     result = bridge.listen(timeout=0)
     assert result["messages"] == []
     assert result["stop"] is False
+
+
+def test_listen_reuses_one_lease_across_polls(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successive listens are one consumer, not a new one each time."""
+    monkeypatch.setattr(bridge, "PROJECT", "lease-keeper")
+    bridge.join()
+    bridge.listen(timeout=0)
+    first = bridge._listen_lease
+    bridge.listen(timeout=0)
+
+    assert first is not None
+    assert bridge._listen_lease == first
+
+
+def test_listen_reports_already_listening_and_can_re_acquire(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A displaced listen() says so, then a deliberate retry takes the slot back.
+
+    The refusal is what stops the bridge and its watcher from splitting the
+    queue. Dropping the lease on refusal is what keeps the bridge able to
+    listen again on purpose: the displaced id itself stays refused forever.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "lease-loser")
+    bridge.join()
+    bridge.listen(timeout=0)  # mints the session's lease and holds the slot
+    displaced = bridge._listen_lease
+
+    # A watcher (another process on the same token) takes the slot over.
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.get(
+            "/receive",
+            params={"timeout": 0.2, "lease": "the-watcher"},
+            headers={"Authorization": f"Bearer {bridge._token}"},
+        )
+
+    refused = bridge.listen(timeout=3)
+    assert refused["error"] == "already_listening"
+    assert "watcher" in str(refused["hint"])
+    assert bridge._listen_lease is None
+
+    # Deliberately listening again mints a fresh id and wins the slot back.
+    recovered = bridge.listen(timeout=0)
+    assert "error" not in recovered
+    assert bridge._listen_lease not in (None, displaced)
 
 
 def test_listen_surfaces_stop(

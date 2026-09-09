@@ -390,6 +390,32 @@ async def test_peek_reports_pending_without_draining(state: HubState) -> None:
     assert after == {"pending": 0, "last": None}
 
 
+async def test_listen_reports_a_lost_listener_slot(state: HubState) -> None:
+    """A displaced session gets a readable refusal, then can re-acquire the slot.
+
+    The hub allows one ``/receive`` consumer per token; here the agent's own
+    background watcher took it. Polling again under the same lease would only be
+    refused, so the tool drops it and says what to do instead.
+    """
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="http-lease")
+    await _tool(server, "listen")(ctx, timeout=0)  # mints the session's lease
+
+    client = state._clients["http-lease"]  # noqa: SLF001 - white-box takeover
+    assert state.acquire_poll_lease(client, "the-watcher") is not None
+
+    refused = await _tool(server, "listen")(ctx, timeout=3)
+    assert refused["error"] == "already_listening"
+    assert "watcher" in str(refused["hint"])
+
+    # Listening again on purpose mints a fresh id and wins the slot back.
+    recovered = await _tool(server, "listen")(ctx, timeout=0)
+    assert "error" not in recovered
+    assert client.poll_lease is not None
+    assert client.poll_lease.lease_id != "the-watcher"
+
+
 async def test_decisions_requires_join(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")

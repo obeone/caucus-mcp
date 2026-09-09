@@ -14,7 +14,9 @@ re-wakes the agent's main turn with the message text.
 Output contract:
 
 * **stdout** carries signal the agent must act on, one event per block: an
-  inbound message (``[caucus] msg ...``) or the stop notice (``[caucus] STOP``).
+  inbound message (``[caucus] msg ...``), the stop notice (``[caucus] STOP``),
+  or a terminal notice: ``[caucus] SESSION EXPIRED`` (re-join) and
+  ``[caucus] DISPLACED`` (another listener took the slot; do not relaunch).
   Quiet polls print nothing, so a background reader is woken only on real
   traffic.
 * **stderr** carries diagnostics (``coloredlogs``), never mistaken for signal.
@@ -49,6 +51,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import secrets
 import sys
 import time
 from pathlib import Path
@@ -147,6 +150,12 @@ def watch(hub: str, token: str, timeout: float) -> int:
     listening. This ensures messages are not buffered in a perpetual-loop
     process that never exits to re-wake the agent.
 
+    Every poll carries one lease id, minted for this process: the hub allows a
+    single ``/receive`` consumer per token, and the newest lease wins. So a
+    watcher relaunched while its predecessor is still polling takes the slot
+    over cleanly, and the predecessor is refused (HTTP 409) and exits instead of
+    splitting the queue with its replacement.
+
     Args:
         hub: Hub base URL (no trailing slash required).
         token: The access token to poll ``/receive`` with.
@@ -157,10 +166,15 @@ def watch(hub: str, token: str, timeout: float) -> int:
         (one-shot-per-wake -- the agent must re-launch to keep listening,
         unless a stop was received), ``1`` if the token is rejected (fatal
         -- a session-expired line is printed to stdout and a re-``join`` is
-        required).
+        required), ``2`` if another listener took the slot (this watcher is
+        the stale one; it exits without asking to be relaunched).
     """
     base = hub.rstrip("/")
     backoff = _BACKOFF_MIN
+    # One lease per watcher process, stable across its polls: re-presenting it
+    # is what tells the hub "same listener, still here" rather than "a second
+    # consumer just showed up".
+    lease = secrets.token_urlsafe(8)
     logger.info("watching %s for inbound messages (poll<=%.0fs)", base, timeout)
     with httpx.Client(base_url=base, timeout=timeout + _HTTP_TIMEOUT_SLACK) as http:
         while True:
@@ -169,7 +183,7 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 # a query token on this GET leaks into httpx and access logs.
                 resp = http.get(
                     "/receive",
-                    params={"timeout": timeout},
+                    params={"timeout": timeout, "lease": lease},
                     headers={"Authorization": f"Bearer {token}"},
                 )
             except httpx.HTTPError as exc:
@@ -192,6 +206,23 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 )
                 logger.error("hub rejected the token; re-join to get a fresh one")
                 return 1
+            if resp.status_code == 409:
+                # Another listener holds this token's single consumer slot,
+                # which means this process is the stale one (the newest lease
+                # always wins). Retrying would only be refused again, and the
+                # live listener is already draining the queue, so say so on
+                # stdout, where the agent woken by this exit will read it, and
+                # go away. The line explicitly forbids a relaunch: relaunching
+                # would steal the slot from the watcher that replaced us and
+                # start the churn over.
+                _emit(
+                    "[caucus] DISPLACED -- another listener now holds this"
+                    " session's inbound slot (a newer watcher or a listen()"
+                    " call). This stale watcher is exiting; do NOT relaunch it"
+                    " unless nothing else is listening."
+                )
+                logger.warning("another listener took the slot; exiting")
+                return 2
             if resp.status_code >= 400:
                 logger.warning(
                     "hub returned HTTP %s; retrying in %.0fs",

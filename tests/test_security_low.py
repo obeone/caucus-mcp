@@ -543,7 +543,12 @@ class _ConnectorErrorThenStop:
         self._call_count = 0
 
     async def receive(
-        self, token: str, timeout: float, *, ack_seq: int | None = None
+        self,
+        token: str,
+        timeout: float,
+        *,
+        ack_seq: int | None = None,
+        lease: str | None = None,
     ) -> Any:
         self._call_count += 1
         if self._call_count == 1:

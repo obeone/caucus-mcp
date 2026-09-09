@@ -48,6 +48,7 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import sys
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -645,6 +646,14 @@ async def _poll_inbound(
     the whole conversation and re-injecting it if this agent is ever reaped and
     revived.
 
+    Every poll carries one lease id, minted for this poller: the hub allows a
+    single ``/receive`` consumer per token. Losing the slot means a second
+    process is now listening under this agent's identity, which this agent
+    cannot fix and must not fight: re-acquiring in a loop would just trade the
+    slot back and forth and split the conversation between the two. It therefore
+    logs the takeover and ends the session, exactly as it does for an operator
+    stop, leaving one listener behind.
+
     **The ACK is sent on enqueue, not on completion.** A batch is acknowledged by
     the very next poll — as soon as it has been handed to the driver, long before
     the agent has answered it. Delivery across an operator ``reset`` is therefore
@@ -672,9 +681,14 @@ async def _poll_inbound(
     # never drains, and a reap + revive replays every one of them as brand-new
     # inbound — the same conversation injected twice.
     ack_seq: int | None = None
+    # One lease for the whole poller: re-presenting it marks every poll as the
+    # same listener, so only a genuinely different consumer counts as a takeover.
+    lease = secrets.token_urlsafe(8)
     while True:
         try:
-            inbound = await connector.receive(token, poll_timeout, ack_seq=ack_seq)
+            inbound = await connector.receive(
+                token, poll_timeout, ack_seq=ack_seq, lease=lease
+            )
         except httpx.HTTPError as exc:
             # Transient hub error (restart, 5xx, dropped connection, read
             # timeout): warn, back off, and retry rather than letting the
@@ -683,6 +697,15 @@ async def _poll_inbound(
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, _BACKOFF_MAX)
             continue
+        if inbound.already_listening:
+            # Someone else is now the single consumer for this token. Retrying
+            # is refused by design, so end the session rather than spin: an
+            # agent that cannot hear the room has nothing left to do here.
+            logger.error(
+                "another listener took over this token; ending session"
+            )
+            stop.set()
+            return
         # A clean poll means the hub is healthy again — drop back to the floor.
         backoff = _BACKOFF_MIN
         # The poll above carried the pending ACK, so the hub has pruned it;

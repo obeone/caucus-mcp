@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
@@ -168,6 +169,11 @@ class _Membership:
         joined_as: The project name this session registered under, or ``None``.
         last_acked_seq: Highest message ``seq`` acknowledged in this session,
             piggybacked on the next :func:`listen` poll.
+        listen_lease: The ``/receive`` lease id this session polls under, minted
+            on its first :func:`listen`. The hub allows one consumer per token,
+            so reusing the id marks successive listens as the same listener;
+            it is cleared on a refusal, and the next listen re-acquires the slot
+            with a fresh id.
         token_file: Path of the 0600 watcher token file written by
             :func:`watch_command`, cleaned up on :func:`leave`. ``None`` when
             none is live.
@@ -184,6 +190,7 @@ class _Membership:
     token: str | None = None
     joined_as: str | None = None
     last_acked_seq: int = 0
+    listen_lease: str | None = None
     token_file: str | None = None
     last_active: float = field(default_factory=time.time)
 
@@ -855,6 +862,9 @@ def build_mcp_server(
         token, name = member.token, member.joined_as
         member.token = None
         member.joined_as = None
+        # The identity is gone, so the lease minted under it is meaningless; a
+        # later re-join listens under a fresh one.
+        member.listen_lease = None
         # /leave has no brake, so a direct unregister is equivalent to routing
         # it and avoids a needless in-process round-trip.
         if token is not None:
@@ -1150,7 +1160,7 @@ def build_mcp_server(
     @_resilient
     async def listen(        ctx: _Ctx, timeout: float = 30.0
     ) -> dict[str, object]:
-        """Long-poll up to `timeout` (optional, default 30.0)s for messages to this agent or broadcast. Requires join. Empty `messages`: poll again. `stop:true`: operator halted the room, end the exchange. Auto-ACKs the previous batch. Errors: not_joined."""
+        """Long-poll up to `timeout` (default 30.0s) for messages to this agent or broadcast. Requires join. Empty `messages`: poll again. `stop:true`: operator halted the room, end the exchange. Auto-ACKs the previous batch. Errors: not_joined, already_listening."""
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
@@ -1158,9 +1168,29 @@ def build_mcp_server(
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
+        if member.listen_lease is None:
+            member.listen_lease = secrets.token_urlsafe(8)
         inbound = await connector.receive(
-            member.token, timeout, ack_seq=member.last_acked_seq or None
+            member.token,
+            timeout,
+            ack_seq=member.last_acked_seq or None,
+            lease=member.listen_lease,
         )
+        if inbound.already_listening:
+            # Another consumer (typically this agent's background watcher) holds
+            # the token's single inbound slot. Drop the lease so a deliberate
+            # later listen() re-acquires with a fresh id, and tell the agent
+            # what to do instead of letting it poll into the same refusal.
+            member.listen_lease = None
+            return {
+                "error": "already_listening",
+                "hint": (
+                    "another listener holds this session's inbound slot"
+                    " (usually your background watcher). Read what it prints"
+                    " instead of polling here; stop it first if you really"
+                    " want to listen() yourself."
+                ),
+            }
         # Advance the local ACK cursor so the next listen() piggybacks it.
         seqs = [
             raw
