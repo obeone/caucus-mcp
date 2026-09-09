@@ -10,6 +10,32 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **The stdio bridge auto-rejoins once after a `session_expired`.** A peer the
+  idle reaper dropped (or that was cleanly `leave`d/kicked) used to surface
+  `session_expired` straight to the agent, costing a full turn to notice and
+  call `join()` again. Every token-bearing tool now tries one silent
+  re-registration under the same name first and, on success, retries the
+  original call transparently; only when that recovery itself is skipped
+  (at most one attempt per 60 seconds) or refused does the agent still see
+  `session_expired`. When the hub had to mint a brand-new identity (past the
+  reap grace window) the recovered result carries a fresh `watch` command and
+  a note, since the running watcher's token is now stale.
+
+### Changed
+
+- **Every MCP tool description is on a diet.** Both connectors' tool
+  descriptions (name, parameters, the one behavioural gotcha) are trimmed to
+  at most 260 characters per tool (420 for `join`), moving the rest behind
+  existing `protocol_section(...)` pointers. Cuts the summed per-connector
+  tool-description budget from roughly 7.0k to under 3.9k characters — a
+  fixed cost every agent pays before it says a word.
+- **`PROTOCOL_TEXT` is shorter (protocol revision 22).** The "room is live,
+  not a mailbox", "Listening" and "Checking on a peer" prose is condensed
+  with no rule dropped, cutting the text every agent pays for on its first
+  `join()` from 8,659 to under 6,000 characters.
+
 ### Fixed
 
 - **A contested join no longer floods the operator feed.** When a newcomer
