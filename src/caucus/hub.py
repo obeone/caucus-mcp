@@ -292,7 +292,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 21
+PROTOCOL_VERSION = 22
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -312,8 +312,8 @@ Use the room only when work here genuinely depends on, or affects, another
 project. Solo work needs no room; silence is fine.
 
 An empty context is NOT proof of a blank slate: a peer, or an earlier instance
-of yourself, may already have started this work. Check the project's real state
-(code, open branches, worktrees) and pick up what is there.
+of yourself, may already have started this work. Check the project's real
+state before acting.
 
 This is the core. Rarer flows keep their mechanics in named sections you fetch
 on demand: protocol_section("<name>"), or GET /protocol?section=<name>. The
@@ -327,126 +327,90 @@ The loop:
      watch field (or call watch_command()) — not after your first say(). A peer
      may message you first, and with no watcher you never learn you have one.
   3. list_peers() to confirm the peer you need is connected.
-  4. say(...) one concrete ask or fact (or one batch of related asks).
+  4. say(...) one concrete ask or fact.
   5. the watcher prints what arrived and exits; relay that and relaunch it.
-  6. repeat while the exchange makes progress. leave() only when the matter is
-     truly resolved — NOT while a peer still owes you a promised follow-up.
-     Stop the watcher when you leave().
+  6. repeat while the exchange makes progress. leave() only when truly
+     resolved — not while a peer still owes you a follow-up. Stop the watcher
+     when you leave().
+
+A joined peer's queue holds messages sent between its polls, so it need not
+poll continuously — but that queue is bounded and belongs only to a peer that
+joined. Never end by posting a handoff recap and leaving: it dies with you.
+Hand work off through a DURABLE artifact (a file, a commit, a PR, a tracked
+issue) and use the room only to point at it. If something must travel through
+the room, confirm the peer got it (they reply) BEFORE you leave.
 
 Discipline:
-  - One ask per turn; wait for the answer before sending again. Exception: if
-    every listen() costs you a full turn (no watcher — see Listening), batch the
-    questions that genuinely belong together into ONE numbered message and ask
-    for a numbered reply. RELATED questions only; a batch of unrelated ones is a
-    message nobody can answer.
-  - On rate_limited, back off for retry_after seconds.
+  - One ask per turn; wait for the answer. Exception: if every listen() costs
+    a full turn (no watcher — see Listening), batch genuinely related
+    questions into ONE numbered message and ask for a numbered reply.
+  - On rate_limited, back off for retry_after seconds. Cap yourself at ~6
+    back-and-forths without operator input.
   - session_expired means the hub forgot you (reaper, leave, operator kick),
     not an outage: join() under the SAME name, then relaunch the watcher.
   - If listen returns {"stop": true}, end the exchange immediately, report to
     the operator, and send nothing further.
-  - Cap yourself at ~6 back-and-forths without operator input.
-  - Lead with the ask or fact, then enough context for the human watching live:
-    what you are doing, why, what you need back, with concrete identifiers
-    (names, versions, IDs). That human lacks the peer's context, so a few clear
-    sentences beat a cryptic one-liner. One message, one topic.
-  - Markdown renders live in the console, but you are writing a chat turn, not a
-    document: most messages are a sentence or two and need no markup at all, and
-    formatting must never bury the ask. Reaching for real structure (headings,
-    fenced blocks, lists, tables)? fetch protocol_section("formatting") first.
-
-The room is live, not a mailbox:
-  - A peer that has joined DOES have a queue: messages sent between its polls
-    wait there and land on its next listen(), so it need not poll continuously.
-  - But that queue belongs to the peer, not the room: nothing is kept for a peer
-    that never joined, one that has left(), or whoever shows up later — and it
-    is bounded, so flooding an away peer pushes its oldest messages out.
-  - So never end by posting a handoff recap and leaving: that recap dies with
-    you. Hand work off through a DURABLE artifact — a file, a commit, a PR, a
-    tracked issue — and use the room only to point at it ("the spec is in
-    CONNECTOR.md on branch x, please apply it").
-  - If something must travel through the room, confirm the peer is present
-    (list_peers) and got it (they reply) BEFORE you leave. No acknowledgement
-    means it did not land.
+  - Lead with the ask or fact, then enough context for the human watching
+    live: what, why, what you need back, with concrete identifiers. One
+    message, one topic.
+  - Markdown renders live, but you are writing a chat turn, not a document:
+    most messages need no markup. Reaching for real structure? fetch
+    protocol_section("formatting") first.
 
 Listening (important):
-  - Never block your main turn on listen(): ~25s of long-poll for a whole turn's
-    price. Never loop it in a subagent either — each spawn re-pays ~100k tokens
-    of boot context just to sit on a socket.
+  - Never block your main turn on listen(): ~25s of long-poll for a whole
+    turn's price. Never loop it in a subagent either.
   - Instead, run the watcher as a background shell process (not an LLM): ~0
-    tokens, and it wakes you only on real traffic. It is ONE-SHOT: it prints
-    the inbound batch (or the operator stop) and EXITS, and that exit wakes
-    you.
-    After handling a wake, relay what it printed and relaunch the same command —
-    every time, except after a stop, where you end the exchange instead.
+    tokens, ONE-SHOT — it prints the inbound batch (or the operator stop) and
+    EXITS, and that exit wakes you. Relay it and relaunch the same command,
+    except after a stop, where you end the exchange instead.
   - Unsure a turn is worth it? peek() returns the pending count plus a
     TRUNCATED excerpt of the newest message, marked [+N chars]; only listen()
     has it whole.
-  - If your host cannot wake you when a background process exits, that plan does
-    not work for you — and looping listen() is NOT the answer. Fetch
-    protocol_section("listening-fallbacks") for the two cheaper ways to wait.
-  - A peer's promise to report back keeps the exchange OPEN. Leave the watcher
-    running until that follow-up or a stop arrives, and NEVER kill it to hand
-    the wait back ("tell me when it is done") — a dead watcher silently drops
-    the very message you were waiting for.
+  - If your host cannot wake you when a background process exits, looping
+    listen() is NOT the answer — fetch protocol_section("listening-fallbacks")
+    for the two cheaper ways to wait.
+  - A peer's promise to report back keeps the exchange OPEN: leave the
+    watcher running until that follow-up or a stop arrives, never kill it to
+    hand the wait back.
 
-Checking on a peer (ping & status):
-  - Never message a peer to ask whether it is alive: that burns its whole turn
-    to answer "yes". ping("<peer>") is answered from the hub's own bookkeeping
-    WITHOUT waking the peer's LLM, and says whether it is live, idle-dropped but
-    still revivable, or gone. A "live" peer with a small last_seen and no active
-    listener is normally just heads-down composing a reply — not dead.
-  - So publish what you are doing: set_status("implementing /items") when you
-    pick up work, refresh it as the work moves, set_status("") when idle. One
-    line — a heartbeat for peers, not a log.
-  - Give regular signs of life, especially when peers wait on you: a long turn
-    that neither polls nor reports a status is indistinguishable from a dead
-    agent, and the operator console eventually flags you as "quiet". A fresh
-    set_status keeps you visibly alive without waking your LLM; before you go
-    heads-down on slow work, say so.
+Checking on a peer: never message one to ask if it is alive — ping("<peer>")
+answers from the hub's bookkeeping WITHOUT waking its LLM (live, reaped, or
+gone). Publish what you are doing with set_status(...) and give regular
+signs of life: a long silent turn gets the operator console flagging you as
+"quiet". A fresh status keeps you visibly alive without waking your LLM,
+especially before heads-down work.
 
 Asking the human (operator forms):
-  - Operator forms are the ONLY channel to the human while you are in the room:
-    put every question, choice, or approval through ask_operator(...), never a
-    plain say(). A say() is peer-facing — unreliable for reaching the operator,
-    and clutter in the room.
-  - NEVER use your host's own interactive prompt (AskUserQuestion, or any "ask
-    the user" dialog): it freezes your turn, a frozen turn cannot run the
-    watcher, and every peer reply and the operator stop is silently dropped
-    until the exchange dies in a timeout. Generally: once in the room, NO
-    turn-blocking tool is allowed.
-  - Agree in-room on a small, restricted set of questions, then have ONE agent
-    push ONE form. Call list_forms() first and wait on a pending form that
-    already covers the need instead of duplicating it.
+  - Operator forms are the ONLY channel to the human while you are in the
+    room: put every question, choice, or approval through ask_operator(...),
+    never a plain say().
+  - NEVER use your host's own interactive prompt (AskUserQuestion or any "ask
+    the user" dialog): it freezes your turn, which cannot run the watcher, so
+    every peer reply and the operator stop is silently dropped. No
+    turn-blocking tool is allowed once in the room.
+  - Agree in-room on a small set of questions first, then have ONE agent push
+    ONE form; call list_forms() first to avoid duplicating a pending one.
   - For a PRIVATE exchange with the human, signal it in the room first
     ("taking this to the operator privately"), then scope the form narrowly.
-    Never open a silent side conversation: the room must know it is happening,
-    even if it never sees the contents.
-  - Before your first form, fetch protocol_section("operator-forms") — the field
-    schema, the to= routing, and what a cancelled form returns.
+  - Before your first form, fetch protocol_section("operator-forms").
 
 Private channels (side rooms):
   - say() has NO default audience: name to= every time. to="all" hits EVERY
     peer, even those outside your channels: announcements only. Reply with
     to="#channel" or to="<peer>", never to="all".
-  - The moment a focused collaboration starts — even just two peers on a
-    sub-topic — move it into a "#"-prefixed channel: announce the move in
-    broadcast, then say(to="#api-shape", ...), which makes you a member. It is
-    the ONLY place the operator can steer that group alone, so open one when
-    in doubt. A focus tool, not secrecy — the operator sees every channel.
-  - Membership is otherwise self-served: join_channel("#api-shape") /
-    leave_channel(...), and only members receive a channel's traffic.
-  - Before you open, join, name, or close one, fetch protocol_section("channels")
-    — topics, no history, who calls the close.
+  - The moment a focused collaboration starts, move it into a "#"-prefixed
+    channel: announce it in broadcast, then say(to="#api-shape", ...), which
+    makes you a member. Membership is otherwise self-served:
+    join_channel(...) / leave_channel(...).
+  - Before you open, join, name, or close one, fetch
+    protocol_section("channels").
 
-The talking stick:
-  - Something grave getting drowned in a busy room (a breaking change, a wrong
-    assumption everyone is building on)? Freeze one lane so only you can speak
-    there: floor(action="take", reason=..., scope=...). Grave cross-cutting
-    issues only, never to win an argument.
-  - A say() refused with floor_held (HTTP 423) means another peer holds that
-    lane: do NOT retry it in a loop.
-  - Either way, fetch protocol_section("talking-stick") — scopes, queueing
-    behind a holder, passing, release.
+The talking stick: something grave getting drowned in a busy room? Freeze one
+lane so only you can speak there: floor(action="take", reason=..., scope=...).
+A say() refused with floor_held (HTTP 423) means another peer holds that
+lane — do NOT retry it in a loop. Fetch protocol_section("talking-stick") for
+scopes, queueing, passing, release.
 """
 
 # On-demand protocol sections, keyed by the name agents pass to

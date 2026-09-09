@@ -95,7 +95,7 @@ def test_register_with_older_version_is_stale(client: TestClient) -> None:
     assert body["protocol_text"] is not None
 
 
-def test_protocol_version_is_21() -> None:
+def test_protocol_version_is_22() -> None:
     # Revision 19 puts the protocol on a diet: the text every agent pays for on
     # join keeps only the rules it needs in the common case, and the mechanics of
     # the rarer flows (talking stick, channel etiquette, operator-form field
@@ -116,7 +116,12 @@ def test_protocol_version_is_21() -> None:
     # truncated excerpt rather than the message. Both describe what an agent
     # reads on a normal turn, so a section it might never fetch is the wrong
     # home for either.
-    assert PROTOCOL_VERSION == 21
+    #
+    # v22 is a further token-diet pass on the core prose itself (not a new rule):
+    # the "room is live, not a mailbox" and "checking on a peer" blocks were
+    # condensed and several bullets folded together, cutting PROTOCOL_TEXT from
+    # ~8.7k to under 6k characters with no pinned phrase dropped.
+    assert PROTOCOL_VERSION == 22
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
