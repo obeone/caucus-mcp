@@ -215,6 +215,7 @@ export default function AgentLauncher() {
             onChange={(e) => setName(e.target.value)}
             placeholder="name"
             aria-label="Agent name"
+            aria-describedby={error ? "agent-launcher-error" : undefined}
             className={cn(
               "w-32 bg-bg text-ink border border-line rounded-sm",
               "text-xs font-mono px-2 py-1 focus:outline-none focus:border-cyan",
@@ -301,22 +302,25 @@ export default function AgentLauncher() {
           </button>
 
           {error && (
-            <p className="text-[10px] font-mono text-red" role="alert">
+            <p id="agent-launcher-error" className="text-[10px] font-mono text-red">
               {error}
             </p>
           )}
         </div>
       </div>
 
-      {/* Roster */}
+      {/* Roster. `role="list"` only applies once there is at least one
+          `listitem` row: an empty roster uses `role="group"` instead so the
+          panel keeps its accessible name without tripping axe's
+          aria-required-children check on a list with no list items. */}
       <div
         className="flex flex-col border-t border-line/40 pt-1.5 max-h-48 overflow-y-auto"
-        role="list"
+        role={agents.length > 0 ? "list" : "group"}
         aria-label="Supervised agents"
       >
         {agents.length === 0 ? (
           <p className="text-[10px] font-mono text-dim/60 px-2 py-1">
-            — no supervised agents —
+            No supervised agents.
           </p>
         ) : (
           agents.map((agent) => (
