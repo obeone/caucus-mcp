@@ -65,7 +65,7 @@ from .models import (
     is_channel,
 )
 from .ratelimit import TokenBucket
-from .state import CapExceeded, Client, HubState, RegisterOutcome
+from .state import MAX_LEASE_ID_CHARS, CapExceeded, Client, HubState, RegisterOutcome
 from .supervisor import (
     AGENT_NAME_RE,
     DEFAULT_MAX_AGENTS,
@@ -303,7 +303,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 22
+PROTOCOL_VERSION = 23
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -364,9 +364,8 @@ Discipline:
   - Lead with the ask or fact, then enough context for the human watching
     live: what, why, what you need back, with concrete identifiers. One
     message, one topic.
-  - Markdown renders live, but you are writing a chat turn, not a document:
-    most messages need no markup. Reaching for real structure? fetch
-    protocol_section("formatting") first.
+  - Markdown renders live, but a chat turn is not a document: most messages
+    need no markup. Real structure? fetch protocol_section("formatting").
 
 Listening (important):
   - Never block your main turn on listen(): ~25s of long-poll for a whole
@@ -375,12 +374,13 @@ Listening (important):
     tokens, ONE-SHOT — it prints the inbound batch (or the operator stop) and
     EXITS, and that exit wakes you. Relay it and relaunch the same command,
     except after a stop, where you end the exchange instead.
+  - already_listening: a newer listener took your slot. Stop polling; only
+    relaunch the watcher if that slot is yours.
   - Unsure a turn is worth it? peek() returns the pending count plus a
     TRUNCATED excerpt of the newest message, marked [+N chars]; only listen()
     has it whole.
-  - If your host cannot wake you when a background process exits, looping
-    listen() is NOT the answer — fetch protocol_section("listening-fallbacks")
-    for the two cheaper ways to wait.
+  - Host cannot wake you when a background process exits? Looping listen() is
+    NOT the answer: fetch protocol_section("listening-fallbacks").
   - A peer's promise to report back keeps the exchange OPEN: leave the
     watcher running until that follow-up or a stop arrives, never kill it to
     hand the wait back.
@@ -389,8 +389,7 @@ Checking on a peer: never message one to ask if it is alive — ping("<peer>")
 answers from the hub's bookkeeping WITHOUT waking its LLM (live, reaped, or
 gone). Publish what you are doing with set_status(...) and give regular
 signs of life: a long silent turn gets the operator console flagging you as
-"quiet". A fresh status keeps you visibly alive without waking your LLM,
-especially before heads-down work.
+"quiet", so refresh it before heads-down work.
 
 Asking the human (operator forms):
   - Operator forms are the ONLY channel to the human while you are in the
@@ -1755,6 +1754,7 @@ async def receive(
     token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
     ack_seq: int | None = Query(default=None),
+    lease: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
@@ -1768,34 +1768,70 @@ async def receive(
     early with an empty message list when the client disconnects mid-poll so
     the live-listener counter is decremented promptly.
 
+    **One token, one consumer.** The poll holds a lease
+    (:meth:`~caucus.state.HubState.acquire_poll_lease`) keyed on ``lease``, so a
+    leftover watcher and the process that replaced it can no longer split the
+    queue between two connections. The newest caller always wins the slot; the
+    one it displaced gets ``409 already_listening`` (immediately if its poll is
+    still in flight, otherwise on its next poll) and must stop polling.
+
     While this call is in flight, ``client.active_polls`` is incremented, which
     lets :meth:`~caucus.state.HubState.register` distinguish a genuine
-    reconnect from a colliding duplicate process.
+    reconnect from a colliding duplicate process. That counter tracks polls, the
+    lease tracks consumers; both are needed, see
+    :attr:`~caucus.state.Client.active_polls`.
 
     Messages returned to the caller are appended to :attr:`~caucus.state.Client.unacked`
     so they can be replayed if the client disconnects before acknowledging them.
     Pass ``ack_seq=<seq>`` to piggyback an ACK on the next poll, confirming
     receipt of all messages up to that sequence number without an extra round-trip.
+    A lease handover leaves that machinery alone: the ACK cursor belongs to the
+    client, not to the lease, so the winner picks up exactly where the loser
+    stopped acknowledging, and anything the losing poll had dequeued but not
+    returned goes back to the head of its queue (see :func:`_release_getter`).
 
     Args:
         ack_seq: Optional piggyback ACK — the highest ``seq`` the caller has
             successfully processed. Equivalent to ``POST /ack`` but saves a
             round-trip by folding the ACK into the next poll.
+        lease: Optional listening-session id, stable across the caller's polls.
+            Omitting it mints a throwaway id for this single poll, which keeps
+            the single-consumer guarantee for a client that knows nothing of
+            leases (every poll simply takes the slot over).
 
     Returns:
         ``{"messages": [...], "mode": "<mode>"}``. The list may be empty when
         the poll times out or the client disconnects, in which case the caller
         should poll again.
+
+    Raises:
+        HTTPException: ``401`` for an unknown token, ``422`` for an oversized
+            ``lease``, ``409 already_listening`` when another consumer holds
+            (or has taken) the slot.
     """
     resolved = _resolve_receive_token(authorization, token)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
+    if lease is not None and len(lease) > MAX_LEASE_ID_CHARS:
+        raise HTTPException(status_code=422, detail="lease id too long")
 
     # Piggyback ACK: acknowledge previously delivered messages before waiting
-    # for new ones, saving the caller an extra round-trip.
+    # for new ones, saving the caller an extra round-trip. Applied *before* the
+    # lease check on purpose: a consumer that is about to be refused still
+    # processed the batch it is acknowledging, and dropping that ACK would have
+    # the hub replay those messages to whoever holds the slot next.
     if ack_seq is not None:
         state.ack(client.token, ack_seq)
+
+    # A caller with no lease id gets a throwaway one, unique to this poll: it
+    # can never be re-presented, so it is never refused, and it still displaces
+    # whoever held the slot. Single consumer, without requiring the client to
+    # know about leases at all.
+    lease_id = lease if lease is not None else f"anon-{secrets.token_urlsafe(6)}"
+    grant = state.acquire_poll_lease(client, lease_id)
+    if grant is None:
+        raise HTTPException(status_code=409, detail="already_listening")
 
     client.active_polls += 1
     loop = asyncio.get_event_loop()
@@ -1804,9 +1840,21 @@ async def receive(
     # re-armed (which is where a message could slip through the crack).
     pri_get: asyncio.Task[Message] | None = None
     chat_get: asyncio.Task[Message] | None = None
+    # Armed once and raced alongside the getters, so losing the lease ends this
+    # poll within a scheduling step instead of at the deadline. The displaced
+    # process must learn it lost while its relaunched successor is still young.
+    lost: asyncio.Task[bool] = asyncio.ensure_future(grant.revoked.wait())
     try:
         deadline = loop.time() + min(timeout, LONG_POLL_SECONDS)
         while True:
+            if grant.revoked.is_set():
+                # A newer consumer took the slot. Return nothing: whatever a
+                # getter dequeued goes back to the head of its queue in the
+                # cleanup below, so the winner reads it, in order, on its own
+                # poll. The client's ACK cursor is untouched, so no message is
+                # dropped and none is handed out twice.
+                raise HTTPException(status_code=409, detail="already_listening")
+
             if await request.is_disconnected():
                 return {"messages": [], "mode": state.mode.value}
 
@@ -1844,7 +1892,9 @@ async def receive(
             # again. The slice below is what keeps the loop returning to the
             # disconnect / mode / pause-gate checks.
             waiters: set[asyncio.Future[Any]] = {
-                task for task in (pri_get, chat_get, resumed) if task is not None
+                task
+                for task in (pri_get, chat_get, resumed, lost)
+                if task is not None
             }
             try:
                 await asyncio.wait(
@@ -1856,6 +1906,13 @@ async def receive(
                 # The gate waiter holds nothing, so dropping it loses nothing.
                 if resumed is not None:
                     resumed.cancel()
+
+            # Re-check the lease before touching the getters: a message pulled
+            # out by a poll that has just lost the slot must not be delivered to
+            # it. Looping back lets the check at the top raise, with the
+            # dequeued message restored by the cleanup block.
+            if grant.revoked.is_set():
+                continue
 
             # Each completed getter is retired (its slot cleared) *before* its
             # message is acted on. Clearing it afterwards would let a raise on
@@ -1898,6 +1955,8 @@ async def receive(
                 }
     finally:
         try:
+            # The revocation waiter holds nothing, so dropping it loses nothing.
+            lost.cancel()
             # Hand back anything a getter dequeued but this response never
             # carried.
             _release_getter(pri_get, client.priority_queue)

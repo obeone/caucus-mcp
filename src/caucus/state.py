@@ -144,6 +144,43 @@ STATUS_BUCKET_REFILL = 1.0
 CONTESTED_NOTICE_WINDOW = 5.0
 """Minimum seconds between two contested-join notices for the same name."""
 
+# A token may have exactly one live ``/receive`` consumer (see
+# :meth:`HubState.acquire_poll_lease`). When a newer consumer takes the slot, the
+# id it displaced is remembered so the loser cannot immediately steal it back:
+# two processes each re-polling after a refusal would otherwise trade the lease
+# forever and neither would ever drain the queue. The memory is a small ring:
+# a lease id is only ever displaced once, and every shipped connector mints a
+# fresh id when it deliberately re-acquires.
+
+REVOKED_LEASE_MEMORY = 8
+"""How many displaced ``/receive`` lease ids a client remembers and refuses."""
+
+MAX_LEASE_ID_CHARS = 64
+"""Longest accepted ``/receive`` lease id, so a peer cannot park junk in state."""
+
+
+@dataclass(slots=True)
+class PollLease:
+    """The single-consumer grant held by one ``/receive`` long-poller.
+
+    A lease outlives an individual poll: the holder keeps it across its whole
+    listening session, so a second process cannot slip a poll in between two of
+    the holder's polls and split the queue between them.
+
+    Attributes:
+        lease_id: The consumer-chosen id this lease was granted to. Stable for
+            as long as one process keeps listening.
+        granted_at: Wall-clock time the lease was granted, for diagnostics.
+        revoked: Set the moment a newer consumer takes the slot. An in-flight
+            poll races this event alongside its queue getters, so the loser
+            returns at once with ``already_listening`` instead of hanging on to
+            its deadline.
+    """
+
+    lease_id: str
+    granted_at: float
+    revoked: asyncio.Event
+
 
 @dataclass(slots=True)
 class Client:
@@ -174,7 +211,20 @@ class Client:
             membership is per-client and explicit (self-join).
         active_polls: Number of in-flight ``/receive`` long-polls currently
             held for this client — i.e. live listeners. Used to tell a genuine
-            reconnect from a colliding duplicate at register time.
+            reconnect from a colliding duplicate at register time. Distinct
+            from :attr:`poll_lease`, which the lease machinery uses: this
+            counter answers "is anybody polling *right now*", the lease answers
+            "who is allowed to poll at all". Register deliberately keeps
+            reading the counter, since a lease survives between two polls and
+            past the holder's death, so deciding CONTESTED on it would wedge a
+            name behind a lease no live process still holds.
+        poll_lease: The single-consumer grant currently held on ``/receive``,
+            or ``None`` before anyone has polled. Managed by
+            :meth:`HubState.acquire_poll_lease`.
+        revoked_leases: Ring of lease ids this client displaced, newest last.
+            A poll presenting one of them is refused rather than granted, so a
+            consumer that lost the slot cannot immediately take it back (see
+            :data:`REVOKED_LEASE_MEMORY`).
         reaped_at: When the idle reaper moved this client to the revival
             graveyard, or ``None`` while it is live. A reaped client keeps its
             token, queue, and channel memberships so any authenticated call can
@@ -246,6 +296,10 @@ class Client:
     last_seen: float = field(default_factory=time.time)
     channels: set[str] = field(default_factory=set)
     active_polls: int = 0
+    poll_lease: PollLease | None = None
+    revoked_leases: deque[str] = field(
+        default_factory=lambda: deque(maxlen=REVOKED_LEASE_MEMORY)
+    )
     reaped_at: float | None = None
     last_acked_seq: int = 0
     unacked: deque[Message] = field(default_factory=lambda: deque(maxlen=200))
@@ -649,6 +703,58 @@ class HubState:
         if reaped is not None:
             return self._revive(reaped)
         return None
+
+    def acquire_poll_lease(self, client: Client, lease_id: str) -> PollLease | None:
+        """Claim the single ``/receive`` consumer slot for ``lease_id``.
+
+        One token, one listener. Without this, a leftover watcher and the fresh
+        one that replaced it both long-poll the same queue and the messages
+        interleave between the two connections, so each consumer sees half the
+        conversation.
+
+        The newest arrival wins, unconditionally: the relaunch case is the whole
+        point, and a rule that let the incumbent keep the slot would lock a
+        bridge out behind the lease of a process that has already died. The
+        displaced lease is revoked (its in-flight poll returns at once) and its
+        id is remembered in :attr:`Client.revoked_leases`, which is what stops
+        the loser from taking the slot straight back on its next poll.
+
+        Re-presenting the id that already holds the lease is a no-op: a
+        listening session polls in a loop under one id, and only a *different*
+        id counts as a takeover.
+
+        Args:
+            client: The client whose consumer slot is being claimed.
+            lease_id: The caller's listening-session id. Callers that mean to
+                re-acquire after losing the slot must mint a fresh one; the
+                previous id stays refused.
+
+        Returns:
+            The live :class:`PollLease` to poll under, or ``None`` when
+            ``lease_id`` was displaced earlier and is therefore refused (the
+            HTTP layer maps that to ``409 already_listening``).
+        """
+        if lease_id in client.revoked_leases:
+            return None
+        current = client.poll_lease
+        if current is not None:
+            if current.lease_id == lease_id:
+                return current
+            # Newest wins: revoke in place so the loser's in-flight poll wakes
+            # on the event rather than blocking to its own deadline.
+            current.revoked.set()
+            client.revoked_leases.append(current.lease_id)
+            logger.info(
+                "%s: /receive lease handed from %s to %s",
+                client.project,
+                current.lease_id,
+                lease_id,
+            )
+        lease = PollLease(
+            lease_id=lease_id, granted_at=time.time(), revoked=asyncio.Event()
+        )
+        client.poll_lease = lease
+        return lease
 
     def _drop(self, client: Client, reason: str, *, revivable: bool = False) -> None:
         """Remove ``client`` from the roster and notify the operator UI.

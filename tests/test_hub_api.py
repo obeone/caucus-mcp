@@ -121,7 +121,11 @@ def test_protocol_version_is_22() -> None:
     # the "room is live, not a mailbox" and "checking on a peer" blocks were
     # condensed and several bullets folded together, cutting PROTOCOL_TEXT from
     # ~8.7k to under 6k characters with no pinned phrase dropped.
-    assert PROTOCOL_VERSION == 22
+    #
+    # v23 adds the single-consumer lease on /receive: one listener per token,
+    # newest wins, and the displaced one is refused with already_listening,
+    # a behaviour change connected bridges must re-read the protocol to learn.
+    assert PROTOCOL_VERSION == 23
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
