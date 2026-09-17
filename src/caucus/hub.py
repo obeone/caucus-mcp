@@ -529,10 +529,13 @@ broadcasting to every other agent in the room. A bare two-peer direct thread
 gives the human no such handle — their only options are a global broadcast or
 staying silent. So channels are not merely an anti-spam tool for 3+ peers.
 
-  - Open one by first announcing it in broadcast ("let's move the schema
-    details to #api-shape"), then say(to="#api-shape", ...). Sending to a
-    channel makes you a member automatically. Peers who care join it; the rest
-    ignore the announcement and never receive the channel's traffic.
+  - Open one by announcing the move in broadcast ("let's move the schema
+    details to #api-shape"), then join_channel("#api-shape") yourself and set
+    its topic — do not open it with your first say() into the channel, since
+    nobody is a member yet. Wait for the peers you named to arrive, then say
+    the substance. A no_recipients warning on that first channel say() is
+    expected, not a failure: it means say the substance again once members are
+    in.
   - Membership is explicit and self-served: join_channel("#api-shape") to start
     receiving it, leave_channel("#api-shape") when the sub-topic is resolved.
     Only members receive a channel's messages — non-members are not spammed.
@@ -1535,17 +1538,17 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
         warning = "no_recipients"
         if req.to == BROADCAST:
             hint = (
-                "nobody is in the room yet; there is no history, so this "
-                "message reached no one and no later joiner will see it. "
-                "Wait for peers (list_peers) and say it again once they are "
+                "nobody is in the room yet; there is no history, so no agent "
+                "heard this message and no later joiner will see it. Wait "
+                "for peers (list_peers) and say it again once they are "
                 "there."
             )
         else:
             hint = (
-                f"nobody is in {req.to} yet; channels have no history, so "
-                "this message reached no one and no later joiner will see "
-                "it. Wait for the audience (list_channels) and say it again "
-                "once they are there."
+                f"nobody is in {req.to} yet; channels have no history, so no "
+                "agent heard this message and no later joiner will see it. "
+                "Wait for the audience (list_channels) and say it again once "
+                "they are there."
             )
         logger.warning(
             "msg %s addressed to %r reached nobody; no_recipients",

@@ -75,6 +75,40 @@ async def test_send_broadcast_reaches_other_peer(live_hub: str) -> None:
     assert any("hello room" in m["content"] for m in inbound.messages)
 
 
+async def test_send_direct_to_absent_peer_reports_missed(live_hub: str) -> None:
+    """``SendResult.missed`` must carry the absent target through the connector."""
+    async with HubConnector(live_hub) as hub:
+        sender = await hub.register("conn-missed-tx", None)
+        result = await hub.send(sender.token, "conn-ghost", "anyone?")
+    assert result.ok is True
+    assert result.delivered_to == []
+    assert result.missed == ["conn-ghost"]
+    assert result.warning is None
+
+
+async def test_send_channel_with_no_other_member_reports_warning_and_hint(
+    live_hub: str,
+) -> None:
+    """A channel send reaching nobody must surface ``warning``/``hint``.
+
+    Uses a channel rather than a broadcast because ``live_hub`` is
+    module-scoped: peers registered by earlier tests are still connected, so
+    a plain broadcast would land on them. A freshly named channel has no
+    other member regardless of what earlier tests registered.
+
+    An empty ``delivered_to`` alone is easy to mistake for "sent, no replies
+    yet"; ``warning``/``hint`` are what tell the connector's caller it is
+    actually "reached no one, unrecoverable".
+    """
+    async with HubConnector(live_hub) as hub:
+        sender = await hub.register("conn-warn-tx", None)
+        result = await hub.send(sender.token, "#conn-warn-solo", "hello?")
+    assert result.ok is True
+    assert result.delivered_to == []
+    assert result.warning == "no_recipients"
+    assert result.hint
+
+
 async def test_receive_quiet_poll_is_empty(live_hub: str) -> None:
     async with HubConnector(live_hub) as hub:
         me = await hub.register("conn-quiet", None)

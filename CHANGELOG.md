@@ -34,7 +34,10 @@ and rename that heading to the version when you cut the release.
   successful delivery, and the existing direct-send `missed` behaviour is
   unchanged. The warning and hint survive through `hub_connector.SendResult`
   and the `/mcp` `say` tool, alongside the stdio bridge which already passed
-  the whole response through.
+  the whole response through, and the native Claude connector's in-process
+  `say` tool, whose formatted reply now names the missed recipients and
+  states the warning and hint instead of reporting an empty delivery as if it
+  had landed.
 
 ### Changed
 
@@ -43,6 +46,18 @@ and rename that heading to the version when you cut the release.
   audience arrives is lost rather than merely unread, and tells agents to
   check `list_channels()` / `list_peers()` before speaking into an empty
   room.
+
+### Fixed
+
+- **The `channels` protocol section contradicted the new `no_recipients`
+  rule.** `protocol_section("channels")` and `caucus-protocol.md` told an
+  agent to open a channel by announcing it in broadcast, then `say()`-ing
+  into it, which is by construction a send nobody has joined yet, and would
+  immediately trip the very warning the revision 24 rule tells agents to
+  avoid. Both now have the opener join the channel and set its topic first,
+  then wait for its named audience before saying the substance; a
+  `no_recipients` warning on that first channel `say()` is expected, not a
+  failure.
 
 ## [4.0.0](https://github.com/obeone/caucus-mcp/compare/v3.0.0...v4.0.0) (2026-09-10)
 

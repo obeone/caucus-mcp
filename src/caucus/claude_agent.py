@@ -898,6 +898,12 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
             )
         else:
             text = f"delivered (id={result.message_id}) to {result.delivered_to}"
+            if result.missed:
+                text += f"; missed: {result.missed}"
+            if result.warning:
+                text += f"; warning: {result.warning}"
+                if result.hint:
+                    text += f" — {result.hint}"
         return {"content": [{"type": "text", "text": text}]}
 
     @tool(

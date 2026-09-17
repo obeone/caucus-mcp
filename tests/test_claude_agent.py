@@ -17,7 +17,7 @@ import pytest
 
 from caucus import claude_agent
 from caucus import hub as hub_module
-from caucus.hub_connector import HubConnector, Inbound
+from caucus.hub_connector import HubConnector, Inbound, SendResult
 
 
 # --- tool policy ---------------------------------------------------------
@@ -179,6 +179,73 @@ def test_agent_text_ignores_non_text_messages() -> None:
         pass
 
     assert claude_agent._agent_text(_Result()) is None
+
+
+# --- in-process "say" tool ------------------------------------------------
+
+
+class _SendingConnector:
+    """Fake connector whose ``send`` returns a scripted :class:`SendResult`."""
+
+    def __init__(self, result: SendResult) -> None:
+        self._result = result
+
+    async def send(self, token: str, to: str, content: str) -> SendResult:
+        return self._result
+
+
+async def _say_reply_text(
+    monkeypatch: pytest.MonkeyPatch, result: SendResult
+) -> str:
+    """Build the caucus server, invoke its ``say`` tool, return the reply text.
+
+    ``create_sdk_mcp_server`` is stubbed to hand back the raw tool list
+    instead of a live MCP server, so the ``say`` handler can be called
+    directly without standing up the SDK transport.
+    """
+    monkeypatch.setattr(
+        claude_agent, "create_sdk_mcp_server", lambda **kwargs: kwargs["tools"]
+    )
+    tools = claude_agent._build_caucus_server(_SendingConnector(result), "tok")
+    say_tool = next(t for t in tools if t.name == "say")
+    reply = await say_tool.handler({"content": "hi", "to": "all"})
+    return str(reply["content"][0]["text"])
+
+
+async def test_say_reports_missed_recipient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A send that missed its named recipient must show that to the agent.
+
+    The native connector used to report only ``delivered_to``, so a message
+    addressed to an absent peer read back as "delivered ... to []" with no
+    hint that nobody actually got it.
+    """
+    result = SendResult(ok=True, message_id="m1", delivered_to=[], missed=["ghost"])
+    text = await _say_reply_text(monkeypatch, result)
+    assert "missed" in text
+    assert "ghost" in text
+
+
+async def test_say_reports_warning_and_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A channel/broadcast send that reaches nobody must surface warning + hint."""
+    result = SendResult(
+        ok=True,
+        message_id="m2",
+        delivered_to=[],
+        warning="no_recipients",
+        hint="nobody is in the room yet",
+    )
+    text = await _say_reply_text(monkeypatch, result)
+    assert "no_recipients" in text
+    assert "nobody is in the room yet" in text
+
+
+async def test_say_omits_missed_and_warning_on_clean_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean delivery must not fabricate a missed/warning mention."""
+    result = SendResult(ok=True, message_id="m3", delivered_to=["peer"])
+    text = await _say_reply_text(monkeypatch, result)
+    assert text == "delivered (id=m3) to ['peer']"
 
 
 # --- loop control --------------------------------------------------------
