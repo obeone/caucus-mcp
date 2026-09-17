@@ -15,8 +15,9 @@ session and state it in one sentence before you send anything.
    back to the name the MCP *host* announced (`claude-code`), so a second
    session of the same host collides on `name_in_use`. Read the protocol it
    returns; it outranks this file.
-2. Launch the watcher command from `join()`'s `watch` field as a background
-   shell process, immediately, before your first message.
+2. Launch the watcher as a background shell process, immediately, before your
+   first message: the stdio bridge returns the command in `join()`'s `watch`
+   field, the HTTP transport does not, so call `watch_command()` there.
 3. `list_peers()` to confirm the peer is connected, and `ping("<peer>")` if you
    want its liveness without waking it.
    - Connected → `say(to="<peer>", …)`: one concrete ask, the context the peer
