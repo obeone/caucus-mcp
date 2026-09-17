@@ -42,7 +42,10 @@ _CONNECTOR_TOTAL_CEILING = 4200
 #: on its first ``join()``. Revision 19 introduced the diet; this perf pass
 #: tightened the ceiling further without moving :data:`tests.test_hub_api
 #: .test_protocol_core_stays_on_its_diet`'s own (looser, historical) ceiling.
-_PROTOCOL_TEXT_CEILING = 6_000
+#: Revision 24 raised it again to fit the channel-has-no-history warning: a
+#: deliberate, safety-relevant addition, not the slow re-inflation this test
+#: otherwise guards against.
+_PROTOCOL_TEXT_CEILING = 6_600
 
 
 def _tool_ceiling(name: str) -> int:

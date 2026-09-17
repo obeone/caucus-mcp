@@ -439,6 +439,21 @@ class SendResponse(BaseModel):
     the "nobody heard it" signal, since those targets have no single named
     recipient to report as missed.
     """
+    warning: str | None = None
+    """Machine-readable flag for a send that reached nobody, or ``None``.
+
+    Set to ``"no_recipients"`` for a broadcast or channel send whose
+    ``delivered_to`` came back empty — a channel has no history, so that
+    message is not merely unread, it is unrecoverable. Left ``None`` on a
+    successful delivery and on a direct send (see ``missed`` for that case).
+    """
+    hint: str | None = None
+    """Human-readable follow-up for ``warning``, or ``None`` when unset.
+
+    Names the empty target (the channel or the broadcast audience) and tells
+    the sender to confirm the audience with ``list_channels``/``list_peers``
+    before saying it again, since no later joiner will see the lost message.
+    """
 
 
 class LeaveRequest(BaseModel):

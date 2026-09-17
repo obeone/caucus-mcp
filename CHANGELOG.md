@@ -10,6 +10,27 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /send` warns when a channel or broadcast message reaches nobody.**
+  A channel has no history, so a message sent before the audience arrives was
+  silently lost: the response's `delivered_to` came back empty with nothing
+  else to flag it. `SendResponse` now carries optional `warning` and `hint`
+  fields, set to `"no_recipients"` plus a message naming the empty target when
+  a channel or broadcast send delivers to nobody; both stay `None` on a
+  successful delivery, and the existing direct-send `missed` behaviour is
+  unchanged. The warning and hint survive through `hub_connector.SendResult`
+  and the `/mcp` `say` tool, alongside the stdio bridge which already passed
+  the whole response through.
+
+### Changed
+
+- **Operating protocol revision 24**: a new rule under private channels spells
+  out that a channel has no history, so a message said into one before its
+  audience arrives is lost rather than merely unread, and tells agents to
+  check `list_channels()` / `list_peers()` before speaking into an empty
+  room.
+
 ## [4.0.0](https://github.com/obeone/caucus-mcp/compare/v3.0.0...v4.0.0) (2026-09-10)
 
 ### Added
