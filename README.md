@@ -100,16 +100,21 @@ uvx --from caucus-mcp caucus-hub --host 127.0.0.1 --port 8765
 /plugin install caucus@caucus
 ```
 
-That installs the four `/caucus:*` commands **and** an MCP entry pointing at
+That installs the five `/caucus:*` commands **and** an MCP entry pointing at
 `${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp`. There is nothing else to
-configure, in this repo or in any other: every Claude Code session on the
-machine can now reach the room. Export `CAUCUS_HUB_URL` if your hub lives
-elsewhere.
+configure, in this repo or in any other. Export `CAUCUS_HUB_URL` if your hub
+lives elsewhere.
 
-**3. Open the console** at **<http://127.0.0.1:8765/>** and leave it in a corner
+**3. Open a fresh session** in the repo you want to join from, and run
+`/caucus:setup` first. A session whose MCP client dialed before the hub was
+listening does not just pick up the tools once one appears; `/caucus:setup`
+checks that, tells you plainly whether you are ready, and walks you through
+fixing it if you are not.
+
+**4. Open the console** at **<http://127.0.0.1:8765/>** and leave it in a corner
 of the screen. That is where you watch, steer and stop.
 
-**4. Send each agent in** from its own repo's session:
+**5. Send each agent in**:
 
 ```shell
 /caucus:status                        # read-only recon: who is already in the room
@@ -117,7 +122,7 @@ of the screen. That is where you watch, steer and stop.
 ```
 
 `/caucus:join` joins the room, starts the watcher, opens the channel, and then
-**waits for the other agents** rather than talking into an empty one. The four
+**waits for the other agents** rather than talking into an empty one. The five
 commands are detailed under [Slash commands for Claude
 Code](#-slash-commands-for-claude-code); for a full exchange from first join to
 clean exit, read [A first exchange, end to
@@ -648,7 +653,7 @@ attached.
 
 ## 🪄 Slash commands for Claude Code
 
-This repo doubles as a **Claude Code plugin**: four `/caucus:*` commands that
+This repo doubles as a **Claude Code plugin**: five `/caucus:*` commands that
 drive the room the way the protocol says it should be driven, so you do not have
 to re-explain it to every agent in every repo.
 
@@ -661,11 +666,30 @@ That installs the commands **and** an MCP entry pointing at
 `${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp`, so a fresh repo needs no
 per-project config at all. Export `CAUCUS_HUB_URL` if your hub lives elsewhere.
 If a project of yours already configures a `caucus` MCP server of its own, drop
-that config once the plugin is installed — two entries mean two connections to
+that config once the plugin is installed: two entries mean two connections to
 the same hub from one session.
+
+The plugin also ships a `SessionStart` hook,
+[`hooks/hub-ensure.sh`](hooks/hub-ensure.sh), that wakes the hub before the
+`/mcp` client dials it: it asks the hub's installed service to start and waits
+for the port to answer, the same way
+[`autostart.py`](src/caucus/autostart.py) does for the other connectors, and
+it never spawns `caucus-hub` itself. That needs the service installed once
+with `caucus-setup-service` (see
+[`docs/running-as-a-service.md`](docs/running-as-a-service.md)); with no
+service installed the hook has nothing to wake and quietly gives up.
+
+The plugin is a client, not the hub, and that hook cannot rescue every case:
+a plugin installed mid-session gets no `SessionStart` at all, so a session
+can end up with zero caucus tools if the hub was not listening the moment it
+connected. Run `/caucus:setup` to find out why and, with your say-so, fix
+it: it checks whether the hub is reachable, whether it is even installed, and
+how your machine can keep it running, asking permission before it does
+anything.
 
 | Command | What it does |
 | --- | --- |
+| `/caucus:setup` | Diagnoses a missing or unreachable hub and, with permission, fixes it. Safe to run with zero caucus tools; nothing else in this table is. |
 | `/caucus:join #channel [directive]` | Joins the room, launches the watcher **before** speaking, opens the channel, and **waits for the other agents to be there** instead of talking into an empty room. |
 | `/caucus:talk <peer> <ask>` | Direct exchange with one named peer, after confirming it is actually connected. |
 | `/caucus:status` | Read-only recon: peers, channels, pending forms, held floor. Does **not** join. |

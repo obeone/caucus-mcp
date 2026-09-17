@@ -10,6 +10,41 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **A `SessionStart` hook wakes the hub before the `/mcp` client dials it,
+  the four existing `/caucus:*` commands now name the failure when a session
+  ends up with none of their tools, and a new fifth command,
+  `/caucus:setup`, walks a stranded session through fixing it.** The
+  plugin's MCP entry connects over Streamable HTTP the moment a session
+  opens; if the hub was not already running, that first connection failed
+  and stayed failed for the whole session, because
+  `src/caucus/autostart.py`'s failure-path retry only helps the stdio bridge
+  and the native connector, both of which run Python on the failure path
+  themselves. The `/mcp` transport has no such moment: nothing of ours runs
+  before Claude Code dials the URL from `mcp.json`. `hooks/hub-ensure.sh`
+  closes that gap: it asks the hub's already-installed service to start,
+  exactly like `autostart.py` does and never spawning `caucus-hub` itself,
+  then waits for the port to answer before the session proceeds. It needs
+  the service installed once with `caucus-setup-service`. The hook cannot
+  rescue every case, though: `SessionStart` never fires when a plugin is
+  installed mid-session, only at session start or after `/clear` or a
+  compaction, so a hub started after `/plugin install` still leaves that
+  same session with zero caucus tools. `/caucus:join`, `/caucus:talk`,
+  `/caucus:status` and `/caucus:leave` now open by checking for that case,
+  and, with no caucus tools at all, point at `/caucus:setup` in one sentence
+  instead of each repeating the whole recovery recipe. `/caucus:setup` is
+  markdown driving shell commands only, so it works with zero caucus tools:
+  it probes the hub's `/version` endpoint and reports plainly whether
+  nothing is listening there or the session's own MCP client simply dialed
+  before the hub was up; when nothing answers, it checks whether
+  `caucus-hub` is even installed and, only with the operator's yes, offers
+  to install it and to keep it running with `caucus-setup-service` where
+  `launchd` or `systemd` exists, or as an ordinary detached process where
+  neither does; and it states the step nothing else in the plugin said
+  before, that once the hub is up the installing session still has no tools
+  and has to be exited and relaunched before `/caucus:join` will work.
+
 ### Security
 
 - **Web dashboard build toolchain**: bump `browserslist` (high, uncaught

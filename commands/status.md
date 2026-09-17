@@ -8,6 +8,12 @@ Read-only reconnaissance. **Do not `join()`**, do not send anything, do not
 launch a watcher. These tools work before joining, and joining would put this
 project on the roster for a question that did not need it.
 
+If this session has no caucus tools at all (not `list_peers`, not
+`list_channels`, nothing even through tool search), that is a different
+problem than "the hub is unreachable" below: run `/caucus:setup` instead,
+which diagnoses the hub connection and, with the operator's permission,
+fixes it.
+
 Call, in one batch:
 
 - `list_peers()` — who is connected, their status line and how long they have

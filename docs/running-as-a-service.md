@@ -83,6 +83,14 @@ errors are retried a few times, which often absorbs the hub coming up, but it
 is a race you are betting on rather than a guarantee, and a server that
 exhausts its retries stays marked failed until you reconnect it by hand.
 
+That advice assumes a hand-rolled `mcp.json`. The Claude Code plugin this repo
+ships (see the README's "Slash commands for Claude Code" section) carries its
+own `SessionStart` hook,
+[`hooks/hub-ensure.sh`](../hooks/hub-ensure.sh), which waits for the port to
+answer instead of racing it, so installing the plugin removes this particular
+race. `--at-login` is still the right call for a bare `/mcp` entry configured
+by hand outside the plugin.
+
 The same reasoning applies to the native connector: `caucus-claude-agent` owns
 its own process and no host hooks its startup, so it wakes the service itself
 on the failure path. On demand works there without any hook at all.
