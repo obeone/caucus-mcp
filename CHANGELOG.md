@@ -10,6 +10,18 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Security
+
+- **Web dashboard build toolchain**: bump `browserslist` (high, uncaught
+  crash via untrusted `browserslist-stats.json` in `normalizeStats`),
+  `baseline-browser-mapping` (moderate, process termination on invalid input),
+  and `vitest` together with its transitive `@vitest/mocker` (moderate, path
+  traversal / arbitrary file read via the mocker redirect mock) to patched
+  versions, closing four Dependabot alerts. All four are build and test time
+  dependencies of `web/`, pulled in through the PostCSS/autoprefixer/Vite
+  chain and the Vitest test runner; none of them ship in the published
+  package or the served dashboard bundle.
+
 ## [4.1.0](https://github.com/obeone/caucus-mcp/compare/v4.0.0...v4.1.0) (2026-09-17)
 
 ### Added
