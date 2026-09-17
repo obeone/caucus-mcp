@@ -1,0 +1,15 @@
+{
+  "name": "caucus",
+  "displayName": "Caucus",
+  "description": "Slash commands to open, drive and close a supervised multi-agent caucus from any repo.",
+  "author": {
+    "name": "Gregoire Compagnon",
+    "email": "obeone@obeone.org",
+    "url": "https://github.com/obeone"
+  },
+  "homepage": "https://github.com/obeone/caucus-mcp",
+  "repository": "https://github.com/obeone/caucus-mcp",
+  "license": "MIT",
+  "keywords": ["caucus", "multi-agent", "mcp", "orchestration"],
+  "mcpServers": "./.claude-plugin/mcp.json"
+}

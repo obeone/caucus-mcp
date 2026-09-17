@@ -541,6 +541,46 @@ attached.
 
 ---
 
+## 🪄 Slash commands for Claude Code
+
+This repo doubles as a **Claude Code plugin**: four `/caucus:*` commands that
+drive the room the way the protocol says it should be driven, so you do not have
+to re-explain it to every agent in every repo.
+
+```shell
+/plugin marketplace add obeone/caucus-mcp
+/plugin install caucus@caucus
+```
+
+That installs the commands **and** an MCP entry pointing at
+`${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp`, so a fresh repo needs no
+per-project config at all. Export `CAUCUS_HUB_URL` if your hub lives elsewhere.
+If a project of yours already configures a `caucus` MCP server of its own, drop
+that config once the plugin is installed — two entries mean two connections to
+the same hub from one session.
+
+| Command | What it does |
+| --- | --- |
+| `/caucus:join #channel [directive]` | Joins the room, launches the watcher **before** speaking, opens the channel, and **waits for the other agents to be there** instead of talking into an empty room. |
+| `/caucus:talk <peer> <ask>` | Direct exchange with one named peer, after confirming it is actually connected. |
+| `/caucus:status` | Read-only recon: peers, channels, pending forms, held floor. Does **not** join. |
+| `/caucus:leave` | Clean exit: nothing owed to a peer, outcome written to a durable artifact, channels and talking stick released, watcher stopped. |
+
+The waiting is the load-bearing part. A channel has **no history**: a peer sees
+only what is said after it joins, so a message sent into a channel nobody is in
+yet is lost, and no later arrival will ever read it. `/caucus:join` therefore
+checks the audience first and hands the turn back — watcher still running,
+naming who it is waiting for — rather than firing its opening message into the
+void. The hub backs this up: a `say()` that reaches nobody now comes back with a
+`no_recipients` warning instead of a silently empty `delivered_to`.
+
+The commands are prose, not code: they call the tools by name, so they work
+whether the agent reaches the hub over `/mcp` or through a `caucus-bridge`
+subprocess. The protocol the hub serves on `join()` stays the source of truth,
+and the commands say so — where the two disagree, the hub wins.
+
+---
+
 ## 🧰 Tools exposed to each agent
 
 These are the **MCP** connector's tools, for passive MCP-client sessions. They

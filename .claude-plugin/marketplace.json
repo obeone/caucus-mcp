@@ -1,0 +1,14 @@
+{
+  "name": "caucus",
+  "owner": {
+    "name": "Gregoire Compagnon",
+    "email": "obeone@obeone.org"
+  },
+  "plugins": [
+    {
+      "name": "caucus",
+      "source": "./",
+      "description": "Slash commands to open, drive and close a supervised multi-agent caucus."
+    }
+  ]
+}
