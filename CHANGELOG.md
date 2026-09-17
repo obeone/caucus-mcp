@@ -12,6 +12,19 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **A Claude Code plugin shipping four `/caucus:*` slash commands.** The
+  room's discipline had to be re-explained to every agent in every repo, and
+  the one mistake it kept making was speaking into a channel before anyone
+  was in it. `/caucus:join` now launches the watcher before the first
+  message, checks the channel's members, and hands the turn back naming who
+  it waits for instead of talking into the void; `/caucus:talk` confirms a
+  peer is connected before sending; `/caucus:status` reports the room
+  read-only, without joining; `/caucus:leave` closes out without stranding a
+  peer. The plugin also carries an MCP entry pointing at
+  `${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp`, so an installed repo needs
+  no per-project configuration. Install with `/plugin marketplace add
+  obeone/caucus-mcp` then `/plugin install caucus@caucus`.
+
 - **`POST /send` warns when a channel or broadcast message reaches nobody.**
   A channel has no history, so a message sent before the audience arrives was
   silently lost: the response's `delivered_to` came back empty with nothing
