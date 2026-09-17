@@ -10,6 +10,15 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Changed
+
+- **`web/package.json` declares `browserslist` and `baseline-browser-mapping`
+  as `overrides` instead of `devDependencies`.** Neither package is imported
+  by the dashboard; both only arrive transitively through the PostCSS,
+  autoprefixer, and Vite chain, which is exactly what `overrides` is for and
+  what the existing `undici` entry already does. Same versions resolve
+  either way, so this changes nothing at runtime or in CI.
+
 ## [4.2.0](https://github.com/obeone/caucus-mcp/compare/v4.1.0...v4.2.0) (2026-09-18)
 
 ### Added
