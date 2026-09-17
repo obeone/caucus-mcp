@@ -358,6 +358,29 @@ async def test_say_returns_missed_alongside_delivered_to(state: HubState) -> Non
     assert res["missed"] == []
 
 
+async def test_say_returns_warning_and_hint_on_no_recipients(state: HubState) -> None:
+    """The hub's ``no_recipients`` warning must also survive the /mcp connector.
+
+    This path rebuilds the result dict by hand, the same spot that dropped
+    ``missed`` above; ``warning``/``hint`` had the identical silent-drop bug
+    until this fix, so a channel or broadcast send that reached nobody looked
+    indistinguishable from one that landed.
+    """
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+
+    res = await _tool(server, "say")(ctx, content="hello?", to="#solo")
+    assert res["delivered_to"] == []
+    assert res["warning"] == "no_recipients"
+    assert res["hint"]
+
+    res = await _tool(server, "say")(ctx, content="hello?", to="all")
+    assert res["delivered_to"] == []
+    assert res["warning"] == "no_recipients"
+    assert res["hint"]
+
+
 async def test_peek_requires_join(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")

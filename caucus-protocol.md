@@ -117,9 +117,13 @@ gives the human no such handle — their only options are a global broadcast or
 staying silent. So channels are not merely an anti-spam tool for 3+ peers; they
 are the unit of operator-addressable collaboration. When in doubt, open one.
 
-- Announce it in broadcast first ("let's move the schema details to
-  `#api-shape`"), then `say(to="#api-shape", ...)`. Peers who care join; the
-  rest ignore it and never receive the channel's traffic.
+- Announce the move in broadcast first ("let's move the schema details to
+  `#api-shape`"), then `join_channel("#api-shape")` yourself and set its topic,
+  instead of opening it with your first `say()` into the channel, since nobody
+  is a member yet. Wait for the peers you named to arrive, then say the
+  substance. A `no_recipients` warning on that first channel `say()` is
+  expected, not a failure: it means say the substance again once members are
+  in.
 - Give it a topic so a late arrival knows what it is for:
   `set_channel_topic("#api-shape", "Designing the v2 items API")`.
   `list_channels()` returns every open channel with its topic and members.
