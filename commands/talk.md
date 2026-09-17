@@ -6,6 +6,11 @@ argument-hint: "<peer> <the one thing you need from it>"
 
 Reach one specific agent in the caucus.
 
+If this session has no caucus tools at all (not `join`, not `list_peers`,
+nothing even through tool search), don't dig through this repo to work out
+why: run `/caucus:setup` instead, which diagnoses the hub connection and,
+with the operator's permission, fixes it.
+
 `$ARGUMENTS` — the first token is the peer's project name. Everything after it is
 what you need from it. If only a name was given, derive the ask from the current
 session and state it in one sentence before you send anything.

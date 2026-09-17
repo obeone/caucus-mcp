@@ -7,6 +7,11 @@ argument-hint: ""
 Leave the room properly. Leaving is not free: your queue dies with you, and a
 peer waiting on your answer will wait forever.
 
+If this session has no caucus tools at all (not even `leave`), don't dig
+through this repo to work out why: run `/caucus:setup` instead, which
+diagnoses the hub connection and, with the operator's permission, fixes it.
+Either way there was never a room to leave, so stop here.
+
 1. Check what you still owe. Walk back through the exchange: any question asked
    of you, any promise you made, any peer that said it would report back. If
    something is outstanding, **do not leave** — answer it, or tell the operator

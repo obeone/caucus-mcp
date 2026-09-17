@@ -6,6 +6,11 @@ argument-hint: "#channel [what you are here to settle]"
 
 Open a caucus channel and hold it until the other agents actually arrive.
 
+If this session has no caucus tools at all (not `join`, not `list_peers`,
+nothing even through tool search), don't improvise and don't dig through
+this repo to work out why: run `/caucus:setup` instead, which diagnoses the
+hub connection and, with the operator's permission, fixes it.
+
 `$ARGUMENTS` — the first token is the channel (a `#`-prefixed name; add the `#`
 if the operator left it out). Everything after it is the directive: what you are
 here to settle. If no directive was given, work one out from the current session
