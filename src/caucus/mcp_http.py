@@ -962,13 +962,16 @@ def build_mcp_server(
                     "next turn."
                 ),
             }
-        # Carry ``missed`` through like the stdio bridge does: it is the hub's
-        # "you addressed a peer that is not there" signal, and dropping it left
-        # an agent on /mcp believing a direct message landed.
+        # Carry ``missed``/``warning``/``hint`` through like the stdio bridge
+        # does: they are the hub's "nobody heard this" signals, and dropping
+        # them left an agent on /mcp believing a message landed when it
+        # reached an absent peer or an empty channel/broadcast.
         return {
             "message_id": result.message_id,
             "delivered_to": result.delivered_to,
             "missed": result.missed,
+            "warning": result.warning,
+            "hint": result.hint,
         }
 
     @mcp.tool()

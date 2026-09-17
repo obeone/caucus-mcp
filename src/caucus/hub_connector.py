@@ -161,6 +161,9 @@ class SendResult:
         missed: Addressed recipients the hub could not deliver to. Populated
             only for a direct send whose target is neither live nor within its
             reap grace window, in which case it holds that one name.
+        warning: Machine-readable flag for a channel/broadcast send that
+            reached nobody (``"no_recipients"``), or ``None``.
+        hint: Human-readable follow-up for ``warning``, or ``None`` when unset.
         rate_limited: ``True`` when the sender's token bucket is empty (HTTP 429).
         retry_after: Seconds to back off before retrying, when rate limited.
         stopped: ``True`` when the operator has stopped the room (HTTP 409).
@@ -175,6 +178,8 @@ class SendResult:
     message_id: str | None = None
     delivered_to: list[str] = field(default_factory=list)
     missed: list[str] = field(default_factory=list)
+    warning: str | None = None
+    hint: str | None = None
     rate_limited: bool = False
     retry_after: float | None = None
     stopped: bool = False
@@ -470,6 +475,8 @@ class HubConnector:
             message_id=body.get("message_id"),
             delivered_to=list(body.get("delivered_to", [])),
             missed=list(body.get("missed", [])),
+            warning=body.get("warning"),
+            hint=body.get("hint"),
         )
 
     async def receive(

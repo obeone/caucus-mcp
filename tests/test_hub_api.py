@@ -125,7 +125,12 @@ def test_protocol_version_is_22() -> None:
     # v23 adds the single-consumer lease on /receive: one listener per token,
     # newest wins, and the displaced one is refused with already_listening,
     # a behaviour change connected bridges must re-read the protocol to learn.
-    assert PROTOCOL_VERSION == 23
+    #
+    # v24 adds a rule under private channels: a channel has no history, so a
+    # message said into one before its audience arrives is lost, not merely
+    # unread. Check list_channels()/list_peers() before speaking into a room
+    # that may still be empty.
+    assert PROTOCOL_VERSION == 24
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(
@@ -397,6 +402,10 @@ def test_direct_send_to_absent_peer_reports_missed(client: TestClient) -> None:
     body = sent.json()
     assert body["delivered_to"] == []
     assert body["missed"] == ["ghost"]
+    # A direct send keeps the older missed-based signal; no_recipients is
+    # reserved for channel/broadcast sends, which have no single named target.
+    assert body["warning"] is None
+    assert body["hint"] is None
 
 
 def test_broadcast_to_empty_room_reports_no_missed(client: TestClient) -> None:
@@ -414,6 +423,57 @@ def test_broadcast_to_empty_room_reports_no_missed(client: TestClient) -> None:
     body = sent.json()
     assert body["delivered_to"] == []
     assert body["missed"] == []
+
+
+def test_channel_send_with_no_other_member_warns_no_recipients(
+    client: TestClient,
+) -> None:
+    """A channel has no history, so a lone sender's message is lost forever.
+
+    The sender auto-joins on send, but joining yourself is not an audience:
+    ``delivered_to`` still comes back empty and the response must flag it
+    with a ``no_recipients`` warning plus a non-empty hint, rather than let
+    the sender read the empty list as "delivered, just no one replied yet".
+    """
+    alpha = _register(client, "alpha")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "#solo", "content": "hello?"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == []
+    assert body["warning"] == "no_recipients"
+    assert body["hint"]
+
+
+def test_broadcast_to_empty_room_warns_no_recipients(client: TestClient) -> None:
+    """The same no_recipients warning applies to a broadcast that reaches nobody."""
+    alpha = _register(client, "alpha")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "all", "content": "hello?"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == []
+    assert body["warning"] == "no_recipients"
+    assert body["hint"]
+
+
+def test_delivered_send_reports_no_warning_or_hint(client: TestClient) -> None:
+    """A send that actually reaches someone must not carry the new fields."""
+    alpha = _register(client, "alpha")
+    _register(client, "beta")
+
+    sent = client.post(
+        "/send", json={"token": alpha, "to": "beta", "content": "hi"}
+    )
+    assert sent.status_code == 200
+    body = sent.json()
+    assert body["delivered_to"] == ["beta"]
+    assert body["warning"] is None
+    assert body["hint"] is None
 
 
 def test_receive_times_out_empty(client: TestClient) -> None:

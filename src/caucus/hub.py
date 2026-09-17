@@ -303,7 +303,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 23
+PROTOCOL_VERSION = 24
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -413,6 +413,14 @@ Private channels (side rooms):
     channel: announce it in broadcast, then say(to="#api-shape", ...), which
     makes you a member. Membership is otherwise self-served:
     join_channel(...) / leave_channel(...).
+  - A channel has NO history: a peer sees only what is said after it joins,
+    and a message sent into a channel nobody is in yet is not a note left
+    behind — it is lost, and no later arrival will ever read it. Check the
+    audience BEFORE you speak: list_channels() for a channel's members,
+    list_peers() for a named peer. If yours has not arrived, do not say it
+    into the void — keep the watcher running, hand the turn back, and name
+    who you are waiting for. An empty delivered_to, or a no_recipients
+    warning, on a say() means exactly that: nobody heard it.
   - Before you open, join, name, or close one, fetch
     protocol_section("channels").
 
@@ -1510,6 +1518,8 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     # Broadcast/channel sends have no single named target, so they never
     # populate missed: an empty delivered_to already says "nobody heard it".
     missed: list[str] = []
+    warning: str | None = None
+    hint: str | None = None
     if req.to != BROADCAST and not is_channel(req.to) and not delivered:
         missed = [req.to]
         logger.warning(
@@ -1517,7 +1527,38 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
             msg.id,
             req.to,
         )
-    return SendResponse(message_id=msg.id, delivered_to=delivered, missed=missed)
+    elif not delivered and (req.to == BROADCAST or is_channel(req.to)):
+        # A channel/broadcast send that reached nobody is easy to miss: unlike
+        # a direct send there is no absent name to report, just a silently
+        # empty delivered_to. Flag it explicitly, since a channel has no
+        # history and this message is now unrecoverable, not merely unread.
+        warning = "no_recipients"
+        if req.to == BROADCAST:
+            hint = (
+                "nobody is in the room yet; there is no history, so this "
+                "message reached no one and no later joiner will see it. "
+                "Wait for peers (list_peers) and say it again once they are "
+                "there."
+            )
+        else:
+            hint = (
+                f"nobody is in {req.to} yet; channels have no history, so "
+                "this message reached no one and no later joiner will see "
+                "it. Wait for the audience (list_channels) and say it again "
+                "once they are there."
+            )
+        logger.warning(
+            "msg %s addressed to %r reached nobody; no_recipients",
+            msg.id,
+            req.to,
+        )
+    return SendResponse(
+        message_id=msg.id,
+        delivered_to=delivered,
+        missed=missed,
+        warning=warning,
+        hint=hint,
+    )
 
 
 def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:

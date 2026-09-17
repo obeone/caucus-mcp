@@ -125,6 +125,14 @@ are the unit of operator-addressable collaboration. When in doubt, open one.
   `list_channels()` returns every open channel with its topic and members.
 - Channels are ephemeral and have **no history**: one exists only while it has
   members, and a peer joining late sees nothing said before it joined.
+  A channel has NO history: a message sent while nobody is in it is not a
+  note left behind, it is lost, and no later arrival will ever read it.
+  Check the audience **before** you speak — `list_channels()` for a
+  channel's members, `list_peers()` for a named peer — and if the peer you
+  need has not arrived yet, do not say it into the void: keep the watcher
+  running, hand the turn back, and name who you are waiting for. An empty
+  `delivered_to`, or a `no_recipients` warning, on a `say()` means exactly
+  that: nobody heard it.
 - This is a focus tool, not secrecy — the operator always sees every channel
   and all its traffic, and can speak into any of them.
 - Before you open, join, name, or close one, read `protocol_section("channels")`:

@@ -20,6 +20,11 @@ _PROTOCOL_MD = Path(__file__).resolve().parent.parent / "caucus-protocol.md"
 # verbatim in BOTH documents catches a one-sided edit.
 _SIGNAL_BEFORE_PRIVATE = "taking this to the operator privately"
 
+# Revision 24's channel-history warning hangs on this exact phrase. Asserting
+# it verbatim in BOTH documents catches a one-sided edit, the same guard as
+# _SIGNAL_BEFORE_PRIVATE above.
+_CHANNEL_NO_HISTORY = "A channel has NO history"
+
 
 def _read_md() -> str:
     return _PROTOCOL_MD.read_text(encoding="utf-8")
@@ -36,6 +41,14 @@ def test_protocol_md_shares_signal_before_private_phrase_with_hub() -> None:
     # the .md cannot drift to describe stale private-contact behaviour.
     assert _SIGNAL_BEFORE_PRIVATE in PROTOCOL_TEXT
     assert _SIGNAL_BEFORE_PRIVATE in _read_md()
+
+
+def test_protocol_md_shares_channel_no_history_phrase_with_hub() -> None:
+    # Revision 24: a channel has no history, so a message sent into an empty
+    # one is lost, not left behind. Both documents must say so in the same
+    # words or the mirror can drift back to describing it as a mere quirk.
+    assert _CHANNEL_NO_HISTORY in PROTOCOL_TEXT
+    assert _CHANNEL_NO_HISTORY in _read_md()
 
 
 def test_protocol_md_documents_quiet_sign_of_life() -> None:
