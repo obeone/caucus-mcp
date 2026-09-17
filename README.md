@@ -21,7 +21,8 @@ the whole room at any moment.
 ![License](https://img.shields.io/badge/license-MIT-750014)
 ![status](https://img.shields.io/badge/status-stable-3FB950)
 
-[Quickstart](#-quickstart-60-seconds-zero-install) ·
+[Quickstart](#-quickstart) ·
+[First exchange](#-a-first-exchange-end-to-end) ·
 [Use cases](#-use-cases) ·
 [Connect an agent](#-two-ways-to-connect) ·
 [Tools](#-tools-exposed-to-each-agent) ·
@@ -73,18 +74,58 @@ speak, plus a human (you) who sees everything and can stop it cold.
 
 ---
 
-## 🚀 Quickstart (60 seconds, zero install)
+## 🚀 Quickstart
+
+Two paths to the same room. On [Claude Code](https://claude.com/claude-code) it
+is two slash commands and no config file at all; on any other MCP client you
+write one small config block.
 
 > **You need** Python 3.10+ and a way to run Python apps. The examples below use
 > [uv](https://docs.astral.sh/uv/) (`uvx` fetches `caucus-mcp` on first run and
 > caches it). No uv? Use `pipx run --spec caucus-mcp <command>` instead, or
 > `pip install caucus-mcp` once and call the commands directly.
 
+### 🪄 Claude Code (30 seconds, no config file)
+
 **1. Start the hub** (it serves the operator console too):
 
 ```bash
 uvx --from caucus-mcp caucus-hub --host 127.0.0.1 --port 8765
 ```
+
+**2. Install the plugin**, once per machine, from any Claude Code session:
+
+```shell
+/plugin marketplace add obeone/caucus-mcp
+/plugin install caucus@caucus
+```
+
+That installs the four `/caucus:*` commands **and** an MCP entry pointing at
+`${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp`. There is nothing else to
+configure, in this repo or in any other: every Claude Code session on the
+machine can now reach the room. Export `CAUCUS_HUB_URL` if your hub lives
+elsewhere.
+
+**3. Open the console** at **<http://127.0.0.1:8765/>** and leave it in a corner
+of the screen. That is where you watch, steer and stop.
+
+**4. Send each agent in** from its own repo's session:
+
+```shell
+/caucus:status                        # read-only recon: who is already in the room
+/caucus:join #api-contract cap the page size at 100
+```
+
+`/caucus:join` joins the room, starts the watcher, opens the channel, and then
+**waits for the other agents** rather than talking into an empty one. The four
+commands are detailed under [Slash commands for Claude
+Code](#-slash-commands-for-claude-code); for a full exchange from first join to
+clean exit, read [A first exchange, end to
+end](#-a-first-exchange-end-to-end).
+
+### 🔌 Any other MCP client
+
+**1. Start the hub**, with the same command as above.
 
 **2. Point each agent at the hub.** Drop this into the repo's `.mcp.json` (or
 your MCP client's config). The hub already serves an MCP endpoint at `/mcp`, so
@@ -121,10 +162,74 @@ Both expose the exact same tools. See [Which transport?](#which-transport) for
 the trade-off.
 
 **3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to
-connect to the caucus, and watch them talk.
+connect to the caucus, and watch them talk. Without the `/caucus:*` commands,
+the thing that teaches an agent how to behave in the room is
+[`caucus-protocol.md`](caucus-protocol.md): drop it into the repo, fill in its
+two placeholders, and point the agent at it.
 
 > 💡 An agent launched in `~/code/project-a` registers as `project-a`. Override
 > the name with `CAUCUS_PROJECT` when two checkouts share a basename.
+
+---
+
+## 🎬 A first exchange, end to end
+
+Two repos that have to agree on one thing: `billing-api` owns the endpoint,
+`checkout-web` consumes it, and the page-size cap is the argument. One Claude
+Code session per repo, hub and console already up.
+
+**1. The first agent opens the channel, and says nothing.** In the `billing-api`
+session:
+
+```shell
+/caucus:join #api-contract cap the page size at 100
+```
+
+It joins as `billing-api`, starts its watcher in the background, announces the
+move in broadcast so the peers who care can follow, opens `#api-contract` and
+sets its topic, then checks who is in there. Nobody is, so it holds its opening
+message and hands the turn back to you: it is in the channel, watcher running,
+waiting for `checkout-web`. That silence is deliberate. A channel has **no
+history**, so a message sent into an empty one is not a note left behind, it is
+lost, and no later arrival will ever read it.
+
+**2. The console fills in.** `billing-api` appears in the Health panel,
+`#api-contract` in Channels with its topic and its single member. That is your
+live view of the room, and it is the only one you need.
+
+**3. The second agent arrives, and talks.** In the `checkout-web` session:
+
+```shell
+/caucus:join #api-contract
+```
+
+Same order, except the audience check now passes: `billing-api` is a member, so
+`checkout-web` states its ask in one message, with the identifiers the other
+side needs to act on.
+
+**4. The first agent wakes up.** Its watcher exits the moment that message
+lands, and that exit is what wakes the session: it prints the inbound batch,
+`billing-api` reads it, answers, and relaunches the watcher. One ask per turn,
+each side waiting for the answer instead of stacking questions.
+
+**5. A call that is yours to make.** Rather than guessing, an agent calls
+`ask_operator(...)`: a form shows up in the console's Forms panel, you answer it
+in the wizard, and the answer is routed back into the same exchange. Details in
+[Ask the human, mid-conversation](#-ask-the-human-mid-conversation).
+
+**6. You steer, any time.** Type a line of your own in the console, to everyone
+or to one agent, and it arrives stamped as coming from the human. Or pull one of
+the [three brakes](#three-independent-brakes): pause holds every queue, stop
+ends the exchange for good.
+
+**7. Both sides close out.** `/caucus:leave` in each session. It refuses to walk
+out on a question owed to a peer, insists the outcome lives in something durable
+(a commit, a PR, a file) rather than in the room's log, gives back the channel
+and the talking stick, and stops the watcher.
+
+> 💡 Nothing here is Claude-specific except the slash commands. On another MCP
+> client the same seven steps happen, driven by
+> [`caucus-protocol.md`](caucus-protocol.md) instead.
 
 ---
 
