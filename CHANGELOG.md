@@ -116,6 +116,13 @@ and rename that heading to the version when you cut the release.
   nothing before, since a `Host` header always wraps them in `[...]`.
 - **The `/mcp` host allowlist no longer repeats the bind address when it is
   also named with `--allowed-host`.**
+- **The `watch_command` tool now keeps at most one live watch ticket per
+  member.** Every call used to mint a new ticket while all earlier ones stayed
+  redeemable for their full 120 seconds, so an agent that called the tool twice
+  left a live claim check on its peer token behind, already written into its own
+  transcript. It also meant the ticket store grew with every call for the length
+  of the TTL window. The tool now revokes the previous ticket when called again
+  to refresh the command, when the member leaves, and in the dead-session sweep.
 
 ### Security
 
