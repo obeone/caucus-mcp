@@ -138,17 +138,23 @@ CONSOLE_CSP = (
 
 @dataclass
 class AuthConfig:
-    """Opt-in operator/observer token configuration for the ``/ui`` socket.
+    """Opt-in credential configuration for the console and the agent door.
 
-    Both tokens default to ``None`` (auth disabled — every connection is an
-    operator, preserving the localhost default). When ``operator`` is set, the
-    ``/ui`` socket demands a first-frame ``{"auth": "<token>"}`` handshake and
-    grades the connection ``operator`` (read-write), ``observer`` (read-only) or
-    rejected.
+    All three credentials default to ``None`` (auth disabled, preserving the
+    localhost default). ``operator``/``observer`` guard the ``/ui`` socket:
+    when ``operator`` is set, ``/ui`` demands a first-frame
+    ``{"auth": "<token>"}`` handshake and grades the connection ``operator``
+    (read-write), ``observer`` (read-only) or rejected.
+
+    ``agent`` is an independent, shared pre-shared key guarding the *agent*
+    door — ``POST /register`` and the ``/mcp`` endpoint — so a hub bound to a
+    non-loopback address is not an open room. It grants no console rights and
+    the console tokens grant no agent rights; the two axes never interact.
     """
 
     operator: str | None = None
     observer: str | None = None
+    agent: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -180,9 +186,58 @@ class AuthConfig:
             return "observer"
         return None
 
+    def agent_ok(self, token: str | None) -> bool:
+        """Return whether ``token`` may pass the agent door.
+
+        When no agent key is configured the door is open — the historical
+        behaviour for a loopback hub, where reaching the port already implies
+        being on the machine. Once a key is set, only that exact key passes,
+        compared with :func:`secrets.compare_digest` so a near-miss cannot be
+        narrowed down by timing.
+
+        Args:
+            token: The bearer token presented by the caller, if any.
+
+        Returns:
+            ``True`` when the caller may register / reach ``/mcp``, ``False``
+            otherwise.
+        """
+        if self.agent is None:
+            return True
+        if token is None:
+            return False
+        return secrets.compare_digest(token, self.agent)
+
 
 auth_config = AuthConfig()
 """Module-level auth config; populated from CLI/env in :func:`main`."""
+
+AGENT_KEY_REQUIRED_DETAIL = (
+    "agent key required: set CAUCUS_AGENT_KEY (or --agent-key) on this client "
+    "to match the hub"
+)
+"""Refusal text for a missing/wrong agent key, naming both the env var and the flag.
+
+Shared by ``POST /register`` and the ``/mcp`` gate so a rejected agent reads the
+same actionable sentence whichever door it knocked on.
+"""
+
+
+def _bearer_from_header(authorization: str | None) -> str | None:
+    """Extract the token from an ``Authorization: Bearer <token>`` header.
+
+    Args:
+        authorization: Raw ``Authorization`` header value, if any.
+
+    Returns:
+        The token when the header is present and carries a non-empty ``Bearer``
+        credential (the scheme is matched case-insensitively, as RFC 7235
+        requires), ``None`` otherwise.
+    """
+    if not authorization or authorization[:7].lower() != "bearer ":
+        return None
+    bearer = authorization[7:].strip()
+    return bearer or None
 
 
 @dataclass
@@ -925,6 +980,82 @@ def _body_too_large_response() -> JSONResponse:
 app.add_middleware(BodySizeLimitMiddleware)
 
 
+class MCPAgentKeyMiddleware:
+    """Require the shared agent key on every ``/mcp`` request when one is set.
+
+    ``/mcp`` is the second agent door (``POST /register`` is the first), and it
+    is one endpoint serving a whole tool surface, so the key is checked once
+    here at the HTTP layer rather than per tool. This keeps a single mechanism:
+    a header, the same one the REST clients send, with no ``key`` argument
+    smuggled into the ``join`` tool.
+
+    Scope discipline, mirroring :class:`MCPPreflightCORSMiddleware`:
+
+    * It acts only when the MCP endpoint is actually mounted
+      (:data:`_mcp_server` is not ``None``), only for the exact
+      :attr:`ServerConfig.mcp_path`, and only when an agent key is configured.
+      Everything else passes straight through, so the REST API, the operator
+      console and every keyless deployment are untouched.
+    * A CORS preflight ``OPTIONS`` carries no ``Authorization`` header by
+      definition, so it is let through: 401-ing it would break the browser
+      exchange before the real, authenticated request is ever sent. The
+      preflight reveals nothing and the actual request that follows is gated.
+    * It sits *inside* :class:`MCPPreflightCORSMiddleware` (registered before
+      it, so it is wrapped by it), which means an allowed-Origin preflight is
+      already answered upstream and never reaches this layer at all.
+
+    The DNS-rebinding ``Host``/``Origin`` allowlist enforced by the transport
+    itself is untouched and still applies after this gate.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap ``app`` with the ``/mcp`` agent-key gate.
+
+        Args:
+            app: The downstream ASGI application to wrap.
+        """
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Gate one ASGI event: refuse an unkeyed ``/mcp`` request, else pass on.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive callable (the inbound event channel).
+            send: The ASGI send callable (the outbound event channel).
+        """
+        if (
+            scope["type"] != "http"
+            or _mcp_server is None
+            or scope.get("path") != server_config.mcp_path
+            or auth_config.agent is None
+            or scope.get("method") == "OPTIONS"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        authorization: str | None = None
+        for name, value in scope.get("headers", []):
+            if name.decode("latin-1").lower() == "authorization":
+                authorization = value.decode("latin-1")
+                break
+        if auth_config.agent_ok(_bearer_from_header(authorization)):
+            await self.app(scope, receive, send)
+            return
+
+        logger.warning("mcp request refused (agent key) path=%s", scope.get("path"))
+        response = JSONResponse(
+            status_code=401, content={"detail": AGENT_KEY_REQUIRED_DETAIL}
+        )
+        await response(scope, receive, send)
+
+
+# Registered before the CORS layer so the final stack is
+# CORS(AgentKey(BodySize(app))): an allowed-Origin preflight is answered by the
+# CORS layer and never reaches this gate, while every real /mcp request does.
+app.add_middleware(MCPAgentKeyMiddleware)
+
+
 class MCPPreflightCORSMiddleware:
     """Answer CORS preflight and stamp CORS headers for the ``/mcp`` endpoint.
 
@@ -1357,7 +1488,9 @@ async def version_info() -> dict[str, str]:
 
 @app.post("/register", response_model=None)
 async def register(
-    req: RegisterRequest, request: Request
+    req: RegisterRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
 ) -> RegisterResponse | JSONResponse:
     """Register a project and hand back its access token.
 
@@ -1376,14 +1509,23 @@ async def register(
     listener is gone (dead process / timed-out watcher), the slot is taken over
     (REPLACED outcome) and a human-readable ``note`` advises the caller.
 
-    The endpoint is unauthenticated by design (a peer has no token yet), so it
-    is throttled per source host (429) to deny a registration flood — a cheap
-    memory-exhaustion DoS — and any :class:`CapExceeded` from the client cap is
-    surfaced as 409.
+    A peer holds no per-peer token yet, so this is the door the shared agent key
+    guards: when one is configured, the caller must present it as
+    ``Authorization: Bearer <key>`` or the request is refused with 401. With no
+    key configured the endpoint stays open (the historical loopback behaviour).
+    Either way it is throttled per source host (429) to deny a registration
+    flood — a cheap memory-exhaustion DoS — and any :class:`CapExceeded` from
+    the client cap is surfaced as 409.
     """
-    # DoS brake: /register is the one mutating endpoint with no token, so the
-    # only attacker handle is the source host. A token bucket per host lets a
-    # whole fleet boot at once but caps a flood.
+    # Agent-key gate first, *before* the rate-limit bucket: a caller with no key
+    # must not be able to drain another host's budget, and refusing an unknown
+    # client should stay as cheap as possible.
+    if not auth_config.agent_ok(_bearer_from_header(authorization)):
+        logger.warning("register refused (agent key) project=%s", req.project)
+        raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+    # DoS brake: /register is the one mutating endpoint with no peer token, so
+    # the only attacker handle is the source host. A token bucket per host lets
+    # a whole fleet boot at once but caps a flood.
     host = request.client.host if request.client else ""
     retry = _register_rate_limited(host)
     if retry is not None:
@@ -1582,11 +1724,7 @@ def _resolve_receive_token(authorization: str | None, token: str | None) -> str 
         The bearer token from the header when present and well-formed, else the
         query token, else ``None``.
     """
-    if authorization and authorization[:7].lower() == "bearer ":
-        bearer = authorization[7:].strip()
-        if bearer:
-            return bearer
-    return token
+    return _bearer_from_header(authorization) or token
 
 
 @app.post("/ask", response_model=None)
@@ -2765,6 +2903,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--agent-key",
+        default=os.environ.get("CAUCUS_AGENT_KEY"),
+        help=(
+            "require this shared key (Authorization: Bearer ...) on /register "
+            "and /mcp so only agents that hold it can join; unset (default) "
+            "leaves the agent door open. Env: CAUCUS_AGENT_KEY"
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         default=os.environ.get("CAUCUS_LOG_FILE"),
         help=(
@@ -2852,6 +2999,7 @@ def main() -> None:
     global disk_log, launcher_config
     auth_config.operator = args.operator_token
     auth_config.observer = args.observer_token
+    auth_config.agent = args.agent_key
 
     # Fail closed at boot, not per request. AuthConfig.role_for grades every
     # caller as "operator" when no operator token is set, so "operator token
@@ -2909,13 +3057,16 @@ def main() -> None:
             mcp_path=args.mcp_path,
             extra_origins=extra_origins,
         )
-        if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.operator_token:
-            logger.warning(
-                "/mcp is exposed on a non-loopback address (%s) without "
-                "--operator-token; any client that can reach this host can "
-                "register as a peer",
-                args.host,
-            )
+    # The agent door (/register, and /mcp when mounted) is open to anything that
+    # can reach the port unless a shared key is set. Loud on a non-loopback bind,
+    # where "reaching the port" no longer implies "is on this machine".
+    if args.host not in _LOOPBACK_HOSTS and not args.agent_key:
+        logger.warning(
+            "the hub is bound to a non-loopback address (%s) without "
+            "--agent-key: any client that can reach this host can register as "
+            "a peer and read the room (Env: CAUCUS_AGENT_KEY)",
+            args.host,
+        )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
     if launcher_config.enabled:
