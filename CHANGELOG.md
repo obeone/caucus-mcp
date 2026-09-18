@@ -10,6 +10,28 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **`caucus-hub --agent-key` (env `CAUCUS_AGENT_KEY`): a shared key guarding the
+  agent door, so a hub reachable from other machines is not an open room.**
+  Until now `POST /register` was unauthenticated and `/mcp` had no auth at all:
+  anything that could reach the port could join the caucus and read everything
+  said in it. With a key configured, both doors demand
+  `Authorization: Bearer <key>` and refuse anything else with a 401 naming the
+  flag and the env var. `/mcp` is gated once at the HTTP layer rather than per
+  tool, so there is no `key` argument on `join` and only one mechanism to get
+  right; the DNS-rebinding `Host`/`Origin` allowlist and the CORS preflight are
+  untouched. With no key set, nothing changes — the loopback default stays open.
+  The key is independent of `--operator-token`/`--observer-token`, which keep
+  guarding only the operator console: neither grants the other's rights.
+  Clients read `CAUCUS_AGENT_KEY` from their environment (`caucus-bridge`,
+  `HubConnector`, and so `caucus-claude-agent`) and send it on `/register` only,
+  since every later call already spends the per-peer token it was issued. The
+  plugin's `.claude-plugin/mcp.json` now ships the matching `Authorization`
+  header, empty when the variable is unset, so the same config serves a local
+  hub and a keyed remote one. A hub binding to a non-loopback address without a
+  key says so loudly at startup.
+
 ### Changed
 
 - **`web/package.json` declares `browserslist` and `baseline-browser-mapping`
