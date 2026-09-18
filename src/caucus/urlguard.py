@@ -13,6 +13,9 @@ refused unless the operator explicitly opts in with ``CAUCUS_ALLOW_REMOTE_HUB``.
 The destination is operator-set configuration (never runtime-untrusted input), so
 this guards an honest misconfiguration rather than an attacker — but it makes the
 localhost-only intent explicit in code and keeps the token on-box by default.
+
+:func:`validate_public_url` is the server-side counterpart: it checks the origin
+the hub *advertises* to agents (``--public-url``) is a bare, usable base URL.
 """
 
 from __future__ import annotations
@@ -78,3 +81,49 @@ def validate_hub_url(url: str) -> str:
         f"token and message content would be sent in cleartext. Use https, a "
         f"loopback host, or set {ALLOW_REMOTE_ENV}=1 to override."
     )
+
+
+def validate_public_url(url: str) -> str:
+    """Validate the hub's advertised public base URL, returning it normalised.
+
+    This is the *server* side of the same configuration knob
+    :func:`validate_hub_url` guards on the client side: the address the hub
+    hands out so an agent on another machine can reach it (``watch_command``'s
+    ``caucus-watch --hub ...``, the ``hub`` field of every tool result). It must
+    therefore be a bare origin — scheme, host, optional port — because the hub
+    appends its own paths to it. The cleartext opt-in of
+    :func:`validate_hub_url` is deliberately *not* applied here: this URL is the
+    operator describing their own deployment, not a client being pointed
+    off-box, and it is the clients reading it that re-run that check.
+
+    Args:
+        url: The operator-supplied base URL (``--public-url`` /
+            ``CAUCUS_PUBLIC_URL``).
+
+    Returns:
+        The URL with any trailing ``/`` removed, ready to concatenate paths to.
+
+    Raises:
+        ValueError: When the scheme is not http/https, the host is missing, or
+            anything follows the origin (path, query, fragment, params).
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"unsupported public URL scheme {scheme!r} in {url!r} "
+            "(expected http or https)"
+        )
+    if not parsed.hostname:
+        raise ValueError(
+            f"public URL {url!r} names no host (expected e.g. https://hub.example.net)"
+        )
+    # A bare origin only: the hub appends "/receive", "/mcp", … to this value,
+    # so a path prefix would silently produce unreachable URLs. "/" is the empty
+    # path spelled out and is accepted (and stripped).
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.params:
+        raise ValueError(
+            f"public URL {url!r} must be a bare origin (scheme://host[:port]) "
+            "with no path, query or fragment"
+        )
+    return url.rstrip("/")
