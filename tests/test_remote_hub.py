@@ -26,7 +26,7 @@ from caucus import hub as hub_module
 from caucus.hub import AuthConfig, ServerConfig, _collect_allowed_hosts
 from caucus.mcp_http import build_mcp_server
 from caucus.state import HubState
-from caucus.urlguard import validate_public_url
+from caucus.urlguard import ALLOW_REMOTE_ENV, validate_hub_url, validate_public_url
 
 # ---------------------------------------------------------------------------
 # --allowed-host / CAUCUS_ALLOWED_HOSTS
@@ -90,6 +90,22 @@ def test_flags_and_env_merge_without_duplicates(
 def test_no_flags_and_no_env_is_empty() -> None:
     """The default stays the loopback-only posture the guard already has."""
     assert _collect_allowed_hosts(None, 8765) == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [("::1", "[::1]:8765"), ("2001:db8::1", "[2001:db8::1]:8765")],
+)
+def test_bare_ipv6_is_bracketed_and_given_the_hubs_port(
+    entry: str, expected: str
+) -> None:
+    """A Host header always brackets an IPv6 literal, so the entry must too.
+
+    Passed through verbatim, ``--allowed-host ::1`` matches no Host header the
+    guard will ever see, and the operator believes they allowed an address they
+    did not.
+    """
+    assert _collect_allowed_hosts([entry], 8765) == [expected]
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +206,54 @@ async def test_watch_command_remote_uses_the_token_env_var(state: HubState) -> N
     assert "--token-file" not in command
 
 
+def _hub_flag(command: str) -> str:
+    """Return the value the emitted command passes to ``caucus-watch --hub``."""
+    parts = command.split()
+    return parts[parts.index("--hub") + 1]
+
+
+async def test_watch_command_https_url_is_accepted_by_the_watcher(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The emitted --hub must survive the check caucus-watch runs on it."""
+    monkeypatch.delenv(ALLOW_REMOTE_ENV, raising=False)
+    server = build_mcp_server(
+        hub_module.app, self_url="https://hub.example.net", remote=True
+    )
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+
+    command = str((await _tool(server, "watch_command")(ctx))["command"])
+    # https needs no opt-in, so the command must not carry one either.
+    assert not command.startswith(ALLOW_REMOTE_ENV)
+    assert validate_hub_url(_hub_flag(command)) == "https://hub.example.net"
+
+
+async def test_watch_command_plain_http_url_carries_the_opt_in(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain-http public URL is refused by the watcher unless the command says so.
+
+    Without the prefix the agent backgrounds a process that exits 2 before its
+    first poll and believes a watcher is listening.
+    """
+    monkeypatch.delenv(ALLOW_REMOTE_ENV, raising=False)
+    server = build_mcp_server(
+        hub_module.app, self_url="http://hub.lan:8765", remote=True
+    )
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+
+    command = str((await _tool(server, "watch_command")(ctx))["command"])
+    assert command.startswith(f"{ALLOW_REMOTE_ENV}=1 CAUCUS_TOKEN=")
+    # Bare, the URL is refused; with the opt-in the command's own prefix sets,
+    # it is accepted -- which is the whole point of emitting the prefix.
+    with pytest.raises(ValueError):
+        validate_hub_url(_hub_flag(command))
+    monkeypatch.setenv(ALLOW_REMOTE_ENV, "1")
+    assert validate_hub_url(_hub_flag(command)) == "http://hub.lan:8765"
+
+
 async def test_watch_command_remote_writes_no_token_file(
     state: HubState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -264,6 +328,21 @@ def test_mount_without_public_url_is_unchanged(
     assert captured["self_url"] == "http://127.0.0.1:8765"
     assert captured["remote"] is False
     assert captured["allowed_hosts"] == ["127.0.0.1:8765"]
+
+
+def test_mount_does_not_repeat_the_bind_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming the bind address as --allowed-host too must not list it twice."""
+    captured = _capture_build(monkeypatch)
+    hub_module._mount_mcp_http(
+        host="192.168.1.10",
+        port=8765,
+        mcp_path="/mcp",
+        extra_origins=set(),
+        extra_hosts=["192.168.1.10:8765"],
+    )
+    assert captured["allowed_hosts"] == ["192.168.1.10:8765"]
 
 
 def test_mount_on_a_non_loopback_bind_is_remote(
@@ -348,11 +427,47 @@ def test_refusal_names_which_credential_is_missing(
 
 
 def test_non_loopback_bind_with_both_credentials_starts(run_main: Any) -> None:
-    """Both doors locked, so the bind is allowed."""
+    """Both doors locked and an address to advertise, so the bind is allowed."""
     started = run_main(
-        "--host", "0.0.0.0", "--operator-token", "op123", "--agent-key", "key123"
+        "--host",
+        "0.0.0.0",
+        "--operator-token",
+        "op123",
+        "--agent-key",
+        "key123",
+        "--public-url",
+        "https://hub.example.net",
     )
     assert started == [("0.0.0.0", 8765)]
+
+
+def test_wildcard_bind_without_a_public_url_refuses(
+    run_main: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """0.0.0.0 is not an address: with both keys set, the URL is still missing."""
+    with pytest.raises(SystemExit) as excinfo:
+        run_main(
+            "--host", "0.0.0.0", "--operator-token", "op123", "--agent-key", "key123"
+        )
+    assert excinfo.value.code == 2
+    message = capsys.readouterr().err
+    assert "--public-url URL    (env CAUCUS_PUBLIC_URL): MISSING" in message
+    # The two doors it *has* got are marked done, so the operator reads one gap.
+    assert "--agent-key KEY  (env CAUCUS_AGENT_KEY): already set" in message
+
+
+def test_concrete_non_loopback_bind_needs_no_public_url(run_main: Any) -> None:
+    """A real interface address advertises itself, so only the keys are demanded."""
+    started = run_main(
+        "--host", "192.168.1.10", "--operator-token", "op123", "--agent-key", "key123"
+    )
+    assert started == [("192.168.1.10", 8765)]
+
+
+def test_the_whole_loopback_range_skips_the_bind_gate(run_main: Any) -> None:
+    """127.0.0.2 is loopback by any honest definition, and now by this one too."""
+    started = run_main("--host", "127.0.0.2")
+    assert started == [("127.0.0.2", 8765)]
 
 
 def test_allow_insecure_bind_is_the_escape_hatch(run_main: Any) -> None:
@@ -370,11 +485,74 @@ def test_loopback_without_credentials_still_starts(run_main: Any) -> None:
 def test_credentials_may_come_from_the_environment(
     run_main: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both flags default from their env vars, so the gate sees them too."""
+    """All three flags default from their env vars, so the gate sees them too."""
     monkeypatch.setenv("CAUCUS_OPERATOR_TOKEN", "op123")
     monkeypatch.setenv("CAUCUS_AGENT_KEY", "key123")
+    monkeypatch.setenv("CAUCUS_PUBLIC_URL", "https://hub.example.net")
     started = run_main("--host", "0.0.0.0")
     assert started == [("0.0.0.0", 8765)]
+
+
+def test_plain_http_public_url_warns_at_startup(
+    run_main: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Said once, at boot: a plain-http advertised URL leaks every peer token."""
+    with caplog.at_level("WARNING", logger="caucus.hub"):
+        run_main(
+            "--host",
+            "0.0.0.0",
+            "--operator-token",
+            "op123",
+            "--agent-key",
+            "key123",
+            "--public-url",
+            "http://hub.lan:8765",
+        )
+    warning = "\n".join(r.getMessage() for r in caplog.records)
+    assert "in clear" in warning
+    assert "CAUCUS_ALLOW_REMOTE_HUB" in warning
+
+
+def test_https_public_url_does_not_warn(
+    run_main: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning is about cleartext, so TLS must silence it."""
+    with caplog.at_level("WARNING", logger="caucus.hub"):
+        run_main(
+            "--host",
+            "0.0.0.0",
+            "--operator-token",
+            "op123",
+            "--agent-key",
+            "key123",
+            "--public-url",
+            "https://hub.example.net",
+        )
+    assert "in clear" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_blank_credentials_are_normalised_to_none(run_main: Any) -> None:
+    """An empty credential means "none configured", not one nobody can present.
+
+    Left raw, ``--agent-key ""`` makes ``agent_ok`` reject every caller and
+    ``--operator-token ""`` flips ``AuthConfig.enabled`` on with a token no
+    first frame can match -- a lockout at both doors. The clients already
+    normalise blank to ``None``; the hub was the odd one out.
+    """
+    run_main(
+        "--agent-key", "", "--operator-token", "", "--observer-token", ""
+    )
+    assert hub_module.auth_config.agent is None
+    assert hub_module.auth_config.operator is None
+    assert hub_module.auth_config.observer is None
+    assert hub_module.auth_config.agent_ok(None) is True
+    assert hub_module.auth_config.enabled is False
+
+
+def test_a_blank_public_url_is_not_an_advertised_address(run_main: Any) -> None:
+    """``--public-url ""`` already normalised to None; keep it that way."""
+    started = run_main("--public-url", "")
+    assert started == [("127.0.0.1", 8765)]
 
 
 def test_an_invalid_public_url_refuses_at_startup(

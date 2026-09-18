@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import secrets
@@ -77,7 +78,12 @@ from .supervisor import (
     LauncherRefused,
     validate_agent_cwd,
 )
-from .urlguard import validate_public_url
+from .urlguard import (
+    ALLOW_REMOTE_ENV,
+    is_loopback_host,
+    needs_remote_optin,
+    validate_public_url,
+)
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -2870,7 +2876,10 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
     threading.Timer(delay, _launch).start()
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: Bind addresses that mean "every interface". They are not addresses anything
+#: connects *to*, so the hub cannot advertise one and has to be told the URL
+#: agents really reach it at (``--public-url``).
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 
 
 def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
@@ -2898,7 +2907,7 @@ def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
     env = os.environ.get("CAUCUS_MCP_HTTP")
     if env is not None:
         return env.strip().lower() in {"1", "true", "yes", "on"}
-    return host in _LOOPBACK_HOSTS
+    return is_loopback_host(host)
 
 
 def _entry_carries_port(entry: str) -> bool:
@@ -2917,7 +2926,53 @@ def _entry_carries_port(entry: str) -> bool:
     """
     if entry.startswith("["):
         return not entry.endswith("]")
+    if _is_bare_ipv6(entry):
+        # Every colon belongs to the address itself, so none of them is a port.
+        return False
     return ":" in entry
+
+
+def _is_bare_ipv6(entry: str) -> bool:
+    """Return whether ``entry`` is an unbracketed IPv6 literal.
+
+    ``--allowed-host ::1`` and ``--allowed-host 2001:db8::1`` are the forms an
+    operator types, but a ``Host`` header always brackets an IPv6 literal
+    (``[::1]:8765``). Recognising the bare form is what lets
+    :func:`_normalise_allowed_host` rewrite it into something the guard can
+    actually match.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+
+    Returns:
+        ``True`` when the whole entry parses as an IPv6 address.
+    """
+    try:
+        ipaddress.IPv6Address(entry)
+    except ValueError:
+        return False
+    return True
+
+
+def _normalise_allowed_host(entry: str, port: int) -> str:
+    """Rewrite one allowlist entry into the ``Host`` header form it must match.
+
+    Three shapes go in: a bare name or IPv4 literal, a bracketed IPv6 literal,
+    and a bare IPv6 literal. All three come out as the guard compares them — an
+    IPv6 address bracketed, and a host with no port completed with the hub's
+    own port, which is what an operator naming a bare host means.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+        port: The port the hub listens on, used to complete bare hosts.
+
+    Returns:
+        The entry as a ``Host`` header value.
+    """
+    if _entry_carries_port(entry):
+        return entry
+    host = f"[{entry}]" if _is_bare_ipv6(entry) else entry
+    return f"{host}:{port}"
 
 
 def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
@@ -2931,7 +2986,9 @@ def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
 
     A bare host is expanded to the hub's own port, which is what an operator
     naming a hostname means; an entry that already carries a port is kept
-    verbatim, so a reverse proxy on another port can be allowed too.
+    verbatim, so a reverse proxy on another port can be allowed too. A bare
+    IPv6 literal is bracketed on the way, since that is the only form a ``Host``
+    header ever spells (see :func:`_normalise_allowed_host`).
 
     Args:
         cli: The repeated ``--allowed-host`` values, or ``None``.
@@ -2946,14 +3003,21 @@ def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
     for entry in (e.strip() for e in raw):
         if not entry:
             continue
-        value = entry if _entry_carries_port(entry) else f"{entry}:{port}"
+        value = _normalise_allowed_host(entry, port)
         if value not in hosts:
             hosts.append(value)
     return hosts
 
 
-def _insecure_bind_message(host: str, *, operator: bool, agent: bool) -> str:
-    """Compose the refusal shown when a non-loopback bind has no credentials.
+def _insecure_bind_message(
+    host: str,
+    *,
+    operator: bool,
+    agent: bool,
+    public_url: bool,
+    wildcard: bool,
+) -> str:
+    """Compose the refusal shown when a non-loopback bind is under-configured.
 
     This message is the whole user experience of the refusal: somebody just had
     their hub refuse to start, and everything they need to fix it — both doors,
@@ -2964,14 +3028,36 @@ def _insecure_bind_message(host: str, *, operator: bool, agent: bool) -> str:
         host: The non-loopback address that was requested.
         operator: Whether an operator token is already configured.
         agent: Whether an agent key is already configured.
+        public_url: Whether an advertised public URL is already configured.
+        wildcard: Whether ``host`` is a wildcard bind, which makes the public
+            URL a third required setting rather than an optional one.
 
     Returns:
         The multi-line refusal text, ready to hand to ``parser.error``.
     """
     mark = {True: "already set", False: "MISSING"}
+    # On a wildcard bind there is no address to advertise, so --public-url joins
+    # the two credentials as a required setting and is marked the same way.
+    reach = (
+        "\nA wildcard bind names no reachable address, so agents must be told\n"
+        "one -- otherwise the Host header they send is rejected by the\n"
+        "DNS-rebinding guard and the watcher command they get points at\n"
+        "127.0.0.1:\n"
+        "\n"
+        f"  --public-url URL    (env CAUCUS_PUBLIC_URL): {mark[public_url]}\n"
+        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
+        if wildcard
+        else "\nThen tell agents where to reach you, or the Host header they send is\n"
+        "rejected by the DNS-rebinding guard and the watcher command they get\n"
+        "points at 127.0.0.1:\n"
+        "\n"
+        "  --public-url URL    (env CAUCUS_PUBLIC_URL)\n"
+        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
+    )
     return (
         f"refusing to bind {host}: a hub on a non-loopback address is reachable\n"
-        "from other machines, and by default neither of its two doors is locked.\n"
+        "from other machines, and by default neither of its two doors is locked\n"
+        "nor does it know the address to hand those machines.\n"
         "\n"
         "  agent door     /register and /mcp - join the room, read everything\n"
         "                 said in it\n"
@@ -2984,15 +3070,10 @@ def _insecure_bind_message(host: str, *, operator: bool, agent: bool) -> str:
         "\n"
         '  export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"\n'
         '  export CAUCUS_OPERATOR_TOKEN="$(openssl rand -hex 24)"\n'
-        f"  caucus-hub --host {host}\n"
-        "\n"
-        "Then tell agents where to reach you, or the Host header they send is\n"
-        "rejected by the DNS-rebinding guard and the watcher command they get\n"
-        "points at 127.0.0.1:\n"
-        "\n"
-        "  --public-url URL    (env CAUCUS_PUBLIC_URL)\n"
-        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
-        "\n"
+        f"  caucus-hub --host {host}"
+        + (" --public-url https://hub.example.net\n" if wildcard else "\n")
+        + reach
+        + "\n"
         "Not what you meant? --host 127.0.0.1 keeps the hub on this machine.\n"
         "Meant it, on a network that already authenticates (a tunnel, a private\n"
         "LAN)? --allow-insecure-bind starts anyway, with both doors open."
@@ -3036,24 +3117,35 @@ def _mount_mcp_http(
     # Record the served path so the CORS layer scopes its preflight handling to
     # exactly this route.
     server_config.mcp_path = mcp_path
-    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    browse_host = "127.0.0.1" if host in _WILDCARD_HOSTS else host
     # An operator-declared public URL wins: on a wildcard bind the rewritten
     # 127.0.0.1 is only right for an agent on this machine, and handing a remote
     # one that address is how watch_command produced an unrunnable command.
     self_url = public_url or f"http://{browse_host}:{port}"
     allowed_hosts: list[str] = list(extra_hosts or [])
     allowed_origins: list[str] = list(extra_origins)
+
+    def _allow_host(value: str) -> None:
+        """Append one ``Host`` value unless the allowlist already carries it.
+
+        The same address arrives from up to three places (``--allowed-host``,
+        the bind address, the public URL's netloc), and a repeated entry means
+        nothing to the guard while making the startup log harder to read.
+        """
+        if value and value not in allowed_hosts:
+            allowed_hosts.append(value)
+
     # A bind-all address is not a connectable origin; only add a concrete host.
-    if host not in ("0.0.0.0", "::"):
-        allowed_hosts.append(f"{host}:{port}")
-        allowed_origins.append(f"http://{host}:{port}")
+    if host not in _WILDCARD_HOSTS:
+        _allow_host(_normalise_allowed_host(host, port))
+        origin = f"http://{_normalise_allowed_host(host, port)}"
+        if origin not in allowed_origins:
+            allowed_origins.append(origin)
     if public_url is not None:
         # The Host header a client dialling the public URL sends is its netloc;
         # allowing it here spares the operator from repeating it as an
         # --allowed-host on every deployment that sets --public-url.
-        netloc = urlparse(public_url).netloc
-        if netloc and netloc not in allowed_hosts:
-            allowed_hosts.append(netloc)
+        _allow_host(urlparse(public_url).netloc)
     _mcp_server = mcp_http.build_mcp_server(
         app,
         self_url=self_url,
@@ -3062,7 +3154,7 @@ def _mount_mcp_http(
         allowed_origins=allowed_origins,
         # Loopback-only is the one deployment where a token file on the hub's
         # filesystem is also on the agent's; anything else gets the env form.
-        remote=public_url is not None or host not in _LOOPBACK_HOSTS,
+        remote=public_url is not None or not is_loopback_host(host),
     )
     # streamable_http_app() lazily creates the session manager (run by lifespan)
     # and registers the endpoint route; attach that route to the hub app.
@@ -3242,25 +3334,36 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    public_url: str | None = args.public_url or None
+
     # Refuse before anything is configured or bound. A non-loopback bind puts
     # both doors on the network, and neither is locked by default: the agent
     # door lets any reachable client join and read the room, the operator door
     # grades every caller as operator. Demand both credentials, once, here --
     # this is the same gate caucus-setup-service applies to the installed unit.
+    # A wildcard bind adds a third requirement: 0.0.0.0 is not an address
+    # anything dials, so without --public-url the hub would advertise the
+    # 127.0.0.1 rewrite and hand every remote agent a watcher command pointing
+    # back at its own machine. Fix that at the source rather than downstream.
+    wildcard = args.host in _WILDCARD_HOSTS
+    under_configured = not (args.operator_token and args.agent_key) or (
+        wildcard and not public_url
+    )
     if (
-        args.host not in _LOOPBACK_HOSTS
+        not is_loopback_host(args.host)
         and not args.allow_insecure_bind
-        and not (args.operator_token and args.agent_key)
+        and under_configured
     ):
         parser.error(
             _insecure_bind_message(
                 args.host,
                 operator=bool(args.operator_token),
                 agent=bool(args.agent_key),
+                public_url=bool(public_url),
+                wildcard=wildcard,
             )
         )
 
-    public_url: str | None = args.public_url or None
     if public_url is not None:
         try:
             public_url = validate_public_url(public_url)
@@ -3268,9 +3371,15 @@ def main() -> None:
             parser.error(str(exc))
 
     global disk_log, launcher_config
-    auth_config.operator = args.operator_token
-    auth_config.observer = args.observer_token
-    auth_config.agent = args.agent_key
+    # `or None` on all three: an exported-but-blank env var (or an explicit
+    # --agent-key "") is "no credential", not a credential nobody can present.
+    # Left raw, an empty agent key makes agent_ok() reject every caller and an
+    # empty operator token turns AuthConfig.enabled on with a token no first
+    # frame can match -- a lockout, in both cases, rather than a no-op. The
+    # clients already normalise the same way (hub_connector, mcp_bridge).
+    auth_config.operator = args.operator_token or None
+    auth_config.observer = args.observer_token or None
+    auth_config.agent = args.agent_key or None
 
     # Fail closed at boot, not per request. AuthConfig.role_for grades every
     # caller as "operator" when no operator token is set, so "operator token
@@ -3284,7 +3393,7 @@ def main() -> None:
                 "every caller is graded as operator and the launcher would let "
                 "anyone who can reach this hub start processes on this machine"
             )
-        if args.host not in _LOOPBACK_HOSTS:
+        if not is_loopback_host(args.host):
             parser.error(
                 f"--enable-agent-launcher requires a loopback bind, got "
                 f"--host {args.host}: process creation must not be reachable "
@@ -3336,7 +3445,7 @@ def main() -> None:
     # The agent door (/register, and /mcp when mounted) is open to anything that
     # can reach the port unless a shared key is set. Only reachable now via
     # --allow-insecure-bind, which is exactly when it deserves saying again.
-    if args.host not in _LOOPBACK_HOSTS and not args.agent_key:
+    if not is_loopback_host(args.host) and not auth_config.agent:
         logger.warning(
             "the hub is bound to a non-loopback address (%s) without "
             "--agent-key: any client that can reach this host can register as "
@@ -3347,6 +3456,22 @@ def main() -> None:
     logger.info("starting hub on http://%s:%d", args.host, args.port)
     if public_url is not None:
         logger.info("advertising %s to agents (--public-url)", public_url)
+        # Said once, at startup, rather than on every watch_command: a plain-http
+        # public URL is the whole deployment's posture, not a per-call surprise.
+        # Every peer token the hub hands out travels to that address in clear,
+        # and so does every message; the watcher command carries the token in an
+        # environment variable and needs CAUCUS_ALLOW_REMOTE_HUB=1 on the agent's
+        # machine just to be allowed to dial it.
+        if needs_remote_optin(public_url):
+            logger.warning(
+                "--public-url %s is plain http to a non-loopback host: peer "
+                "tokens and every message cross the network in clear, and the "
+                "watcher command agents are handed has to carry %s=1 to run at "
+                "all. Terminate TLS in front of the hub (https://) or reach it "
+                "through a tunnel instead",
+                public_url,
+                ALLOW_REMOTE_ENV,
+            )
     if launcher_config.enabled:
         # Loud on purpose: this hub can now start processes on this machine.
         logger.warning(
