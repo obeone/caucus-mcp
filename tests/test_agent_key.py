@@ -436,11 +436,34 @@ def test_read_surface_does_not_fall_back_to_the_open_operator_role(
     assert resp.status_code == 401
 
 
-def test_ping_stays_open_on_a_keyed_hub(
+def test_ping_stays_open_without_a_key(client: TestClient) -> None:
+    """The loopback default is untouched: no key configured, no header needed."""
+    assert client.get("/ping", params={"peer": "nobody"}).status_code == 200
+
+
+def test_ping_refuses_an_unkeyed_caller(
     client: TestClient, with_agent_key: None
 ) -> None:
-    """The liveness probe is deliberately left open, unlike the roster."""
-    assert client.get("/ping", params={"peer": "nobody"}).status_code == 200
+    """``/ping`` returns far more than liveness, so a keyed hub must gate it.
+
+    The payload confirms a named peer exists, when it was last seen, whether a
+    listener is attached, and the peer's own ``set_status`` prose. Unguarded,
+    anyone who can reach a keyed non-loopback hub reads all of it.
+    """
+    assert client.get("/ping", params={"peer": "nobody"}).status_code == 401
+
+
+def test_ping_accepts_the_agent_key(
+    client: TestClient, with_agent_key: None
+) -> None:
+    """The same bearer ``/register`` takes answers the probe."""
+    resp = client.get(
+        "/ping",
+        params={"peer": "nobody"},
+        headers={"Authorization": f"Bearer {AGENT_KEY}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "absent"
 
 
 async def test_connector_read_surface_carries_the_key(
@@ -454,6 +477,7 @@ async def test_connector_read_surface_carries_the_key(
         assert await connector.peers() == []
         assert await connector.channels() == {}
         assert await connector.list_forms() == []
+        assert (await connector.ping("nobody"))["state"] == "absent"
 
 
 # ---------------------------------------------------------------------------

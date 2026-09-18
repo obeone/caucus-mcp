@@ -14,7 +14,9 @@ import time
 import httpx
 import pytest
 
+from caucus import hub as hub_module
 from caucus import watch as watch_module
+from caucus.hub import AuthConfig
 
 
 def _register_peer(base: str, project: str) -> str:
@@ -220,7 +222,19 @@ def test_watch_returns_one_on_unknown_token(
     assert "watch_command()" in emitted[0]
 
 
-# --- token resolution ----------------------------------------------------
+# --- credential resolution -----------------------------------------------
+#
+# One chain, flags before environment:
+#   --token > --token-file > --ticket > CAUCUS_TOKEN > CAUCUS_TICKET
+# The first three cases below are the historical token order, unchanged; the
+# rest pin where the ticket slots into it.
+
+
+@pytest.fixture(autouse=True)
+def _no_credential_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's own CAUCUS_* credentials out of every case."""
+    monkeypatch.delenv("CAUCUS_TOKEN", raising=False)
+    monkeypatch.delenv("CAUCUS_TICKET", raising=False)
 
 
 def test_resolve_token_prefers_explicit_flag(
@@ -229,7 +243,10 @@ def test_resolve_token_prefers_explicit_flag(
     file = tmp_path / "tok"
     file.write_text("from-file")
     monkeypatch.setenv("CAUCUS_TOKEN", "from-env")
-    assert watch_module._resolve_token("from-flag", str(file)) == "from-flag"
+    assert watch_module._resolve_credential("from-flag", str(file), "tk") == (
+        "from-flag",
+        None,
+    )
 
 
 def test_resolve_token_reads_file_over_env(
@@ -238,16 +255,75 @@ def test_resolve_token_reads_file_over_env(
     file = tmp_path / "tok"
     file.write_text("  from-file\n")  # surrounding whitespace is stripped
     monkeypatch.setenv("CAUCUS_TOKEN", "from-env")
-    assert watch_module._resolve_token(None, str(file)) == "from-file"
+    assert watch_module._resolve_credential(None, str(file), "tk") == (
+        "from-file",
+        None,
+    )
 
 
 def test_resolve_token_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CAUCUS_TOKEN", "from-env")
-    assert watch_module._resolve_token(None, None) == "from-env"
+    assert watch_module._resolve_credential(None, None, None) == ("from-env", None)
 
 
-def test_resolve_token_none_when_nothing_supplied(
+def test_resolve_token_none_when_nothing_supplied() -> None:
+    assert watch_module._resolve_credential(None, None, None) == (None, None)
+
+
+def test_ticket_flag_beats_an_ambient_token_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("CAUCUS_TOKEN", raising=False)
-    assert watch_module._resolve_token(None, None) is None
+    """Flags win over environment, the rule the module docstring already states."""
+    monkeypatch.setenv("CAUCUS_TOKEN", "from-env")
+    assert watch_module._resolve_credential(None, None, "tk") == (None, "tk")
+
+
+def test_token_env_beats_the_ticket_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Between the two ambient forms, a token needs no round-trip; prefer it."""
+    monkeypatch.setenv("CAUCUS_TOKEN", "from-env")
+    monkeypatch.setenv("CAUCUS_TICKET", "tk-env")
+    assert watch_module._resolve_credential(None, None, None) == ("from-env", None)
+
+
+def test_ticket_env_is_the_last_resort(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CAUCUS_TICKET", "tk-env")
+    assert watch_module._resolve_credential(None, None, None) == (None, "tk-env")
+
+
+# --- ticket redemption ---------------------------------------------------
+
+
+def test_redeem_ticket_returns_the_token(live_hub: str) -> None:
+    """The happy path: one POST exchanges the ticket for the peer token."""
+    token = _register_peer(live_hub, "redeemer")
+    ticket = hub_module.state.issue_watch_ticket(token)
+    assert watch_module.redeem_ticket(live_hub, ticket) == token
+
+
+def test_redeem_ticket_is_single_use(live_hub: str) -> None:
+    """A replayed ticket buys nothing, which is the whole point of the design."""
+    token = _register_peer(live_hub, "replayer")
+    ticket = hub_module.state.issue_watch_ticket(token)
+    assert watch_module.redeem_ticket(live_hub, ticket) == token
+    assert watch_module.redeem_ticket(live_hub, ticket) is None
+
+
+def test_redeem_ticket_sends_the_agent_key(
+    live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keyed hub gates the exchange; the watcher reads the key from its env."""
+    token = _register_peer(live_hub, "keyed-watcher")
+    ticket = hub_module.state.issue_watch_ticket(token)
+    # The live_hub server is module-scoped and reads this global per request,
+    # so monkeypatch both installs the key and takes it back off afterwards.
+    monkeypatch.setattr(hub_module, "auth_config", AuthConfig(agent="the-key"))
+    monkeypatch.delenv("CAUCUS_AGENT_KEY", raising=False)
+    assert watch_module.redeem_ticket(live_hub, ticket) is None
+    # Still unspent: the 401 fires before the ticket is ever looked up.
+    monkeypatch.setenv("CAUCUS_AGENT_KEY", "the-key")
+    assert watch_module.redeem_ticket(live_hub, ticket) == token
+
+
+def test_redeem_ticket_returns_none_when_the_hub_is_unreachable() -> None:
+    """A transport failure is fatal like a refusal, not a traceback."""
+    assert watch_module.redeem_ticket("http://127.0.0.1:1", "tk") is None

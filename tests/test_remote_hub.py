@@ -7,7 +7,8 @@ Four surfaces, all introduced together because none of them is usable alone:
 * ``--public-url`` / ``CAUCUS_PUBLIC_URL`` and its validation
   (:func:`caucus.urlguard.validate_public_url`),
 * the ``watch_command`` tool handing a remote agent a runnable command instead
-  of a path on the hub's own filesystem,
+  of a path on the hub's own filesystem, and the single-use watch ticket that
+  keeps the peer token out of that command,
 * the startup refusal on a non-loopback bind without both credentials.
 
 The refusal tests drive :func:`caucus.hub.main` itself with ``uvicorn.run``
@@ -21,11 +22,12 @@ import sys
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 from caucus import hub as hub_module
 from caucus.hub import AuthConfig, ServerConfig, _collect_allowed_hosts
 from caucus.mcp_http import build_mcp_server
-from caucus.state import HubState
+from caucus.state import WATCH_TICKET_TTL, HubState
 from caucus.urlguard import ALLOW_REMOTE_ENV, validate_hub_url, validate_public_url
 
 # ---------------------------------------------------------------------------
@@ -184,26 +186,41 @@ async def test_watch_command_loopback_keeps_the_token_file(state: HubState) -> N
     assert not os.path.exists(path)
 
 
-async def test_watch_command_remote_uses_the_token_env_var(state: HubState) -> None:
-    """A remote agent gets a command that references nothing on the hub's disk."""
+async def test_watch_command_remote_hands_out_a_ticket_not_the_token(
+    state: HubState,
+) -> None:
+    """A remote agent gets a claim check, never the room bearer itself.
+
+    The peer token opens ``/receive``, ``/send``, ``/ack``, ``/channels/*``,
+    ``/ask`` and ``/floor``, and the agent key gates none of them. Printing it
+    in a shell command would put it in the agent's transcript, its shell
+    history and the watcher's environ, which is exactly what the loopback
+    token file exists to prevent.
+    """
     server = build_mcp_server(
         hub_module.app, self_url="https://hub.example.net", remote=True
     )
     ctx = _ctx("s1")
-    await _tool(server, "join")(ctx, project="alpha")
+    joined = await _tool(server, "join")(ctx, project="alpha")
 
     res = await _tool(server, "watch_command")(ctx)
     command = str(res["command"])
-    assignment, _, rest = command.partition(" ")
-    token = assignment.removeprefix("CAUCUS_TOKEN=")
-    # The token still travels in the result, now as the env var caucus-watch
-    # reads, and it is this peer's real live token.
-    assert assignment.startswith("CAUCUS_TOKEN=") and token
+    prefix, _, ticket = command.partition(" --ticket ")
+    assert prefix == "caucus-watch --hub https://hub.example.net"
+    assert ticket
+    # The ticket is real: it redeems to this peer's live token, once.
+    token = state.redeem_watch_ticket(ticket)
+    assert token is not None
     client = state.client_for(token)
     assert client is not None and client.project == "alpha"
-    assert rest == "caucus-watch --hub https://hub.example.net"
-    # The whole point: nothing naming a path on the hub's filesystem.
+    # And the token itself appears nowhere in the whole result payload, not
+    # merely outside the command string.
+    assert token not in repr(res)
+    assert "CAUCUS_TOKEN" not in command
+    # Nothing naming a path on the hub's filesystem either.
     assert "--token-file" not in command
+    # join()'s own payload must not leak it as a consolation prize.
+    assert token not in repr(joined)
 
 
 def _hub_flag(command: str) -> str:
@@ -245,7 +262,7 @@ async def test_watch_command_plain_http_url_carries_the_opt_in(
     await _tool(server, "join")(ctx, project="alpha")
 
     command = str((await _tool(server, "watch_command")(ctx))["command"])
-    assert command.startswith(f"{ALLOW_REMOTE_ENV}=1 CAUCUS_TOKEN=")
+    assert command.startswith(f"{ALLOW_REMOTE_ENV}=1 caucus-watch ")
     # Bare, the URL is refused; with the opt-in the command's own prefix sets,
     # it is accepted -- which is the whole point of emitting the prefix.
     with pytest.raises(ValueError):
@@ -270,6 +287,100 @@ async def test_watch_command_remote_writes_no_token_file(
     ctx = _ctx("s1")
     await _tool(server, "join")(ctx, project="alpha")
     await _tool(server, "watch_command")(ctx)
+
+
+# ---------------------------------------------------------------------------
+# Watch tickets: HubState store and POST /watch-ticket/redeem
+# ---------------------------------------------------------------------------
+
+REDEEM_PATH = "/watch-ticket/redeem"
+
+
+def test_watch_ticket_redeems_exactly_once(state: HubState) -> None:
+    """Single use is the property the whole design rests on."""
+    ticket = state.issue_watch_ticket("peer-token")
+    assert state.redeem_watch_ticket(ticket) == "peer-token"
+    assert state.redeem_watch_ticket(ticket) is None
+
+
+def test_watch_ticket_expires(state: HubState) -> None:
+    """Past its TTL a ticket is gone, whether or not anyone swept it.
+
+    The clock is driven, not slept on: a real wait would put two minutes of
+    dead time in the suite to prove one comparison.
+    """
+    ticket = state.issue_watch_ticket("peer-token", now=1000.0)
+    assert state.redeem_watch_ticket(ticket, now=1000.0 + WATCH_TICKET_TTL - 1) == (
+        "peer-token"
+    )
+    again = state.issue_watch_ticket("peer-token", now=2000.0)
+    assert state.redeem_watch_ticket(again, now=2000.0 + WATCH_TICKET_TTL + 1) is None
+
+
+def test_unknown_watch_ticket_redeems_to_nothing(state: HubState) -> None:
+    """A guessed or invented ticket buys nothing."""
+    state.issue_watch_ticket("peer-token")
+    assert state.redeem_watch_ticket("not-a-ticket") is None
+
+
+def test_expired_watch_tickets_are_swept_by_the_idle_reaper(state: HubState) -> None:
+    """The store must not grow: the sweep the hub already runs prunes it."""
+    state.issue_watch_ticket("peer-token", now=1000.0)
+    assert len(state._watch_tickets) == 1
+    state.reap_stale(state.client_ttl, now=1000.0 + WATCH_TICKET_TTL + 1)
+    assert state._watch_tickets == {}
+
+
+def test_redeem_endpoint_returns_the_token_once(client: TestClient) -> None:
+    """The endpoint is the state store's behaviour over HTTP: 200 then 404."""
+    ticket = hub_module.state.issue_watch_ticket("peer-token")
+    resp = client.post(REDEEM_PATH, json={"ticket": ticket})
+    assert resp.status_code == 200
+    assert resp.json() == {"token": "peer-token"}
+    replay = client.post(REDEEM_PATH, json={"ticket": ticket})
+    assert replay.status_code == 404
+    assert "watch_command()" in replay.json()["detail"]
+
+
+def test_redeem_endpoint_404s_an_unknown_ticket(client: TestClient) -> None:
+    """404, not 401: the caller's credential was fine, the ticket is not there."""
+    assert client.post(REDEEM_PATH, json={"ticket": "nope"}).status_code == 404
+
+
+def test_redeem_endpoint_requires_the_agent_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keyed hub must not hand peer tokens to whoever can reach the port."""
+    ticket = hub_module.state.issue_watch_ticket("peer-token")
+    monkeypatch.setattr(hub_module, "auth_config", AuthConfig(agent="the-key"))
+    refused = client.post(REDEEM_PATH, json={"ticket": ticket})
+    assert refused.status_code == 401
+    # The refusal fires before the lookup, so the ticket survives it intact.
+    ok = client.post(
+        REDEEM_PATH,
+        json={"ticket": ticket},
+        headers={"Authorization": "Bearer the-key"},
+    )
+    assert ok.status_code == 200
+    assert ok.json() == {"token": "peer-token"}
+
+
+def test_a_ticket_for_a_dead_peer_resurrects_nothing(client: TestClient) -> None:
+    """A ticket is a claim check on a token, not a second life for a peer.
+
+    Redemption knows nothing about clients, so it still answers; the token it
+    hands back is then refused by ``client_for`` exactly as it already is
+    today, and the watcher's first ``/receive`` earns the usual 401.
+    """
+    token = client.post("/register", json={"project": "ghost"}).json()["token"]
+    ticket = hub_module.state.issue_watch_ticket(token)
+    assert hub_module.state.unregister(token) == "ghost"
+
+    resp = client.post(REDEEM_PATH, json={"ticket": ticket})
+    assert resp.status_code == 200
+    handed_back = resp.json()["token"]
+    assert handed_back == token
+    assert hub_module.state.client_for(handed_back) is None
 
 
 # ---------------------------------------------------------------------------
