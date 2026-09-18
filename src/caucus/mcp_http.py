@@ -83,6 +83,7 @@ from .models import (
     session_expired_error,
 )
 from .state import CapExceeded, RegisterOutcome
+from .urlguard import ALLOW_REMOTE_ENV, needs_remote_optin
 
 logger = logging.getLogger("caucus.mcp_http")
 
@@ -1241,7 +1242,19 @@ def build_mcp_server(
             # The token file lives on the hub's filesystem, which is not the
             # agent's, so its path would name nothing runnable. caucus-watch
             # also reads CAUCUS_TOKEN; that form travels.
-            command = f"CAUCUS_TOKEN={member.token} caucus-watch --hub {self_url}"
+            #
+            # caucus-watch runs the same fail-closed check on --hub that every
+            # other client does, and a plain-http URL to a non-loopback host is
+            # refused with exit 2 before the first poll. Handing the agent a
+            # command that dies instantly is worse than handing it none: it
+            # backgrounds it and believes a watcher is listening. So carry the
+            # opt-in the operator already made by advertising that URL. Asked
+            # without consulting this process's own environment, because the
+            # command runs in the agent's.
+            optin = f"{ALLOW_REMOTE_ENV}=1 " if needs_remote_optin(self_url) else ""
+            command = (
+                f"{optin}CAUCUS_TOKEN={member.token} caucus-watch --hub {self_url}"
+            )
         else:
             member.token_file = _write_token_file(member.token)
             command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
