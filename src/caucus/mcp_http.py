@@ -479,6 +479,7 @@ def build_mcp_server(
     mcp_path: str = "/mcp",
     allowed_hosts: list[str] | None = None,
     allowed_origins: list[str] | None = None,
+    remote: bool = False,
 ) -> FastMCP:
     """Construct the in-process Streamable HTTP MCP server for the hub.
 
@@ -499,6 +500,11 @@ def build_mcp_server(
         allowed_hosts: Extra ``Host`` allowlist entries for DNS-rebinding
             protection (typically the served ``host:port``).
         allowed_origins: Extra browser ``Origin`` allowlist entries.
+        remote: Whether this hub may be serving agents on other machines (a
+            non-loopback bind, or an operator-declared ``--public-url``). It
+            only changes how ``watch_command`` hands over the access token: a
+            path on the hub's filesystem means nothing to a remote agent, so it
+            gets a ``CAUCUS_TOKEN`` environment form instead of a token file.
 
     Returns:
         A configured :class:`FastMCP` ready to mount and run.
@@ -1219,12 +1225,19 @@ def build_mcp_server(
         assert member is not None
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
-        # Drop any prior token file for this session before writing a fresh one.
+        # Drop any prior token file for this session; a remote agent gets none.
         _remove_token_file(member.token_file)
-        member.token_file = _write_token_file(member.token)
+        member.token_file = None
         # self_url, not the ASGITransport: the external watcher is a separate
         # process and needs a real reachable hub URL.
-        command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
+        if remote:
+            # The token file lives on the hub's filesystem, which is not the
+            # agent's, so its path would name nothing runnable. caucus-watch
+            # also reads CAUCUS_TOKEN; that form travels.
+            command = f"CAUCUS_TOKEN={member.token} caucus-watch --hub {self_url}"
+        else:
+            member.token_file = _write_token_file(member.token)
+            command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
         # No usage note here: the protocol already carries the run/relaunch/stop
         # rules verbatim, and repeating them on every call bought the agent
         # nothing it had not already read.
