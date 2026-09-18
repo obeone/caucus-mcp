@@ -743,9 +743,15 @@ class HubState:
         The ticket is what a *remote* watcher is handed in place of the peer
         token: it grants nothing by itself, is spent by the first redemption,
         and dies on its own after :data:`WATCH_TICKET_TTL` seconds. Nothing
-        here validates ``peer_token``: a ticket for a token the hub later
-        forgets simply hands back a token ``client_for`` already rejects, so a
-        reaped peer cannot be resurrected through a stale ticket.
+        here validates ``peer_token``: redemption just hands the token back
+        unchanged, and what it is then worth is entirely up to ``client_for``,
+        exactly as if it had been presented directly. A token whose peer is
+        still on the roster, or was idle-reaped but is still inside its
+        ``reaped_grace`` window, revives the peer on the first authenticated
+        call that carries it: that is ``client_for``'s ordinary resurrection
+        behaviour, not something a ticket adds or bypasses. Only a token the
+        hub has truly forgotten (never issued, or past ``reaped_grace``) is
+        rejected.
 
         Args:
             peer_token: The access token the ticket will be exchanged for.

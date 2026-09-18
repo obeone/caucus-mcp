@@ -452,6 +452,40 @@ def test_a_ticket_for_a_dead_peer_resurrects_nothing(client: TestClient) -> None
     assert hub_module.state.client_for(handed_back) is None
 
 
+def test_a_reaped_peer_is_revived_through_a_redeemed_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counterpart of the dead-peer case above: a *soft* drop does revive.
+
+    ``issue_watch_ticket``'s docstring used to claim a reaped peer can never be
+    resurrected through a stale ticket. That is only true once the token is
+    truly forgotten. Redemption just hands the token back unchanged, and
+    inside ``reaped_grace`` ``client_for`` revives it exactly as it would for
+    the token presented directly, ticket or not.
+
+    A short ``client_ttl`` is used (rather than the ``state``/``client``
+    fixtures' defaults) so the peer can be reaped well inside the ticket's own
+    :data:`~caucus.state.WATCH_TICKET_TTL`, which the default 300s idle window
+    would blow straight past.
+    """
+    fresh = HubState(client_ttl=10.0)
+    monkeypatch.setattr(hub_module, "state", fresh)
+    with TestClient(hub_module.app) as client:
+        token = client.post("/register", json={"project": "ghost"}).json()["token"]
+        ticket = fresh.issue_watch_ticket(token)
+        last_seen = fresh._clients["ghost"].last_seen
+        reap_at = last_seen + fresh.client_ttl + 1
+        assert fresh.reap_stale(fresh.client_ttl, now=reap_at) == ["ghost"]
+
+        resp = client.post(REDEEM_PATH, json={"ticket": ticket})
+        assert resp.status_code == 200
+        handed_back = resp.json()["token"]
+        assert handed_back == token
+        revived = fresh.client_for(handed_back)
+        assert revived is not None
+        assert revived.project == "ghost"
+
+
 # ---------------------------------------------------------------------------
 # _mount_mcp_http wiring
 # ---------------------------------------------------------------------------

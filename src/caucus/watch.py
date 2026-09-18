@@ -45,18 +45,26 @@ Configuration (flags win over environment):
   > ``CAUCUS_TICKET``. The first three are the launcher's explicit choice; the
   last two are ambient.
 
-  - ``--token`` is the raw access token, and the only form that puts it in the
-    process argv.
+  - ``--token`` is the raw access token, put directly into the process argv
+    (``--token-file`` below exists precisely to avoid that for the loopback
+    case).
   - ``--token-file`` is a path holding the token; it keeps the secret out of
     argv and out of the launching transcript, which is why a loopback
     ``watch_command()`` emits this form.
   - ``--ticket`` / ``CAUCUS_TICKET`` is a **single-use, short-lived** claim
     check a *remote* ``watch_command()`` hands out instead: the token file's
     path means nothing on the agent's machine, and the token itself must not
-    travel through the agent's transcript. The watcher spends the ticket once
-    at startup against ``POST /watch-ticket/redeem`` (presenting
-    ``CAUCUS_AGENT_KEY`` when the hub is keyed) and then polls exactly as it
-    would with a direct token.
+    travel through the agent's transcript. Like ``--token``, the ticket does
+    land in argv, so any other local uid on the watcher's machine can read it
+    with ``ps`` for as long as it stays redeemable. That exposure is accepted
+    rather than engineered away (moving it to stdin would complicate the
+    backgrounded command for a credential that is already single-use and
+    short-lived): the window is bounded by the same single use and by
+    :data:`caucus.state.WATCH_TICKET_TTL`, so a ``ps`` snoop gets at most one
+    exchange, and only within the ticket's short life, never the room bearer
+    itself. The watcher spends the ticket once at startup against
+    ``POST /watch-ticket/redeem`` (presenting ``CAUCUS_AGENT_KEY`` when the
+    hub is keyed) and then polls exactly as it would with a direct token.
 * ``--timeout`` -- per-poll long-poll ceiling in seconds (default ``25``).
 """
 
