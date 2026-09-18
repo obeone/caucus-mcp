@@ -34,16 +34,52 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 ALLOW_REMOTE_ENV = "CAUCUS_ALLOW_REMOTE_HUB"
 
 
-def _is_loopback(host: str) -> bool:
-    """Return whether ``host`` is a loopback hostname or IP address."""
+def is_loopback_host(host: str) -> bool:
+    """Return whether ``host`` is a loopback hostname or IP address.
+
+    The single definition of "loopback" for the whole package: the client-side
+    hub-URL guard below, the hub's own bind gate, the service installer's
+    refusal, and the autostart probe all call this, so ``127.0.0.2`` and
+    ``[::1]`` cannot be loopback in one place and remote in another. Anything
+    that is neither ``localhost`` nor a numeric loopback address (the whole of
+    ``127.0.0.0/8`` and ``::1``) is treated as remote — including the wildcard
+    binds ``0.0.0.0`` and ``::``, which are *not* addresses one connects to.
+
+    Args:
+        host: A hostname or IP literal, with or without IPv6 brackets.
+
+    Returns:
+        ``True`` when a connection to ``host`` cannot leave this machine.
+    """
     if host.lower() in _LOOPBACK_HOSTNAMES:
         return True
     try:
         # Strip IPv6 brackets if a netloc form slipped through (urlparse already
-        # removes them for .hostname, but be defensive).
+        # removes them for .hostname, but callers hand us raw CLI values too).
         return ipaddress.ip_address(host.strip("[]")).is_loopback
     except ValueError:
         return False
+
+
+def needs_remote_optin(url: str) -> bool:
+    """Return whether ``url`` is the plain-http-off-box shape that needs opt-in.
+
+    Answers the question :func:`validate_hub_url` asks *before* it consults the
+    environment, so a caller can tell that a URL will be refused on a machine
+    that has not set :data:`ALLOW_REMOTE_ENV` — even when this process happens
+    to have set it. The hub uses that to prefix the ``caucus-watch`` command it
+    hands a remote agent, which runs in somebody else's environment.
+
+    Args:
+        url: A hub base URL.
+
+    Returns:
+        ``True`` when the URL is plain ``http`` to a non-loopback host.
+    """
+    parsed = urlparse(url)
+    return parsed.scheme.lower() == "http" and not is_loopback_host(
+        parsed.hostname or ""
+    )
 
 
 def validate_hub_url(url: str) -> str:
@@ -72,7 +108,7 @@ def validate_hub_url(url: str) -> str:
         raise ValueError(
             f"unsupported hub URL scheme {scheme!r} in {url!r} (expected http or https)"
         )
-    if scheme == "https" or _is_loopback(host):
+    if not needs_remote_optin(url):
         return url
     if os.environ.get(ALLOW_REMOTE_ENV, "").strip().lower() in _TRUTHY:
         return url
