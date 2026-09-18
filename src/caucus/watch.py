@@ -40,9 +40,31 @@ Configuration (flags win over environment):
 
 * ``--hub`` / ``CAUCUS_HUB_URL`` -- hub base URL (default
   ``http://127.0.0.1:8765``).
-* The access token (required), resolved by precedence: ``--token`` (explicit) >
-  ``--token-file`` (a path holding the token -- keeps it out of the process
-  argv and the launching transcript) > ``CAUCUS_TOKEN``.
+* A credential (required), resolved by one precedence chain, flags before
+  environment: ``--token`` > ``--token-file`` > ``--ticket`` > ``CAUCUS_TOKEN``
+  > ``CAUCUS_TICKET``. The first three are the launcher's explicit choice; the
+  last two are ambient.
+
+  - ``--token`` is the raw access token, put directly into the process argv
+    (``--token-file`` below exists precisely to avoid that for the loopback
+    case).
+  - ``--token-file`` is a path holding the token; it keeps the secret out of
+    argv and out of the launching transcript, which is why a loopback
+    ``watch_command()`` emits this form.
+  - ``--ticket`` / ``CAUCUS_TICKET`` is a **single-use, short-lived** claim
+    check a *remote* ``watch_command()`` hands out instead: the token file's
+    path means nothing on the agent's machine, and the token itself must not
+    travel through the agent's transcript. Like ``--token``, the ticket does
+    land in argv, so any other local uid on the watcher's machine can read it
+    with ``ps`` for as long as it stays redeemable. That exposure is accepted
+    rather than engineered away (moving it to stdin would complicate the
+    backgrounded command for a credential that is already single-use and
+    short-lived): the window is bounded by the same single use and by
+    :data:`caucus.state.WATCH_TICKET_TTL`, so a ``ps`` snoop gets at most one
+    exchange, and only within the ticket's short life, never the room bearer
+    itself. The watcher spends the ticket once at startup against
+    ``POST /watch-ticket/redeem`` (presenting ``CAUCUS_AGENT_KEY`` when the
+    hub is keyed) and then polls exactly as it would with a direct token.
 * ``--timeout`` -- per-poll long-poll ceiling in seconds (default ``25``).
 """
 
@@ -59,10 +81,15 @@ from pathlib import Path
 import httpx
 
 from . import __version__
+from .hub_connector import AGENT_KEY_ENV
 from .logging_setup import configure_logging
 from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.watch")
+
+# One short POST, before the loop starts: a hub that cannot answer a ticket
+# redemption in this long is not going to serve a 25s long-poll either.
+_REDEEM_TIMEOUT = 10.0
 
 # Seconds added to the per-poll timeout to size the HTTP client ceiling, so the
 # server long-poll always returns before httpx gives up (mirrors the bridge's
@@ -268,31 +295,91 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 return 0
 
 
-def _resolve_token(token: str | None, token_file: str | None) -> str | None:
-    """Resolve the access token by precedence: flag, then file, then env.
+def _resolve_credential(
+    token: str | None, token_file: str | None, ticket: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve the watcher's one credential, flags before environment.
 
-    The token-file form lets the launcher keep the secret out of the process
-    argv and its own transcript -- the command references only a path.
+    Precedence, highest first: ``--token``, ``--token-file``, ``--ticket``,
+    ``CAUCUS_TOKEN``, ``CAUCUS_TICKET``. The historical order between the three
+    token forms is untouched; the ticket slots in where the module docstring's
+    "flags win over environment" rule puts it, after the explicit token flags
+    and ahead of the ambient env vars. At most one of the two results is ever
+    set: a direct token is used as is, a ticket is exchanged for one.
 
     Args:
         token: Value of ``--token`` (or ``None``).
         token_file: Value of ``--token-file`` (or ``None``).
+        ticket: Value of ``--ticket`` (or ``None``).
 
     Returns:
-        The resolved token, or ``None`` if none was supplied.
+        A ``(token, ticket)`` pair; ``(None, None)`` when nothing was supplied.
 
     Raises:
         OSError: If ``token_file`` is given but cannot be read.
     """
     if token:
-        return token
+        return token, None
     if token_file:
-        return Path(token_file).read_text(encoding="utf-8").strip()
-    return os.environ.get("CAUCUS_TOKEN")
+        return Path(token_file).read_text(encoding="utf-8").strip(), None
+    if ticket:
+        return None, ticket
+    env_token = os.environ.get("CAUCUS_TOKEN")
+    if env_token:
+        return env_token, None
+    return None, os.environ.get("CAUCUS_TICKET") or None
+
+
+def redeem_ticket(hub: str, ticket: str) -> str | None:
+    """Exchange a single-use watch ticket for this peer's access token.
+
+    One POST, once, before the first poll. The agent key is read straight from
+    the watcher's own environment (the same ``CAUCUS_AGENT_KEY`` the connector
+    reads) because a keyed hub gates this endpoint like ``/register``; on an
+    unkeyed hub the header is simply absent.
+
+    Args:
+        hub: Hub base URL (no trailing slash required).
+        ticket: The ticket to spend.
+
+    Returns:
+        The peer access token, or ``None`` when the hub refused the ticket or
+        could not be reached (both are fatal for this process, and both are
+        answered by asking the agent for a fresh ``watch_command()``).
+    """
+    headers = {}
+    agent_key = os.environ.get(AGENT_KEY_ENV)
+    if agent_key:
+        headers["Authorization"] = f"Bearer {agent_key}"
+    try:
+        with httpx.Client(base_url=hub.rstrip("/"), timeout=_REDEEM_TIMEOUT) as http:
+            resp = http.post(
+                "/watch-ticket/redeem", json={"ticket": ticket}, headers=headers
+            )
+    except httpx.HTTPError as exc:
+        logger.error("could not reach the hub to redeem the watch ticket: %s", exc)
+        return None
+    if resp.status_code >= 400:
+        # Never log the ticket itself, only what the hub made of it.
+        logger.error("hub refused the watch ticket (HTTP %s)", resp.status_code)
+        return None
+    try:
+        token = resp.json().get("token")
+    except ValueError as exc:  # pragma: no cover - a proxy returning non-JSON
+        logger.error("watch-ticket redemption returned a non-JSON body: %s", exc)
+        return None
+    return str(token) if token else None
 
 
 def main() -> None:
-    """CLI entry point: parse config and run the watch loop until it exits."""
+    """CLI entry point: parse config and run the watch loop until it exits.
+
+    Resolves the one credential by the precedence documented on
+    :func:`_resolve_credential`, redeeming a ticket for a token first when that
+    is the form supplied. Exits ``1`` on a refused or unredeemable ticket, after
+    printing the actionable remedy to stdout (the agent is woken by this
+    process exiting and reads what it left there, not the stderr log).
+    """
     parser = argparse.ArgumentParser(
         prog="caucus-watch",
         description="Zero-token Caucus inbound-message watcher (long-poll loop).",
@@ -318,6 +405,14 @@ def main() -> None:
         help="Path to a file holding the token; keeps it out of argv/transcript.",
     )
     parser.add_argument(
+        "--ticket",
+        default=None,
+        help=(
+            "Single-use, short-lived ticket to exchange for the token"
+            " (what a remote watch_command() hands out)."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=25.0,
@@ -335,11 +430,29 @@ def main() -> None:
     configure_logging(sys.stderr)
 
     try:
-        token = _resolve_token(args.token, args.token_file)
+        token, ticket = _resolve_credential(args.token, args.token_file, args.ticket)
     except OSError as exc:
         parser.error(f"could not read --token-file: {exc}")
+    if token is None and ticket is not None:
+        token = redeem_ticket(args.hub, ticket)
+        if token is None:
+            # The agent is woken by this process EXITING and reads stdout, so
+            # the remedy has to be there, not only in the stderr log line
+            # redeem_ticket already wrote. Without it a rejected ticket looks
+            # like the watcher dying for no reason.
+            _emit(
+                "[caucus] TICKET REJECTED -- the hub would not exchange this"
+                " watch ticket for a token. A ticket is single-use and lives"
+                " about two minutes, so a reused or stale one is refused."
+                " Call watch_command() for a fresh command and relaunch."
+                " Watcher exiting."
+            )
+            sys.exit(1)
     if not token:
-        parser.error("a token is required (--token, --token-file, or CAUCUS_TOKEN)")
+        parser.error(
+            "a credential is required (--token, --token-file, --ticket,"
+            " CAUCUS_TOKEN, or CAUCUS_TICKET)"
+        )
 
     try:
         sys.exit(watch(args.hub, token, args.timeout))

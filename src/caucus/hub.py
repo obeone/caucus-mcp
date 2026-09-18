@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import os
 import secrets
@@ -22,6 +23,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import coloredlogs
 import uvicorn
@@ -62,10 +64,18 @@ from .models import (
     SendResponse,
     SpawnAgentRequest,
     StatusRequest,
+    WatchTicketRedeemRequest,
     is_channel,
 )
 from .ratelimit import TokenBucket
-from .state import MAX_LEASE_ID_CHARS, CapExceeded, Client, HubState, RegisterOutcome
+from .state import (
+    MAX_LEASE_ID_CHARS,
+    WATCH_TICKET_TTL,
+    CapExceeded,
+    Client,
+    HubState,
+    RegisterOutcome,
+)
 from .supervisor import (
     AGENT_NAME_RE,
     DEFAULT_MAX_AGENTS,
@@ -75,6 +85,12 @@ from .supervisor import (
     LauncherDisabled,
     LauncherRefused,
     validate_agent_cwd,
+)
+from .urlguard import (
+    ALLOW_REMOTE_ENV,
+    is_loopback_host,
+    needs_remote_optin,
+    validate_public_url,
 )
 
 if TYPE_CHECKING:
@@ -138,17 +154,23 @@ CONSOLE_CSP = (
 
 @dataclass
 class AuthConfig:
-    """Opt-in operator/observer token configuration for the ``/ui`` socket.
+    """Opt-in credential configuration for the console and the agent door.
 
-    Both tokens default to ``None`` (auth disabled — every connection is an
-    operator, preserving the localhost default). When ``operator`` is set, the
-    ``/ui`` socket demands a first-frame ``{"auth": "<token>"}`` handshake and
-    grades the connection ``operator`` (read-write), ``observer`` (read-only) or
-    rejected.
+    All three credentials default to ``None`` (auth disabled, preserving the
+    localhost default). ``operator``/``observer`` guard the ``/ui`` socket:
+    when ``operator`` is set, ``/ui`` demands a first-frame
+    ``{"auth": "<token>"}`` handshake and grades the connection ``operator``
+    (read-write), ``observer`` (read-only) or rejected.
+
+    ``agent`` is an independent, shared pre-shared key guarding the *agent*
+    door — ``POST /register`` and the ``/mcp`` endpoint — so a hub bound to a
+    non-loopback address is not an open room. It grants no console rights and
+    the console tokens grant no agent rights; the two axes never interact.
     """
 
     operator: str | None = None
     observer: str | None = None
+    agent: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -159,9 +181,13 @@ class AuthConfig:
         """Return the role a ``token`` grants, or ``None`` if it grants none.
 
         Uses :func:`secrets.compare_digest` for constant-time comparison so a
-        token is never leaked through timing. When auth is disabled every caller
-        is an ``operator``. The operator token is checked first, so a token
-        configured for both roles grants the higher one.
+        token is never leaked through timing. The comparison is done on UTF-8
+        **bytes**: ``compare_digest`` raises ``TypeError`` on a ``str`` holding
+        anything outside ASCII, and headers decode as latin-1, so a caller could
+        otherwise turn ``Authorization: Bearer é`` into an unhandled 500. When
+        auth is disabled every caller is an ``operator``. The operator token is
+        checked first, so a token configured for both roles grants the higher
+        one.
 
         Args:
             token: The token presented in the first frame, if any.
@@ -174,15 +200,70 @@ class AuthConfig:
             return "operator"
         if token is None:
             return None
-        if self.operator is not None and secrets.compare_digest(token, self.operator):
+        presented = token.encode("utf-8")
+        if self.operator is not None and secrets.compare_digest(
+            presented, self.operator.encode("utf-8")
+        ):
             return "operator"
-        if self.observer is not None and secrets.compare_digest(token, self.observer):
+        if self.observer is not None and secrets.compare_digest(
+            presented, self.observer.encode("utf-8")
+        ):
             return "observer"
         return None
+
+    def agent_ok(self, token: str | None) -> bool:
+        """Return whether ``token`` may pass the agent door.
+
+        When no agent key is configured the door is open — the historical
+        behaviour for a loopback hub, where reaching the port already implies
+        being on the machine. Once a key is set, only that exact key passes,
+        compared with :func:`secrets.compare_digest` on UTF-8 bytes (see
+        :meth:`role_for` for why bytes) so a near-miss cannot be narrowed down
+        by timing and a non-ASCII bearer cannot raise instead of being refused.
+
+        Args:
+            token: The bearer token presented by the caller, if any.
+
+        Returns:
+            ``True`` when the caller may register / reach ``/mcp``, ``False``
+            otherwise.
+        """
+        if self.agent is None:
+            return True
+        if token is None:
+            return False
+        return secrets.compare_digest(token.encode("utf-8"), self.agent.encode("utf-8"))
 
 
 auth_config = AuthConfig()
 """Module-level auth config; populated from CLI/env in :func:`main`."""
+
+AGENT_KEY_REQUIRED_DETAIL = (
+    "agent key required: set CAUCUS_AGENT_KEY (or --agent-key) on this client "
+    "to match the hub"
+)
+"""Refusal text for a missing/wrong agent key, naming both the env var and the flag.
+
+Shared by ``POST /register`` and the ``/mcp`` gate so a rejected agent reads the
+same actionable sentence whichever door it knocked on.
+"""
+
+
+def _bearer_from_header(authorization: str | None) -> str | None:
+    """Extract the token from an ``Authorization: Bearer <token>`` header.
+
+    Args:
+        authorization: Raw ``Authorization`` header value, if any.
+
+    Returns:
+        The token when the header is present and carries a non-empty ``Bearer``
+        credential (the scheme is matched case-insensitively, as RFC 7235
+        requires), ``None`` otherwise.
+    """
+    if not authorization or authorization[:7].lower() != "bearer ":
+        return None
+    bearer = authorization[7:].strip()
+    return bearer or None
 
 
 @dataclass
@@ -925,6 +1006,82 @@ def _body_too_large_response() -> JSONResponse:
 app.add_middleware(BodySizeLimitMiddleware)
 
 
+class MCPAgentKeyMiddleware:
+    """Require the shared agent key on every ``/mcp`` request when one is set.
+
+    ``/mcp`` is the second agent door (``POST /register`` is the first), and it
+    is one endpoint serving a whole tool surface, so the key is checked once
+    here at the HTTP layer rather than per tool. This keeps a single mechanism:
+    a header, the same one the REST clients send, with no ``key`` argument
+    smuggled into the ``join`` tool.
+
+    Scope discipline, mirroring :class:`MCPPreflightCORSMiddleware`:
+
+    * It acts only when the MCP endpoint is actually mounted
+      (:data:`_mcp_server` is not ``None``), only for the exact
+      :attr:`ServerConfig.mcp_path`, and only when an agent key is configured.
+      Everything else passes straight through, so the REST API, the operator
+      console and every keyless deployment are untouched.
+    * It sits *inside* :class:`MCPPreflightCORSMiddleware` (registered before
+      it, so it is wrapped by it), which means a genuine CORS preflight — an
+      ``OPTIONS`` from an allowed ``Origin`` — is already answered upstream and
+      never reaches this layer at all. That is what lets this gate apply to
+      ``OPTIONS`` as well: the browser exchange is owned entirely by the CORS
+      layer, so an unkeyed ``OPTIONS`` arriving *here* is not a preflight and
+      has no business reaching the MCP transport, which would build a session
+      transport and a task group for it before answering 405.
+
+    The DNS-rebinding ``Host``/``Origin`` allowlist enforced by the transport
+    itself is untouched and still applies after this gate.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Wrap ``app`` with the ``/mcp`` agent-key gate.
+
+        Args:
+            app: The downstream ASGI application to wrap.
+        """
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Gate one ASGI event: refuse an unkeyed ``/mcp`` request, else pass on.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive callable (the inbound event channel).
+            send: The ASGI send callable (the outbound event channel).
+        """
+        if (
+            scope["type"] != "http"
+            or _mcp_server is None
+            or scope.get("path") != server_config.mcp_path
+            or auth_config.agent is None
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        authorization: str | None = None
+        for name, value in scope.get("headers", []):
+            if name.decode("latin-1").lower() == "authorization":
+                authorization = value.decode("latin-1")
+                break
+        if auth_config.agent_ok(_bearer_from_header(authorization)):
+            await self.app(scope, receive, send)
+            return
+
+        logger.warning("mcp request refused (agent key) path=%s", scope.get("path"))
+        response = JSONResponse(
+            status_code=401, content={"detail": AGENT_KEY_REQUIRED_DETAIL}
+        )
+        await response(scope, receive, send)
+
+
+# Registered before the CORS layer so the final stack is
+# CORS(AgentKey(BodySize(app))): an allowed-Origin preflight is answered by the
+# CORS layer and never reaches this gate, while every real /mcp request does.
+app.add_middleware(MCPAgentKeyMiddleware)
+
+
 class MCPPreflightCORSMiddleware:
     """Answer CORS preflight and stamp CORS headers for the ``/mcp`` endpoint.
 
@@ -1124,35 +1281,168 @@ async def index() -> FileResponse:
     return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
 
 
+def _require_agent_read(authorization: str | None) -> None:
+    """Gate the agent-readable roster endpoints on the shared agent key.
+
+    ``/peers``, ``/channels`` and ``/forms`` are the "scout before you commit"
+    surface: they answer before a caller has joined, so there is no peer token
+    to demand. That was defensible while the hub only ever bound to loopback,
+    but on a keyed non-loopback hub it meant the agent key closed ``/register``
+    and ``/mcp`` while anyone who could reach the port still read the roster,
+    every peer's self-reported status, every private channel's name, topic and
+    membership, and the text of every pending operator form.
+
+    So: when an agent key is configured, these endpoints demand it — the same
+    ``Authorization: Bearer`` header ``/register`` takes. An operator or
+    observer token is accepted too, because the console's own tooling holds
+    that one and not the agent key. With no agent key configured (the loopback
+    default) the endpoints stay open, exactly as before.
+
+    Args:
+        authorization: Raw ``Authorization`` header value, if any.
+
+    Raises:
+        HTTPException: 401 when a key is configured and the caller has neither
+            it nor a console token.
+    """
+    if auth_config.agent is None:
+        return
+    presented = _bearer_from_header(authorization)
+    if auth_config.agent_ok(presented):
+        return
+    # `auth_config.enabled` guard, not just role_for: with no operator token
+    # configured role_for grades *every* caller as operator, which would hand
+    # the whole surface back to anyone the moment a hub set an agent key alone.
+    if auth_config.enabled and auth_config.role_for(presented) in (
+        "operator",
+        "observer",
+    ):
+        return
+    raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+
+
 @app.get("/peers")
-async def peers() -> dict[str, list[str]]:
-    """List currently connected project names."""
+async def peers(
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[str]]:
+    """List currently connected project names.
+
+    Gated on the shared agent key when one is configured; open otherwise. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
+    """
+    _require_agent_read(authorization)
     return {"peers": state.peers()}
 
 
 @app.get("/ping")
-async def ping(peer: str = Query(min_length=1, max_length=64)) -> dict[str, object]:
+async def ping(
+    peer: str = Query(min_length=1, max_length=64),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
     """Report a peer's liveness and self-reported status without disturbing it.
 
     A presence probe answered entirely from the hub's in-memory bookkeeping, so
     the target agent's turn is never consumed — the whole point of a ping is to
     learn "is it still there, and what is it doing?" for ~0 cost to the peer.
-    Open (no token), like ``/peers``: liveness is no more sensitive than the
-    roster. See :meth:`~caucus.state.HubState.ping` for the response shape
+
+    Gated on the shared agent key when one is configured, exactly like
+    ``/peers``, ``/channels`` and ``/forms`` (see :func:`_require_agent_read`):
+    the payload is far more than liveness. It confirms whether a *named* peer
+    exists, how long since it last touched the hub, whether a listener is
+    attached, and its own last :meth:`~caucus.state.HubState.set_status`
+    string, which is peer-authored prose describing what that agent is working
+    on. On a keyed non-loopback hub, handing that to anyone who can reach the
+    port is a disclosure the key exists to prevent. With no key configured (the
+    loopback default) it stays open, as before.
+
+    See :meth:`~caucus.state.HubState.ping` for the full response shape
     (``state`` is ``live`` / ``reaped`` / ``absent``).
+
+    Args:
+        peer: The project name to probe.
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return state.ping(peer)
 
 
+@app.post("/watch-ticket/redeem")
+async def redeem_watch_ticket(
+    req: WatchTicketRedeemRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Exchange a single-use watch ticket for the peer token it stands for.
+
+    The door ``caucus-watch --ticket`` knocks on. A remote agent is handed a
+    ticket rather than its peer token, because that token is the room bearer
+    for ``/receive``, ``/send``, ``/ack``, ``/channels/*``, ``/ask`` and
+    ``/floor``: printing it in a shell command would put it in the agent's
+    transcript, its shell history and the watcher's environ, which is exactly
+    what the loopback token file exists to avoid. The ticket is spent here,
+    once, seconds after it was minted.
+
+    Gated on the shared agent key the same way ``POST /register`` is: a keyed
+    hub must not hand tokens to whoever can reach the port. An unknown, already
+    spent or expired ticket answers **404**, not 401: the caller's credential
+    was fine, the ticket simply is not there any more, and conflating the two
+    would have the watcher report a dead session when all it needs is a fresh
+    ``watch_command()``.
+
+    Args:
+        req: The body carrying the ticket to spend.
+        authorization: ``Authorization: Bearer <agent key>``, required only
+            when the hub runs with an agent key.
+
+    Returns:
+        ``{"token": "<peer token>"}``.
+
+    Raises:
+        HTTPException: 401 when the agent key is missing or wrong, 404 when the
+            ticket is unknown, already spent, or past its TTL.
+    """
+    if not auth_config.agent_ok(_bearer_from_header(authorization)):
+        # Deliberately logged without the ticket value: this response is the
+        # one place a peer token is handed out, so nothing about the exchange
+        # belongs in a log file.
+        logger.warning("watch-ticket redeem refused (agent key)")
+        raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+    token = state.redeem_watch_ticket(req.ticket)
+    if token is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "watch ticket unknown, already used, or expired: a ticket is"
+                f" single-use and lives {WATCH_TICKET_TTL:.0f}s. Call"
+                " watch_command() again for a fresh one."
+            ),
+        )
+    return {"token": token}
+
+
 @app.get("/channels")
-async def channels() -> dict[str, dict[str, dict[str, object]]]:
+async def channels(
+    authorization: str | None = Header(default=None),
+) -> dict[str, dict[str, dict[str, object]]]:
     """List active private channels with their topic and members.
 
     Channels are ephemeral (derived from live membership), so this only ever
     lists channels with at least one connected member. Each entry is
     ``{"topic": str | None, "members": [name, ...]}``. Serves both agent
     discovery (including the late-joiner directory) and the operator console.
+
+    Gated on the shared agent key when one is configured; open otherwise. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return {"channels": state.channels()}
 
 
@@ -1357,7 +1647,9 @@ async def version_info() -> dict[str, str]:
 
 @app.post("/register", response_model=None)
 async def register(
-    req: RegisterRequest, request: Request
+    req: RegisterRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
 ) -> RegisterResponse | JSONResponse:
     """Register a project and hand back its access token.
 
@@ -1376,14 +1668,23 @@ async def register(
     listener is gone (dead process / timed-out watcher), the slot is taken over
     (REPLACED outcome) and a human-readable ``note`` advises the caller.
 
-    The endpoint is unauthenticated by design (a peer has no token yet), so it
-    is throttled per source host (429) to deny a registration flood — a cheap
-    memory-exhaustion DoS — and any :class:`CapExceeded` from the client cap is
-    surfaced as 409.
+    A peer holds no per-peer token yet, so this is the door the shared agent key
+    guards: when one is configured, the caller must present it as
+    ``Authorization: Bearer <key>`` or the request is refused with 401. With no
+    key configured the endpoint stays open (the historical loopback behaviour).
+    Either way it is throttled per source host (429) to deny a registration
+    flood — a cheap memory-exhaustion DoS — and any :class:`CapExceeded` from
+    the client cap is surfaced as 409.
     """
-    # DoS brake: /register is the one mutating endpoint with no token, so the
-    # only attacker handle is the source host. A token bucket per host lets a
-    # whole fleet boot at once but caps a flood.
+    # Agent-key gate first, *before* the rate-limit bucket: a caller with no key
+    # must not be able to drain another host's budget, and refusing an unknown
+    # client should stay as cheap as possible.
+    if not auth_config.agent_ok(_bearer_from_header(authorization)):
+        logger.warning("register refused (agent key) project=%s", req.project)
+        raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+    # DoS brake: /register is the one mutating endpoint with no peer token, so
+    # the only attacker handle is the source host. A token bucket per host lets
+    # a whole fleet boot at once but caps a flood.
     host = request.client.host if request.client else ""
     retry = _register_rate_limited(host)
     if retry is not None:
@@ -1582,11 +1883,7 @@ def _resolve_receive_token(authorization: str | None, token: str | None) -> str 
         The bearer token from the header when present and well-formed, else the
         query token, else ``None``.
     """
-    if authorization and authorization[:7].lower() == "bearer ":
-        bearer = authorization[7:].strip()
-        if bearer:
-            return bearer
-    return token
+    return _bearer_from_header(authorization) or token
 
 
 @app.post("/ask", response_model=None)
@@ -1640,13 +1937,25 @@ async def ask(req: AskRequest) -> AskResponse | JSONResponse:
 
 
 @app.get("/forms")
-async def forms() -> dict[str, list[dict[str, object]]]:
+async def forms(
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[dict[str, object]]]:
     """List the currently pending operator forms.
 
-    Read-only and unauthenticated, like ``/peers``: an agent calls this before
-    pushing a form so it does not duplicate one already awaiting the operator.
-    Resolved forms are dropped, so this only lists pending ones.
+    Read-only and joinable-before-join, like ``/peers``: an agent calls this
+    before pushing a form so it does not duplicate one already awaiting the
+    operator. Resolved forms are dropped, so this only lists pending ones.
+
+    Gated on the shared agent key when one is configured; open otherwise. A
+    pending form carries the asker's question verbatim, so it is exactly the
+    kind of content the key exists to keep off the network. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return {"forms": state.list_forms()}
 
 
@@ -2110,8 +2419,8 @@ async def status_set(req: StatusRequest) -> dict[str, object] | JSONResponse:
 async def floor_list() -> dict[str, dict[str, dict[str, object]]]:
     """List the active talking sticks, keyed by scope.
 
-    Open (no token), like ``/peers`` and ``/ping``: which scopes are currently
-    locked is no more sensitive than the roster. Each entry is
+    Open (no token), unlike the agent-key-gated ``/peers``, ``/ping``,
+    ``/channels`` and ``/forms``. Each entry is
     ``{"scope", "holder", "reason", "hands": [...], "since"}``. An empty map
     means no stick is up and every scope is open. Lets an agent scout whether the
     floor it is about to use is held before it speaks.
@@ -2642,7 +2951,10 @@ def _open_browser(url: str, delay: float = 1.0) -> None:
     threading.Timer(delay, _launch).start()
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: Bind addresses that mean "every interface". They are not addresses anything
+#: connects *to*, so the hub cannot advertise one and has to be told the URL
+#: agents really reach it at (``--public-url``).
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 
 
 def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
@@ -2670,10 +2982,262 @@ def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
     env = os.environ.get("CAUCUS_MCP_HTTP")
     if env is not None:
         return env.strip().lower() in {"1", "true", "yes", "on"}
-    return host in _LOOPBACK_HOSTS
+    return is_loopback_host(host)
 
 
-def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[str]) -> None:
+def _entry_carries_port(entry: str) -> bool:
+    """Return whether an allowed-host entry already names a port.
+
+    ``Host`` header values spell an IPv6 literal in brackets (``[::1]:8765``),
+    so the bracket form decides on its own: a closing ``]`` at the end means no
+    port followed. Everything else is a name or an IPv4 literal, where a single
+    colon can only introduce the port.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+
+    Returns:
+        ``True`` when a port is present and the entry should be used verbatim.
+    """
+    if entry.startswith("["):
+        return not entry.endswith("]")
+    if _is_bare_ipv6(entry):
+        # Every colon belongs to the address itself, so none of them is a port.
+        return False
+    return ":" in entry
+
+
+def _is_bare_ipv6(entry: str) -> bool:
+    """Return whether ``entry`` is an unbracketed IPv6 literal.
+
+    ``--allowed-host ::1`` and ``--allowed-host 2001:db8::1`` are the forms an
+    operator types, but a ``Host`` header always brackets an IPv6 literal
+    (``[::1]:8765``). Recognising the bare form is what lets
+    :func:`_normalise_allowed_host` rewrite it into something the guard can
+    actually match.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+
+    Returns:
+        ``True`` when the whole entry parses as an IPv6 address.
+    """
+    try:
+        ipaddress.IPv6Address(entry)
+    except ValueError:
+        return False
+    return True
+
+
+def _normalise_allowed_host(entry: str, port: int) -> str:
+    """Rewrite one allowlist entry into the ``Host`` header form it must match.
+
+    Three shapes go in: a bare name or IPv4 literal, a bracketed IPv6 literal,
+    and a bare IPv6 literal. All three come out as the guard compares them — an
+    IPv6 address bracketed, and a host with no port completed with the hub's
+    own port, which is what an operator naming a bare host means.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+        port: The port the hub listens on, used to complete bare hosts.
+
+    Returns:
+        The entry as a ``Host`` header value.
+    """
+    if _entry_carries_port(entry):
+        return entry
+    host = f"[{entry}]" if _is_bare_ipv6(entry) else entry
+    return f"{host}:{port}"
+
+
+def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
+    """Build the extra ``Host`` allowlist for the ``/mcp`` DNS-rebinding guard.
+
+    Mirrors the ``--allowed-origin`` / ``CAUCUS_ALLOWED_ORIGINS`` pair: repeated
+    CLI flags merged with a comma-separated environment variable. Without this,
+    the only non-loopback entry the guard ever learns is the bind address
+    itself, so a hub on ``0.0.0.0`` reached as ``hub.lan:8765`` is refused with
+    no way for the operator to allow it.
+
+    A bare host is expanded to the hub's own port, which is what an operator
+    naming a hostname means; an entry that already carries a port is kept
+    verbatim, so a reverse proxy on another port can be allowed too. A bare
+    IPv6 literal is bracketed on the way, since that is the only form a ``Host``
+    header ever spells (see :func:`_normalise_allowed_host`).
+
+    Args:
+        cli: The repeated ``--allowed-host`` values, or ``None``.
+        port: The port the hub listens on, used to complete bare hosts.
+
+    Returns:
+        The de-duplicated ``host:port`` entries, in the order first seen.
+    """
+    raw = list(cli or [])
+    raw.extend(os.environ.get("CAUCUS_ALLOWED_HOSTS", "").split(","))
+    hosts: list[str] = []
+    for entry in (e.strip() for e in raw):
+        if not entry:
+            continue
+        value = _normalise_allowed_host(entry, port)
+        if value not in hosts:
+            hosts.append(value)
+    return hosts
+
+
+def _doors_block(*, operator: bool, agent: bool, requirement: str) -> str:
+    """Render the two-doors inventory shared by both credential refusals.
+
+    The flag names, the environment variables and the ``openssl`` lines have to
+    read identically whether the hub was refused for its bind address or for the
+    public URL it advertises; spelling them twice is how one of the two ends up
+    naming a flag that was renamed in the other.
+
+    Args:
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+        requirement: The sentence introducing the generation snippet, which
+            names *why* both credentials are demanded in this particular case.
+
+    Returns:
+        The doors inventory, the requirement sentence and the two ``export``
+        lines, ending with a newline.
+    """
+    mark = {True: "already set", False: "MISSING"}
+    return (
+        "  agent door     /register and /mcp - join the room, read everything\n"
+        "                 said in it\n"
+        f"                 --agent-key KEY  (env CAUCUS_AGENT_KEY): {mark[agent]}\n"
+        "  operator door  /ui - pause, stop, kick, read the whole transcript\n"
+        "                 --operator-token TOKEN  (env CAUCUS_OPERATOR_TOKEN):"
+        f" {mark[operator]}\n"
+        "\n"
+        f"{requirement} Generate and set them:\n"
+        "\n"
+        '  export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"\n'
+        '  export CAUCUS_OPERATOR_TOKEN="$(openssl rand -hex 24)"\n'
+    )
+
+
+def _insecure_bind_message(
+    host: str,
+    *,
+    operator: bool,
+    agent: bool,
+    public_url: bool,
+    wildcard: bool,
+) -> str:
+    """Compose the refusal shown when a non-loopback bind is under-configured.
+
+    This message is the whole user experience of the refusal: somebody just had
+    their hub refuse to start, and everything they need to fix it — both doors,
+    both flags, both environment variables, the escape hatch, and the way back
+    to a loopback bind — has to be in this one block.
+
+    Args:
+        host: The non-loopback address that was requested.
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+        public_url: Whether an advertised public URL is already configured.
+        wildcard: Whether ``host`` is a wildcard bind, which makes the public
+            URL a third required setting rather than an optional one.
+
+    Returns:
+        The multi-line refusal text, ready to hand to ``parser.error``.
+    """
+    mark = {True: "already set", False: "MISSING"}
+    # On a wildcard bind there is no address to advertise, so --public-url joins
+    # the two credentials as a required setting and is marked the same way.
+    reach = (
+        "\nA wildcard bind names no reachable address, so agents must be told\n"
+        "one -- otherwise the Host header they send is rejected by the\n"
+        "DNS-rebinding guard and the watcher command they get points at\n"
+        "127.0.0.1:\n"
+        "\n"
+        f"  --public-url URL    (env CAUCUS_PUBLIC_URL): {mark[public_url]}\n"
+        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
+        if wildcard
+        else "\nThen tell agents where to reach you, or the Host header they send is\n"
+        "rejected by the DNS-rebinding guard and the watcher command they get\n"
+        "points at 127.0.0.1:\n"
+        "\n"
+        "  --public-url URL    (env CAUCUS_PUBLIC_URL)\n"
+        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
+    )
+    return (
+        f"refusing to bind {host}: a hub on a non-loopback address is reachable\n"
+        "from other machines, and by default neither of its two doors is locked\n"
+        "nor does it know the address to hand those machines.\n"
+        "\n"
+        + _doors_block(
+            operator=operator,
+            agent=agent,
+            requirement="Both are required on a non-loopback bind.",
+        )
+        + f"  caucus-hub --host {host}"
+        + (" --public-url https://hub.example.net\n" if wildcard else "\n")
+        + reach
+        + "\n"
+        "Not what you meant? --host 127.0.0.1 keeps the hub on this machine.\n"
+        "Meant it, on a network that already authenticates (a tunnel, a private\n"
+        "LAN)? --allow-insecure-bind starts anyway, with both doors open."
+    )
+
+
+def _insecure_public_url_message(
+    public_url: str,
+    *,
+    operator: bool,
+    agent: bool,
+) -> str:
+    """Compose the refusal shown when an advertised hub is under-configured.
+
+    The sibling of :func:`_insecure_bind_message` for the deployment where the
+    socket is *not* the exposure: the hub binds to loopback and something in
+    front of it (a tunnel, a reverse proxy, a port forward) carries the outside
+    world in. Nothing about the bind address betrays that, so the only signal
+    the hub has is the operator declaring a public URL that is not loopback --
+    and that declaration has to be taken as seriously as a non-loopback bind,
+    because the doors behind it are exactly as open.
+
+    Args:
+        public_url: The non-loopback base URL the operator asked to advertise.
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+
+    Returns:
+        The multi-line refusal text, ready to hand to ``parser.error``.
+    """
+    return (
+        f"refusing to start: --public-url {public_url} says agents on other\n"
+        "machines dial this hub, and by default neither of its two doors is\n"
+        "locked. The bind is loopback, so the socket is not the exposure --\n"
+        "whatever sits in front of it is, and anything reaching that front\n"
+        "reaches both of these:\n"
+        "\n"
+        + _doors_block(
+            operator=operator,
+            agent=agent,
+            requirement="Both are required once the hub is advertised off-box.",
+        )
+        + f"  caucus-hub --host 127.0.0.1 --public-url {public_url}\n"
+        "\n"
+        "Not what you meant? A loopback public URL (http://localhost:8765) is\n"
+        "just a nicer address for this machine and needs none of this.\n"
+        "Meant it, behind something that already authenticates? "
+        "--allow-insecure-bind\n"
+        "starts anyway, with both doors open."
+    )
+
+
+def _mount_mcp_http(
+    *,
+    host: str,
+    port: int,
+    mcp_path: str,
+    extra_origins: set[str],
+    extra_hosts: list[str] | None = None,
+    public_url: str | None = None,
+) -> None:
     """Build the Streamable HTTP MCP server and attach its route to the hub app.
 
     Mirrors the ``disk_log`` pattern (amendment A4): sets the module global
@@ -2691,6 +3255,10 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
         port: The port the hub listens on.
         mcp_path: The path the endpoint serves at (e.g. ``/mcp``).
         extra_origins: Operator-approved extra browser origins (the CSWSH set).
+        extra_hosts: Operator-approved extra ``Host`` values from
+            :func:`_collect_allowed_hosts`, or ``None``.
+        public_url: The externally reachable base URL from ``--public-url``,
+            or ``None`` to advertise the bind address.
     """
     global _mcp_server
     from . import mcp_http
@@ -2698,20 +3266,44 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
     # Record the served path so the CORS layer scopes its preflight handling to
     # exactly this route.
     server_config.mcp_path = mcp_path
-    browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    self_url = f"http://{browse_host}:{port}"
-    allowed_hosts: list[str] = []
+    browse_host = "127.0.0.1" if host in _WILDCARD_HOSTS else host
+    # An operator-declared public URL wins: on a wildcard bind the rewritten
+    # 127.0.0.1 is only right for an agent on this machine, and handing a remote
+    # one that address is how watch_command produced an unrunnable command.
+    self_url = public_url or f"http://{browse_host}:{port}"
+    allowed_hosts: list[str] = list(extra_hosts or [])
     allowed_origins: list[str] = list(extra_origins)
+
+    def _allow_host(value: str) -> None:
+        """Append one ``Host`` value unless the allowlist already carries it.
+
+        The same address arrives from up to three places (``--allowed-host``,
+        the bind address, the public URL's netloc), and a repeated entry means
+        nothing to the guard while making the startup log harder to read.
+        """
+        if value and value not in allowed_hosts:
+            allowed_hosts.append(value)
+
     # A bind-all address is not a connectable origin; only add a concrete host.
-    if host not in ("0.0.0.0", "::"):
-        allowed_hosts.append(f"{host}:{port}")
-        allowed_origins.append(f"http://{host}:{port}")
+    if host not in _WILDCARD_HOSTS:
+        _allow_host(_normalise_allowed_host(host, port))
+        origin = f"http://{_normalise_allowed_host(host, port)}"
+        if origin not in allowed_origins:
+            allowed_origins.append(origin)
+    if public_url is not None:
+        # The Host header a client dialling the public URL sends is its netloc;
+        # allowing it here spares the operator from repeating it as an
+        # --allowed-host on every deployment that sets --public-url.
+        _allow_host(urlparse(public_url).netloc)
     _mcp_server = mcp_http.build_mcp_server(
         app,
         self_url=self_url,
         mcp_path=mcp_path,
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
+        # Loopback-only is the one deployment where a token file on the hub's
+        # filesystem is also on the agent's; anything else gets the env form.
+        remote=public_url is not None or not is_loopback_host(host),
     )
     # streamable_http_app() lazily creates the session manager (run by lifespan)
     # and registers the endpoint route; attach that route to the hub app.
@@ -2765,6 +3357,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--agent-key",
+        default=os.environ.get("CAUCUS_AGENT_KEY"),
+        help=(
+            "require this shared key (Authorization: Bearer ...) on /register "
+            "and /mcp so only agents that hold it can join; unset (default) "
+            "leaves the agent door open. Env: CAUCUS_AGENT_KEY"
+        ),
+    )
+    parser.add_argument(
         "--log-file",
         default=os.environ.get("CAUCUS_LOG_FILE"),
         help=(
@@ -2790,6 +3391,40 @@ def main() -> None:
             "extra browser Origin allowed to open the /ui WebSocket (repeatable; "
             "CSWSH allowlist). Loopback origins on the served port are always "
             "allowed. Env: CAUCUS_ALLOWED_ORIGINS (comma-separated)"
+        ),
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help=(
+            "extra Host header value the /mcp DNS-rebinding guard accepts "
+            "(repeatable). Needed to reach a hub bound to 0.0.0.0 under a "
+            "name, e.g. --allowed-host hub.lan. A bare host is allowed on this "
+            "hub's port; pass host:port for anything else. Loopback is always "
+            "allowed. Env: CAUCUS_ALLOWED_HOSTS (comma-separated)"
+        ),
+    )
+    parser.add_argument(
+        "--public-url",
+        default=os.environ.get("CAUCUS_PUBLIC_URL"),
+        metavar="URL",
+        help=(
+            "base URL other machines reach this hub at, e.g. "
+            "https://hub.example.net. Advertised to agents instead of the bind "
+            "address, so the caucus-watch command they are handed is runnable "
+            "off-box. Scheme plus host, no path. Env: CAUCUS_PUBLIC_URL"
+        ),
+    )
+    parser.add_argument(
+        "--allow-insecure-bind",
+        action="store_true",
+        help=(
+            "start without --operator-token and --agent-key on a non-loopback "
+            "address, or behind a non-loopback --public-url. Both doors stay "
+            "open to anything that can reach the hub; only for a network that "
+            "already authenticates"
         ),
     )
     parser.add_argument(
@@ -2849,9 +3484,77 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    public_url: str | None = args.public_url or None
+
+    # Refuse before anything is configured or bound. A non-loopback bind puts
+    # both doors on the network, and neither is locked by default: the agent
+    # door lets any reachable client join and read the room, the operator door
+    # grades every caller as operator. Demand both credentials, once, here --
+    # this is the same gate caucus-setup-service applies to the installed unit.
+    # A wildcard bind adds a third requirement: 0.0.0.0 is not an address
+    # anything dials, so without --public-url the hub would advertise the
+    # 127.0.0.1 rewrite and hand every remote agent a watcher command pointing
+    # back at its own machine. Fix that at the source rather than downstream.
+    # A loopback bind is not proof the hub is unreachable: behind a tunnel or a
+    # reverse proxy the socket stays on 127.0.0.1 while the world dials the
+    # front. The one thing the operator tells us in that shape is --public-url,
+    # and _mount_mcp_http already reads a non-loopback one as "remote" (see its
+    # `remote=` argument). The credentials gate has to read it the same way, or
+    # the exact deployment that most needs both doors locked is the one that
+    # starts without either. A loopback public URL is just a prettier address
+    # for this machine and arms nothing.
+    wildcard = args.host in _WILDCARD_HOSTS
+    # Parsed defensively: the value is still unvalidated here, and one that
+    # urlparse finds no hostname in must fall through to validate_public_url
+    # below rather than be read as an exposure. A URL that *does* name a
+    # non-loopback host but fails validation for another reason (a path, say)
+    # hits this gate first, which is the right order: missing credentials on an
+    # advertised hub outrank the shape of the address being advertised.
+    advertised_host = urlparse(public_url).hostname if public_url else None
+    advertised_remote = (
+        public_url
+        if advertised_host is not None and not is_loopback_host(advertised_host)
+        else None
+    )
+    under_configured = not (args.operator_token and args.agent_key) or (
+        wildcard and not public_url
+    )
+    if not args.allow_insecure_bind and under_configured:
+        if not is_loopback_host(args.host):
+            parser.error(
+                _insecure_bind_message(
+                    args.host,
+                    operator=bool(args.operator_token),
+                    agent=bool(args.agent_key),
+                    public_url=bool(public_url),
+                    wildcard=wildcard,
+                )
+            )
+        elif advertised_remote is not None:
+            parser.error(
+                _insecure_public_url_message(
+                    advertised_remote,
+                    operator=bool(args.operator_token),
+                    agent=bool(args.agent_key),
+                )
+            )
+
+    if public_url is not None:
+        try:
+            public_url = validate_public_url(public_url)
+        except ValueError as exc:
+            parser.error(str(exc))
+
     global disk_log, launcher_config
-    auth_config.operator = args.operator_token
-    auth_config.observer = args.observer_token
+    # `or None` on all three: an exported-but-blank env var (or an explicit
+    # --agent-key "") is "no credential", not a credential nobody can present.
+    # Left raw, an empty agent key makes agent_ok() reject every caller and an
+    # empty operator token turns AuthConfig.enabled on with a token no first
+    # frame can match -- a lockout, in both cases, rather than a no-op. The
+    # clients already normalise the same way (hub_connector, mcp_bridge).
+    auth_config.operator = args.operator_token or None
+    auth_config.observer = args.observer_token or None
+    auth_config.agent = args.agent_key or None
 
     # Fail closed at boot, not per request. AuthConfig.role_for grades every
     # caller as "operator" when no operator token is set, so "operator token
@@ -2865,7 +3568,7 @@ def main() -> None:
                 "every caller is graded as operator and the launcher would let "
                 "anyone who can reach this hub start processes on this machine"
             )
-        if args.host not in _LOOPBACK_HOSTS:
+        if not is_loopback_host(args.host):
             parser.error(
                 f"--enable-agent-launcher requires a loopback bind, got "
                 f"--host {args.host}: process creation must not be reachable "
@@ -2892,6 +3595,9 @@ def main() -> None:
     extra_origins: set[str] = set(args.allowed_origin or [])
     env_origins = os.environ.get("CAUCUS_ALLOWED_ORIGINS", "")
     extra_origins.update(o.strip() for o in env_origins.split(",") if o.strip())
+    # Same shape for the Host allowlist, which the /mcp DNS-rebinding guard
+    # reads. Bare entries are completed with this hub's own port.
+    extra_hosts = _collect_allowed_hosts(args.allowed_host, args.port)
     server_config.host = args.host
     server_config.port = args.port
     server_config.allowed_origins = frozenset(extra_origins)
@@ -2908,16 +3614,39 @@ def main() -> None:
             port=args.port,
             mcp_path=args.mcp_path,
             extra_origins=extra_origins,
+            extra_hosts=extra_hosts,
+            public_url=public_url,
         )
-        if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.operator_token:
-            logger.warning(
-                "/mcp is exposed on a non-loopback address (%s) without "
-                "--operator-token; any client that can reach this host can "
-                "register as a peer",
-                args.host,
-            )
+    # The agent door (/register, and /mcp when mounted) is open to anything that
+    # can reach the port unless a shared key is set. Only reachable now via
+    # --allow-insecure-bind, which is exactly when it deserves saying again.
+    if not is_loopback_host(args.host) and not auth_config.agent:
+        logger.warning(
+            "the hub is bound to a non-loopback address (%s) without "
+            "--agent-key: any client that can reach this host can register as "
+            "a peer and read the room (Env: CAUCUS_AGENT_KEY)",
+            args.host,
+        )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
+    if public_url is not None:
+        logger.info("advertising %s to agents (--public-url)", public_url)
+        # Said once, at startup, rather than on every watch_command: a plain-http
+        # public URL is the whole deployment's posture, not a per-call surprise.
+        # Every peer token the hub hands out travels to that address in clear,
+        # and so does every message; the watcher command carries the token in an
+        # environment variable and needs CAUCUS_ALLOW_REMOTE_HUB=1 on the agent's
+        # machine just to be allowed to dial it.
+        if needs_remote_optin(public_url):
+            logger.warning(
+                "--public-url %s is plain http to a non-loopback host: peer "
+                "tokens and every message cross the network in clear, and the "
+                "watcher command agents are handed has to carry %s=1 to run at "
+                "all. Terminate TLS in front of the hub (https://) or reach it "
+                "through a tunnel instead",
+                public_url,
+                ALLOW_REMOTE_ENV,
+            )
     if launcher_config.enabled:
         # Loud on purpose: this hub can now start processes on this machine.
         logger.warning(

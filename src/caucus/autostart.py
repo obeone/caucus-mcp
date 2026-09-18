@@ -36,12 +36,12 @@ import urllib.request
 
 from .setup_service import (
     DEFAULT_LABEL,
-    LOOPBACK_HOSTS,
     SYSTEMD_UNIT_NAME,
     SetupError,
     detect_platform,
     unit_path,
 )
+from .urlguard import is_loopback_host
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ def is_local(hub_url: str) -> bool:
         host = urllib.parse.urlparse(hub_url).hostname
     except ValueError:
         return False
-    return host is not None and host in LOOPBACK_HOSTS
+    return host is not None and is_loopback_host(host)
 
 
 def service_installed(label: str = DEFAULT_LABEL) -> bool:

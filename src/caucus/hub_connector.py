@@ -24,6 +24,7 @@ agent's job.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from types import TracebackType
@@ -31,6 +32,9 @@ from types import TracebackType
 import httpx
 
 logger = logging.getLogger("caucus.connector")
+
+#: Environment variable carrying the hub's shared agent key, if it runs with one.
+AGENT_KEY_ENV = "CAUCUS_AGENT_KEY"
 
 # Default HTTP timeout. Sits above the hub's 25s long-poll ceiling so a quiet
 # ``/receive`` returns on the server's terms rather than tripping the client
@@ -258,6 +262,7 @@ class HubConnector:
         timeout: float = DEFAULT_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
         limits: httpx.Limits | None = None,
+        agent_key: str | None = None,
     ) -> None:
         """Initialize the connector.
 
@@ -278,17 +283,39 @@ class HubConnector:
                 URL/socket transport, untouched.
             limits: Optional explicit connection-pool bounds. ``None`` uses
                 httpx's defaults.
+            agent_key: The hub's shared agent key, presented on ``/register``
+                when the hub demands one. ``None`` (the default) falls back to
+                the :data:`AGENT_KEY_ENV` environment variable, so an agent
+                inherits the key from its environment with no wiring; an empty
+                value means "no key" (the hub is open).
         """
         self._base = hub_url.rstrip("/")
         self._timeout = timeout
         self._transport = transport
         self._limits = limits
+        self._agent_key = agent_key or os.environ.get(AGENT_KEY_ENV) or None
         self._http: httpx.AsyncClient | None = None
 
     @property
     def hub_url(self) -> str:
         """The normalized hub base URL (no trailing slash)."""
         return self._base
+
+    def _agent_headers(self) -> dict[str, str] | None:
+        """Return the ``Authorization`` header carrying the shared agent key.
+
+        Sent on the calls made *without* a peer token: ``/register``, and the
+        pre-join read surface (``/peers``, ``/channels``, ``/forms``) the hub
+        now gates on the same key. Every other call spends the peer token on
+        that header instead, so the key is never sent alongside it.
+
+        Returns:
+            ``{"Authorization": "Bearer <key>"}`` when a key is configured, else
+            ``None`` so httpx sends no extra header at all.
+        """
+        if self._agent_key is None:
+            return None
+        return {"Authorization": f"Bearer {self._agent_key}"}
 
     # PYI034 wants `Self`, which needs Python 3.11; the floor here is 3.10.
     async def __aenter__(self) -> HubConnector:  # noqa: PYI034
@@ -393,7 +420,9 @@ class HubConnector:
             NameInUseError: If the hub refuses the join with HTTP 409 because
                 a live listener already holds the project name and the presented
                 token (if any) did not match.
-            httpx.HTTPError: If the hub is unreachable or returns an error.
+            httpx.HTTPError: If the hub is unreachable or returns an error —
+                including HTTP 401 when the hub requires a shared agent key and
+                this connector holds none or the wrong one.
         """
         http = self._require_http()
         payload: dict[str, object] = {
@@ -402,7 +431,7 @@ class HubConnector:
         }
         if token is not None:
             payload["token"] = token
-        resp = await http.post("/register", json=payload)
+        resp = await http.post("/register", json=payload, headers=self._agent_headers())
         if resp.status_code == 409:
             body = resp.json()
             raise NameInUseError(
@@ -618,7 +647,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/peers")
+        resp = await http.get("/peers", headers=self._agent_headers())
         resp.raise_for_status()
         return list(resp.json().get("peers", []))
 
@@ -626,8 +655,9 @@ class HubConnector:
         """Probe a peer's liveness and self-reported status from the hub.
 
         Answered entirely from the hub's in-memory bookkeeping, so the target
-        agent's turn is never consumed. Open endpoint (no token), like
-        :meth:`peers`.
+        agent's turn is never consumed. Carries the shared agent key when one is
+        configured, like :meth:`peers`: the hub gates this probe on it, because
+        the payload includes the peer's own self-reported activity line.
 
         Args:
             peer: The project name to check.
@@ -641,7 +671,9 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/ping", params={"peer": peer})
+        resp = await http.get(
+            "/ping", params={"peer": peer}, headers=self._agent_headers()
+        )
         resp.raise_for_status()
         return dict(resp.json())
 
@@ -721,7 +753,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/forms")
+        resp = await http.get("/forms", headers=self._agent_headers())
         resp.raise_for_status()
         return list(resp.json().get("forms", []))
 
@@ -822,7 +854,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/channels")
+        resp = await http.get("/channels", headers=self._agent_headers())
         resp.raise_for_status()
         return dict(resp.json().get("channels", {}))
 

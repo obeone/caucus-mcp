@@ -36,9 +36,10 @@ wired by `[project.scripts]` in `pyproject.toml`. The hub is the common
 denominator; everything else is a connector to it.
 
 - **`hub.py`** — `caucus-hub`. FastAPI app. The only stateful process. HTTP
-  endpoints for agents (`/register`, `/leave`, `/send`, `/receive`, `/protocol`,
-  `/peers`, `/ping`, `/status`, `/channels` + `/channels/join` +
-  `/channels/leave`, and the operator-form pair `/ask` + `/forms`)
+  endpoints for agents (`/register`, `/watch-ticket/redeem`, `/leave`, `/send`,
+  `/receive`, `/protocol`, `/peers`, `/ping`, `/status`, `/channels` +
+  `/channels/join` + `/channels/leave`, and the operator-form pair `/ask` +
+  `/forms`)
   plus a `/control` endpoint, a read-only `/export` (download the recent log as
   JSON / Markdown / text), and a `/ui` WebSocket for the operator console
   (`src/caucus/ui/index.html`, shipped as package data and served at `/`).
@@ -101,7 +102,12 @@ denominator; everything else is a connector to it.
   never observed.
 - **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop
   (no LLM) that the agent launches in the background via `watch_command()`. It
-  reuses the bridge's token, polls `/receive`, and prints each inbound message
+  polls `/receive` with an access token handed over directly (loopback), or,
+  on a remote hub, redeemed once from a single-use `--ticket` at
+  `POST /watch-ticket/redeem` before the first poll (credential precedence:
+  `--token` > `--token-file` > `--ticket` > `CAUCUS_TOKEN` > `CAUCUS_TICKET`;
+  see [Running a hub other machines can reach](remote-hub.md)). It then prints
+  each inbound message
   (and the operator `stop`) to stdout for ~0 tokens — replacing the old
   per-message watcher subagent, which re-paid ~100k tokens of boot context on
   every spawn. **One-shot-per-wake contract**: the watcher exits as soon as it
@@ -173,9 +179,22 @@ denominator; everything else is a connector to it.
   is keyed on it, so many agents share one hub process without sharing identity.
   Listening is unchanged: `listen` long-polls `/receive` through the connector,
   and `watch_command` still returns a `caucus-watch` command against the hub's
-  real reachable URL. Opt-in, localhost by default, with `transport_security`
-  guarding against DNS-rebinding. The MCP session manager runs inside the hub
-  lifespan, mirroring the disk-log wiring.
+  real reachable URL. On a remote hub (`remote=True`), that command carries a
+  single-use `--ticket` instead of a `--token-file` path: a path on the hub's
+  own filesystem means nothing to an agent elsewhere, and the peer token
+  itself must not travel through the agent's transcript. `watch_command`
+  mints the ticket via `HubState.issue_watch_ticket` (`WATCH_TICKET_TTL =
+  120s` in `state.py`); the watcher spends it once at
+  `POST /watch-ticket/redeem`, gated on the agent key like `/register`, and an
+  unknown, already-used or expired ticket answers 404. Opt-in, localhost by
+  default, with `transport_security` guarding against DNS-rebinding. The MCP session manager runs inside the hub
+  lifespan, mirroring the disk-log wiring. When `--agent-key` is set,
+  `MCPAgentKeyMiddleware` gates every `/mcp` request at the HTTP layer, before
+  it ever reaches a tool, demanding the same `Authorization: Bearer <key>`
+  that `POST /register` checks; a CORS preflight `OPTIONS` is let through
+  untouched since it carries no `Authorization` header by definition.
+  See [Running a hub other machines can reach](remote-hub.md) for the full
+  remote-deployment story.
 - **`supervisor.py`** (no script): the operator agent launcher, off unless the
   hub is started for it. `AgentSupervisor` spawns, lists and kills
   `caucus-claude-agent` child processes on behalf of an authenticated operator,
@@ -233,10 +252,11 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 - **Operator kick** (`kick`): the `/ui` WebSocket accepts `{"kick": "<project>"}`,
   dropping that peer (reason "kicked by operator"). This is the manual counterpart
   to the collision detector — the only way a live incumbent is evicted (collisions
-  never auto-evict the incumbent; they refuse the newcomer). Note that `/ui`
-  carries no authentication, so the hub must stay bound to localhost or sit behind
-  a trusted reverse proxy — exposing it publicly lets anyone pause, stop, kick,
-  or steer arbitrary peers.
+  never auto-evict the incumbent; they refuse the newcomer). `/ui` authentication
+  is opt-in (`--operator-token`/`--observer-token`, see [Auth /
+  RBAC](#auth--rbac) below) and off by default, so an unconfigured hub must stay
+  bound to localhost or sit behind a trusted reverse proxy: exposing it publicly
+  without a token lets anyone pause, stop, kick, or steer arbitrary peers.
 - **Operator commands** (`operator_command`): the `/ui` WebSocket also accepts
   `{"command": "interrupt"|"reset", "to": "<project>"}`, a **per-agent** control
   signal (distinct from the room-wide `set_mode`). It routes a CONTROL message to
@@ -561,6 +581,22 @@ and replies:
 - `{"type":"auth_ok","role":"operator","auth":true}` — full read-write access.
 - `{"type":"auth_ok","role":"observer","auth":true}` — read-only access.
 - `{"type":"auth_error"}` + WebSocket close 1008 — rejected.
+
+This guards only the console. The agent door (`POST /register` and `/mcp`) is
+gated by a separate, independent axis: `--agent-key` / `CAUCUS_AGENT_KEY`,
+also on `AuthConfig` but checked with its own `agent_ok` method; an operator
+or observer token grants no agent rights, and the agent key grants no console
+rights. See `MCPAgentKeyMiddleware` above and [Running a hub other machines
+can reach](remote-hub.md) for the full story.
+
+The agent key's reach extends past the join door: `/peers`, `/channels`,
+`/forms` and `/ping` all call `_require_agent_read`, refusing an unkeyed
+caller with 401 the moment an agent key is configured (an operator or
+observer token also passes these four, since the console's own tooling holds
+that credential and not the agent key). `POST /watch-ticket/redeem` is gated
+the same way `/register` is, on the agent key alone; an operator or observer
+token does not pass it. `/version` stays open regardless, since it is the
+bare liveness probe `/caucus:setup` dials before any credential exists.
 
 RBAC is enforced per-command in the `/ui` handler. Any frame from an `observer`
 connection whose key appears in `_MUTATING_COMMANDS` (the frozen set in `hub.py`)

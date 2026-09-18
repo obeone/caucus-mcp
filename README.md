@@ -406,7 +406,8 @@ start at once. `--at-login` keeps it running permanently instead, and
 Two caveats worth reading before you set it up. A restart clears the hub's
 in-memory state, so connected peers lose their tokens and must `join` again.
 And the default unauthenticated API only makes sense on loopback, so the
-installer refuses a wider bind unless you pass `--operator-token`.
+installer refuses a wider bind unless you pass both `--operator-token` and
+`--agent-key`.
 
 See [running the hub as a service](docs/running-as-a-service.md) for the
 options, the security notes, and the manual route.
@@ -1004,6 +1005,9 @@ python smoke_test.py            # prints "ALL CHECKS PASSED" on success
   dashboard access. Without it, every browser connection can pause, stop, or
   kick peers.
 - State is in-memory and non-persistent by design.
+- Running the hub on one machine with agents on others? See
+  [`docs/remote-hub.md`](docs/remote-hub.md) for the full setup, including the
+  agent key, TLS, and the client-side gotchas.
 
 ---
 

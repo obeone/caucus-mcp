@@ -2,7 +2,10 @@
   "mcpServers": {
     "caucus": {
       "type": "http",
-      "url": "${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp"
+      "url": "${CAUCUS_HUB_URL:-http://127.0.0.1:8765}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CAUCUS_AGENT_KEY:-}"
+      }
     }
   }
 }

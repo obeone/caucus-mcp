@@ -21,6 +21,11 @@ Configuration via environment variables:
   launches it at the repo root), so the same ``.mcp.json`` is copy-pasteable
   into any repo without editing. ``join`` can still override it per call.
 * ``CAUCUS_HUB_URL``  -- hub base URL (default ``http://127.0.0.1:8765``).
+* ``CAUCUS_AGENT_KEY`` -- shared key for a hub that guards its agent door
+  (``caucus-hub --agent-key``). Optional: unset means the hub is open, which is
+  the loopback default. Presented as ``Authorization: Bearer <key>`` on
+  ``/register`` and on the pre-join read surface (``/peers``, ``/channels``,
+  ``/forms``); every call made after join spends the per-peer token instead.
 """
 
 from __future__ import annotations
@@ -66,6 +71,30 @@ def _default_project() -> str:
 
 HUB_URL = os.environ.get("CAUCUS_HUB_URL", "http://127.0.0.1:8765").rstrip("/")
 PROJECT = os.environ.get("CAUCUS_PROJECT") or _default_project()
+# Shared key for a hub that guards its agent door; ``None`` when the hub is open
+# (the loopback default). An empty value is normalized to None so an exported
+# but blank env var does not turn into an empty bearer.
+AGENT_KEY: str | None = os.environ.get("CAUCUS_AGENT_KEY") or None
+
+
+def _agent_headers() -> dict[str, str]:
+    """Return the extra headers carrying the shared agent key.
+
+    The key is presented on the calls made *without* a peer token: ``/register``
+    and the pre-join read surface (``/peers``, ``/channels``, ``/forms``), which
+    the hub gates on the same key. Every other call already spends the peer
+    token as its own ``Authorization`` bearer, so the key never joins it there.
+    Read from the module global at call time so a test (or a re-exec) can
+    rebind it.
+
+    Returns:
+        ``{"Authorization": "Bearer <key>"}`` when a key is configured, else an
+        empty mapping (httpx then sends no extra header at all).
+    """
+    if AGENT_KEY is None:
+        return {}
+    return {"Authorization": f"Bearer {AGENT_KEY}"}
+
 
 mcp = FastMCP(
     "caucus",
@@ -308,7 +337,7 @@ def _attempt_auto_rejoin() -> str | None:
         payload["token"] = _token
     try:
         with _client() as http:
-            resp = http.post("/register", json=payload)
+            resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 logger.warning(
                     "auto-rejoin refused for project=%s: name is held by"
@@ -611,7 +640,7 @@ def join(
         payload["token"] = _token
     try:
         with _client() as http:
-            resp = http.post("/register", json=payload)
+            resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 body = resp.json()
                 note = body.get("note", "an active listener already holds this name")
@@ -771,7 +800,7 @@ def list_peers() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/peers")
+        resp = http.get("/peers", headers=_agent_headers())
         resp.raise_for_status()
         return {"peers": list(resp.json().get("peers", []))}
 
@@ -784,7 +813,7 @@ def ping(peer: str) -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/ping", params={"peer": peer})
+        resp = http.get("/ping", params={"peer": peer}, headers=_agent_headers())
         resp.raise_for_status()
         return dict(resp.json())
 
@@ -903,7 +932,7 @@ def list_channels() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/channels")
+        resp = http.get("/channels", headers=_agent_headers())
         resp.raise_for_status()
         return {"channels": dict(resp.json().get("channels", {}))}
 
@@ -1005,7 +1034,7 @@ def list_forms() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/forms")
+        resp = http.get("/forms", headers=_agent_headers())
         resp.raise_for_status()
         return {"forms": list(resp.json().get("forms", []))}
 

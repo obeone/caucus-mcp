@@ -83,6 +83,7 @@ from .models import (
     session_expired_error,
 )
 from .state import CapExceeded, RegisterOutcome
+from .urlguard import ALLOW_REMOTE_ENV, needs_remote_optin
 
 logger = logging.getLogger("caucus.mcp_http")
 
@@ -177,6 +178,12 @@ class _Membership:
         token_file: Path of the 0600 watcher token file written by
             :func:`watch_command`, cleaned up on :func:`leave`. ``None`` when
             none is live.
+        watch_ticket: The single outstanding remote watch ticket minted by
+            :func:`watch_command` for this session, or ``None`` when none is
+            live. Revoked (via :meth:`HubState.revoke_watch_ticket`) and
+            replaced on the next :func:`watch_command` refresh, and revoked
+            outright on :func:`leave` and in the dead-session sweep, so at
+            most one ticket for this session's token is ever redeemable.
         last_active: ``time.time()`` of this session's most recent tool call.
             Only load-bearing while the session is *unjoined*: it is the sole
             liveness signal such a record has (it owns no hub client), so the
@@ -192,6 +199,7 @@ class _Membership:
     last_acked_seq: int = 0
     listen_lease: str | None = None
     token_file: str | None = None
+    watch_ticket: str | None = None
     last_active: float = field(default_factory=time.time)
 
 
@@ -479,6 +487,7 @@ def build_mcp_server(
     mcp_path: str = "/mcp",
     allowed_hosts: list[str] | None = None,
     allowed_origins: list[str] | None = None,
+    remote: bool = False,
 ) -> FastMCP:
     """Construct the in-process Streamable HTTP MCP server for the hub.
 
@@ -499,6 +508,12 @@ def build_mcp_server(
         allowed_hosts: Extra ``Host`` allowlist entries for DNS-rebinding
             protection (typically the served ``host:port``).
         allowed_origins: Extra browser ``Origin`` allowlist entries.
+        remote: Whether this hub may be serving agents on other machines (a
+            non-loopback bind, or an operator-declared ``--public-url``). It
+            only changes how ``watch_command`` hands over the access token: a
+            path on the hub's filesystem means nothing to a remote agent, so it
+            gets a single-use ``--ticket`` it redeems for the token instead of
+            a token file.
 
     Returns:
         A configured :class:`FastMCP` ready to mount and run.
@@ -513,7 +528,7 @@ def build_mcp_server(
     sessions: dict[str, _Membership] = {}
 
     def _sweep_dead_sessions(*, now: float | None = None) -> None:
-        """Remove per-session state and token files for sessions that are gone.
+        """Remove per-session state, token files and watch tickets for gone sessions.
 
         Called by the hub reaper on every sweep tick, right after
         :meth:`HubState.reap_stale`. Two kinds of corpse, because the two kinds
@@ -550,6 +565,10 @@ def build_mcp_server(
             member = sessions.pop(sid, None)
             if member is not None:
                 _remove_token_file(member.token_file)
+                # Mirror the leave() cleanup: a session reaped as dead must
+                # not leave its watch ticket outstanding either.
+                if member.watch_ticket is not None:
+                    _hub.state.revoke_watch_ticket(member.watch_ticket)
                 logger.debug("swept dead mcp-http session sid=%s", sid)
 
     # The connector is process-lived: created and entered lazily on first use
@@ -570,6 +589,13 @@ def build_mcp_server(
                     _INTERNAL_BASE_URL,
                     transport=httpx.ASGITransport(app=app),
                     limits=_POOL_LIMITS,
+                    # Every call re-enters the hub's real handler stack, agent
+                    # key gate included, so this in-process client has to carry
+                    # the key like any other. Read from the live config rather
+                    # than the environment: --agent-key on the command line
+                    # never sets CAUCUS_AGENT_KEY, and main() assigns this
+                    # before the mount, so it is set by the time a tool runs.
+                    agent_key=_hub.auth_config.agent,
                 )
                 await existing.__aenter__()
                 conn_holder["connector"] = existing
@@ -871,6 +897,11 @@ def build_mcp_server(
             _hub.state.unregister(token)
         _remove_token_file(member.token_file)
         member.token_file = None
+        # A departing agent must not leave a live ticket redeemable for the
+        # token it just gave up.
+        if member.watch_ticket is not None:
+            _hub.state.revoke_watch_ticket(member.watch_ticket)
+            member.watch_ticket = None
         logger.info("left Caucus (was project=%s)", name)
         return {"left": True, "project": name}
 
@@ -1219,12 +1250,44 @@ def build_mcp_server(
         assert member is not None
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
-        # Drop any prior token file for this session before writing a fresh one.
+        # Drop any prior token file for this session; a remote agent gets none.
         _remove_token_file(member.token_file)
-        member.token_file = _write_token_file(member.token)
+        member.token_file = None
         # self_url, not the ASGITransport: the external watcher is a separate
         # process and needs a real reachable hub URL.
-        command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
+        if remote:
+            # The token file lives on the hub's filesystem, which is not the
+            # agent's, so its path would name nothing runnable. The peer token
+            # itself must not travel either: it is the room bearer for
+            # /receive, /send, /ack, /channels/*, /ask and /floor, and the
+            # whole point of the token file is to keep it out of argv and out
+            # of the launching transcript. So hand over a single-use,
+            # short-lived ticket the watcher exchanges for the token over one
+            # keyed call to /watch-ticket/redeem.
+            #
+            # caucus-watch runs the same fail-closed check on --hub that every
+            # other client does, and a plain-http URL to a non-loopback host is
+            # refused with exit 2 before the first poll. Handing the agent a
+            # command that dies instantly is worse than handing it none: it
+            # backgrounds it and believes a watcher is listening. So carry the
+            # opt-in the operator already made by advertising that URL. Asked
+            # without consulting this process's own environment, because the
+            # command runs in the agent's.
+            #
+            # The docstring below invites a refresh ("call anytime post-join
+            # to get or refresh"), and each refresh must retire the ticket it
+            # replaces: otherwise every call left one more live bearer
+            # credential outstanding for the same peer token, each already
+            # written into the agent's transcript.
+            if member.watch_ticket is not None:
+                _hub.state.revoke_watch_ticket(member.watch_ticket)
+            optin = f"{ALLOW_REMOTE_ENV}=1 " if needs_remote_optin(self_url) else ""
+            ticket = _hub.state.issue_watch_ticket(member.token)
+            member.watch_ticket = ticket
+            command = f"{optin}caucus-watch --hub {self_url} --ticket {ticket}"
+        else:
+            member.token_file = _write_token_file(member.token)
+            command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
         # No usage note here: the protocol already carries the run/relaunch/stop
         # rules verbatim, and repeating them on every call bought the agent
         # nothing it had not already read.

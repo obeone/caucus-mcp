@@ -44,6 +44,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
+
+from .urlguard import is_loopback_host, validate_public_url
 
 DEFAULT_LABEL = "com.github.obeone.caucus-hub"
 DEFAULT_HOST = "127.0.0.1"
@@ -54,13 +57,21 @@ SYSTEMD_UNIT_NAME = "caucus-hub.service"
 #: instead of appending a second one, and leaves the operator's hooks alone.
 HOOK_MARKER = "[caucus-mcp:hub-ensure]"
 
-#: Hosts where the hub's unauthenticated-by-default agent API is defensible.
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: Bind addresses that mean "every interface", mirroring ``caucus.hub``. They
+#: name no reachable address, so an install on one has to be told the URL agents
+#: really dial (``--public-url``) or the hub itself refuses to start.
+WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 
 #: Tokens land in an XML plist and in a shell-sourced env file. Rather than
 #: escaping for both, restrict them to characters neither treats specially;
 #: every sane generator (``openssl rand -hex``, ``uuidgen``, base64url) fits.
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+#: Same idea for the values that are addresses rather than secrets: a public URL
+#: and the ``Host`` allowlist entries travel through the same plist and env-file
+#: plumbing, so they get a charset neither format treats specially. Wide enough
+#: for ``https://hub.example.net:8443`` and ``[2001:db8::1]:8765``.
+ADDRESS_RE = re.compile(r"^[A-Za-z0-9._~:/\[\]-]+$")
 
 Platform = Literal["launchd", "systemd"]
 
@@ -258,23 +269,69 @@ def resolve_binary(explicit: str | None = None) -> Path:
     return Path(found).resolve()
 
 
-def validate_tokens(operator: str | None, observer: str | None) -> None:
+def validate_tokens(
+    operator: str | None, observer: str | None, agent: str | None = None
+) -> None:
     """Reject tokens carrying characters that would need escaping downstream.
 
     Args:
         operator: Read-write dashboard token, or ``None``.
         observer: Read-only dashboard token, or ``None``.
+        agent: Shared agent key guarding ``/register`` and ``/mcp``, or
+            ``None``. Travels through the same plist and env-file plumbing as
+            the two dashboard tokens, so it gets the same charset bound.
 
     Raises:
-        SetupError: When either token contains anything outside
+        SetupError: When any of them contains anything outside
             :data:`TOKEN_RE`.
     """
-    for name, value in (("--operator-token", operator), ("--observer-token", observer)):
+    for name, value in (
+        ("--operator-token", operator),
+        ("--observer-token", observer),
+        ("--agent-key", agent),
+    ):
         if value is not None and not TOKEN_RE.match(value):
             raise SetupError(
                 f"{name} may only contain letters, digits and . _ ~ -\n"
                 "Generate one with:  openssl rand -hex 24"
             )
+
+
+def validate_addresses(public_url: str | None, allowed_hosts: list[str] | None) -> None:
+    """Reject advertised addresses that the unit templates could not carry.
+
+    These are not secrets, but they travel the same route the tokens do — an XML
+    plist and a shell-sourced env file — so they get the same "nothing either
+    format treats specially" bound. The public URL is additionally held to the
+    hub's own rule (scheme plus host, no path), so a URL that would make the hub
+    refuse to start is caught while installing instead.
+
+    Args:
+        public_url: Base URL agents will be told to reach the hub at, or
+            ``None``.
+        allowed_hosts: ``Host`` header values the ``/mcp`` guard should accept,
+            or ``None``.
+
+    Raises:
+        SetupError: On a value outside :data:`ADDRESS_RE`, an allowed host
+            carrying a comma (the env form's separator), or a public URL the hub
+            would itself reject.
+    """
+    for name, value in (
+        ("--public-url", public_url),
+        *(("--allowed-host", h) for h in allowed_hosts or []),
+    ):
+        if value is None:
+            continue
+        if not ADDRESS_RE.match(value):
+            raise SetupError(
+                f"{name} {value!r} may only contain letters, digits and . _ ~ - : / [ ]"
+            )
+    if public_url is not None:
+        try:
+            validate_public_url(public_url)
+        except ValueError as exc:
+            raise SetupError(str(exc)) from exc
 
 
 def check_port(port: int) -> None:
@@ -299,29 +356,130 @@ def check_port(port: int) -> None:
         )
 
 
-def check_bind(host: str, operator_token: str | None) -> None:
-    """Refuse a network-visible bind that nobody can be kept out of.
+def check_bind(
+    host: str,
+    operator_token: str | None,
+    agent_key: str | None,
+    public_url: str | None = None,
+) -> None:
+    """Refuse a network-visible bind the installed hub could not serve safely.
 
-    The hub serves its agent API unauthenticated by default, which is
+    The hub serves both its doors unauthenticated by default, which is
     defensible precisely because it binds to loopback. Bound wider, any browser
-    that reaches the port gets full operator rights: pause, stop, kick.
+    that reaches the port gets full operator rights (pause, stop, kick) and any
+    client that reaches it can register as a peer and read the room. The
+    operator token only ever guarded the first of those, so it is demanded here
+    together with the agent key.
+
+    A wildcard bind adds a third requirement, for the same reason ``caucus-hub``
+    demands it at startup: ``0.0.0.0`` is not an address anything dials, so
+    without ``--public-url`` the hub advertises its ``127.0.0.1`` rewrite to
+    agents on other machines. Refusing here rather than at first start means the
+    operator finds out while installing, not from a unit that loads and then
+    exits.
+
+    A loopback bind behind a non-loopback ``--public-url`` is the same exposure
+    reached a different way -- a tunnel or a reverse proxy carries the world to
+    a socket that never left this machine -- and ``caucus-hub`` refuses it at
+    startup for that reason. Refusing it here too is what keeps the installer
+    from writing a unit that cannot start.
 
     Args:
         host: Address the hub would bind to.
         operator_token: Token that would gate operator access, if any.
+        agent_key: Shared key that would gate ``/register`` and ``/mcp``, if
+            any.
+        public_url: Base URL agents would be told to reach the hub at, if any.
 
     Raises:
-        SetupError: For a non-loopback host with no operator token.
+        SetupError: For a non-loopback host missing a credential, a wildcard
+            host with no public URL, or a loopback host advertised under a
+            non-loopback public URL without both credentials.
     """
-    if host in LOOPBACK_HOSTS or operator_token:
-        return
-    raise SetupError(
-        f"refusing to bind {host} without --operator-token.\n"
-        "On a non-loopback address the dashboard accepts any browser that can\n"
-        "reach it, with full operator rights. Keep 127.0.0.1, or run:\n"
-        f'  caucus-setup-service --host {host} '
-        '--operator-token "$(openssl rand -hex 24)"'
+    advertised_host = urlparse(public_url).hostname if public_url else None
+    advertised_remote = advertised_host is not None and not is_loopback_host(
+        advertised_host
     )
+    if is_loopback_host(host) and not advertised_remote:
+        return
+    if operator_token and agent_key and (public_url or host not in WILDCARD_HOSTS):
+        return
+    wildcard = host in WILDCARD_HOSTS
+    if is_loopback_host(host):
+        raise SetupError(
+            f"refusing to advertise {public_url} without --operator-token and\n"
+            "--agent-key. The bind stays on loopback, but a public URL says\n"
+            "agents on other machines dial this hub, and whatever carries them\n"
+            "in reaches a dashboard that grants full operator rights to any\n"
+            "browser and a /register any client can walk through.\n"
+            "Drop --public-url, or run:\n"
+            f"  caucus-setup-service --host {host} \\\n"
+            '      --operator-token "$(openssl rand -hex 24)" \\\n'
+            '      --agent-key "$(openssl rand -hex 24)" \\\n'
+            f"      --public-url {public_url}"
+        )
+    raise SetupError(
+        f"refusing to bind {host} without --operator-token and --agent-key"
+        + (" and --public-url.\n" if wildcard else ".\n")
+        + "On a non-loopback address the dashboard accepts any browser that can\n"
+        "reach it, with full operator rights, and any client that reaches the\n"
+        "port can join the caucus and read everything said in it.\n"
+        + (
+            "A wildcard bind also names no address to hand agents, so they would\n"
+            "be told to reach this hub at 127.0.0.1 -- their own machine.\n"
+            if wildcard
+            else ""
+        )
+        + "Keep 127.0.0.1, or run:\n"
+        f"  caucus-setup-service --host {host} \\\n"
+        '      --operator-token "$(openssl rand -hex 24)" \\\n'
+        '      --agent-key "$(openssl rand -hex 24)"'
+        + (" \\\n      --public-url https://hub.example.net" if wildcard else "")
+    )
+
+
+def service_environment(
+    operator_token: str | None = None,
+    observer_token: str | None = None,
+    agent_key: str | None = None,
+    public_url: str | None = None,
+    allowed_hosts: list[str] | None = None,
+    mcp_http: bool = False,
+) -> list[tuple[str, str]]:
+    """Build the environment the installed hub reads its configuration from.
+
+    Every setting the service needs beyond ``--host``/``--port`` travels as an
+    environment variable rather than a command-line flag, because both unit
+    formats already have a place for one (the plist's ``EnvironmentVariables``,
+    systemd's ``EnvironmentFile``) and neither has a place for a variable-length
+    argument list. ``caucus-hub`` reads all six as the documented fallback for
+    the matching flag.
+
+    Args:
+        operator_token: Read-write dashboard token, or ``None``.
+        observer_token: Read-only dashboard token, or ``None``.
+        agent_key: Shared key guarding ``/register`` and ``/mcp``, or ``None``.
+        public_url: Base URL agents are told to reach the hub at, or ``None``.
+        allowed_hosts: Extra ``Host`` values the ``/mcp`` DNS-rebinding guard
+            accepts; joined with commas, which is the form the hub splits on.
+        mcp_http: Force the in-process MCP endpoint on. Needed on a non-loopback
+            bind, where it is off by default.
+
+    Returns:
+        The ``(name, value)`` pairs to write, in a stable order, with every
+        unset one dropped.
+    """
+    pairs = [
+        ("CAUCUS_OPERATOR_TOKEN", operator_token),
+        ("CAUCUS_OBSERVER_TOKEN", observer_token),
+        ("CAUCUS_AGENT_KEY", agent_key),
+        ("CAUCUS_PUBLIC_URL", public_url),
+        ("CAUCUS_ALLOWED_HOSTS", ",".join(allowed_hosts or []) or None),
+        # Only ever written as the opt-in: absent means "let the hub decide",
+        # which is on for loopback and off elsewhere.
+        ("CAUCUS_MCP_HTTP", "1" if mcp_http else None),
+    ]
+    return [(name, value) for name, value in pairs if value]
 
 
 def render_unit(
@@ -335,6 +493,10 @@ def render_unit(
     at_login: bool = False,
     operator_token: str | None = None,
     observer_token: str | None = None,
+    agent_key: str | None = None,
+    public_url: str | None = None,
+    allowed_hosts: list[str] | None = None,
+    mcp_http: bool = False,
 ) -> str:
     """Render the service definition for ``kind``.
 
@@ -349,6 +511,12 @@ def render_unit(
         operator_token: Embedded in the plist; systemd reads it from
             :func:`env_file_path` instead.
         observer_token: Same treatment as ``operator_token``.
+        agent_key: Shared key guarding ``/register`` and ``/mcp``; same
+            treatment as ``operator_token``.
+        public_url: Base URL advertised to agents; same treatment.
+        allowed_hosts: Extra ``Host`` values for the ``/mcp`` guard; same
+            treatment.
+        mcp_http: Force the in-process MCP endpoint on; same treatment.
 
     Returns:
         The complete file contents, ready to write.
@@ -363,12 +531,15 @@ def render_unit(
         )
 
     environment = ""
-    for name, value in (
-        ("CAUCUS_OPERATOR_TOKEN", operator_token),
-        ("CAUCUS_OBSERVER_TOKEN", observer_token),
+    for name, value in service_environment(
+        operator_token,
+        observer_token,
+        agent_key,
+        public_url,
+        allowed_hosts,
+        mcp_http,
     ):
-        if value:
-            environment += f"    <key>{name}</key>\n    <string>{value}</string>\n"
+        environment += f"    <key>{name}</key>\n    <string>{value}</string>\n"
 
     return LAUNCHD_TEMPLATE.format(
         label=label,
@@ -569,24 +740,39 @@ def apply_hook(path: Path, command: str) -> dict[str, object]:
     return {"changed": True, "path": str(path), "action": action}
 
 
-def write_env_file(operator: str | None, observer: str | None) -> Path | None:
-    """Write the systemd token file, or return ``None`` when there is nothing to.
+def write_env_file(
+    operator: str | None,
+    observer: str | None,
+    agent: str | None = None,
+    public_url: str | None = None,
+    allowed_hosts: list[str] | None = None,
+    mcp_http: bool = False,
+) -> Path | None:
+    """Write the systemd environment file, or ``None`` when there is nothing to.
+
+    The launchd plist carries these inline; systemd reads them from this file,
+    which is why both paths go through :func:`service_environment` rather than
+    each listing the variables itself.
 
     Args:
         operator: Read-write dashboard token, or ``None``.
         observer: Read-only dashboard token, or ``None``.
+        agent: Shared key guarding ``/register`` and ``/mcp``, or ``None``.
+        public_url: Base URL advertised to agents, or ``None``.
+        allowed_hosts: Extra ``Host`` values for the ``/mcp`` guard, or ``None``.
+        mcp_http: Force the in-process MCP endpoint on.
 
     Returns:
-        The path written, or ``None`` when no token was supplied.
+        The path written, or ``None`` when nothing had to be configured.
     """
-    if not operator and not observer:
+    env = service_environment(
+        operator, observer, agent, public_url, allowed_hosts, mcp_http
+    )
+    if not env:
         return None
     path = env_file_path()
     lines = ["# Written by caucus-setup-service. Read by the systemd user unit."]
-    if operator:
-        lines.append(f"CAUCUS_OPERATOR_TOKEN={operator}")
-    if observer:
-        lines.append(f"CAUCUS_OBSERVER_TOKEN={observer}")
+    lines.extend(f"{name}={value}" for name, value in env)
     _atomic_write(path, "\n".join(lines) + "\n")
     return path
 
@@ -690,6 +876,10 @@ def describe_plan(
     operator_token: str | None,
     hook_path: Path | None,
     hook_action: str,
+    agent_key: str | None = None,
+    public_url: str | None = None,
+    allowed_hosts: list[str] | None = None,
+    mcp_http: bool = False,
 ) -> str:
     """Build the human-readable summary shown before anything is written.
 
@@ -705,6 +895,11 @@ def describe_plan(
         hook_path: Settings file the hook goes into, or ``None`` when the
             operator declined it.
         hook_action: What would happen to that file.
+        agent_key: Present when the agent door will be gated by a shared key.
+        public_url: Present when agents will be told a different address than
+            the bind one.
+        allowed_hosts: Extra ``Host`` values the ``/mcp`` guard will accept.
+        mcp_http: Whether the in-process MCP endpoint is forced on.
 
     Returns:
         A multi-line block, ending without a trailing newline.
@@ -714,6 +909,7 @@ def describe_plan(
         if at_login
         else "on demand, when an agent session opens"
     )
+    agent_access = "shared agent key required" if agent_key else "open (loopback only)"
     lines = [
         "",
         f"Caucus hub as a {kind} service. Here is what will happen:",
@@ -722,7 +918,14 @@ def describe_plan(
         f"           runs {binary} on {host}:{port}, logging to {logfile}",
         f"  starts   {starts}",
         f"  access   {'operator token required' if operator_token else 'open (loopback only)'}",
+        f"  agents   {agent_access}",
     ]
+    if public_url:
+        lines.append(f"  advertise {public_url} (what agents are told to dial)")
+    if allowed_hosts:
+        lines.append(f"  hosts    /mcp also accepts {', '.join(allowed_hosts)}")
+    if mcp_http:
+        lines.append("  mcp      in-process /mcp endpoint forced on")
     if hook_path is not None:
         verb = {"created": "create", "updated": "update", "unchanged": "leave"}
         lines.append(
@@ -842,6 +1045,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--observer-token", help="token for read-only dashboard access"
     )
     parser.add_argument(
+        "--agent-key",
+        help="shared key agents must send to join (guards /register and /mcp)",
+    )
+    parser.add_argument(
+        "--public-url",
+        metavar="URL",
+        help=(
+            "base URL other machines reach this hub at, e.g. "
+            "https://hub.example.net. Required with --host 0.0.0.0, which names "
+            "no address the hub could advertise on its own"
+        ),
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help=(
+            "extra Host header value the /mcp DNS-rebinding guard accepts "
+            "(repeatable), e.g. --allowed-host hub.lan"
+        ),
+    )
+    parser.add_argument(
+        "--mcp-http",
+        action="store_true",
+        help=(
+            "serve the in-process /mcp endpoint. On by default for a loopback "
+            "bind and off elsewhere, so this is the opt-in a remote hub needs"
+        ),
+    )
+    parser.add_argument(
         "--at-login",
         action="store_true",
         help="start the hub at login and keep it up, instead of on demand",
@@ -896,9 +1130,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Your log file, token file and SessionStart hook were left alone.")
             return 0
 
-        validate_tokens(args.operator_token, args.observer_token)
+        validate_tokens(args.operator_token, args.observer_token, args.agent_key)
+        validate_addresses(args.public_url, args.allowed_host)
         check_port(args.port)
-        check_bind(args.host, args.operator_token)
+        check_bind(args.host, args.operator_token, args.agent_key, args.public_url)
         binary = resolve_binary(args.binary)
         logfile = (
             Path(args.log_file).expanduser() if args.log_file else default_log_path(kind)
@@ -914,6 +1149,10 @@ def main(argv: list[str] | None = None) -> int:
             at_login=args.at_login,
             operator_token=args.operator_token,
             observer_token=args.observer_token,
+            agent_key=args.agent_key,
+            public_url=args.public_url,
+            allowed_hosts=args.allowed_host,
+            mcp_http=args.mcp_http,
         )
 
         command = hook_command(kind, args.label)
@@ -940,6 +1179,10 @@ def main(argv: list[str] | None = None) -> int:
                 operator_token=args.operator_token,
                 hook_path=hook_path,
                 hook_action=hook_action,
+                agent_key=args.agent_key,
+                public_url=args.public_url,
+                allowed_hosts=args.allowed_host,
+                mcp_http=args.mcp_http,
             )
         )
 
@@ -955,7 +1198,14 @@ def main(argv: list[str] | None = None) -> int:
 
         _atomic_write(unit, rendered)
         if kind == "systemd":
-            write_env_file(args.operator_token, args.observer_token)
+            write_env_file(
+                args.operator_token,
+                args.observer_token,
+                args.agent_key,
+                args.public_url,
+                args.allowed_host,
+                args.mcp_http,
+            )
         if hook_path is not None:
             apply_hook(hook_path, command)
         load_service(kind, unit, at_login=args.at_login, label=args.label)
