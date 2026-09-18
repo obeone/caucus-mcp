@@ -735,7 +735,8 @@ def join(
     if automode.is_claude_code():
         try:
             result["automode"] = automode.detect()
-        except Exception as exc:  # pragma: no cover - must never break join
+        # Deliberately blind: probing auto mode must never break join().
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
             logger.warning("auto-mode detection skipped: %s", exc)
             result["automode"] = {"operator_rule": "unknown"}
     return result

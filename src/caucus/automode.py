@@ -234,7 +234,11 @@ def apply_rule(project_dir: Path | None = None) -> dict[str, object]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
-                raise ValueError("settings root is not a JSON object")
+                # ValueError (not TypeError) on purpose: the except clause
+                # below folds it into the RuntimeError callers expect.
+                raise ValueError(  # noqa: TRY004
+                    "settings root is not a JSON object"
+                )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot parse {path}: {exc}") from exc
 
