@@ -505,7 +505,8 @@ def build_mcp_server(
             non-loopback bind, or an operator-declared ``--public-url``). It
             only changes how ``watch_command`` hands over the access token: a
             path on the hub's filesystem means nothing to a remote agent, so it
-            gets a ``CAUCUS_TOKEN`` environment form instead of a token file.
+            gets a single-use ``--ticket`` it redeems for the token instead of
+            a token file.
 
     Returns:
         A configured :class:`FastMCP` ready to mount and run.
@@ -1240,8 +1241,13 @@ def build_mcp_server(
         # process and needs a real reachable hub URL.
         if remote:
             # The token file lives on the hub's filesystem, which is not the
-            # agent's, so its path would name nothing runnable. caucus-watch
-            # also reads CAUCUS_TOKEN; that form travels.
+            # agent's, so its path would name nothing runnable. The peer token
+            # itself must not travel either: it is the room bearer for
+            # /receive, /send, /ack, /channels/*, /ask and /floor, and the
+            # whole point of the token file is to keep it out of argv and out
+            # of the launching transcript. So hand over a single-use,
+            # short-lived ticket the watcher exchanges for the token over one
+            # keyed call to /watch-ticket/redeem.
             #
             # caucus-watch runs the same fail-closed check on --hub that every
             # other client does, and a plain-http URL to a non-loopback host is
@@ -1252,9 +1258,8 @@ def build_mcp_server(
             # without consulting this process's own environment, because the
             # command runs in the agent's.
             optin = f"{ALLOW_REMOTE_ENV}=1 " if needs_remote_optin(self_url) else ""
-            command = (
-                f"{optin}CAUCUS_TOKEN={member.token} caucus-watch --hub {self_url}"
-            )
+            ticket = _hub.state.issue_watch_ticket(member.token)
+            command = f"{optin}caucus-watch --hub {self_url} --ticket {ticket}"
         else:
             member.token_file = _write_token_file(member.token)
             command = f"caucus-watch --hub {self_url} --token-file {member.token_file}"
