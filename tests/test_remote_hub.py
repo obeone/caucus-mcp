@@ -467,14 +467,27 @@ def test_a_reaped_peer_is_revived_through_a_redeemed_ticket(
     fixtures' defaults) so the peer can be reaped well inside the ticket's own
     :data:`~caucus.state.WATCH_TICKET_TTL`, which the default 300s idle window
     would blow straight past.
+
+    ``reap_stale`` measures two different deadlines against the single ``now``
+    it is handed: the idle window it reaps against, and the watch-ticket expiry
+    it prunes against. So the reap instant has to sit strictly between
+    ``client_ttl`` and ``WATCH_TICKET_TTL``: too early and the peer is not
+    stale yet, too late and the sweep spends the ticket before the redemption
+    can. Both the mint and the reap are therefore driven off one reference
+    instant, and that instant is placed at the midpoint of the two constants:
+    the relationship the test depends on is then arithmetic on the constants
+    themselves, not an agreement between a synthetic clock and the wall clock
+    that happens to hold while the suite is fast.
     """
     fresh = HubState(client_ttl=10.0)
     monkeypatch.setattr(hub_module, "state", fresh)
     with TestClient(hub_module.app) as client:
         token = client.post("/register", json={"project": "ghost"}).json()["token"]
-        ticket = fresh.issue_watch_ticket(token)
-        last_seen = fresh._clients["ghost"].last_seen
-        reap_at = last_seen + fresh.client_ttl + 1
+        # One reference instant for every clock this test drives: the moment the
+        # peer was put on the roster.
+        registered_at = fresh._clients["ghost"].last_seen
+        ticket = fresh.issue_watch_ticket(token, now=registered_at)
+        reap_at = registered_at + (fresh.client_ttl + WATCH_TICKET_TTL) / 2
         assert fresh.reap_stale(fresh.client_ttl, now=reap_at) == ["ghost"]
 
         resp = client.post(REDEEM_PATH, json={"ticket": ticket})
