@@ -91,19 +91,62 @@ def test_check_port_rejects_above_max_without_mentioning_root() -> None:
 
 @pytest.mark.parametrize("host", sorted(setup_service.LOOPBACK_HOSTS))
 def test_check_bind_loopback_without_token_is_ok(host: str) -> None:
-    """Loopback addresses need no operator token."""
-    setup_service.check_bind(host, None)
+    """Loopback addresses need no credentials at all."""
+    setup_service.check_bind(host, None, None)
 
 
 def test_check_bind_wildcard_without_token_raises() -> None:
-    """A network-visible bind with no operator token is refused."""
+    """A network-visible bind with no credentials is refused."""
     with pytest.raises(setup_service.SetupError):
-        setup_service.check_bind("0.0.0.0", None)
+        setup_service.check_bind("0.0.0.0", None, None)
 
 
-def test_check_bind_wildcard_with_token_is_ok() -> None:
-    """The same bind is accepted once an operator token gates it."""
-    setup_service.check_bind("0.0.0.0", "sometoken123")
+def test_check_bind_wildcard_with_only_the_operator_token_raises() -> None:
+    """The operator token alone never guarded /register or /mcp.
+
+    The old gate stopped here, which let the installer write a unit whose agent
+    door was open to the whole network. Both credentials are required now.
+    """
+    with pytest.raises(setup_service.SetupError) as excinfo:
+        setup_service.check_bind("0.0.0.0", "sometoken123", None)
+    assert "--agent-key" in str(excinfo.value)
+
+
+def test_check_bind_wildcard_with_only_the_agent_key_raises() -> None:
+    """Symmetrically, the agent key alone leaves the dashboard open."""
+    with pytest.raises(setup_service.SetupError) as excinfo:
+        setup_service.check_bind("0.0.0.0", None, "somekey123")
+    assert "--operator-token" in str(excinfo.value)
+
+
+def test_check_bind_wildcard_with_both_credentials_is_ok() -> None:
+    """The same bind is accepted once both doors are gated."""
+    setup_service.check_bind("0.0.0.0", "sometoken123", "somekey123")
+
+
+def test_validate_tokens_rejects_a_hostile_agent_key() -> None:
+    """The agent key rides the same plist/env plumbing, so same charset bound."""
+    with pytest.raises(setup_service.SetupError) as excinfo:
+        setup_service.validate_tokens(None, None, "key with spaces")
+    assert "--agent-key" in str(excinfo.value)
+
+
+def test_render_unit_launchd_carries_the_agent_key() -> None:
+    """A launchd plist embeds CAUCUS_AGENT_KEY alongside the dashboard tokens."""
+    plist = _render_launchd(operator_token="op123", agent_key="key123")
+    assert "CAUCUS_AGENT_KEY" in plist
+    assert "key123" in plist
+
+
+def test_write_env_file_carries_the_agent_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The systemd env file gains a CAUCUS_AGENT_KEY line when a key is set."""
+    target = tmp_path / "caucus-hub.env"
+    monkeypatch.setattr(setup_service, "env_file_path", lambda: target)
+    written = setup_service.write_env_file(None, None, "key123")
+    assert written == target
+    assert "CAUCUS_AGENT_KEY=key123" in target.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
