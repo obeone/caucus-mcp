@@ -362,11 +362,161 @@ async def test_connector_without_a_key_is_refused(
     assert excinfo.value.response.status_code == 401
 
 
-def test_bridge_register_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bridge_agent_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     """The bridge sends the key only when one is configured."""
     monkeypatch.setattr(bridge_module, "AGENT_KEY", None)
-    assert bridge_module._register_headers() == {}
+    assert bridge_module._agent_headers() == {}
     monkeypatch.setattr(bridge_module, "AGENT_KEY", AGENT_KEY)
-    assert bridge_module._register_headers() == {
+    assert bridge_module._agent_headers() == {
         "Authorization": f"Bearer {AGENT_KEY}"
     }
+
+
+# ---------------------------------------------------------------------------
+# The pre-join read surface: /peers, /channels, /forms
+# ---------------------------------------------------------------------------
+
+READ_PATHS = ("/peers", "/channels", "/forms")
+
+
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_read_surface_is_open_without_a_key(client: TestClient, path: str) -> None:
+    """The loopback default is untouched: no key configured, no header needed."""
+    assert client.get(path).status_code == 200
+
+
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_read_surface_refuses_an_unkeyed_caller(
+    client: TestClient, with_agent_key: None, path: str
+) -> None:
+    """A key closing /register but not the roster closes nothing worth closing.
+
+    Unguarded, these three hand anyone who can reach a keyed 0.0.0.0 hub the
+    peer roster, every private channel's name, topic and members, and the text
+    of every pending operator form.
+    """
+    assert client.get(path).status_code == 401
+
+
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_read_surface_accepts_the_agent_key(
+    client: TestClient, with_agent_key: None, path: str
+) -> None:
+    """The same bearer ``/register`` takes opens the read surface."""
+    resp = client.get(path, headers={"Authorization": f"Bearer {AGENT_KEY}"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("path", READ_PATHS)
+@pytest.mark.parametrize("role", ["operator", "observer"])
+def test_read_surface_accepts_a_console_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str, role: str
+) -> None:
+    """The console's own tooling holds a console token, not the agent key."""
+    monkeypatch.setattr(
+        hub_module,
+        "auth_config",
+        AuthConfig(operator="op-token", observer="obs-token", agent=AGENT_KEY),
+    )
+    token = "op-token" if role == "operator" else "obs-token"
+    assert client.get(path, headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+
+@pytest.mark.parametrize("path", READ_PATHS)
+def test_read_surface_does_not_fall_back_to_the_open_operator_role(
+    client: TestClient, with_agent_key: None, path: str
+) -> None:
+    """With no operator token every caller grades as operator; that must not pass.
+
+    ``AuthConfig.role_for`` answers ``"operator"`` for anything when auth is
+    disabled, so a gate written on ``role_for`` alone would hand the whole
+    surface straight back on a hub keyed with ``--agent-key`` and nothing else.
+    """
+    resp = client.get(path, headers={"Authorization": "Bearer nonsense"})
+    assert resp.status_code == 401
+
+
+def test_ping_stays_open_on_a_keyed_hub(
+    client: TestClient, with_agent_key: None
+) -> None:
+    """The liveness probe is deliberately left open, unlike the roster."""
+    assert client.get("/ping", params={"peer": "nobody"}).status_code == 200
+
+
+async def test_connector_read_surface_carries_the_key(
+    state: HubState, with_agent_key: None
+) -> None:
+    """The connector must send the key on the calls it makes before joining."""
+    transport = httpx.ASGITransport(app=hub_module.app)
+    async with HubConnector(
+        "http://hub.invalid", transport=transport, agent_key=AGENT_KEY
+    ) as connector:
+        assert await connector.peers() == []
+        assert await connector.channels() == {}
+        assert await connector.list_forms() == []
+
+
+# ---------------------------------------------------------------------------
+# A non-ASCII bearer must be refused, not raise
+# ---------------------------------------------------------------------------
+
+#: Sent as raw bytes, because httpx refuses to encode a non-ASCII ``str`` header
+#: (and an attacker with a socket is under no such constraint). The ASGI server
+#: decodes these bytes as latin-1, so they reach the credential comparison as a
+#: ``str`` ``secrets.compare_digest`` raises on.
+NON_ASCII_BEARER = b"Bearer \xe9"
+
+
+def test_non_ascii_bearer_is_refused_on_register(
+    client: TestClient, with_agent_key: None
+) -> None:
+    """A TypeError here is an unthrottled 500: the gate runs before the bucket."""
+    resp = client.post(
+        "/register",
+        json={"project": "alpha"},
+        headers={"Authorization": NON_ASCII_BEARER},
+    )
+    assert resp.status_code == 401
+
+
+def test_non_ascii_bearer_is_refused_on_the_read_surface(
+    client: TestClient, with_agent_key: None
+) -> None:
+    """Same input, same answer, on the endpoints gated by the same helper."""
+    resp = client.get("/peers", headers={"Authorization": NON_ASCII_BEARER})
+    assert resp.status_code == 401
+
+
+def test_non_ascii_console_token_grades_as_no_role() -> None:
+    """``role_for`` compares bytes too, so it answers None instead of raising."""
+    config = AuthConfig(operator="op-token", observer="obs-token")
+    assert config.role_for("\xe9") is None
+
+
+def test_non_ascii_bearer_is_refused_on_mcp(
+    mcp_hub: tuple[str, HubState], with_agent_key: None
+) -> None:
+    """The ``/mcp`` ASGI gate reads the same header and must not raise either."""
+    base, _ = mcp_hub
+    resp = httpx.post(
+        f"{base}/mcp",
+        headers={"Authorization": NON_ASCII_BEARER},
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        timeout=5.0,
+    )
+    assert resp.status_code == 401
+
+
+def test_unkeyed_options_on_mcp_is_gated(
+    mcp_hub: tuple[str, HubState], with_agent_key: None
+) -> None:
+    """An unkeyed ``OPTIONS`` must not reach the transport at all.
+
+    A real CORS preflight carries an allowed ``Origin`` and is answered by the
+    CORS layer wrapping this gate, so an ``OPTIONS`` arriving here is not a
+    preflight -- and letting it through made the SDK build a session transport
+    and a task group per request before answering 405.
+    """
+    base, _ = mcp_hub
+    resp = httpx.request("OPTIONS", f"{base}/mcp", timeout=5.0)
+    assert resp.status_code == 401

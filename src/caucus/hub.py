@@ -167,9 +167,13 @@ class AuthConfig:
         """Return the role a ``token`` grants, or ``None`` if it grants none.
 
         Uses :func:`secrets.compare_digest` for constant-time comparison so a
-        token is never leaked through timing. When auth is disabled every caller
-        is an ``operator``. The operator token is checked first, so a token
-        configured for both roles grants the higher one.
+        token is never leaked through timing. The comparison is done on UTF-8
+        **bytes**: ``compare_digest`` raises ``TypeError`` on a ``str`` holding
+        anything outside ASCII, and headers decode as latin-1, so a caller could
+        otherwise turn ``Authorization: Bearer é`` into an unhandled 500. When
+        auth is disabled every caller is an ``operator``. The operator token is
+        checked first, so a token configured for both roles grants the higher
+        one.
 
         Args:
             token: The token presented in the first frame, if any.
@@ -182,9 +186,14 @@ class AuthConfig:
             return "operator"
         if token is None:
             return None
-        if self.operator is not None and secrets.compare_digest(token, self.operator):
+        presented = token.encode("utf-8")
+        if self.operator is not None and secrets.compare_digest(
+            presented, self.operator.encode("utf-8")
+        ):
             return "operator"
-        if self.observer is not None and secrets.compare_digest(token, self.observer):
+        if self.observer is not None and secrets.compare_digest(
+            presented, self.observer.encode("utf-8")
+        ):
             return "observer"
         return None
 
@@ -194,8 +203,9 @@ class AuthConfig:
         When no agent key is configured the door is open — the historical
         behaviour for a loopback hub, where reaching the port already implies
         being on the machine. Once a key is set, only that exact key passes,
-        compared with :func:`secrets.compare_digest` so a near-miss cannot be
-        narrowed down by timing.
+        compared with :func:`secrets.compare_digest` on UTF-8 bytes (see
+        :meth:`role_for` for why bytes) so a near-miss cannot be narrowed down
+        by timing and a non-ASCII bearer cannot raise instead of being refused.
 
         Args:
             token: The bearer token presented by the caller, if any.
@@ -208,7 +218,7 @@ class AuthConfig:
             return True
         if token is None:
             return False
-        return secrets.compare_digest(token, self.agent)
+        return secrets.compare_digest(token.encode("utf-8"), self.agent.encode("utf-8"))
 
 
 auth_config = AuthConfig()
@@ -998,13 +1008,14 @@ class MCPAgentKeyMiddleware:
       :attr:`ServerConfig.mcp_path`, and only when an agent key is configured.
       Everything else passes straight through, so the REST API, the operator
       console and every keyless deployment are untouched.
-    * A CORS preflight ``OPTIONS`` carries no ``Authorization`` header by
-      definition, so it is let through: 401-ing it would break the browser
-      exchange before the real, authenticated request is ever sent. The
-      preflight reveals nothing and the actual request that follows is gated.
     * It sits *inside* :class:`MCPPreflightCORSMiddleware` (registered before
-      it, so it is wrapped by it), which means an allowed-Origin preflight is
-      already answered upstream and never reaches this layer at all.
+      it, so it is wrapped by it), which means a genuine CORS preflight — an
+      ``OPTIONS`` from an allowed ``Origin`` — is already answered upstream and
+      never reaches this layer at all. That is what lets this gate apply to
+      ``OPTIONS`` as well: the browser exchange is owned entirely by the CORS
+      layer, so an unkeyed ``OPTIONS`` arriving *here* is not a preflight and
+      has no business reaching the MCP transport, which would build a session
+      transport and a task group for it before answering 405.
 
     The DNS-rebinding ``Host``/``Origin`` allowlist enforced by the transport
     itself is untouched and still applies after this gate.
@@ -1031,7 +1042,6 @@ class MCPAgentKeyMiddleware:
             or _mcp_server is None
             or scope.get("path") != server_config.mcp_path
             or auth_config.agent is None
-            or scope.get("method") == "OPTIONS"
         ):
             await self.app(scope, receive, send)
             return
@@ -1257,9 +1267,60 @@ async def index() -> FileResponse:
     return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
 
 
+def _require_agent_read(authorization: str | None) -> None:
+    """Gate the agent-readable roster endpoints on the shared agent key.
+
+    ``/peers``, ``/channels`` and ``/forms`` are the "scout before you commit"
+    surface: they answer before a caller has joined, so there is no peer token
+    to demand. That was defensible while the hub only ever bound to loopback,
+    but on a keyed non-loopback hub it meant the agent key closed ``/register``
+    and ``/mcp`` while anyone who could reach the port still read the roster,
+    every peer's self-reported status, every private channel's name, topic and
+    membership, and the text of every pending operator form.
+
+    So: when an agent key is configured, these endpoints demand it — the same
+    ``Authorization: Bearer`` header ``/register`` takes. An operator or
+    observer token is accepted too, because the console's own tooling holds
+    that one and not the agent key. With no agent key configured (the loopback
+    default) the endpoints stay open, exactly as before.
+
+    Args:
+        authorization: Raw ``Authorization`` header value, if any.
+
+    Raises:
+        HTTPException: 401 when a key is configured and the caller has neither
+            it nor a console token.
+    """
+    if auth_config.agent is None:
+        return
+    presented = _bearer_from_header(authorization)
+    if auth_config.agent_ok(presented):
+        return
+    # `auth_config.enabled` guard, not just role_for: with no operator token
+    # configured role_for grades *every* caller as operator, which would hand
+    # the whole surface back to anyone the moment a hub set an agent key alone.
+    if auth_config.enabled and auth_config.role_for(presented) in (
+        "operator",
+        "observer",
+    ):
+        return
+    raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+
+
 @app.get("/peers")
-async def peers() -> dict[str, list[str]]:
-    """List currently connected project names."""
+async def peers(
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[str]]:
+    """List currently connected project names.
+
+    Gated on the shared agent key when one is configured; open otherwise. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
+    """
+    _require_agent_read(authorization)
     return {"peers": state.peers()}
 
 
@@ -1270,22 +1331,37 @@ async def ping(peer: str = Query(min_length=1, max_length=64)) -> dict[str, obje
     A presence probe answered entirely from the hub's in-memory bookkeeping, so
     the target agent's turn is never consumed — the whole point of a ping is to
     learn "is it still there, and what is it doing?" for ~0 cost to the peer.
-    Open (no token), like ``/peers``: liveness is no more sensitive than the
-    roster. See :meth:`~caucus.state.HubState.ping` for the response shape
-    (``state`` is ``live`` / ``reaped`` / ``absent``).
+    Open (no token) even on a keyed hub, unlike ``/peers``: it answers about one
+    name the caller already has to know, and it is the liveness probe a peer
+    uses before it holds anything. Note what that does disclose to anyone who
+    can reach the port: whether a *named* peer exists, how long since it last
+    touched the hub, whether a listener is attached, and its own last
+    :meth:`~caucus.state.HubState.set_status` string. See
+    :meth:`~caucus.state.HubState.ping` for the full response shape (``state``
+    is ``live`` / ``reaped`` / ``absent``).
     """
     return state.ping(peer)
 
 
 @app.get("/channels")
-async def channels() -> dict[str, dict[str, dict[str, object]]]:
+async def channels(
+    authorization: str | None = Header(default=None),
+) -> dict[str, dict[str, dict[str, object]]]:
     """List active private channels with their topic and members.
 
     Channels are ephemeral (derived from live membership), so this only ever
     lists channels with at least one connected member. Each entry is
     ``{"topic": str | None, "members": [name, ...]}``. Serves both agent
     discovery (including the late-joiner directory) and the operator console.
+
+    Gated on the shared agent key when one is configured; open otherwise. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return {"channels": state.channels()}
 
 
@@ -1780,13 +1856,25 @@ async def ask(req: AskRequest) -> AskResponse | JSONResponse:
 
 
 @app.get("/forms")
-async def forms() -> dict[str, list[dict[str, object]]]:
+async def forms(
+    authorization: str | None = Header(default=None),
+) -> dict[str, list[dict[str, object]]]:
     """List the currently pending operator forms.
 
-    Read-only and unauthenticated, like ``/peers``: an agent calls this before
-    pushing a form so it does not duplicate one already awaiting the operator.
-    Resolved forms are dropped, so this only lists pending ones.
+    Read-only and joinable-before-join, like ``/peers``: an agent calls this
+    before pushing a form so it does not duplicate one already awaiting the
+    operator. Resolved forms are dropped, so this only lists pending ones.
+
+    Gated on the shared agent key when one is configured; open otherwise. A
+    pending form carries the asker's question verbatim, so it is exactly the
+    kind of content the key exists to keep off the network. See
+    :func:`_require_agent_read`.
+
+    Args:
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return {"forms": state.list_forms()}
 
 
