@@ -12,6 +12,24 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **`caucus-hub --allowed-host` (env `CAUCUS_ALLOWED_HOSTS`, comma-separated)
+  and `--public-url` (env `CAUCUS_PUBLIC_URL`): the two things a hub needed to
+  be usable from another machine.** The `/mcp` DNS-rebinding guard only ever
+  learned the bind address, so a hub on `0.0.0.0` reached as `hub.lan:8765`
+  was refused with no way to allow it; `--allowed-host` adds entries to that
+  same guard without weakening it, taking a bare host (allowed on the hub's own
+  port) or an explicit `host:port`. `--public-url` is the base URL other
+  machines reach the hub at, replacing the `127.0.0.1` the hub used to
+  advertise on a wildcard bind — most visibly in the `watch_command` tool,
+  which handed a remote agent a `caucus-watch --hub http://127.0.0.1:8765` it
+  could not run. Off a loopback-only deployment, `watch_command` also stops
+  pointing at a token file on the hub's filesystem (meaningless to an agent
+  elsewhere) and returns the `CAUCUS_TOKEN=... caucus-watch --hub ...` form
+  instead. Loopback keeps the token-file behaviour unchanged.
+- **`caucus-setup-service --agent-key`**, so the installed service unit carries
+  the shared agent key (launchd plist environment, systemd env file) the same
+  way it already carries the dashboard tokens.
+
 - **`caucus-hub --agent-key` (env `CAUCUS_AGENT_KEY`): a shared key guarding the
   agent door, so a hub reachable from other machines is not an open room.**
   Until now `POST /register` was unauthenticated and `/mcp` had no auth at all:
@@ -34,6 +52,16 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **`caucus-hub` now refuses to start on a non-loopback bind unless both
+  `--operator-token` and `--agent-key` are set** (`--allow-insecure-bind` is
+  the explicit escape hatch). A hub on `0.0.0.0` used to start silently with
+  both doors open: every caller graded as operator, every reachable client free
+  to join and read the room. The refusal names both flags, both environment
+  variables, the two flags needed to make the hub reachable afterwards, and the
+  way back to loopback. Anyone binding non-loopback today must either set the
+  two credentials or pass `--allow-insecure-bind`. `caucus-setup-service`
+  applied a weaker version of the same gate, asking only for the operator token
+  which never guarded `/register` or `/mcp`; it now asks for the agent key too.
 - **`web/package.json` declares `browserslist` and `baseline-browser-mapping`
   as `overrides` instead of `devDependencies`.** Neither package is imported
   by the dashboard; both only arrive transitively through the PostCSS,
