@@ -143,6 +143,31 @@ def test_check_bind_treats_the_whole_loopback_range_as_local() -> None:
     setup_service.check_bind("127.0.0.2", None, None)
 
 
+def test_check_bind_loopback_host_with_remote_public_url_raises() -> None:
+    """A tunnel or reverse proxy in front of a loopback bind is the same exposure."""
+    with pytest.raises(setup_service.SetupError, match="refusing to advertise"):
+        setup_service.check_bind(
+            "127.0.0.1", None, None, "https://hub.example.net"
+        )
+
+
+def test_check_bind_loopback_with_remote_url_and_both_credentials_is_ok() -> None:
+    """Both doors gated, so advertising the loopback bind elsewhere is fine."""
+    setup_service.check_bind(
+        "127.0.0.1", "sometoken123", "somekey123", "https://hub.example.net"
+    )
+
+
+def test_check_bind_loopback_host_with_loopback_public_url_is_ok() -> None:
+    """A loopback ``public_url`` is just a nicer address, not an exposure."""
+    setup_service.check_bind("127.0.0.1", None, None, "http://localhost:8765")
+
+
+def test_check_bind_loopback_host_without_public_url_is_unchanged() -> None:
+    """No advertised address at all keeps the original, credential-free posture."""
+    setup_service.check_bind("127.0.0.1", None, None, None)
+
+
 def test_validate_tokens_rejects_a_hostile_agent_key() -> None:
     """The agent key rides the same plist/env plumbing, so same charset bound."""
     with pytest.raises(setup_service.SetupError) as excinfo:
