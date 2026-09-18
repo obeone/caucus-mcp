@@ -77,7 +77,12 @@ claude = [
     "claude-agent-sdk>=0.2.93",
 ]
 dev = [
-    "ruff>=0.5",
+    # Narrow band on purpose: ruff expands its *default* rule set between
+    # minor releases (0.16 went from ~61 enabled rules to ~415, turning a
+    # clean tree into 9 findings with no code change) and also sharpens
+    # individual checks, so an open range means every contributor lints
+    # against a different rule set. Bump this deliberately, in its own PR.
+    "ruff>=0.16,<0.17",
     "mypy>=1.10",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -107,6 +112,12 @@ packages = ["src/caucus"]
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+
+[tool.ruff.lint]
+# S310 (urlopen with an unaudited scheme) is not in ruff's default set, but
+# autostart.py opens a URL whose scheme comes from configuration, so keep
+# the check on and the suppression there an explicit, reviewed decision.
+extend-select = ["S310"]
 
 [tool.mypy]
 python_version = "3.10"
