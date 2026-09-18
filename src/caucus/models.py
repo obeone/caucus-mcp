@@ -84,10 +84,12 @@ def request_carried_token(request: httpx.Request, token: str | None) -> bool:
 
     A hub ``401`` means "your session died" only when the call that earned it
     actually carried this session's token. The read-only endpoints
-    (``/protocol``, ``/peers``, ``/channels``, ``/ping``, ``/forms``) are
-    unauthenticated and can still answer ``401`` when an auth proxy sits in
-    front of the hub; calling that a lost membership would send the agent off
-    to re-``join`` a hub that never let it through in the first place.
+    (``/protocol``, ``/peers``, ``/channels``, ``/ping``, ``/forms``) never do:
+    they answer before a join, and the three the hub gates on a configured
+    agent key present that shared key instead. They can still answer ``401`` --
+    on a wrong or missing agent key, or from an auth proxy in front of the hub
+    -- and calling either a lost membership would send the agent off to
+    re-``join`` a hub that never let it through in the first place.
 
     Both places a token can ride are checked: the ``Authorization: Bearer``
     header the GET endpoints use, and the JSON body the POSTs use.

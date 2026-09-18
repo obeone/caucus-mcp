@@ -576,6 +576,13 @@ def build_mcp_server(
                     _INTERNAL_BASE_URL,
                     transport=httpx.ASGITransport(app=app),
                     limits=_POOL_LIMITS,
+                    # Every call re-enters the hub's real handler stack, agent
+                    # key gate included, so this in-process client has to carry
+                    # the key like any other. Read from the live config rather
+                    # than the environment: --agent-key on the command line
+                    # never sets CAUCUS_AGENT_KEY, and main() assigns this
+                    # before the mount, so it is set by the time a tool runs.
+                    agent_key=_hub.auth_config.agent,
                 )
                 await existing.__aenter__()
                 conn_holder["connector"] = existing

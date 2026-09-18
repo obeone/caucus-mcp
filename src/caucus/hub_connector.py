@@ -301,6 +301,22 @@ class HubConnector:
         """The normalized hub base URL (no trailing slash)."""
         return self._base
 
+    def _agent_headers(self) -> dict[str, str] | None:
+        """Return the ``Authorization`` header carrying the shared agent key.
+
+        Sent on the calls made *without* a peer token: ``/register``, and the
+        pre-join read surface (``/peers``, ``/channels``, ``/forms``) the hub
+        now gates on the same key. Every other call spends the peer token on
+        that header instead, so the key is never sent alongside it.
+
+        Returns:
+            ``{"Authorization": "Bearer <key>"}`` when a key is configured, else
+            ``None`` so httpx sends no extra header at all.
+        """
+        if self._agent_key is None:
+            return None
+        return {"Authorization": f"Bearer {self._agent_key}"}
+
     async def __aenter__(self) -> HubConnector:
         """Open the underlying HTTP client.
 
@@ -414,15 +430,7 @@ class HubConnector:
         }
         if token is not None:
             payload["token"] = token
-        # The agent key rides only here: /register is the one call made without
-        # a peer token, and every later call already spends that token as its
-        # own bearer. Sending it twice would be two credentials on one header.
-        headers = (
-            {"Authorization": f"Bearer {self._agent_key}"}
-            if self._agent_key is not None
-            else None
-        )
-        resp = await http.post("/register", json=payload, headers=headers)
+        resp = await http.post("/register", json=payload, headers=self._agent_headers())
         if resp.status_code == 409:
             body = resp.json()
             raise NameInUseError(
@@ -638,7 +646,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/peers")
+        resp = await http.get("/peers", headers=self._agent_headers())
         resp.raise_for_status()
         return list(resp.json().get("peers", []))
 
@@ -741,7 +749,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/forms")
+        resp = await http.get("/forms", headers=self._agent_headers())
         resp.raise_for_status()
         return list(resp.json().get("forms", []))
 
@@ -842,7 +850,7 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/channels")
+        resp = await http.get("/channels", headers=self._agent_headers())
         resp.raise_for_status()
         return dict(resp.json().get("channels", {}))
 

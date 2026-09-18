@@ -24,7 +24,8 @@ Configuration via environment variables:
 * ``CAUCUS_AGENT_KEY`` -- shared key for a hub that guards its agent door
   (``caucus-hub --agent-key``). Optional: unset means the hub is open, which is
   the loopback default. Presented as ``Authorization: Bearer <key>`` on
-  ``/register`` only; every later call spends the per-peer token instead.
+  ``/register`` and on the pre-join read surface (``/peers``, ``/channels``,
+  ``/forms``); every call made after join spends the per-peer token instead.
 """
 
 from __future__ import annotations
@@ -76,13 +77,15 @@ PROJECT = os.environ.get("CAUCUS_PROJECT") or _default_project()
 AGENT_KEY: str | None = os.environ.get("CAUCUS_AGENT_KEY") or None
 
 
-def _register_headers() -> dict[str, str]:
-    """Return the extra headers for a ``/register`` call.
+def _agent_headers() -> dict[str, str]:
+    """Return the extra headers carrying the shared agent key.
 
-    The agent key is presented only here: ``/register`` is the one call made
-    before this process holds a peer token, and every later call already spends
-    that token as its own ``Authorization`` bearer. Read from the module global
-    at call time so a test (or a re-exec) can rebind it.
+    The key is presented on the calls made *without* a peer token: ``/register``
+    and the pre-join read surface (``/peers``, ``/channels``, ``/forms``), which
+    the hub gates on the same key. Every other call already spends the peer
+    token as its own ``Authorization`` bearer, so the key never joins it there.
+    Read from the module global at call time so a test (or a re-exec) can
+    rebind it.
 
     Returns:
         ``{"Authorization": "Bearer <key>"}`` when a key is configured, else an
@@ -334,7 +337,7 @@ def _attempt_auto_rejoin() -> str | None:
         payload["token"] = _token
     try:
         with _client() as http:
-            resp = http.post("/register", json=payload, headers=_register_headers())
+            resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 logger.warning(
                     "auto-rejoin refused for project=%s: name is held by"
@@ -637,7 +640,7 @@ def join(
         payload["token"] = _token
     try:
         with _client() as http:
-            resp = http.post("/register", json=payload, headers=_register_headers())
+            resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 body = resp.json()
                 note = body.get("note", "an active listener already holds this name")
@@ -796,7 +799,7 @@ def list_peers() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/peers")
+        resp = http.get("/peers", headers=_agent_headers())
         resp.raise_for_status()
         return {"peers": list(resp.json().get("peers", []))}
 
@@ -928,7 +931,7 @@ def list_channels() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/channels")
+        resp = http.get("/channels", headers=_agent_headers())
         resp.raise_for_status()
         return {"channels": dict(resp.json().get("channels", {}))}
 
@@ -1030,7 +1033,7 @@ def list_forms() -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/forms")
+        resp = http.get("/forms", headers=_agent_headers())
         resp.raise_for_status()
         return {"forms": list(resp.json().get("forms", []))}
 
