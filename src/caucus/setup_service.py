@@ -258,18 +258,27 @@ def resolve_binary(explicit: str | None = None) -> Path:
     return Path(found).resolve()
 
 
-def validate_tokens(operator: str | None, observer: str | None) -> None:
+def validate_tokens(
+    operator: str | None, observer: str | None, agent: str | None = None
+) -> None:
     """Reject tokens carrying characters that would need escaping downstream.
 
     Args:
         operator: Read-write dashboard token, or ``None``.
         observer: Read-only dashboard token, or ``None``.
+        agent: Shared agent key guarding ``/register`` and ``/mcp``, or
+            ``None``. Travels through the same plist and env-file plumbing as
+            the two dashboard tokens, so it gets the same charset bound.
 
     Raises:
-        SetupError: When either token contains anything outside
+        SetupError: When any of them contains anything outside
             :data:`TOKEN_RE`.
     """
-    for name, value in (("--operator-token", operator), ("--observer-token", observer)):
+    for name, value in (
+        ("--operator-token", operator),
+        ("--observer-token", observer),
+        ("--agent-key", agent),
+    ):
         if value is not None and not TOKEN_RE.match(value):
             raise SetupError(
                 f"{name} may only contain letters, digits and . _ ~ -\n"
@@ -299,28 +308,37 @@ def check_port(port: int) -> None:
         )
 
 
-def check_bind(host: str, operator_token: str | None) -> None:
+def check_bind(host: str, operator_token: str | None, agent_key: str | None) -> None:
     """Refuse a network-visible bind that nobody can be kept out of.
 
-    The hub serves its agent API unauthenticated by default, which is
+    The hub serves both its doors unauthenticated by default, which is
     defensible precisely because it binds to loopback. Bound wider, any browser
-    that reaches the port gets full operator rights: pause, stop, kick.
+    that reaches the port gets full operator rights (pause, stop, kick) and any
+    client that reaches it can register as a peer and read the room. The
+    operator token only ever guarded the first of those, so it is demanded here
+    together with the agent key, matching the gate ``caucus-hub`` itself now
+    applies at startup.
 
     Args:
         host: Address the hub would bind to.
         operator_token: Token that would gate operator access, if any.
+        agent_key: Shared key that would gate ``/register`` and ``/mcp``, if
+            any.
 
     Raises:
-        SetupError: For a non-loopback host with no operator token.
+        SetupError: For a non-loopback host missing either credential.
     """
-    if host in LOOPBACK_HOSTS or operator_token:
+    if host in LOOPBACK_HOSTS or (operator_token and agent_key):
         return
     raise SetupError(
-        f"refusing to bind {host} without --operator-token.\n"
+        f"refusing to bind {host} without --operator-token and --agent-key.\n"
         "On a non-loopback address the dashboard accepts any browser that can\n"
-        "reach it, with full operator rights. Keep 127.0.0.1, or run:\n"
-        f'  caucus-setup-service --host {host} '
-        '--operator-token "$(openssl rand -hex 24)"'
+        "reach it, with full operator rights, and any client that reaches the\n"
+        "port can join the caucus and read everything said in it.\n"
+        "Keep 127.0.0.1, or run:\n"
+        f"  caucus-setup-service --host {host} \\\n"
+        '      --operator-token "$(openssl rand -hex 24)" \\\n'
+        '      --agent-key "$(openssl rand -hex 24)"'
     )
 
 
@@ -335,6 +353,7 @@ def render_unit(
     at_login: bool = False,
     operator_token: str | None = None,
     observer_token: str | None = None,
+    agent_key: str | None = None,
 ) -> str:
     """Render the service definition for ``kind``.
 
@@ -349,6 +368,8 @@ def render_unit(
         operator_token: Embedded in the plist; systemd reads it from
             :func:`env_file_path` instead.
         observer_token: Same treatment as ``operator_token``.
+        agent_key: Shared key guarding ``/register`` and ``/mcp``; same
+            treatment as ``operator_token``.
 
     Returns:
         The complete file contents, ready to write.
@@ -366,6 +387,7 @@ def render_unit(
     for name, value in (
         ("CAUCUS_OPERATOR_TOKEN", operator_token),
         ("CAUCUS_OBSERVER_TOKEN", observer_token),
+        ("CAUCUS_AGENT_KEY", agent_key),
     ):
         if value:
             environment += f"    <key>{name}</key>\n    <string>{value}</string>\n"
@@ -569,17 +591,20 @@ def apply_hook(path: Path, command: str) -> dict[str, object]:
     return {"changed": True, "path": str(path), "action": action}
 
 
-def write_env_file(operator: str | None, observer: str | None) -> Path | None:
+def write_env_file(
+    operator: str | None, observer: str | None, agent: str | None = None
+) -> Path | None:
     """Write the systemd token file, or return ``None`` when there is nothing to.
 
     Args:
         operator: Read-write dashboard token, or ``None``.
         observer: Read-only dashboard token, or ``None``.
+        agent: Shared key guarding ``/register`` and ``/mcp``, or ``None``.
 
     Returns:
-        The path written, or ``None`` when no token was supplied.
+        The path written, or ``None`` when no credential was supplied.
     """
-    if not operator and not observer:
+    if not operator and not observer and not agent:
         return None
     path = env_file_path()
     lines = ["# Written by caucus-setup-service. Read by the systemd user unit."]
@@ -587,6 +612,8 @@ def write_env_file(operator: str | None, observer: str | None) -> Path | None:
         lines.append(f"CAUCUS_OPERATOR_TOKEN={operator}")
     if observer:
         lines.append(f"CAUCUS_OBSERVER_TOKEN={observer}")
+    if agent:
+        lines.append(f"CAUCUS_AGENT_KEY={agent}")
     _atomic_write(path, "\n".join(lines) + "\n")
     return path
 
@@ -689,6 +716,7 @@ def describe_plan(
     operator_token: str | None,
     hook_path: Path | None,
     hook_action: str,
+    agent_key: str | None = None,
 ) -> str:
     """Build the human-readable summary shown before anything is written.
 
@@ -704,6 +732,7 @@ def describe_plan(
         hook_path: Settings file the hook goes into, or ``None`` when the
             operator declined it.
         hook_action: What would happen to that file.
+        agent_key: Present when the agent door will be gated by a shared key.
 
     Returns:
         A multi-line block, ending without a trailing newline.
@@ -713,6 +742,7 @@ def describe_plan(
         if at_login
         else "on demand, when an agent session opens"
     )
+    agent_access = "shared agent key required" if agent_key else "open (loopback only)"
     lines = [
         "",
         f"Caucus hub as a {kind} service. Here is what will happen:",
@@ -721,6 +751,7 @@ def describe_plan(
         f"           runs {binary} on {host}:{port}, logging to {logfile}",
         f"  starts   {starts}",
         f"  access   {'operator token required' if operator_token else 'open (loopback only)'}",
+        f"  agents   {agent_access}",
     ]
     if hook_path is not None:
         verb = {"created": "create", "updated": "update", "unchanged": "leave"}
@@ -841,6 +872,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--observer-token", help="token for read-only dashboard access"
     )
     parser.add_argument(
+        "--agent-key",
+        help="shared key agents must send to join (guards /register and /mcp)",
+    )
+    parser.add_argument(
         "--at-login",
         action="store_true",
         help="start the hub at login and keep it up, instead of on demand",
@@ -895,9 +930,9 @@ def main(argv: list[str] | None = None) -> int:
             print("Your log file, token file and SessionStart hook were left alone.")
             return 0
 
-        validate_tokens(args.operator_token, args.observer_token)
+        validate_tokens(args.operator_token, args.observer_token, args.agent_key)
         check_port(args.port)
-        check_bind(args.host, args.operator_token)
+        check_bind(args.host, args.operator_token, args.agent_key)
         binary = resolve_binary(args.binary)
         logfile = (
             Path(args.log_file).expanduser() if args.log_file else default_log_path(kind)
@@ -913,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
             at_login=args.at_login,
             operator_token=args.operator_token,
             observer_token=args.observer_token,
+            agent_key=args.agent_key,
         )
 
         command = hook_command(kind, args.label)
@@ -939,6 +975,7 @@ def main(argv: list[str] | None = None) -> int:
                 operator_token=args.operator_token,
                 hook_path=hook_path,
                 hook_action=hook_action,
+                agent_key=args.agent_key,
             )
         )
 
@@ -954,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
 
         _atomic_write(unit, rendered)
         if kind == "systemd":
-            write_env_file(args.operator_token, args.observer_token)
+            write_env_file(args.operator_token, args.observer_token, args.agent_key)
         if hook_path is not None:
             apply_hook(hook_path, command)
         load_service(kind, unit, at_login=args.at_login, label=args.label)

@@ -406,7 +406,8 @@ start at once. `--at-login` keeps it running permanently instead, and
 Two caveats worth reading before you set it up. A restart clears the hub's
 in-memory state, so connected peers lose their tokens and must `join` again.
 And the default unauthenticated API only makes sense on loopback, so the
-installer refuses a wider bind unless you pass `--operator-token`.
+installer refuses a wider bind unless you pass both `--operator-token` and
+`--agent-key`.
 
 See [running the hub as a service](docs/running-as-a-service.md) for the
 options, the security notes, and the manual route.
