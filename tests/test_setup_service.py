@@ -89,7 +89,7 @@ def test_check_port_rejects_above_max_without_mentioning_root() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("host", sorted(setup_service.LOOPBACK_HOSTS))
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
 def test_check_bind_loopback_without_token_is_ok(host: str) -> None:
     """Loopback addresses need no credentials at all."""
     setup_service.check_bind(host, None, None)
@@ -120,8 +120,27 @@ def test_check_bind_wildcard_with_only_the_agent_key_raises() -> None:
 
 
 def test_check_bind_wildcard_with_both_credentials_is_ok() -> None:
-    """The same bind is accepted once both doors are gated."""
-    setup_service.check_bind("0.0.0.0", "sometoken123", "somekey123")
+    """The same bind is accepted once both doors are gated and an address is set."""
+    setup_service.check_bind(
+        "0.0.0.0", "sometoken123", "somekey123", "https://hub.example.net"
+    )
+
+
+def test_check_bind_wildcard_without_public_url_raises() -> None:
+    """0.0.0.0 names no address to advertise, so the install must supply one."""
+    with pytest.raises(setup_service.SetupError) as excinfo:
+        setup_service.check_bind("0.0.0.0", "sometoken123", "somekey123")
+    assert "--public-url" in str(excinfo.value)
+
+
+def test_check_bind_concrete_host_needs_no_public_url() -> None:
+    """A real interface address already advertises itself correctly."""
+    setup_service.check_bind("192.168.1.10", "sometoken123", "somekey123")
+
+
+def test_check_bind_treats_the_whole_loopback_range_as_local() -> None:
+    """127.0.0.2 is loopback too; one definition, shared with the hub."""
+    setup_service.check_bind("127.0.0.2", None, None)
 
 
 def test_validate_tokens_rejects_a_hostile_agent_key() -> None:
@@ -147,6 +166,60 @@ def test_write_env_file_carries_the_agent_key(
     written = setup_service.write_env_file(None, None, "key123")
     assert written == target
     assert "CAUCUS_AGENT_KEY=key123" in target.read_text(encoding="utf-8")
+
+
+def test_render_unit_launchd_carries_the_remote_settings() -> None:
+    """A remote install needs the advertised URL, the Host allowlist and /mcp.
+
+    Without them the unit starts a hub with ``/mcp`` off (the non-loopback
+    default) advertising an address nothing off-box can dial -- exactly the
+    deployment the bind refusal tells the operator to build.
+    """
+    plist = _render_launchd(
+        operator_token="op123",
+        agent_key="key123",
+        public_url="https://hub.example.net",
+        allowed_hosts=["hub.lan", "hub.example.net"],
+        mcp_http=True,
+    )
+    assert "<string>https://hub.example.net</string>" in plist
+    assert "<string>hub.lan,hub.example.net</string>" in plist
+    assert "CAUCUS_MCP_HTTP" in plist
+
+
+def test_write_env_file_carries_the_remote_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """systemd reads the same six variables out of the environment file."""
+    target = tmp_path / "caucus-hub.env"
+    monkeypatch.setattr(setup_service, "env_file_path", lambda: target)
+    setup_service.write_env_file(
+        None, None, None, "https://hub.example.net", ["hub.lan"], True
+    )
+    body = target.read_text(encoding="utf-8")
+    assert "CAUCUS_PUBLIC_URL=https://hub.example.net" in body
+    assert "CAUCUS_ALLOWED_HOSTS=hub.lan" in body
+    assert "CAUCUS_MCP_HTTP=1" in body
+
+
+def test_mcp_http_is_only_ever_written_as_the_opt_in() -> None:
+    """Absent means "let the hub decide", which is on for loopback."""
+    assert not any(
+        name == "CAUCUS_MCP_HTTP" for name, _ in setup_service.service_environment()
+    )
+
+
+def test_validate_addresses_rejects_a_hostile_allowed_host() -> None:
+    """Allowed hosts ride the same plist/env plumbing, so same charset bound."""
+    with pytest.raises(setup_service.SetupError):
+        setup_service.validate_addresses(None, ["hub.lan; rm -rf /"])
+
+
+def test_validate_addresses_rejects_a_public_url_the_hub_would_refuse() -> None:
+    """Catch a URL with a path while installing, not at the first failed start."""
+    with pytest.raises(setup_service.SetupError) as excinfo:
+        setup_service.validate_addresses("https://hub.example.net/caucus", None)
+    assert "bare origin" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
