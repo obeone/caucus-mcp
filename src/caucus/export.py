@@ -46,7 +46,8 @@ def normalise_format(fmt: str) -> str:
 
 def _fmt_ts(ts: float) -> str:
     """Render a Unix timestamp as a local ``YYYY-MM-DD HH:MM:SS`` wall-clock string."""
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    # Naive on purpose: transcripts show the reader's own wall clock.
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")  # noqa: DTZ006
 
 
 def _target(recipient: str) -> str:

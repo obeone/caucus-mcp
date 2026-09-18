@@ -138,9 +138,8 @@ class DiskLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # Serialise against prune's read-modify-replace; the critical
             # section is just the single append write.
-            with self._file_lock:
-                with self.path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self._file_lock, self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:  # pragma: no cover - disk error path
             logger.exception("failed to append to disk log %s", self.path)
 
