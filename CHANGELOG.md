@@ -14,11 +14,13 @@ and rename that heading to the version when you cut the release.
 
 - **`docs/remote-hub.md`**, the guide for running a hub on one machine with
   agents joining from others: a verified end-to-end walkthrough for both the
-  `/mcp` and `caucus-bridge` connection paths, a flags/env reference table, a
-  Caddy TLS example (the hub has none of its own), and the failure modes an
-  operator actually hits (a wrong or missing agent key, a disallowed `Host` or
-  `Origin`, the client-side plain-http refusal). Linked from the README's
-  security notes.
+  `/mcp` and `caucus-bridge` connection paths (including the single-use watch
+  ticket a remote `watch_command()` now hands out), a flags/env reference
+  table, a Caddy TLS example (the hub has none of its own), the failure modes
+  an operator actually hits (a wrong or missing agent key, a disallowed `Host`
+  or `Origin`, a rejected watch ticket, the client-side plain-http refusal),
+  and a threat-model section spelling out what the agent key does and does not
+  buy. Linked from the README's security notes.
 - **`caucus-hub --allowed-host` (env `CAUCUS_ALLOWED_HOSTS`, comma-separated)
   and `--public-url` (env `CAUCUS_PUBLIC_URL`): the two things a hub needed to
   be usable from another machine.** The `/mcp` DNS-rebinding guard only ever
@@ -67,6 +69,11 @@ and rename that heading to the version when you cut the release.
   means "not configured" rather than locking out every caller. The clients
   already treated a blank value that way; the hub did not.
 
+- **`POST /watch-ticket/redeem`, gated on the agent key like `/register`; an
+  unknown, spent or expired ticket answers 404.**
+- **`caucus-watch --ticket` / `CAUCUS_TICKET`, with credential precedence
+  `--token` > `--token-file` > `--ticket` > `CAUCUS_TOKEN` > `CAUCUS_TICKET`.**
+
 ### Changed
 
 - **`caucus-hub` now refuses to start on a non-loopback bind unless both
@@ -112,12 +119,21 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
-- **`/peers`, `/channels` and `/forms` now require the shared agent key when
-  one is configured** (an operator or observer token is accepted too). On a
-  keyed non-loopback hub, these endpoints previously handed anyone who could
-  reach the port the peer roster, every peer's status string, every private
-  channel's name, topic and members, and the text of every pending operator
-  form.
+- **`/peers`, `/channels`, `/forms` and `/ping` now require the shared agent
+  key when one is configured** (an operator or observer token is accepted
+  too). On a keyed non-loopback hub, these endpoints previously handed anyone
+  who could reach the port the peer roster, every peer's status string, every
+  private channel's name, topic and members, and the text of every pending
+  operator form. `/ping` alone disclosed whether a named peer exists, its
+  last-seen age, whether a listener was attached, and the peer's own
+  `set_status` text. Unkeyed hubs are unaffected.
+- **`watch_command` on a remote hub no longer prints the peer token; it hands
+  out a single-use 120-second ticket the watcher exchanges over
+  `POST /watch-ticket/redeem`.** That token is the room bearer for
+  `/receive`, `/send`, `/ack`, `/channels/*`, `/ask` and `/floor`, and the
+  agent key gates none of those, so printing it put full room access into the
+  agent's transcript, its shell history and the watcher's environ. The
+  loopback deployment keeps its 0600 token file unchanged.
 - **A non-ASCII `Authorization: Bearer` value no longer crashes the hub with a
   500.** It raised `TypeError` inside `secrets.compare_digest`, and on
   `/register` the credential gate runs before the rate-limit bucket, so

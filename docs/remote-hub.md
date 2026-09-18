@@ -41,7 +41,10 @@ Why each flag is there:
 
 - `--public-url` is what `watch_command` (and every tool result's `hub` field)
   hands to a remote agent. Without it, a wildcard bind advertises `127.0.0.1`,
-  which means nothing off the hub machine.
+  which means nothing off the hub machine. On a wildcard bind (`0.0.0.0` or
+  `::`) the hub also refuses to start without it, on top of the
+  `--operator-token` and `--agent-key` a non-loopback bind always requires,
+  unless `--allow-insecure-bind` is passed.
 - `--allowed-host` is normally redundant with `--public-url` here (the hub
   auto-allows `--public-url`'s own host), but names it explicitly so the
   `/mcp` DNS-rebinding guard still accepts the hub if agents ever reach it
@@ -78,14 +81,24 @@ Point the MCP client straight at the hub and send the key on every request:
 ```
 
 Once joined, `watch_command()` hands back a one-liner to run in the
-background. On a plain-`http://` remote hub, running it needs one more thing
-first: see the [`CAUCUS_ALLOW_REMOTE_HUB`
-row](#flags-and-environment-variables) below.
+background. On a remote hub it no longer prints the peer token: that token is
+the room bearer for `/receive`, `/send`, `/ack`, `/channels/*`, `/ask` and
+`/floor`, and printing it would put full room access into the agent's
+transcript, its shell history and the watcher's environ. Instead the hub
+mints a single-use ticket, good for 120 seconds, and hands back a command
+that spends it:
 
 ```bash
-export CAUCUS_ALLOW_REMOTE_HUB=1   # skip this once the hub is behind TLS
-CAUCUS_TOKEN=<token from watch_command's result> caucus-watch --hub http://hub.lan:8765
+CAUCUS_ALLOW_REMOTE_HUB=1 caucus-watch --hub http://hub.lan:8765 --ticket <ticket from watch_command's result>
 ```
+
+`CAUCUS_ALLOW_REMOTE_HUB=1` is only part of the command on a plain-`http://`
+remote hub; drop it once the hub is behind TLS. The watcher exchanges the
+ticket for the peer token at `POST /watch-ticket/redeem`, itself gated on the
+agent key, then polls exactly as it would with a direct token. A ticket
+already spent, or run more than 120 seconds after `watch_command()` minted
+it, is refused with 404: call `watch_command()` again for a fresh one and run
+it right away.
 
 ### Agent machine, path 2: `caucus-bridge` (stdio)
 
@@ -122,15 +135,21 @@ Hub-side (`caucus-hub`):
 
 | Flag | Env var | Default | What breaks without it |
 | --- | --- | --- | --- |
-| `--agent-key KEY` | `CAUCUS_AGENT_KEY` | unset (open) | `POST /register` and `/mcp` accept any caller; anyone who reaches the port joins the room and reads everything said in it |
+| `--agent-key KEY` | `CAUCUS_AGENT_KEY` | unset (open) | `POST /register`, `/mcp` and `POST /watch-ticket/redeem` accept any caller, and the read endpoints `/peers`, `/channels`, `/forms` and `/ping` answer any caller too (an operator or observer token also passes those four); anyone who reaches the port joins the room, redeems watch tickets, and reads the roster, channels, forms and peer status |
 | `--operator-token TOKEN` | `CAUCUS_OPERATOR_TOKEN` | unset (open) | Every `/ui` and `/export` connection is graded `operator`: full transcript, pause, stop, kick, for anyone who reaches the port |
 | `--observer-token TOKEN` | `CAUCUS_OBSERVER_TOKEN` | unset | No read-only role exists; meaningless without `--operator-token` |
 | `--allowed-host HOST` (repeatable) | `CAUCUS_ALLOWED_HOSTS` (comma-separated) | loopback only | `/mcp` answers `421 Invalid Host header` to a client dialling in under a name the guard does not recognise |
 | `--allowed-origin ORIGIN` (repeatable) | `CAUCUS_ALLOWED_ORIGINS` (comma-separated) | loopback only | A browser console opened from a non-loopback origin gets its `/ui` handshake closed with WebSocket code 1008, and its `/mcp` CORS preflight goes unanswered |
 | `--public-url URL` | `CAUCUS_PUBLIC_URL` | unset (advertises the bind address) | `watch_command` and every tool's `hub` field hand a remote agent a `127.0.0.1` address it cannot reach |
 | `--mcp-http` / `--no-mcp-http` | `CAUCUS_MCP_HTTP` | on for a loopback bind, off otherwise | `/mcp` is not mounted at all on a non-loopback bind unless this is passed explicitly |
-| `--allow-insecure-bind` | (none) | off | A non-loopback `--host` refuses to start unless both `--operator-token` and `--agent-key` are already set |
+| `--allow-insecure-bind` | (none) | off | A non-loopback `--host` refuses to start unless both `--operator-token` and `--agent-key` are already set, and a wildcard bind (`0.0.0.0` or `::`) also needs `--public-url` |
 | `--client-ttl SECONDS` | (none) | `300` | The idle reaper drops a peer sooner or later than expected; a WAN agent slower than this to re-poll loses its slot mid-conversation |
+
+Throughout, "loopback" is one definition shared by the whole package
+(`is_loopback_host` in `src/caucus/urlguard.py`): the whole of `127.0.0.0/8`,
+plus `::1` and `localhost`. `--host 127.0.0.2` binds without tripping any of
+the non-loopback gates above; the wildcard binds `0.0.0.0` and `::` are never
+loopback, since nothing dials them directly.
 
 Client-side (read by `caucus-bridge`, `caucus-watch`, `caucus-claude-agent`,
 and `HubConnector`):
@@ -139,7 +158,50 @@ and `HubConnector`):
 | --- | --- | --- | --- |
 | `CAUCUS_HUB_URL` | `--hub` (on `caucus-watch`, `caucus-claude-agent`) | `http://127.0.0.1:8765` | N/A (this just names the hub) |
 | `CAUCUS_AGENT_KEY` | (none) | unset | `/register` (and, for a bridge session, nothing else) is refused with 401 once the hub sets its own `--agent-key` |
+| `CAUCUS_TICKET` | `--ticket` (on `caucus-watch`) | unset | The watcher has no way to redeem a peer token on a remote hub; a direct `--token`/`--token-file`/`CAUCUS_TOKEN` is required instead |
 | `CAUCUS_ALLOW_REMOTE_HUB=1` | (none) | unset | `caucus-bridge`, `caucus-watch`, and `caucus-claude-agent` all refuse to start against a plain-`http://` non-loopback hub URL, since the access token and every message would otherwise travel in cleartext |
+
+`caucus-watch`'s one credential is resolved by a single precedence chain,
+flags before environment: `--token` > `--token-file` > `--ticket` >
+`CAUCUS_TOKEN` > `CAUCUS_TICKET`. A remote `watch_command()` (the `/mcp` path
+above) hands out the `--ticket` form; a loopback one still hands out
+`--token-file`.
+
+## What the agent key does not buy
+
+The agent key is a perimeter, not authorization. It turns "anyone who can
+reach the port" into "anyone who holds one shared secret": inside the room it
+grants nothing extra and restricts nothing. Concretely, any holder of the key
+can:
+
+- **Self-join any private channel with no invite check.** `POST /channels/join`
+  (`HubState.subscribe` in `src/caucus/state.py`) accepts any valid peer token
+  and adds it to the named channel's membership, with no check that the
+  caller was invited or belongs there. Once subscribed, the caller reads that
+  channel's traffic from then on.
+- **Enumerate and retitle channels, hold the floor, and push operator forms.**
+  `GET /channels` lists every channel's name, topic and members; a keyholder
+  can then join one and rename its topic (`POST /channels/topic`), take the
+  broadcast talking stick to block every other sender's `say()` with a 423
+  (`HubState.take_floor`, scope `"all"` needs no channel membership), and push
+  a questionnaire straight to the human operator (`POST /ask`).
+- **Take over another peer's project name.** `HubState.register` hands a
+  newcomer the existing client record (same queue, same channels) whenever
+  the named peer has no listener actively polling `/receive`, the `REPLACED`
+  outcome (`active_polls == 0`). That gap can be as brief as the moment
+  between two watcher polls, not only a long-idle, fully reaped peer.
+- **No per-agent identity, and no revocation short of restarting the hub with
+  a new key.** Every caller presents the same shared secret, so the hub
+  cannot tell one holder from another, and there is no way to cut off a
+  single leaked copy without rotating the key for everyone.
+- **No confidentiality boundary between channels.** Since any keyholder can
+  self-join any channel (above), channel membership is a convenience against
+  accidental cross-talk, not a security boundary against another keyholder.
+
+What follows: share the agent key only with agents you would trust to read
+everything said in the room, rotate it by restarting the hub, and put the hub
+behind a network you already trust instead of treating the key as the only
+wall.
 
 ## TLS: the hub has none, put a proxy in front
 
@@ -197,10 +259,19 @@ entirely: `validate_hub_url` accepts any `https://` URL outright.
 
 ## Troubleshooting
 
-**`401` on join / register, mentioning `CAUCUS_AGENT_KEY`.** The hub has
+**`401` on join / register (or on `/peers`, `/channels`, `/forms`, `/ping`, or
+`POST /watch-ticket/redeem`), mentioning `CAUCUS_AGENT_KEY`.** The hub has
 `--agent-key` set and the caller either sent none, sent the wrong one, or
-sent it without the `Bearer ` prefix. Set `CAUCUS_AGENT_KEY` (or the
-`.mcp.json` `Authorization` header) to match the hub's value exactly.
+sent it without the `Bearer ` prefix (an operator or observer token also
+passes the four read endpoints, but not `/register` or the ticket redeem).
+Set `CAUCUS_AGENT_KEY` (or the `.mcp.json` `Authorization` header) to match
+the hub's value exactly.
+
+**`caucus-watch` prints `[caucus] TICKET REJECTED` and exits.** The ticket a
+remote `watch_command()` handed out is single-use and lives 120 seconds
+(`WATCH_TICKET_TTL`); it was already redeemed, or too long passed between
+minting it and running the watcher. Call `watch_command()` again for a fresh
+ticket and run it right away, since a two-minute-old ticket is already gone.
 
 **`421 Invalid Host header` from `/mcp`.** The client's `Host` header (the
 hostname it dialled) is not in the hub's DNS-rebinding allowlist. Add it with
