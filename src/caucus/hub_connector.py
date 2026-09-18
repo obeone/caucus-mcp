@@ -290,7 +290,8 @@ class HubConnector:
         """The normalized hub base URL (no trailing slash)."""
         return self._base
 
-    async def __aenter__(self) -> HubConnector:
+    # PYI034 wants `Self`, which needs Python 3.11; the floor here is 3.10.
+    async def __aenter__(self) -> HubConnector:  # noqa: PYI034
         """Open the underlying HTTP client.
 
         When an injected ``transport`` was supplied it is bound here so requests

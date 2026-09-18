@@ -669,7 +669,8 @@ def probe(host: str, port: int, *, attempts: int = 10) -> bool:
     url = f"http://{bracket}:{port}/version"
     for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(url, timeout=2):  # noqa: S310 - fixed http URL
+            # Fixed http scheme, built from the literal prefix just above.
+            with urllib.request.urlopen(url, timeout=2):
                 return True
         except (urllib.error.URLError, OSError):
             if attempt < attempts - 1:

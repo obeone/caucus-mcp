@@ -187,7 +187,8 @@ class _AgentClient(Protocol):
         """Abort the in-flight turn; safe to call from a concurrent task."""
         ...
 
-    async def __aenter__(self) -> _AgentClient:
+    # PYI034 wants `Self`, which needs Python 3.11; the floor here is 3.10.
+    async def __aenter__(self) -> _AgentClient:  # noqa: PYI034
         """Open the SDK session."""
         ...
 
@@ -941,7 +942,8 @@ def _build_caucus_server(connector: HubConnector, token: str) -> Any:
         fields = args.get("fields") or []
         try:
             result = await connector.ask_operator(token, to, args["title"], fields)
-        except Exception as exc:  # surface a bad request to the agent, don't crash
+        # Deliberately blind: any failure becomes a message, never a crash.
+        except Exception as exc:  # noqa: BLE001
             text = f"could not open form: {exc}"
         else:
             text = f"form opened (id={result.form_id}) → {result.to}"
