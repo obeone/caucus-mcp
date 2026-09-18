@@ -654,8 +654,9 @@ class HubConnector:
         """Probe a peer's liveness and self-reported status from the hub.
 
         Answered entirely from the hub's in-memory bookkeeping, so the target
-        agent's turn is never consumed. Open endpoint (no token), like
-        :meth:`peers`.
+        agent's turn is never consumed. Carries the shared agent key when one is
+        configured, like :meth:`peers`: the hub gates this probe on it, because
+        the payload includes the peer's own self-reported activity line.
 
         Args:
             peer: The project name to check.
@@ -669,7 +670,9 @@ class HubConnector:
             httpx.HTTPError: If the hub is unreachable or returns an error.
         """
         http = self._require_http()
-        resp = await http.get("/ping", params={"peer": peer})
+        resp = await http.get(
+            "/ping", params={"peer": peer}, headers=self._agent_headers()
+        )
         resp.raise_for_status()
         return dict(resp.json())
 

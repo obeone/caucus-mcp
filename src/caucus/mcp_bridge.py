@@ -812,7 +812,7 @@ def ping(peer: str) -> dict[str, object]:
     if gate is not None:
         return gate
     with _client() as http:
-        resp = http.get("/ping", params={"peer": peer})
+        resp = http.get("/ping", params={"peer": peer}, headers=_agent_headers())
         resp.raise_for_status()
         return dict(resp.json())
 

@@ -64,10 +64,18 @@ from .models import (
     SendResponse,
     SpawnAgentRequest,
     StatusRequest,
+    WatchTicketRedeemRequest,
     is_channel,
 )
 from .ratelimit import TokenBucket
-from .state import MAX_LEASE_ID_CHARS, CapExceeded, Client, HubState, RegisterOutcome
+from .state import (
+    MAX_LEASE_ID_CHARS,
+    WATCH_TICKET_TTL,
+    CapExceeded,
+    Client,
+    HubState,
+    RegisterOutcome,
+)
 from .supervisor import (
     AGENT_NAME_RE,
     DEFAULT_MAX_AGENTS,
@@ -1331,22 +1339,89 @@ async def peers(
 
 
 @app.get("/ping")
-async def ping(peer: str = Query(min_length=1, max_length=64)) -> dict[str, object]:
+async def ping(
+    peer: str = Query(min_length=1, max_length=64),
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
     """Report a peer's liveness and self-reported status without disturbing it.
 
     A presence probe answered entirely from the hub's in-memory bookkeeping, so
     the target agent's turn is never consumed — the whole point of a ping is to
     learn "is it still there, and what is it doing?" for ~0 cost to the peer.
-    Open (no token) even on a keyed hub, unlike ``/peers``: it answers about one
-    name the caller already has to know, and it is the liveness probe a peer
-    uses before it holds anything. Note what that does disclose to anyone who
-    can reach the port: whether a *named* peer exists, how long since it last
-    touched the hub, whether a listener is attached, and its own last
-    :meth:`~caucus.state.HubState.set_status` string. See
-    :meth:`~caucus.state.HubState.ping` for the full response shape (``state``
-    is ``live`` / ``reaped`` / ``absent``).
+
+    Gated on the shared agent key when one is configured, exactly like
+    ``/peers``, ``/channels`` and ``/forms`` (see :func:`_require_agent_read`):
+    the payload is far more than liveness. It confirms whether a *named* peer
+    exists, how long since it last touched the hub, whether a listener is
+    attached, and its own last :meth:`~caucus.state.HubState.set_status`
+    string, which is peer-authored prose describing what that agent is working
+    on. On a keyed non-loopback hub, handing that to anyone who can reach the
+    port is a disclosure the key exists to prevent. With no key configured (the
+    loopback default) it stays open, as before.
+
+    See :meth:`~caucus.state.HubState.ping` for the full response shape
+    (``state`` is ``live`` / ``reaped`` / ``absent``).
+
+    Args:
+        peer: The project name to probe.
+        authorization: ``Authorization: Bearer <agent key>`` (or a console
+            token), required only when the hub runs with an agent key.
     """
+    _require_agent_read(authorization)
     return state.ping(peer)
+
+
+@app.post("/watch-ticket/redeem")
+async def redeem_watch_ticket(
+    req: WatchTicketRedeemRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Exchange a single-use watch ticket for the peer token it stands for.
+
+    The door ``caucus-watch --ticket`` knocks on. A remote agent is handed a
+    ticket rather than its peer token, because that token is the room bearer
+    for ``/receive``, ``/send``, ``/ack``, ``/channels/*``, ``/ask`` and
+    ``/floor``: printing it in a shell command would put it in the agent's
+    transcript, its shell history and the watcher's environ, which is exactly
+    what the loopback token file exists to avoid. The ticket is spent here,
+    once, seconds after it was minted.
+
+    Gated on the shared agent key the same way ``POST /register`` is: a keyed
+    hub must not hand tokens to whoever can reach the port. An unknown, already
+    spent or expired ticket answers **404**, not 401: the caller's credential
+    was fine, the ticket simply is not there any more, and conflating the two
+    would have the watcher report a dead session when all it needs is a fresh
+    ``watch_command()``.
+
+    Args:
+        req: The body carrying the ticket to spend.
+        authorization: ``Authorization: Bearer <agent key>``, required only
+            when the hub runs with an agent key.
+
+    Returns:
+        ``{"token": "<peer token>"}``.
+
+    Raises:
+        HTTPException: 401 when the agent key is missing or wrong, 404 when the
+            ticket is unknown, already spent, or past its TTL.
+    """
+    if not auth_config.agent_ok(_bearer_from_header(authorization)):
+        # Deliberately logged without the ticket value: this response is the
+        # one place a peer token is handed out, so nothing about the exchange
+        # belongs in a log file.
+        logger.warning("watch-ticket redeem refused (agent key)")
+        raise HTTPException(status_code=401, detail=AGENT_KEY_REQUIRED_DETAIL)
+    token = state.redeem_watch_ticket(req.ticket)
+    if token is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "watch ticket unknown, already used, or expired: a ticket is"
+                f" single-use and lives {WATCH_TICKET_TTL:.0f}s. Call"
+                " watch_command() again for a fresh one."
+            ),
+        )
+    return {"token": token}
 
 
 @app.get("/channels")
@@ -2344,8 +2419,8 @@ async def status_set(req: StatusRequest) -> dict[str, object] | JSONResponse:
 async def floor_list() -> dict[str, dict[str, dict[str, object]]]:
     """List the active talking sticks, keyed by scope.
 
-    Open (no token), like ``/peers`` and ``/ping``: which scopes are currently
-    locked is no more sensitive than the roster. Each entry is
+    Open (no token), unlike the agent-key-gated ``/peers``, ``/ping``,
+    ``/channels`` and ``/forms``. Each entry is
     ``{"scope", "holder", "reason", "hands": [...], "since"}``. An empty map
     means no stick is up and every scope is open. Lets an agent scout whether the
     floor it is about to use is held before it speaks.
