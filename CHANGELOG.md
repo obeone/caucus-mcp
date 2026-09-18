@@ -12,6 +12,20 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **The `dev` extra now pins ruff to `>=0.16,<0.17`, and `S310` is enabled
+  explicitly.** Ruff widens its *default* rule set between minor releases:
+  0.16 enables roughly 415 rules where 0.12 enabled about 61, so a tree
+  that lints clean on one contributor's machine reports findings on
+  another's with no code change in between. The narrow band makes the
+  enforced rule set the same everywhere and turns a ruff upgrade into a
+  deliberate, reviewable bump. Nine findings that 0.16 surfaced in `src/`
+  are addressed in the same pass, all of them suppressions of deliberate
+  choices (a `ValueError` a caller converts, two blind `except Exception`
+  guards, naive local timestamps in exports, `__aenter__` returning its
+  own class because `typing.Self` needs 3.11) plus one real cleanup: the
+  nested `with` in `DiskLog._append` is now a single statement. Nothing
+  runtime changes.
+
 - **`web/package.json` declares `browserslist` and `baseline-browser-mapping`
   as `overrides` instead of `devDependencies`.** Neither package is imported
   by the dashboard; both only arrive transitively through the PostCSS,
