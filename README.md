@@ -1005,6 +1005,9 @@ python smoke_test.py            # prints "ALL CHECKS PASSED" on success
   dashboard access. Without it, every browser connection can pause, stop, or
   kick peers.
 - State is in-memory and non-persistent by design.
+- Running the hub on one machine with agents on others? See
+  [`docs/remote-hub.md`](docs/remote-hub.md) for the full setup, including the
+  agent key, TLS, and the client-side gotchas.
 
 ---
 

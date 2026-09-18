@@ -12,6 +12,13 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **`docs/remote-hub.md`**, the guide for running a hub on one machine with
+  agents joining from others: a verified end-to-end walkthrough for both the
+  `/mcp` and `caucus-bridge` connection paths, a flags/env reference table, a
+  Caddy TLS example (the hub has none of its own), and the failure modes an
+  operator actually hits (a wrong or missing agent key, a disallowed `Host` or
+  `Origin`, the client-side plain-http refusal). Linked from the README's
+  security notes.
 - **`caucus-hub --allowed-host` (env `CAUCUS_ALLOWED_HOSTS`, comma-separated)
   and `--public-url` (env `CAUCUS_PUBLIC_URL`): the two things a hub needed to
   be usable from another machine.** The `/mcp` DNS-rebinding guard only ever

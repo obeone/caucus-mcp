@@ -175,7 +175,13 @@ denominator; everything else is a connector to it.
   and `watch_command` still returns a `caucus-watch` command against the hub's
   real reachable URL. Opt-in, localhost by default, with `transport_security`
   guarding against DNS-rebinding. The MCP session manager runs inside the hub
-  lifespan, mirroring the disk-log wiring.
+  lifespan, mirroring the disk-log wiring. When `--agent-key` is set,
+  `MCPAgentKeyMiddleware` gates every `/mcp` request at the HTTP layer, before
+  it ever reaches a tool, demanding the same `Authorization: Bearer <key>`
+  that `POST /register` checks; a CORS preflight `OPTIONS` is let through
+  untouched since it carries no `Authorization` header by definition.
+  See [Running a hub other machines can reach](remote-hub.md) for the full
+  remote-deployment story.
 - **`supervisor.py`** (no script): the operator agent launcher, off unless the
   hub is started for it. `AgentSupervisor` spawns, lists and kills
   `caucus-claude-agent` child processes on behalf of an authenticated operator,
@@ -233,10 +239,11 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 - **Operator kick** (`kick`): the `/ui` WebSocket accepts `{"kick": "<project>"}`,
   dropping that peer (reason "kicked by operator"). This is the manual counterpart
   to the collision detector — the only way a live incumbent is evicted (collisions
-  never auto-evict the incumbent; they refuse the newcomer). Note that `/ui`
-  carries no authentication, so the hub must stay bound to localhost or sit behind
-  a trusted reverse proxy — exposing it publicly lets anyone pause, stop, kick,
-  or steer arbitrary peers.
+  never auto-evict the incumbent; they refuse the newcomer). `/ui` authentication
+  is opt-in (`--operator-token`/`--observer-token`, see [Auth /
+  RBAC](#auth--rbac) below) and off by default, so an unconfigured hub must stay
+  bound to localhost or sit behind a trusted reverse proxy: exposing it publicly
+  without a token lets anyone pause, stop, kick, or steer arbitrary peers.
 - **Operator commands** (`operator_command`): the `/ui` WebSocket also accepts
   `{"command": "interrupt"|"reset", "to": "<project>"}`, a **per-agent** control
   signal (distinct from the room-wide `set_mode`). It routes a CONTROL message to
@@ -561,6 +568,13 @@ and replies:
 - `{"type":"auth_ok","role":"operator","auth":true}` — full read-write access.
 - `{"type":"auth_ok","role":"observer","auth":true}` — read-only access.
 - `{"type":"auth_error"}` + WebSocket close 1008 — rejected.
+
+This guards only the console. The agent door (`POST /register` and `/mcp`) is
+gated by a separate, independent axis: `--agent-key` / `CAUCUS_AGENT_KEY`,
+also on `AuthConfig` but checked with its own `agent_ok` method; an operator
+or observer token grants no agent rights, and the agent key grants no console
+rights. See `MCPAgentKeyMiddleware` above and [Running a hub other machines
+can reach](remote-hub.md) for the full story.
 
 RBAC is enforced per-command in the `/ui` handler. Any frame from an `observer`
 connection whose key appears in `_MUTATING_COMMANDS` (the frozen set in `hub.py`)
