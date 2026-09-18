@@ -178,6 +178,12 @@ class _Membership:
         token_file: Path of the 0600 watcher token file written by
             :func:`watch_command`, cleaned up on :func:`leave`. ``None`` when
             none is live.
+        watch_ticket: The single outstanding remote watch ticket minted by
+            :func:`watch_command` for this session, or ``None`` when none is
+            live. Revoked (via :meth:`HubState.revoke_watch_ticket`) and
+            replaced on the next :func:`watch_command` refresh, and revoked
+            outright on :func:`leave` and in the dead-session sweep, so at
+            most one ticket for this session's token is ever redeemable.
         last_active: ``time.time()`` of this session's most recent tool call.
             Only load-bearing while the session is *unjoined*: it is the sole
             liveness signal such a record has (it owns no hub client), so the
@@ -193,6 +199,7 @@ class _Membership:
     last_acked_seq: int = 0
     listen_lease: str | None = None
     token_file: str | None = None
+    watch_ticket: str | None = None
     last_active: float = field(default_factory=time.time)
 
 
@@ -521,7 +528,7 @@ def build_mcp_server(
     sessions: dict[str, _Membership] = {}
 
     def _sweep_dead_sessions(*, now: float | None = None) -> None:
-        """Remove per-session state and token files for sessions that are gone.
+        """Remove per-session state, token files and watch tickets for gone sessions.
 
         Called by the hub reaper on every sweep tick, right after
         :meth:`HubState.reap_stale`. Two kinds of corpse, because the two kinds
@@ -558,6 +565,10 @@ def build_mcp_server(
             member = sessions.pop(sid, None)
             if member is not None:
                 _remove_token_file(member.token_file)
+                # Mirror the leave() cleanup: a session reaped as dead must
+                # not leave its watch ticket outstanding either.
+                if member.watch_ticket is not None:
+                    _hub.state.revoke_watch_ticket(member.watch_ticket)
                 logger.debug("swept dead mcp-http session sid=%s", sid)
 
     # The connector is process-lived: created and entered lazily on first use
@@ -886,6 +897,11 @@ def build_mcp_server(
             _hub.state.unregister(token)
         _remove_token_file(member.token_file)
         member.token_file = None
+        # A departing agent must not leave a live ticket redeemable for the
+        # token it just gave up.
+        if member.watch_ticket is not None:
+            _hub.state.revoke_watch_ticket(member.watch_ticket)
+            member.watch_ticket = None
         logger.info("left Caucus (was project=%s)", name)
         return {"left": True, "project": name}
 
@@ -1257,8 +1273,17 @@ def build_mcp_server(
             # opt-in the operator already made by advertising that URL. Asked
             # without consulting this process's own environment, because the
             # command runs in the agent's.
+            #
+            # The docstring below invites a refresh ("call anytime post-join
+            # to get or refresh"), and each refresh must retire the ticket it
+            # replaces: otherwise every call left one more live bearer
+            # credential outstanding for the same peer token, each already
+            # written into the agent's transcript.
+            if member.watch_ticket is not None:
+                _hub.state.revoke_watch_ticket(member.watch_ticket)
             optin = f"{ALLOW_REMOTE_ENV}=1 " if needs_remote_optin(self_url) else ""
             ticket = _hub.state.issue_watch_ticket(member.token)
+            member.watch_ticket = ticket
             command = f"{optin}caucus-watch --hub {self_url} --ticket {ticket}"
         else:
             member.token_file = _write_token_file(member.token)

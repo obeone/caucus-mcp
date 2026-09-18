@@ -223,6 +223,75 @@ async def test_watch_command_remote_hands_out_a_ticket_not_the_token(
     assert token not in repr(joined)
 
 
+async def test_watch_command_refresh_revokes_the_previous_ticket(
+    state: HubState,
+) -> None:
+    """Refreshing must retire the old ticket, not just mint a new one beside it.
+
+    Without this, every ``watch_command()`` call left the prior ticket
+    outstanding for its full TTL: N calls meant N live bearer credentials for
+    the same peer token, each one already sitting in the agent's transcript.
+    """
+    server = build_mcp_server(
+        hub_module.app, self_url="https://hub.example.net", remote=True
+    )
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+
+    first = str((await _tool(server, "watch_command")(ctx))["command"])
+    _, _, first_ticket = first.partition(" --ticket ")
+    second = str((await _tool(server, "watch_command")(ctx))["command"])
+    _, _, second_ticket = second.partition(" --ticket ")
+
+    assert first_ticket and second_ticket and first_ticket != second_ticket
+    # The retired ticket is dead...
+    assert state.redeem_watch_ticket(first_ticket) is None
+    # ...while the fresh one still works.
+    assert state.redeem_watch_ticket(second_ticket) is not None
+
+
+async def test_leave_revokes_the_outstanding_watch_ticket(
+    state: HubState,
+) -> None:
+    """A departing agent must not leave a live ticket for the token it dropped."""
+    server = build_mcp_server(
+        hub_module.app, self_url="https://hub.example.net", remote=True
+    )
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+    command = str((await _tool(server, "watch_command")(ctx))["command"])
+    _, _, ticket = command.partition(" --ticket ")
+    assert ticket
+
+    await _tool(server, "leave")(ctx)
+
+    assert state.redeem_watch_ticket(ticket) is None
+
+
+async def test_dead_session_sweep_revokes_its_ticket(
+    state: HubState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session reaped as dead must not leave its ticket redeemable behind it."""
+    from caucus import mcp_http
+
+    server = build_mcp_server(
+        hub_module.app, self_url="https://hub.example.net", remote=True
+    )
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alpha")
+    command = str((await _tool(server, "watch_command")(ctx))["command"])
+    _, _, ticket = command.partition(" --ticket ")
+    assert ticket
+
+    # Simulate the joined session's hub client having died, exactly as
+    # test_session_reaper_sweeps_dead_sessions does in test_mcp_http.py.
+    monkeypatch.setattr(state, "client_for", lambda _tok: None)
+    assert mcp_http._session_reaper_fn is not None
+    mcp_http._session_reaper_fn()
+
+    assert state.redeem_watch_ticket(ticket) is None
+
+
 def _hub_flag(command: str) -> str:
     """Return the value the emitted command passes to ``caucus-watch --hub``."""
     parts = command.split()

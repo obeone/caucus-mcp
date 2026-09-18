@@ -761,6 +761,23 @@ class HubState:
         self._watch_tickets[ticket] = (peer_token, ref + WATCH_TICKET_TTL)
         return ticket
 
+    def revoke_watch_ticket(self, ticket: str) -> None:
+        """Invalidate one outstanding watch ticket before it is ever redeemed.
+
+        Used wherever a ticket is superseded before anyone spends it: minting
+        a fresh one for the same member (``watch_command()`` advertises "call
+        again to refresh", and without this every earlier ticket stayed
+        redeemable for its full :data:`WATCH_TICKET_TTL`, so N calls left N
+        live bearer credentials for the same peer token), on an explicit
+        ``leave()``, and in the dead-session sweep. A no-op when ``ticket`` is
+        already spent, expired, or was never issued, so callers can revoke
+        whatever they last minted without first checking it is still there.
+
+        Args:
+            ticket: The ticket to invalidate.
+        """
+        self._watch_tickets.pop(ticket, None)
+
     def redeem_watch_ticket(
         self, ticket: str, *, now: float | None = None
     ) -> str | None:
