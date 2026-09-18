@@ -142,7 +142,7 @@ Hub-side (`caucus-hub`):
 | `--allowed-origin ORIGIN` (repeatable) | `CAUCUS_ALLOWED_ORIGINS` (comma-separated) | loopback only | A browser console opened from a non-loopback origin gets its `/ui` handshake closed with WebSocket code 1008, and its `/mcp` CORS preflight goes unanswered |
 | `--public-url URL` | `CAUCUS_PUBLIC_URL` | unset (advertises the bind address) | `watch_command` and every tool's `hub` field hand a remote agent a `127.0.0.1` address it cannot reach |
 | `--mcp-http` / `--no-mcp-http` | `CAUCUS_MCP_HTTP` | on for a loopback bind, off otherwise | `/mcp` is not mounted at all on a non-loopback bind unless this is passed explicitly |
-| `--allow-insecure-bind` | (none) | off | A non-loopback `--host` refuses to start unless both `--operator-token` and `--agent-key` are already set, and a wildcard bind (`0.0.0.0` or `::`) also needs `--public-url` |
+| `--allow-insecure-bind` | (none) | off | A non-loopback `--host`, or a non-loopback `--public-url` on any bind, refuses to start unless both `--operator-token` and `--agent-key` are already set, and a wildcard bind (`0.0.0.0` or `::`) also needs `--public-url`. A loopback `--public-url` (`http://localhost:8765`) arms nothing |
 | `--client-ttl SECONDS` | (none) | `300` | The idle reaper drops a peer sooner or later than expected; a WAN agent slower than this to re-poll loses its slot mid-conversation |
 
 Throughout, "loopback" is one definition shared by the whole package
@@ -207,10 +207,12 @@ wall.
 
 `caucus-hub`'s `uvicorn.run(...)` call takes no TLS arguments: there is no
 `--tls-cert` flag to reach for. Terminate TLS in front of it instead. Because
-the reverse proxy is what faces the network, the hub itself can stay bound
-to loopback, which sidesteps its own non-loopback-bind refusal entirely; set
-`--agent-key` and `--operator-token` anyway, since the hub is reachable from
-the network the moment the proxy is:
+the reverse proxy is what faces the network, the hub itself stays bound to
+loopback — but it still demands `--agent-key` and `--operator-token`, because
+`--public-url https://hub.example.net` is you telling it that agents on other
+machines dial it. That is the same exposure a non-loopback bind is, reached
+through the proxy instead of the socket, and the hub refuses to start without
+both credentials:
 
 ```bash
 export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"

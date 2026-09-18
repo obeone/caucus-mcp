@@ -126,6 +126,20 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **A non-loopback `--public-url` now arms the same credentials guard a
+  non-loopback bind does.** The guard only ever looked at the bind address, so
+  a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local
+  reverse proxy came up without a word when started with
+  `--public-url https://hub.example.net` and no `--agent-key`: `/register`,
+  `/peers` and `/watch-ticket/redeem` open to anyone who reached the tunnel,
+  and the dashboard granting operator rights to any browser that did. The hub
+  already read that URL as "this is remote" when deciding what `watch_command`
+  hands a remote agent; the credentials gate now agrees, and refuses to start
+  without both `--operator-token` and `--agent-key`. A loopback public URL
+  (`http://localhost:8765`) is just a nicer address for this machine and arms
+  nothing, and `--allow-insecure-bind` still starts anyway. `check_bind` in
+  `caucus-setup-service` applies the same rule, so the installer refuses the
+  configuration instead of writing a unit that cannot start.
 - **`/peers`, `/channels`, `/forms` and `/ping` now require the shared agent
   key when one is configured** (an operator or observer token is accepted
   too). On a keyed non-loopback hub, these endpoints previously handed anyone

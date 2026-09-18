@@ -3084,6 +3084,40 @@ def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
     return hosts
 
 
+def _doors_block(*, operator: bool, agent: bool, requirement: str) -> str:
+    """Render the two-doors inventory shared by both credential refusals.
+
+    The flag names, the environment variables and the ``openssl`` lines have to
+    read identically whether the hub was refused for its bind address or for the
+    public URL it advertises; spelling them twice is how one of the two ends up
+    naming a flag that was renamed in the other.
+
+    Args:
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+        requirement: The sentence introducing the generation snippet, which
+            names *why* both credentials are demanded in this particular case.
+
+    Returns:
+        The doors inventory, the requirement sentence and the two ``export``
+        lines, ending with a newline.
+    """
+    mark = {True: "already set", False: "MISSING"}
+    return (
+        "  agent door     /register and /mcp - join the room, read everything\n"
+        "                 said in it\n"
+        f"                 --agent-key KEY  (env CAUCUS_AGENT_KEY): {mark[agent]}\n"
+        "  operator door  /ui - pause, stop, kick, read the whole transcript\n"
+        "                 --operator-token TOKEN  (env CAUCUS_OPERATOR_TOKEN):"
+        f" {mark[operator]}\n"
+        "\n"
+        f"{requirement} Generate and set them:\n"
+        "\n"
+        '  export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"\n'
+        '  export CAUCUS_OPERATOR_TOKEN="$(openssl rand -hex 24)"\n'
+    )
+
+
 def _insecure_bind_message(
     host: str,
     *,
@@ -3134,24 +3168,64 @@ def _insecure_bind_message(
         "from other machines, and by default neither of its two doors is locked\n"
         "nor does it know the address to hand those machines.\n"
         "\n"
-        "  agent door     /register and /mcp - join the room, read everything\n"
-        "                 said in it\n"
-        f"                 --agent-key KEY  (env CAUCUS_AGENT_KEY): {mark[agent]}\n"
-        "  operator door  /ui - pause, stop, kick, read the whole transcript\n"
-        "                 --operator-token TOKEN  (env CAUCUS_OPERATOR_TOKEN):"
-        f" {mark[operator]}\n"
-        "\n"
-        "Both are required on a non-loopback bind. Generate and set them:\n"
-        "\n"
-        '  export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"\n'
-        '  export CAUCUS_OPERATOR_TOKEN="$(openssl rand -hex 24)"\n'
-        f"  caucus-hub --host {host}"
+        + _doors_block(
+            operator=operator,
+            agent=agent,
+            requirement="Both are required on a non-loopback bind.",
+        )
+        + f"  caucus-hub --host {host}"
         + (" --public-url https://hub.example.net\n" if wildcard else "\n")
         + reach
         + "\n"
         "Not what you meant? --host 127.0.0.1 keeps the hub on this machine.\n"
         "Meant it, on a network that already authenticates (a tunnel, a private\n"
         "LAN)? --allow-insecure-bind starts anyway, with both doors open."
+    )
+
+
+def _insecure_public_url_message(
+    public_url: str,
+    *,
+    operator: bool,
+    agent: bool,
+) -> str:
+    """Compose the refusal shown when an advertised hub is under-configured.
+
+    The sibling of :func:`_insecure_bind_message` for the deployment where the
+    socket is *not* the exposure: the hub binds to loopback and something in
+    front of it (a tunnel, a reverse proxy, a port forward) carries the outside
+    world in. Nothing about the bind address betrays that, so the only signal
+    the hub has is the operator declaring a public URL that is not loopback --
+    and that declaration has to be taken as seriously as a non-loopback bind,
+    because the doors behind it are exactly as open.
+
+    Args:
+        public_url: The non-loopback base URL the operator asked to advertise.
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+
+    Returns:
+        The multi-line refusal text, ready to hand to ``parser.error``.
+    """
+    return (
+        f"refusing to start: --public-url {public_url} says agents on other\n"
+        "machines dial this hub, and by default neither of its two doors is\n"
+        "locked. The bind is loopback, so the socket is not the exposure --\n"
+        "whatever sits in front of it is, and anything reaching that front\n"
+        "reaches both of these:\n"
+        "\n"
+        + _doors_block(
+            operator=operator,
+            agent=agent,
+            requirement="Both are required once the hub is advertised off-box.",
+        )
+        + f"  caucus-hub --host 127.0.0.1 --public-url {public_url}\n"
+        "\n"
+        "Not what you meant? A loopback public URL (http://localhost:8765) is\n"
+        "just a nicer address for this machine and needs none of this.\n"
+        "Meant it, behind something that already authenticates? "
+        "--allow-insecure-bind\n"
+        "starts anyway, with both doors open."
     )
 
 
@@ -3347,9 +3421,10 @@ def main() -> None:
         "--allow-insecure-bind",
         action="store_true",
         help=(
-            "start on a non-loopback address without --operator-token and "
-            "--agent-key. Both doors stay open to anything that can reach the "
-            "port; only for a network that already authenticates"
+            "start without --operator-token and --agent-key on a non-loopback "
+            "address, or behind a non-loopback --public-url. Both doors stay "
+            "open to anything that can reach the hub; only for a network that "
+            "already authenticates"
         ),
     )
     parser.add_argument(
@@ -3420,24 +3495,49 @@ def main() -> None:
     # anything dials, so without --public-url the hub would advertise the
     # 127.0.0.1 rewrite and hand every remote agent a watcher command pointing
     # back at its own machine. Fix that at the source rather than downstream.
+    # A loopback bind is not proof the hub is unreachable: behind a tunnel or a
+    # reverse proxy the socket stays on 127.0.0.1 while the world dials the
+    # front. The one thing the operator tells us in that shape is --public-url,
+    # and _mount_mcp_http already reads a non-loopback one as "remote" (see its
+    # `remote=` argument). The credentials gate has to read it the same way, or
+    # the exact deployment that most needs both doors locked is the one that
+    # starts without either. A loopback public URL is just a prettier address
+    # for this machine and arms nothing.
     wildcard = args.host in _WILDCARD_HOSTS
+    # Parsed defensively: the value is still unvalidated here, and one that
+    # urlparse finds no hostname in must fall through to validate_public_url
+    # below rather than be read as an exposure. A URL that *does* name a
+    # non-loopback host but fails validation for another reason (a path, say)
+    # hits this gate first, which is the right order: missing credentials on an
+    # advertised hub outrank the shape of the address being advertised.
+    advertised_host = urlparse(public_url).hostname if public_url else None
+    advertised_remote = (
+        public_url
+        if advertised_host is not None and not is_loopback_host(advertised_host)
+        else None
+    )
     under_configured = not (args.operator_token and args.agent_key) or (
         wildcard and not public_url
     )
-    if (
-        not is_loopback_host(args.host)
-        and not args.allow_insecure_bind
-        and under_configured
-    ):
-        parser.error(
-            _insecure_bind_message(
-                args.host,
-                operator=bool(args.operator_token),
-                agent=bool(args.agent_key),
-                public_url=bool(public_url),
-                wildcard=wildcard,
+    if not args.allow_insecure_bind and under_configured:
+        if not is_loopback_host(args.host):
+            parser.error(
+                _insecure_bind_message(
+                    args.host,
+                    operator=bool(args.operator_token),
+                    agent=bool(args.agent_key),
+                    public_url=bool(public_url),
+                    wildcard=wildcard,
+                )
             )
-        )
+        elif advertised_remote is not None:
+            parser.error(
+                _insecure_public_url_message(
+                    advertised_remote,
+                    operator=bool(args.operator_token),
+                    agent=bool(args.agent_key),
+                )
+            )
 
     if public_url is not None:
         try:

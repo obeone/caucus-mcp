@@ -785,7 +785,117 @@ def test_a_blank_public_url_is_not_an_advertised_address(run_main: Any) -> None:
 def test_an_invalid_public_url_refuses_at_startup(
     run_main: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A public URL with a path would build unreachable addresses; refuse it."""
+    """A public URL with a path would build unreachable addresses; refuse it.
+
+    Both credentials are supplied so the loopback+public-url credentials guard
+    (below) does not intercept first: this test is about ``validate_public_url``
+    rejecting the path, not about the credentials gate.
+    """
     with pytest.raises(SystemExit):
-        run_main("--public-url", "https://hub.example.net/caucus")
+        run_main(
+            "--public-url",
+            "https://hub.example.net/caucus",
+            "--operator-token",
+            "op123",
+            "--agent-key",
+            "key123",
+        )
     assert "bare origin" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A loopback bind advertised under a non-loopback --public-url
+# ---------------------------------------------------------------------------
+
+
+def test_loopback_bind_with_remote_public_url_without_credentials_refuses(
+    run_main: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A loopback socket behind a public URL is exactly as exposed as a wide bind.
+
+    The bind itself never leaves this machine, but declaring a non-loopback
+    ``--public-url`` says a tunnel or reverse proxy carries the outside world
+    in, and ``_mount_mcp_http`` already treats that as ``remote=True``. The
+    credentials gate has to read it the same way.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        run_main("--public-url", "https://hub.example.net")
+    assert excinfo.value.code == 2
+    message = capsys.readouterr().err
+    for needle in (
+        "--public-url",
+        "https://hub.example.net",
+        "--agent-key",
+        "CAUCUS_AGENT_KEY",
+        "--operator-token",
+        "CAUCUS_OPERATOR_TOKEN",
+    ):
+        assert needle in message, f"refusal does not mention {needle}"
+
+
+def test_loopback_bind_with_remote_public_url_names_which_credential_is_missing(
+    run_main: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Half-configured is the common case here too; say which half is done."""
+    with pytest.raises(SystemExit):
+        run_main("--public-url", "https://hub.example.net", "--agent-key", "key123")
+    message = capsys.readouterr().err
+    assert "--agent-key KEY  (env CAUCUS_AGENT_KEY): already set" in message
+    assert "--operator-token TOKEN  (env CAUCUS_OPERATOR_TOKEN): MISSING" in message
+
+
+def test_loopback_bind_with_remote_public_url_and_both_credentials_starts(
+    run_main: Any,
+) -> None:
+    """Both doors locked, so declaring the hub reachable elsewhere is allowed."""
+    started = run_main(
+        "--public-url",
+        "https://hub.example.net",
+        "--operator-token",
+        "op123",
+        "--agent-key",
+        "key123",
+    )
+    assert started == [("127.0.0.1", 8765)]
+
+
+def test_loopback_bind_with_remote_public_url_allow_insecure_bind_starts(
+    run_main: Any,
+) -> None:
+    """The same escape hatch as the bind guard covers the public-url guard."""
+    started = run_main(
+        "--public-url", "https://hub.example.net", "--allow-insecure-bind"
+    )
+    assert started == [("127.0.0.1", 8765)]
+
+
+def test_loopback_public_url_arms_nothing(run_main: Any) -> None:
+    """localhost is just a prettier address for this machine, not an exposure."""
+    started = run_main("--public-url", "http://localhost:8765")
+    assert started == [("127.0.0.1", 8765)]
+
+
+def test_remote_public_url_from_the_environment_arms_the_guard(
+    run_main: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``CAUCUS_PUBLIC_URL`` is read the same way ``--public-url`` is."""
+    monkeypatch.setenv("CAUCUS_PUBLIC_URL", "https://hub.example.net")
+    with pytest.raises(SystemExit):
+        run_main()
+    assert "https://hub.example.net" in capsys.readouterr().err
+
+
+def test_malformed_public_url_on_a_loopback_bind_is_not_caught_by_the_new_guard(
+    run_main: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No parseable hostname arms nothing here; ``validate_public_url`` is the error.
+
+    ``urlparse("garbage").hostname`` is ``None``, so the credentials guard sees
+    no advertised host at all and stays quiet, leaving the more useful
+    ``validate_public_url`` error as what the operator sees.
+    """
+    with pytest.raises(SystemExit):
+        run_main("--public-url", "garbage")
+    message = capsys.readouterr().err
+    assert "unsupported public URL scheme" in message
+    assert "refusing to start" not in message
