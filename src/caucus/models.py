@@ -85,7 +85,7 @@ def request_carried_token(request: httpx.Request, token: str | None) -> bool:
     A hub ``401`` means "your session died" only when the call that earned it
     actually carried this session's token. The read-only endpoints
     (``/protocol``, ``/peers``, ``/channels``, ``/ping``, ``/forms``) never do:
-    they answer before a join, and the three the hub gates on a configured
+    they answer before a join, and the four the hub gates on a configured
     agent key present that shared key instead. They can still answer ``401`` --
     on a wrong or missing agent key, or from an auth proxy in front of the hub
     -- and calling either a lost membership would send the agent off to
@@ -544,6 +544,19 @@ class AckRequest(BaseModel):
 
     token: str
     seq: int = PydField(ge=0)
+
+
+class WatchTicketRedeemRequest(BaseModel):
+    """Body for ``POST /watch-ticket/redeem``.
+
+    Spends the single-use ticket a remote ``watch_command`` handed out and
+    exchanges it for the peer's access token, so the token itself never travels
+    through the agent's transcript, shell history or process argv. The bound
+    matches the minted width (``secrets.token_urlsafe(24)``) with room to
+    spare, so a caller cannot park an oversized string in a request body.
+    """
+
+    ticket: str = PydField(min_length=1, max_length=128)
 
 
 class StatusRequest(BaseModel):

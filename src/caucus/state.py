@@ -158,6 +158,20 @@ REVOKED_LEASE_MEMORY = 8
 MAX_LEASE_ID_CHARS = 64
 """Longest accepted ``/receive`` lease id, so a peer cannot park junk in state."""
 
+# A remote agent cannot be handed a token file (the path names nothing on its
+# machine), and handing it the peer token itself puts the room bearer in its
+# transcript, its shell history and the watcher's environ. So ``watch_command``
+# mints a *ticket* instead: an opaque one-shot claim check the watcher exchanges
+# for the real token over one keyed HTTP call, seconds after it is issued.
+
+WATCH_TICKET_TTL = 120.0
+"""Seconds a minted watch ticket stays redeemable.
+
+Long enough for an agent to background the command it was just handed, short
+enough that a ticket leaked into a transcript is worthless by the time anyone
+reads it. Single use on top of that: the first redemption consumes it.
+"""
+
 
 @dataclass(slots=True)
 class PollLease:
@@ -441,6 +455,10 @@ class HubState:
         # send to that scope (see :meth:`floor_blocks`). In-memory only.
         self._floors: dict[str, Floor] = {}  # scope -> Floor
         self._forms: dict[str, Form] = {}  # form id -> pending Form
+        # Outstanding single-use watch tickets: ticket -> (peer token, expiry).
+        # Minted by ``watch_command`` on a remote hub and consumed by the very
+        # next ``POST /watch-ticket/redeem``; see :meth:`issue_watch_ticket`.
+        self._watch_tickets: dict[str, tuple[str, float]] = {}
         # Last time a contested-join notice fired, per contested project name.
         # Repeats inside CONTESTED_NOTICE_WINDOW are silently swallowed so a
         # register retry loop cannot flood the operator feed. Entries are
@@ -704,6 +722,79 @@ class HubState:
             return self._revive(reaped)
         return None
 
+    # --- watch tickets ---------------------------------------------------
+
+    def _prune_watch_tickets(self, ref: float) -> None:
+        """Forget every watch ticket whose TTL has lapsed.
+
+        Called on every mint, on every redemption and from the idle-reaper
+        sweep, so the store is bounded by the tickets issued inside one TTL
+        window rather than by the process lifetime.
+
+        Args:
+            ref: Reference timestamp to measure expiry against.
+        """
+        for ticket in [t for t, (_, exp) in self._watch_tickets.items() if exp <= ref]:
+            self._watch_tickets.pop(ticket, None)
+
+    def issue_watch_ticket(self, peer_token: str, *, now: float | None = None) -> str:
+        """Mint a single-use, short-lived claim check for ``peer_token``.
+
+        The ticket is what a *remote* watcher is handed in place of the peer
+        token: it grants nothing by itself, is spent by the first redemption,
+        and dies on its own after :data:`WATCH_TICKET_TTL` seconds. Nothing
+        here validates ``peer_token``: a ticket for a token the hub later
+        forgets simply hands back a token ``client_for`` already rejects, so a
+        reaped peer cannot be resurrected through a stale ticket.
+
+        Args:
+            peer_token: The access token the ticket will be exchanged for.
+            now: Reference timestamp (defaults to :func:`time.time`);
+                injectable for deterministic tests.
+
+        Returns:
+            The freshly minted ticket string.
+        """
+        ref = time.time() if now is None else now
+        self._prune_watch_tickets(ref)
+        ticket = secrets.token_urlsafe(24)
+        self._watch_tickets[ticket] = (peer_token, ref + WATCH_TICKET_TTL)
+        return ticket
+
+    def redeem_watch_ticket(
+        self, ticket: str, *, now: float | None = None
+    ) -> str | None:
+        """Spend a watch ticket and return the peer token it stood for.
+
+        Strictly single use: a match is deleted before it is returned, so a
+        replay of the same ticket (a second watcher, or anyone who read it out
+        of a transcript) gets nothing. Unknown and expired tickets are
+        indistinguishable to the caller, by design.
+
+        The lookup walks the (small, TTL-bounded) store comparing with
+        :func:`secrets.compare_digest` on UTF-8 bytes rather than hashing the
+        string into a dict: same constant-time discipline the hub's other
+        credentials use, and bytes because ``compare_digest`` raises on a
+        ``str`` holding anything outside ASCII.
+
+        Args:
+            ticket: The ticket presented by the caller.
+            now: Reference timestamp (defaults to :func:`time.time`);
+                injectable for deterministic tests.
+
+        Returns:
+            The peer token, or ``None`` when the ticket is unknown, already
+            spent, or past its TTL.
+        """
+        ref = time.time() if now is None else now
+        self._prune_watch_tickets(ref)
+        presented = ticket.encode("utf-8")
+        for candidate, (peer_token, _) in list(self._watch_tickets.items()):
+            if secrets.compare_digest(presented, candidate.encode("utf-8")):
+                del self._watch_tickets[candidate]
+                return peer_token
+        return None
+
     def acquire_poll_lease(self, client: Client, lease_id: str) -> PollLease | None:
         """Claim the single ``/receive`` consumer slot for ``lease_id``.
 
@@ -912,7 +1003,8 @@ class HubState:
         Each reaped peer is announced to the UI and parked in the revival
         graveyard (``revivable=True``) so it can be resurrected by any later
         authenticated call. The same sweep also forgets graveyard entries whose
-        :attr:`reaped_grace` window has lapsed — those tokens are dead for good.
+        :attr:`reaped_grace` window has lapsed (those tokens are dead for good),
+        and drops watch tickets past :data:`WATCH_TICKET_TTL`.
 
         Args:
             ttl: Maximum idle time, in seconds, before a client is reaped.
@@ -938,6 +1030,10 @@ class HubState:
             expired = self._reaped.pop(token, None)
             if expired is not None:
                 self._reaped_by_project.pop(expired.project, None)
+        # Piggyback the watch-ticket expiry on the sweep the hub already runs:
+        # a ticket nobody ever redeems would otherwise sit in memory until the
+        # next mint happened to prune it.
+        self._prune_watch_tickets(ref)
         return [c.project for c in stale]
 
     def ack(self, token: str, seq: int) -> bool:
