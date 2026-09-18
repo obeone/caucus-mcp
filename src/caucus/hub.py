@@ -22,6 +22,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import coloredlogs
 import uvicorn
@@ -76,6 +77,7 @@ from .supervisor import (
     LauncherRefused,
     validate_agent_cwd,
 )
+from .urlguard import validate_public_url
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -2811,7 +2813,113 @@ def _resolve_mcp_http(explicit: bool | None, host: str) -> bool:
     return host in _LOOPBACK_HOSTS
 
 
-def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[str]) -> None:
+def _entry_carries_port(entry: str) -> bool:
+    """Return whether an allowed-host entry already names a port.
+
+    ``Host`` header values spell an IPv6 literal in brackets (``[::1]:8765``),
+    so the bracket form decides on its own: a closing ``]`` at the end means no
+    port followed. Everything else is a name or an IPv4 literal, where a single
+    colon can only introduce the port.
+
+    Args:
+        entry: One ``--allowed-host`` value, already stripped.
+
+    Returns:
+        ``True`` when a port is present and the entry should be used verbatim.
+    """
+    if entry.startswith("["):
+        return not entry.endswith("]")
+    return ":" in entry
+
+
+def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
+    """Build the extra ``Host`` allowlist for the ``/mcp`` DNS-rebinding guard.
+
+    Mirrors the ``--allowed-origin`` / ``CAUCUS_ALLOWED_ORIGINS`` pair: repeated
+    CLI flags merged with a comma-separated environment variable. Without this,
+    the only non-loopback entry the guard ever learns is the bind address
+    itself, so a hub on ``0.0.0.0`` reached as ``hub.lan:8765`` is refused with
+    no way for the operator to allow it.
+
+    A bare host is expanded to the hub's own port, which is what an operator
+    naming a hostname means; an entry that already carries a port is kept
+    verbatim, so a reverse proxy on another port can be allowed too.
+
+    Args:
+        cli: The repeated ``--allowed-host`` values, or ``None``.
+        port: The port the hub listens on, used to complete bare hosts.
+
+    Returns:
+        The de-duplicated ``host:port`` entries, in the order first seen.
+    """
+    raw = list(cli or [])
+    raw.extend(os.environ.get("CAUCUS_ALLOWED_HOSTS", "").split(","))
+    hosts: list[str] = []
+    for entry in (e.strip() for e in raw):
+        if not entry:
+            continue
+        value = entry if _entry_carries_port(entry) else f"{entry}:{port}"
+        if value not in hosts:
+            hosts.append(value)
+    return hosts
+
+
+def _insecure_bind_message(host: str, *, operator: bool, agent: bool) -> str:
+    """Compose the refusal shown when a non-loopback bind has no credentials.
+
+    This message is the whole user experience of the refusal: somebody just had
+    their hub refuse to start, and everything they need to fix it — both doors,
+    both flags, both environment variables, the escape hatch, and the way back
+    to a loopback bind — has to be in this one block.
+
+    Args:
+        host: The non-loopback address that was requested.
+        operator: Whether an operator token is already configured.
+        agent: Whether an agent key is already configured.
+
+    Returns:
+        The multi-line refusal text, ready to hand to ``parser.error``.
+    """
+    mark = {True: "already set", False: "MISSING"}
+    return (
+        f"refusing to bind {host}: a hub on a non-loopback address is reachable\n"
+        "from other machines, and by default neither of its two doors is locked.\n"
+        "\n"
+        "  agent door     /register and /mcp - join the room, read everything\n"
+        "                 said in it\n"
+        f"                 --agent-key KEY  (env CAUCUS_AGENT_KEY): {mark[agent]}\n"
+        "  operator door  /ui - pause, stop, kick, read the whole transcript\n"
+        "                 --operator-token TOKEN  (env CAUCUS_OPERATOR_TOKEN):"
+        f" {mark[operator]}\n"
+        "\n"
+        "Both are required on a non-loopback bind. Generate and set them:\n"
+        "\n"
+        '  export CAUCUS_AGENT_KEY="$(openssl rand -hex 24)"\n'
+        '  export CAUCUS_OPERATOR_TOKEN="$(openssl rand -hex 24)"\n'
+        f"  caucus-hub --host {host}\n"
+        "\n"
+        "Then tell agents where to reach you, or the Host header they send is\n"
+        "rejected by the DNS-rebinding guard and the watcher command they get\n"
+        "points at 127.0.0.1:\n"
+        "\n"
+        "  --public-url URL    (env CAUCUS_PUBLIC_URL)\n"
+        "  --allowed-host HOST (env CAUCUS_ALLOWED_HOSTS, comma-separated)\n"
+        "\n"
+        "Not what you meant? --host 127.0.0.1 keeps the hub on this machine.\n"
+        "Meant it, on a network that already authenticates (a tunnel, a private\n"
+        "LAN)? --allow-insecure-bind starts anyway, with both doors open."
+    )
+
+
+def _mount_mcp_http(
+    *,
+    host: str,
+    port: int,
+    mcp_path: str,
+    extra_origins: set[str],
+    extra_hosts: list[str] | None = None,
+    public_url: str | None = None,
+) -> None:
     """Build the Streamable HTTP MCP server and attach its route to the hub app.
 
     Mirrors the ``disk_log`` pattern (amendment A4): sets the module global
@@ -2829,6 +2937,10 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
         port: The port the hub listens on.
         mcp_path: The path the endpoint serves at (e.g. ``/mcp``).
         extra_origins: Operator-approved extra browser origins (the CSWSH set).
+        extra_hosts: Operator-approved extra ``Host`` values from
+            :func:`_collect_allowed_hosts`, or ``None``.
+        public_url: The externally reachable base URL from ``--public-url``,
+            or ``None`` to advertise the bind address.
     """
     global _mcp_server
     from . import mcp_http
@@ -2837,19 +2949,32 @@ def _mount_mcp_http(*, host: str, port: int, mcp_path: str, extra_origins: set[s
     # exactly this route.
     server_config.mcp_path = mcp_path
     browse_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    self_url = f"http://{browse_host}:{port}"
-    allowed_hosts: list[str] = []
+    # An operator-declared public URL wins: on a wildcard bind the rewritten
+    # 127.0.0.1 is only right for an agent on this machine, and handing a remote
+    # one that address is how watch_command produced an unrunnable command.
+    self_url = public_url or f"http://{browse_host}:{port}"
+    allowed_hosts: list[str] = list(extra_hosts or [])
     allowed_origins: list[str] = list(extra_origins)
     # A bind-all address is not a connectable origin; only add a concrete host.
     if host not in ("0.0.0.0", "::"):
         allowed_hosts.append(f"{host}:{port}")
         allowed_origins.append(f"http://{host}:{port}")
+    if public_url is not None:
+        # The Host header a client dialling the public URL sends is its netloc;
+        # allowing it here spares the operator from repeating it as an
+        # --allowed-host on every deployment that sets --public-url.
+        netloc = urlparse(public_url).netloc
+        if netloc and netloc not in allowed_hosts:
+            allowed_hosts.append(netloc)
     _mcp_server = mcp_http.build_mcp_server(
         app,
         self_url=self_url,
         mcp_path=mcp_path,
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
+        # Loopback-only is the one deployment where a token file on the hub's
+        # filesystem is also on the agent's; anything else gets the env form.
+        remote=public_url is not None or host not in _LOOPBACK_HOSTS,
     )
     # streamable_http_app() lazily creates the session manager (run by lifespan)
     # and registers the endpoint route; attach that route to the hub app.
@@ -2940,6 +3065,39 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help=(
+            "extra Host header value the /mcp DNS-rebinding guard accepts "
+            "(repeatable). Needed to reach a hub bound to 0.0.0.0 under a "
+            "name, e.g. --allowed-host hub.lan. A bare host is allowed on this "
+            "hub's port; pass host:port for anything else. Loopback is always "
+            "allowed. Env: CAUCUS_ALLOWED_HOSTS (comma-separated)"
+        ),
+    )
+    parser.add_argument(
+        "--public-url",
+        default=os.environ.get("CAUCUS_PUBLIC_URL"),
+        metavar="URL",
+        help=(
+            "base URL other machines reach this hub at, e.g. "
+            "https://hub.example.net. Advertised to agents instead of the bind "
+            "address, so the caucus-watch command they are handed is runnable "
+            "off-box. Scheme plus host, no path. Env: CAUCUS_PUBLIC_URL"
+        ),
+    )
+    parser.add_argument(
+        "--allow-insecure-bind",
+        action="store_true",
+        help=(
+            "start on a non-loopback address without --operator-token and "
+            "--agent-key. Both doors stay open to anything that can reach the "
+            "port; only for a network that already authenticates"
+        ),
+    )
+    parser.add_argument(
         "--mcp-http",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -2996,6 +3154,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Refuse before anything is configured or bound. A non-loopback bind puts
+    # both doors on the network, and neither is locked by default: the agent
+    # door lets any reachable client join and read the room, the operator door
+    # grades every caller as operator. Demand both credentials, once, here --
+    # this is the same gate caucus-setup-service applies to the installed unit.
+    if (
+        args.host not in _LOOPBACK_HOSTS
+        and not args.allow_insecure_bind
+        and not (args.operator_token and args.agent_key)
+    ):
+        parser.error(
+            _insecure_bind_message(
+                args.host,
+                operator=bool(args.operator_token),
+                agent=bool(args.agent_key),
+            )
+        )
+
+    public_url: str | None = args.public_url or None
+    if public_url is not None:
+        try:
+            public_url = validate_public_url(public_url)
+        except ValueError as exc:
+            parser.error(str(exc))
+
     global disk_log, launcher_config
     auth_config.operator = args.operator_token
     auth_config.observer = args.observer_token
@@ -3040,6 +3223,9 @@ def main() -> None:
     extra_origins: set[str] = set(args.allowed_origin or [])
     env_origins = os.environ.get("CAUCUS_ALLOWED_ORIGINS", "")
     extra_origins.update(o.strip() for o in env_origins.split(",") if o.strip())
+    # Same shape for the Host allowlist, which the /mcp DNS-rebinding guard
+    # reads. Bare entries are completed with this hub's own port.
+    extra_hosts = _collect_allowed_hosts(args.allowed_host, args.port)
     server_config.host = args.host
     server_config.port = args.port
     server_config.allowed_origins = frozenset(extra_origins)
@@ -3056,10 +3242,12 @@ def main() -> None:
             port=args.port,
             mcp_path=args.mcp_path,
             extra_origins=extra_origins,
+            extra_hosts=extra_hosts,
+            public_url=public_url,
         )
     # The agent door (/register, and /mcp when mounted) is open to anything that
-    # can reach the port unless a shared key is set. Loud on a non-loopback bind,
-    # where "reaching the port" no longer implies "is on this machine".
+    # can reach the port unless a shared key is set. Only reachable now via
+    # --allow-insecure-bind, which is exactly when it deserves saying again.
     if args.host not in _LOOPBACK_HOSTS and not args.agent_key:
         logger.warning(
             "the hub is bound to a non-loopback address (%s) without "
@@ -3069,6 +3257,8 @@ def main() -> None:
         )
     coloredlogs.install(level=args.log_level, fmt="%(asctime)s %(name)s %(levelname)s %(message)s")
     logger.info("starting hub on http://%s:%d", args.host, args.port)
+    if public_url is not None:
+        logger.info("advertising %s to agents (--public-url)", public_url)
     if launcher_config.enabled:
         # Loud on purpose: this hub can now start processes on this machine.
         logger.warning(
