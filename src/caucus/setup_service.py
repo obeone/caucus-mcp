@@ -44,6 +44,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from .urlguard import is_loopback_host, validate_public_url
 
@@ -377,6 +378,12 @@ def check_bind(
     operator finds out while installing, not from a unit that loads and then
     exits.
 
+    A loopback bind behind a non-loopback ``--public-url`` is the same exposure
+    reached a different way -- a tunnel or a reverse proxy carries the world to
+    a socket that never left this machine -- and ``caucus-hub`` refuses it at
+    startup for that reason. Refusing it here too is what keeps the installer
+    from writing a unit that cannot start.
+
     Args:
         host: Address the hub would bind to.
         operator_token: Token that would gate operator access, if any.
@@ -385,14 +392,32 @@ def check_bind(
         public_url: Base URL agents would be told to reach the hub at, if any.
 
     Raises:
-        SetupError: For a non-loopback host missing a credential, or a wildcard
-            host with no public URL.
+        SetupError: For a non-loopback host missing a credential, a wildcard
+            host with no public URL, or a loopback host advertised under a
+            non-loopback public URL without both credentials.
     """
-    if is_loopback_host(host):
+    advertised_host = urlparse(public_url).hostname if public_url else None
+    advertised_remote = advertised_host is not None and not is_loopback_host(
+        advertised_host
+    )
+    if is_loopback_host(host) and not advertised_remote:
         return
     if operator_token and agent_key and (public_url or host not in WILDCARD_HOSTS):
         return
     wildcard = host in WILDCARD_HOSTS
+    if is_loopback_host(host):
+        raise SetupError(
+            f"refusing to advertise {public_url} without --operator-token and\n"
+            "--agent-key. The bind stays on loopback, but a public URL says\n"
+            "agents on other machines dial this hub, and whatever carries them\n"
+            "in reaches a dashboard that grants full operator rights to any\n"
+            "browser and a /register any client can walk through.\n"
+            "Drop --public-url, or run:\n"
+            f"  caucus-setup-service --host {host} \\\n"
+            '      --operator-token "$(openssl rand -hex 24)" \\\n'
+            '      --agent-key "$(openssl rand -hex 24)" \\\n'
+            f"      --public-url {public_url}"
+        )
     raise SetupError(
         f"refusing to bind {host} without --operator-token and --agent-key"
         + (" and --public-url.\n" if wildcard else ".\n")
