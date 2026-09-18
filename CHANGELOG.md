@@ -32,10 +32,17 @@ and rename that heading to the version when you cut the release.
   could not run. Off a loopback-only deployment, `watch_command` also stops
   pointing at a token file on the hub's filesystem (meaningless to an agent
   elsewhere) and returns the `CAUCUS_TOKEN=... caucus-watch --hub ...` form
-  instead. Loopback keeps the token-file behaviour unchanged.
-- **`caucus-setup-service --agent-key`**, so the installed service unit carries
-  the shared agent key (launchd plist environment, systemd env file) the same
-  way it already carries the dashboard tokens.
+  instead. Loopback keeps the token-file behaviour unchanged. The hub also
+  warns at startup when `--public-url` is plain `http` to a non-loopback host,
+  since peer tokens and message content then cross the network in clear.
+- **`caucus-setup-service` now installs the remote-hub settings too**, so the
+  installed service starts up already configured for a remote deployment
+  instead of needing flags added by hand afterwards. `--agent-key` carries the
+  shared agent key into the service unit (launchd plist environment, systemd
+  env file) the same way it already carried the dashboard tokens, and
+  `--public-url`, repeatable `--allowed-host` and `--mcp-http` join it there:
+  all three travel into the same plist and env file, and show up in the
+  installer's plan before anything is written.
 
 - **`caucus-hub --agent-key` (env `CAUCUS_AGENT_KEY`): a shared key guarding the
   agent door, so a hub reachable from other machines is not an open room.**
@@ -55,7 +62,10 @@ and rename that heading to the version when you cut the release.
   plugin's `.claude-plugin/mcp.json` now ships the matching `Authorization`
   header, empty when the variable is unset, so the same config serves a local
   hub and a keyed remote one. A hub binding to a non-loopback address without a
-  key says so loudly at startup.
+  key says so loudly at startup. An empty `--agent-key`, `--operator-token` or
+  `--observer-token`, or a blank environment variable behind any of them, now
+  means "not configured" rather than locking out every caller. The clients
+  already treated a blank value that way; the hub did not.
 
 ### Changed
 
@@ -66,15 +76,56 @@ and rename that heading to the version when you cut the release.
   to join and read the room. The refusal names both flags, both environment
   variables, the two flags needed to make the hub reachable afterwards, and the
   way back to loopback. Anyone binding non-loopback today must either set the
-  two credentials or pass `--allow-insecure-bind`. `caucus-setup-service`
-  applied a weaker version of the same gate, asking only for the operator token
-  which never guarded `/register` or `/mcp`; it now asks for the agent key too.
+  two credentials or pass `--allow-insecure-bind`. On top of that, a wildcard
+  bind (`--host 0.0.0.0` or `--host ::`) also requires `--public-url`, since a
+  hub with no other address to give out used to advertise `127.0.0.1` to
+  remote agents, which is useless to them; `--allow-insecure-bind` bypasses
+  this too, and a concrete address such as `--host 192.168.1.10` is
+  unaffected. What counts as loopback for this gate is now one definition
+  shared by the hub, `caucus-setup-service`, the autostart probe and the
+  `/mcp` URL guard: the whole of `127.0.0.0/8` plus `::1` and `localhost`.
+  `--host 127.0.0.2` and `--host ::1` now skip the non-loopback bind gate, as
+  they always should have. Before, three call sites disagreed: two matched
+  against hardcoded string sets that missed both forms, while only the third
+  used a real `ipaddress` check. `caucus-setup-service` applied a weaker
+  version of the same gate, asking only for the operator token which never
+  guarded `/register` or `/mcp`; it now asks for the agent key too.
 - **`web/package.json` declares `browserslist` and `baseline-browser-mapping`
   as `overrides` instead of `devDependencies`.** Neither package is imported
   by the dashboard; both only arrive transitively through the PostCSS,
   autoprefixer, and Vite chain, which is exactly what `overrides` is for and
   what the existing `undici` entry already does. Same versions resolve
   either way, so this changes nothing at runtime or in CI.
+
+### Fixed
+
+- **The `caucus-watch` command handed to a remote agent over `/mcp` now
+  carries `CAUCUS_ALLOW_REMOTE_HUB=1` when the advertised URL needs it.** It
+  previously exited 2 before its first poll, refusing to run against a
+  non-loopback hub URL, while the agent that received it believed a watcher
+  was already running.
+- **`--allowed-host ::1` and `--allowed-host 2001:db8::1` are bracketed into
+  the form a `Host` header actually carries.** Bare IPv6 literals matched
+  nothing before, since a `Host` header always wraps them in `[...]`.
+- **The `/mcp` host allowlist no longer repeats the bind address when it is
+  also named with `--allowed-host`.**
+
+### Security
+
+- **`/peers`, `/channels` and `/forms` now require the shared agent key when
+  one is configured** (an operator or observer token is accepted too). On a
+  keyed non-loopback hub, these endpoints previously handed anyone who could
+  reach the port the peer roster, every peer's status string, every private
+  channel's name, topic and members, and the text of every pending operator
+  form.
+- **A non-ASCII `Authorization: Bearer` value no longer crashes the hub with a
+  500.** It raised `TypeError` inside `secrets.compare_digest`, and on
+  `/register` the credential gate runs before the rate-limit bucket, so
+  nothing throttled a caller repeating it. All credential comparisons now
+  compare bytes.
+- **An unauthenticated `OPTIONS /mcp` no longer skips the agent-key gate.** It
+  previously reached the MCP transport, which built a session transport and a
+  task group per request before answering with a plain 405.
 
 ## [4.2.0](https://github.com/obeone/caucus-mcp/compare/v4.1.0...v4.2.0) (2026-09-18)
 
