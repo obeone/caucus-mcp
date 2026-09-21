@@ -401,3 +401,80 @@ describe("wsStore — getStoredToken()", () => {
   });
 });
 
+
+describe("wsStore — round-mode floor events", () => {
+  beforeEach(resetStore);
+
+  it("a floor event carrying mode/ring/deadline lands in the store intact", () => {
+    handle({
+      type: "floor",
+      floors: {
+        all: {
+          scope: "all",
+          holder: "bravo",
+          reason: "design review",
+          hands: [],
+          since: 1758000000,
+          mode: "round",
+          round: {
+            ring: ["bravo", "charlie", "alpha"],
+            deadline: 1758000300,
+            remaining: 287.4,
+            turn_seconds: 300,
+            extensions: 1,
+            total_extensions: 4,
+            silent_turns: 0,
+            started_by: "alpha",
+            started_at: 1758000000,
+            paused: false,
+            held: { charlie: 3, alpha: 3 },
+          },
+        },
+      },
+    });
+
+    const entry = useDashStore.getState().floors.all;
+    expect(entry.mode).toBe("round");
+    expect(entry.round?.ring).toEqual(["bravo", "charlie", "alpha"]);
+    expect(entry.round?.deadline).toBe(1758000300);
+    expect(entry.round?.extensions).toBe(1);
+    expect(entry.round?.paused).toBe(false);
+    expect(entry.round?.held).toEqual({ charlie: 3, alpha: 3 });
+  });
+
+  it("an exclusive floor entry keeps working with no round payload", () => {
+    handle({
+      type: "floor",
+      floors: {
+        "#design": {
+          scope: "#design",
+          holder: "alpha",
+          reason: null,
+          hands: ["bravo"],
+          since: 1758000000,
+        },
+      },
+    });
+
+    const entry = useDashStore.getState().floors["#design"];
+    expect(entry.holder).toBe("alpha");
+    expect(entry.mode).toBeUndefined();
+    expect(entry.round).toBeUndefined();
+  });
+
+  it("sendFloorAdvance emits {floor:{action:'advance',scope}}", () => {
+    const send = vi.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useDashStore.setState({ _send: send } as any);
+    useDashStore.getState().sendFloorAdvance("all");
+    expect(send).toHaveBeenCalledWith({ floor: { action: "advance", scope: "all" } });
+  });
+
+  it("sendFloorClear is what ends a round: {floor:{action:'clear',scope}}", () => {
+    const send = vi.fn();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useDashStore.setState({ _send: send } as any);
+    useDashStore.getState().sendFloorClear("#design");
+    expect(send).toHaveBeenCalledWith({ floor: { action: "clear", scope: "#design" } });
+  });
+});

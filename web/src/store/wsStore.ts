@@ -432,6 +432,11 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   sendFloorClear: (scope) =>
     get()._send({ floor: { action: "clear", scope } }),
 
+  // Wire format: {"floor":{"action":"advance","scope":"<scope>"}} — skips the
+  // current turn and hands the stick to the next peer in the ring.
+  sendFloorAdvance: (scope) =>
+    get()._send({ floor: { action: "advance", scope } }),
+
   // Wire format: {"say":"<text>","to":"<scope>"} — hub dispatches on the "say"
   // key (legacy console format, hub.py line ~1062); a {to,content} payload is
   // silently ignored.

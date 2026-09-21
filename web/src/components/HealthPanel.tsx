@@ -23,6 +23,7 @@ import {
   Play,
   Pause,
   Clock,
+  Hourglass,
   Square,
   RotateCcw,
 } from "lucide-react";
@@ -151,7 +152,16 @@ function PeerCard({
             listening
           </span>
         )}
-        {peer.quiet && (
+        {peer.waiting_turn && (
+          <span
+            className="flex items-center gap-1 text-dim"
+            title="parked in a round: it holds no turn, so it polls in silence by design. This is healthy, not stuck."
+          >
+            <Hourglass size={10} />
+            waiting its turn
+          </span>
+        )}
+        {peer.quiet && !peer.waiting_turn && (
           <span
             className="flex items-center gap-1 text-amber"
             title="no poll and no status update for a while — may be mid-long-turn or stuck; check its status or ping it"
@@ -160,7 +170,7 @@ function PeerCard({
             quiet · {peer.last_seen_age !== null ? `${peer.last_seen_age.toFixed(1)}s` : "?"}
           </span>
         )}
-        {!peer.quiet && peer.last_seen_age !== null && (
+        {!peer.quiet && !peer.waiting_turn && peer.last_seen_age !== null && (
           <span title="Last seen">
             seen {peer.last_seen_age.toFixed(1)}s ago
           </span>
@@ -495,7 +505,9 @@ export default function HealthPanel({ compact = false }: HealthPanelProps) {
 
   const live = peers.filter((p) => p.state === "live");
   const reaped = peers.filter((p) => p.state === "reaped");
-  const quiet = peers.filter((p) => p.quiet);
+  // A peer parked in a round is quiet by design, so it must not inflate the
+  // quiet tally the operator reads as a warning.
+  const quiet = peers.filter((p) => p.quiet && !p.waiting_turn);
 
   // ── Compact mode (left rail) ─────────────────────────────────────────────
   if (compact) {
