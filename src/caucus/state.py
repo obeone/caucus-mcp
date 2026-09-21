@@ -410,6 +410,16 @@ that a holder *can* hold the room indefinitely, so the count is surfaced to the
 operator rather than capped — see :data:`ROUND_EXTENSION_WARN`.
 """
 
+ROUND_MIN_SECONDS = 15.0
+"""Shortest per-turn budget an operator or a caller may set.
+
+Below this a turn cannot survive one long-poll cycle plus an agent's own
+latency, so the stick would move before the holder had even read its backlog.
+"""
+
+ROUND_MAX_SECONDS = 3600.0
+"""Longest per-turn budget. Bounds the damage a malformed value can do."""
+
 ROUND_EXTENSION_WARN = 3
 """Extensions by a single holder after which the room is told once.
 
@@ -865,6 +875,10 @@ class HubState:
         self._by_token[client.token] = client
         self._announce_system(f"{project} joined")
         self._push_ui({"type": "peers", "peers": self.peers_info()})
+        # Walking into a room that is mid-round earns a seat at the tail of the
+        # broadcast ring. Channel rings are joined by :meth:`subscribe`, since
+        # membership is what decides them.
+        self._join_round(BROADCAST, project)
         return Registration(RegisterOutcome.FRESH, client)
 
     def kick(self, project: str) -> bool:
@@ -1165,6 +1179,13 @@ class HubState:
             self._safe_put(client, msg)
             client.last_pending = msg
 
+        # A peer reaped mid-round was dropped from the ring by
+        # _relinquish_floors; coming back earns a fresh seat at the tail rather
+        # than silently sitting out every remaining lap.
+        self._join_round(BROADCAST, client.project)
+        for channel in client.channels:
+            self._join_round(channel, client.project)
+
         # Build the reconnect notice for the operator console.
         if downtime is not None:
             mins, secs = divmod(int(downtime), 60)
@@ -1225,7 +1246,11 @@ class HubState:
         """
         ref = time.time() if now is None else now
         cutoff = ref - ttl
-        stale = [c for c in self._clients.values() if c.last_seen < cutoff]
+        stale = [
+            c
+            for c in self._clients.values()
+            if c.last_seen < cutoff and not self._holds_live_turn(c.project, ref)
+        ]
         for client in stale:
             self._drop(client, "timed out", revivable=True)
         # Forget reaped identities whose grace window has lapsed; their tokens
@@ -1442,11 +1467,19 @@ class HubState:
         # status exemption is earned across turns; the threshold (default 180s,
         # below the 300s reaper) is what keeps a single long turn from tripping
         # it. ``status_stale`` is a looser, cosmetic dim off the same threshold.
+        #
+        # A peer parked in a round is exempt. Retention means it polls in total
+        # silence, by design, for as long as the table takes to come round to
+        # it — so it would cross the threshold and read to the operator as a
+        # dead agent precisely when it is behaving correctly. ``waiting_turn``
+        # says what is actually going on instead.
         status_age = None if client.status_ts is None else ref - client.status_ts
         last_seen_age = ref - client.last_seen
+        waiting_turn = self._parked_in_round(name)
         quiet = (
             probe["state"] == "live"
             and not client.paused
+            and not waiting_turn
             and (status_age is None or status_age > self._quiet_after)
             and last_seen_age > self._quiet_after
         )
@@ -1462,6 +1495,7 @@ class HubState:
             "status_age": probe["status_age"],
             "last_seen_age": probe["last_seen_age"],
             "quiet": quiet,
+            "waiting_turn": waiting_turn,
             "status_stale": status_stale,
             "uptime": round(ref - client.first_seen, 1),
             "msg_count": client.msg_count,
@@ -1513,6 +1547,14 @@ class HubState:
         if not client.paused:
             client.paused = True
             self._announce_system(f"⏸ {name} paused by operator")
+            # A paused holder can never read the backlog its turn flushed, so
+            # the turn is dead on arrival and the whole ring would wait out its
+            # budget for nothing. Move the stick on; the peer keeps its place
+            # and is skipped until the operator resumes it.
+            for scope in list(self._floors):
+                floor = self._round_floor(scope)
+                if floor is not None and floor.holder == name:
+                    self._advance_floor(floor, silent=True)
             self._push_ui({"type": "peers", "peers": self.peers_info()})
         return True
 
@@ -1872,6 +1914,10 @@ class HubState:
             client.channels.add(channel)
             self._announce_system(f"{client.project} joined {channel}")
             self._push_ui({"type": "channels", "channels": self.channels()})
+            # Arriving in a channel that is mid-round earns a seat at the tail,
+            # so the newcomer speaks after everyone already in this lap rather
+            # than not at all.
+            self._join_round(channel, client.project)
         return True
 
     def unsubscribe(self, token: str, channel: str) -> bool:
@@ -2074,6 +2120,12 @@ class HubState:
         if is_channel(scope) and scope not in client.channels:
             return {"ok": False, "error": "not_a_member", "scope": scope}
         floor = self._floors.get(scope)
+        if floor is not None and floor.round is not None:
+            # A scope runs one mode or the other. Seizing a lane that is already
+            # taking turns fairly would be a way to jump the queue, so it is
+            # refused outright rather than queued: there is no hand queue to
+            # queue into, and the caller already has a place in the ring.
+            return self._round_in_progress(floor, client.project)
         if floor is not None and floor.holder != client.project:
             position = self._add_hand(floor, client.project)
             self._push_floor_ui()
@@ -2128,6 +2180,11 @@ class HubState:
         floor = self._floors.get(scope)
         if floor is None:
             return {"ok": False, "error": "no_floor", "scope": scope}
+        if floor.round is not None:
+            # Silently accepting a hand here would strand the caller: a round
+            # has no hand queue, so nothing would ever read it. Tell it where it
+            # already stands in the ring instead.
+            return self._round_in_progress(floor, client.project)
         if floor.holder == client.project:
             return {"ok": True, "scope": scope, "position": 0}
         position = self._add_hand(floor, client.project)
@@ -2142,6 +2199,8 @@ class HubState:
         floor = self._floors.get(scope)
         if floor is None:
             return {"ok": False, "error": "no_floor", "scope": scope}
+        if floor.round is not None:
+            return self._round_in_progress(floor, client.project)
         if client.project in floor.hands:
             floor.hands.remove(client.project)
             self._push_floor_ui()
@@ -2158,8 +2217,18 @@ class HubState:
             token: The caller's access token (must be the holder).
             scope: The floor scope being passed.
 
+        In a **rotating round** this is the "nothing to add" verb — the caller
+        gives up its turn, the stick moves to the next ring member, and the turn
+        counts toward the silent lap that ends a round nobody is feeding. It is
+        what ``say(turn="pass")`` is wired to.
+
+        Args:
+            token: The caller's access token (must be the holder).
+            scope: The floor scope being passed.
+
         Returns:
-            ``{"ok": True, "scope", "passed_to": <name>}`` when handed on,
+            ``{"ok": True, "scope", "passed_to": <name>}`` when handed on (plus
+            ``ring`` and ``deadline_in`` in a round),
             ``{"ok": True, "scope", "released": True}`` when put away, or
             ``{"ok": False, "error": ...}`` — ``unknown_token``, ``no_floor``, or
             ``not_holder`` (with ``held_by``).
@@ -2168,10 +2237,28 @@ class HubState:
         if result is not None:
             return result
         floor = self._floors[scope]
+        was_round = floor.round is not None
         new_holder = self._advance_floor(floor)
         if new_holder is None:
-            return {"ok": True, "scope": scope, "released": True}
-        return {"ok": True, "scope": scope, "passed_to": new_holder}
+            released: dict[str, object] = {
+                "ok": True,
+                "scope": scope,
+                "released": True,
+            }
+            if was_round:
+                released["round_over"] = True
+            return released
+        passed: dict[str, object] = {
+            "ok": True,
+            "scope": scope,
+            "passed_to": new_holder,
+        }
+        rnd = floor.round
+        if rnd is not None:
+            passed["ring"] = list(rnd.ring)
+            passed["deadline"] = rnd.deadline
+            passed["deadline_in"] = int(rnd.turn_seconds)
+        return passed
 
     def drop_floor(self, token: str, scope: str) -> dict[str, object]:
         """Put the stick away outright (crisis over), even with hands still up.
@@ -2181,10 +2268,43 @@ class HubState:
         queue. Use it when the crisis has passed; use ``pass_floor`` to keep the
         floor alive for the next speaker.
 
+        In a **rotating round** this is how the round ends early: the ring is
+        torn down, every withheld backlog is released, and the lane reopens.
+        Allowed to the current holder or to whoever opened the round, since the
+        opener should not have to wait for its own turn to come round again to
+        stop something it started.
+
         Returns:
             ``{"ok": True, "scope", "released": True}``, or ``{"ok": False,
             "error": ...}`` — ``unknown_token``, ``no_floor``, or ``not_holder``.
         """
+        floor = self._floors.get(scope)
+        rnd = floor.round if floor is not None else None
+        if rnd is not None:
+            client = self.client_for(token)
+            if client is None:
+                return {"ok": False, "error": "unknown_token"}
+            assert floor is not None
+            if client.project not in (floor.holder, rnd.started_by):
+                return {
+                    "ok": False,
+                    "error": "not_holder",
+                    "scope": scope,
+                    "held_by": floor.holder,
+                    "hint": (
+                        f"only {floor.holder} (holding) or {rnd.started_by} "
+                        "(who opened the round) can end it"
+                    ),
+                }
+            self._release_floor(
+                floor, by=client.project, note="round ended"
+            )
+            return {
+                "ok": True,
+                "scope": scope,
+                "released": True,
+                "round_over": True,
+            }
         result = self._holder_gate(token, scope)
         if result is not None:
             return result
@@ -2221,6 +2341,490 @@ class HubState:
                 "held_by": floor.holder,
             }
         return None
+
+    # --- talking stick: rotating rounds ----------------------------------
+
+    def _round_in_progress(self, floor: Floor, project: str) -> dict[str, object]:
+        """Build the refusal handed to an exclusive-mode verb during a round.
+
+        Carries where the caller already stands, so the answer to "can I have
+        the floor" is "you already have a place in the queue, here it is"
+        rather than a bare error the agent will retry.
+        """
+        rnd = floor.round
+        position = (
+            rnd.ring.index(project) + 1
+            if rnd is not None and project in rnd.ring
+            else None
+        )
+        return {
+            "ok": False,
+            "error": "round_in_progress",
+            "scope": floor.scope,
+            "held_by": floor.holder,
+            "deadline": rnd.deadline if rnd is not None else None,
+            "position": position,
+            "hint": (
+                f"a round-table is running on {floor.scope}; {floor.holder} has "
+                "the stick. Do not take or raise — the hub hands the stick "
+                "round on its own and will bring you everything said meanwhile."
+            ),
+        }
+
+    def _holds_live_turn(self, project: str, now: float) -> bool:
+        """Whether ``project`` is inside an unexpired turn of some round.
+
+        The reaper consults this so a holder that parked to compose is not
+        dropped mid-turn. Without it the default turn budget (300s) matches the
+        default ``client_ttl`` exactly, and a peer that used its whole turn to
+        think would be reaped and re-enter the round as a *departure* — losing
+        its place and reporting to the operator as "left" rather than "thinking".
+
+        Safely bounded: a peer that is genuinely gone cannot extend, so its
+        deadline lapses, :meth:`sweep_rounds` moves the stick on, and the very
+        next reap sweep collects it normally.
+        """
+        for floor in self._floors.values():
+            rnd = floor.round
+            if rnd is not None and floor.holder == project and now < rnd.deadline:
+                return True
+        return False
+
+    def _parked_in_round(self, project: str) -> bool:
+        """Whether ``project`` is waiting its turn in any round.
+
+        A parked peer polls in silence by design, so it would otherwise cross
+        the ``quiet`` liveness threshold long before its turn comes round and
+        read to the operator as a peer that has died. This lets the roster say
+        "waiting its turn" instead.
+        """
+        for floor in self._floors.values():
+            rnd = floor.round
+            if (
+                rnd is not None
+                and floor.holder != project
+                and project in rnd.ring
+            ):
+                return True
+        return False
+
+    def _ring_for(self, scope: str, *, first: str) -> list[str]:
+        """Build a round's rotation order for ``scope``, ``first`` at the head.
+
+        Order is room-join order: ``_clients`` is insertion-ordered by
+        registration, so it is free and stable. Channel membership carries no
+        timestamp of its own (:attr:`Client.channels` is a set), so a channel
+        round is room-join order filtered by membership — close enough to
+        "who got here first", and the alternative would mean widening every
+        membership site to record a time nobody else needs.
+
+        Paused peers are included: a pause is expected to be temporary, and
+        dropping them would silently shrink the table. They are skipped when the
+        stick comes round (see :meth:`_can_hold`) and rejoin the rotation on
+        resume without having lost their place.
+        """
+        ring = [
+            name
+            for name, client in self._clients.items()
+            if name != first and (scope == BROADCAST or scope in client.channels)
+        ]
+        return [first, *ring][:MAX_ROUND_RING]
+
+    def _join_round(self, scope: str, project: str) -> None:
+        """Append ``project`` to a live round on ``scope``, if there is one.
+
+        Called when a peer registers, is revived, or subscribes to a channel, so
+        somebody arriving mid-round still gets a turn. The tail is the right
+        place: it speaks after everyone already in this lap, and it raises the
+        eligible count, so the silent-lap test cannot end the round on a peer
+        that has not had its first turn.
+        """
+        floor = self._round_floor(scope)
+        if floor is None:
+            return
+        rnd = floor.round
+        assert rnd is not None
+        if project in rnd.ring or len(rnd.ring) >= MAX_ROUND_RING:
+            return
+        rnd.ring.append(project)
+        self._push_floor_ui()
+
+    def start_round(
+        self,
+        token: str,
+        scope: str,
+        reason: str,
+        *,
+        turn_seconds: float | None = None,
+    ) -> dict[str, object]:
+        """Open a rotating round on ``scope``; the caller speaks first.
+
+        Announces the round to the whole scope — one of only two moments a round
+        wakes everybody, the other being its end — because every peer needs to
+        learn *now* that the lane has gone quiet on purpose.
+
+        Args:
+            token: The caller's access token. It takes the first turn.
+            scope: ``"all"`` or a ``#``-prefixed channel the caller has joined.
+            reason: What the round is about; shown in the opening notice.
+            turn_seconds: Per-turn budget, or ``None`` for the hub's default.
+
+        Returns:
+            ``{"ok": True, "scope", "holder", "reason", "ring", "deadline",
+            "turn_seconds"}``, or ``{"ok": False, "error": ...}`` —
+            ``unknown_token``, ``bad_scope``, ``not_a_member``, ``floor_held``
+            (an exclusive stick is up), ``round_in_progress``, or
+            ``not_enough_peers``.
+        """
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        if scope != BROADCAST and not is_channel(scope):
+            return {"ok": False, "error": "bad_scope", "scope": scope}
+        if is_channel(scope) and scope not in client.channels:
+            return {"ok": False, "error": "not_a_member", "scope": scope}
+        existing = self._floors.get(scope)
+        if existing is not None:
+            if existing.round is not None:
+                return self._round_in_progress(existing, client.project)
+            return {
+                "ok": False,
+                "error": "floor_held",
+                "scope": scope,
+                "held_by": existing.holder,
+                "reason": existing.reason or None,
+                "hint": (
+                    f"{existing.holder} holds an exclusive stick on {scope}; a "
+                    "round cannot open until it is put away"
+                ),
+            }
+        ring = self._ring_for(scope, first=client.project)
+        if len(ring) < 2:
+            # A ring of one ends on its own first lap, which reads as the hub
+            # ignoring the request. Refuse it plainly instead.
+            return {
+                "ok": False,
+                "error": "not_enough_peers",
+                "scope": scope,
+                "hint": "a round needs at least two peers in the scope",
+            }
+        budget = (
+            turn_seconds
+            if turn_seconds is not None and math.isfinite(turn_seconds)
+            and turn_seconds > 0.0
+            else self.round_turn_seconds
+        )
+        cleaned = reason.strip()
+        now = time.time()
+        rnd = Round(
+            ring=ring,
+            deadline=now + budget,
+            turn_seconds=budget,
+            started_by=client.project,
+            started_at=now,
+            granted_seen=client.last_seen,
+        )
+        floor = Floor(
+            scope=scope, holder=client.project, reason=cleaned, round=rnd
+        )
+        self._floors[scope] = floor
+        label = self._scope_label(scope)
+        detail = f" — {cleaned}" if cleaned else ""
+        order = " → ".join(ring)
+        self._announce_floor(
+            scope,
+            f"🔄 {client.project} opened a round-table for {label}{detail}. "
+            f"Order: {order}. Each peer gets {int(budget)}s. Until your turn "
+            f"comes the hub HOLDS {label}'s messages for you and hands you the "
+            "whole backlog at once — a quiet lane now means a round, not an "
+            "empty room. Do not raise a hand and do not retry a refused say().",
+        )
+        self._push_floor_ui()
+        return {
+            "ok": True,
+            "scope": scope,
+            "holder": client.project,
+            "reason": cleaned or None,
+            "ring": list(ring),
+            "deadline": rnd.deadline,
+            "turn_seconds": budget,
+        }
+
+    def start_round_as_operator(
+        self, scope: str, reason: str, *, turn_seconds: float | None = None
+    ) -> dict[str, object]:
+        """Open a round from the console; the operator is not in the ring.
+
+        The operator speaks regardless of any stick and never routes through
+        ``/send``, so putting them in the rotation would only add a seat that
+        blocks the table whenever they are away from the keyboard. The first
+        turn goes to the first peer in join order instead.
+        """
+        if scope != BROADCAST and not is_channel(scope):
+            return {"ok": False, "error": "bad_scope", "scope": scope}
+        existing = self._floors.get(scope)
+        if existing is not None:
+            return {
+                "ok": False,
+                "error": (
+                    "round_in_progress"
+                    if existing.round is not None
+                    else "floor_held"
+                ),
+                "scope": scope,
+                "held_by": existing.holder,
+            }
+        members = [
+            name
+            for name, client in self._clients.items()
+            if scope == BROADCAST or scope in client.channels
+        ]
+        if len(members) < 2:
+            return {
+                "ok": False,
+                "error": "not_enough_peers",
+                "scope": scope,
+                "hint": "a round needs at least two peers in the scope",
+            }
+        first = members[0]
+        token = self._clients[first].token
+        result = self.start_round(token, scope, reason, turn_seconds=turn_seconds)
+        floor = self._floors.get(scope)
+        if floor is not None and floor.round is not None:
+            floor.round.started_by = "operator"
+        return result
+
+    def extend_turn(self, token: str, scope: str) -> dict[str, object]:
+        """Push the current holder's deadline out; tell nobody but the holder.
+
+        This is ``say(turn="extend")`` — "I am still thinking". It routes
+        **nothing**: only the caller learns (in this return value) and the
+        operator console (through the ``floor`` event). That is not a filter
+        someone could regress, it is the shape of the method — it never touches
+        :meth:`route`.
+
+        Extensions are unlimited on purpose: an agent that genuinely needs
+        longer should not have to choose between a half-formed answer and losing
+        its turn. The room is told once, and only once, when a single holder
+        crosses :data:`ROUND_EXTENSION_WARN`, so a filibuster is visible to the
+        operator rather than merely possible.
+
+        Returns:
+            ``{"ok": True, "scope", "holder", "deadline", "deadline_in",
+            "extensions"}``, or ``{"ok": False, "error": ...}`` —
+            ``unknown_token``, ``no_floor``, ``not_a_round``, or ``not_holder``.
+        """
+        client = self.client_for(token)
+        if client is None:
+            return {"ok": False, "error": "unknown_token"}
+        floor = self._floors.get(scope)
+        if floor is None:
+            return {"ok": False, "error": "no_floor", "scope": scope}
+        rnd = floor.round
+        if rnd is None:
+            return {
+                "ok": False,
+                "error": "not_a_round",
+                "scope": scope,
+                "hint": (
+                    "an exclusive stick has no deadline to extend; "
+                    'floor(action="drop") when you are done'
+                ),
+            }
+        if floor.holder != client.project:
+            return {
+                "ok": False,
+                "error": "not_holder",
+                "scope": scope,
+                "held_by": floor.holder,
+            }
+        # Re-baseline from now when the deadline has already lapsed, so an
+        # extension that lands in the gap before the sweep buys a full window
+        # rather than a few leftover seconds.
+        base = max(rnd.deadline, time.time())
+        rnd.deadline = base + self.round_extend_seconds
+        rnd.extensions += 1
+        rnd.total_extensions += 1
+        if rnd.extensions == ROUND_EXTENSION_WARN:
+            self._announce_system(
+                f"{floor.holder} has extended its turn on {floor.scope} "
+                f"{rnd.extensions} times — the round is waiting on it."
+            )
+        self._push_floor_ui()
+        return {
+            "ok": True,
+            "scope": scope,
+            "holder": floor.holder,
+            "deadline": rnd.deadline,
+            "deadline_in": int(self.round_extend_seconds),
+            "extensions": rnd.extensions,
+        }
+
+    def force_advance(self, scope: str) -> bool:
+        """Operator: take the stick off the current holder now.
+
+        Counts as silence, so repeatedly skipping an unresponsive table still
+        closes the round instead of spinning forever. Returns ``False`` when no
+        round is running on ``scope``.
+        """
+        floor = self._round_floor(scope)
+        if floor is None:
+            return False
+        self._advance_floor(floor, silent=True)
+        return True
+
+    def set_turn_seconds(self, scope: str, seconds: float) -> dict[str, object] | None:
+        """Operator: retune one round's per-turn budget, re-baselining the turn.
+
+        Validated like :meth:`set_rate_limit` — a rejected value is a strict
+        no-op, never a partial application — because an operator knob that
+        half-applies is worse than one that refuses.
+
+        Returns:
+            The new public floor entry, or ``None`` when the scope has no round
+            or the value is out of range.
+        """
+        floor = self._round_floor(scope)
+        if floor is None:
+            return None
+        if not math.isfinite(seconds) or not (
+            ROUND_MIN_SECONDS <= seconds <= ROUND_MAX_SECONDS
+        ):
+            return None
+        rnd = floor.round
+        assert rnd is not None
+        rnd.turn_seconds = seconds
+        floor.since = time.time()
+        rnd.deadline = floor.since + seconds
+        self._announce_system(
+            f"turn budget for {floor.scope} is now {int(seconds)}s"
+        )
+        self._push_floor_ui()
+        return self._floor_public(floor)
+
+    def speak_turn(self, project: str, scope: str) -> dict[str, object] | None:
+        """Rotate because ``project`` just said something on ``scope``.
+
+        Called by ``POST /send`` immediately after :meth:`route`, so one ``say``
+        both delivers the message and hands the stick on. Returns ``None`` when
+        there is no round on that scope or the sender was not holding it, which
+        is what keeps the ordinary send path untouched.
+
+        Returns:
+            The ``stick`` payload for :class:`~caucus.models.SendResponse`, or
+            ``None`` outside a round.
+        """
+        floor = self._round_floor(scope)
+        if floor is None or floor.holder != project:
+            return None
+        new_holder = self._advance_floor(floor, silent=False)
+        if new_holder is None:
+            return {
+                "scope": scope,
+                "holder": None,
+                "ring": [],
+                "deadline_in": None,
+                "you_hold": False,
+                "note": (
+                    f"turn spent; the round on {scope} is over and the lane is "
+                    "open again."
+                ),
+            }
+        rnd = floor.round
+        assert rnd is not None
+        ring = list(rnd.ring)
+        ahead = ring.index(project) if project in ring else None
+        again = (
+            f" You speak again in {ahead} turn(s)."
+            if ahead is not None and ahead > 0
+            else ""
+        )
+        return {
+            "scope": scope,
+            "holder": new_holder,
+            "ring": ring,
+            "deadline_in": int(rnd.turn_seconds),
+            "you_hold": False,
+            "note": (
+                f"turn spent; the stick is now with {new_holder} (scope "
+                f"{scope}, {int(rnd.turn_seconds)}s). Ring: "
+                f"{' > '.join(ring)}.{again}"
+            ),
+        }
+
+    def sweep_rounds(self, *, now: float | None = None) -> list[str]:
+        """Advance every round whose turn has run out; return the scopes moved.
+
+        Two ways a turn runs out. The ordinary one is the deadline lapsing. The
+        other is a holder that never picked the stick up at all: if its
+        ``last_seen`` has not moved since the turn was granted and
+        :data:`ROUND_PICKUP_GRACE` has passed, it is not listening, and the
+        table should not spend a full budget waiting on it. The grace window
+        comfortably exceeds one long-poll cycle, so a live watcher always
+        refreshes in time.
+
+        A no-op while the room is not RUNNING: a peer whose queue is gated by
+        the pause cannot read its turn, so it must not burn it.
+
+        Args:
+            now: Injected clock for deterministic tests, matching
+                :meth:`reap_stale` and :meth:`health`.
+
+        Returns:
+            The scopes whose stick moved (or whose round ended) on this sweep.
+        """
+        if self._mode is not ControlMode.RUNNING:
+            return []
+        stamp = time.time() if now is None else now
+        moved: list[str] = []
+        for scope in list(self._floors):
+            floor = self._floors.get(scope)
+            if floor is None or floor.round is None:
+                continue
+            rnd = floor.round
+            expired = stamp >= rnd.deadline
+            if not expired:
+                holder = self._clients.get(floor.holder)
+                never_picked_up = (
+                    holder is not None
+                    and holder.last_seen <= rnd.granted_seen
+                    and stamp - floor.since > ROUND_PICKUP_GRACE
+                )
+                if not never_picked_up:
+                    continue
+            self._advance_floor(floor, silent=True)
+            moved.append(scope)
+        return moved
+
+    def _freeze_round_clocks(self) -> None:
+        """Stop every round's turn clock because the room is no longer running.
+
+        A paused peer's queue is gated, so the holder cannot read the backlog
+        its turn flushed — burning the budget anyway would mean every round
+        expiring at once the moment the operator resumes. Idempotent: a round
+        already frozen keeps its original ``paused_at``.
+        """
+        stamp = time.time()
+        for floor in self._floors.values():
+            rnd = floor.round
+            if rnd is not None and rnd.paused_at is None:
+                rnd.paused_at = stamp
+
+    def _thaw_round_clocks(self) -> None:
+        """Shift every frozen deadline forward by however long the pause lasted."""
+        stamp = time.time()
+        touched = False
+        for floor in self._floors.values():
+            rnd = floor.round
+            if rnd is None or rnd.paused_at is None:
+                continue
+            held_for = max(0.0, stamp - rnd.paused_at)
+            rnd.deadline += held_for
+            floor.since += held_for
+            rnd.paused_at = None
+            touched = True
+        if touched:
+            self._push_floor_ui()
 
     def _advance_floor(self, floor: Floor, *, silent: bool = True) -> str | None:
         """Pass ``floor`` on, or release it — in whichever mode it is running.
@@ -2776,10 +3380,19 @@ class HubState:
         Stopping wakes any waiters (so they observe the stop) and floods a
         control signal into every queue. Resuming/resetting reopens the gate.
         """
+        previous = self._mode
         self._mode = mode
         if mode is ControlMode.PAUSED:
             self._transmit.clear()
+            self._freeze_round_clocks()
         elif mode is ControlMode.STOPPED:
+            # Release every withheld backlog *before* the stop notice, so a peer
+            # parked in a round reads what it missed rather than losing it to a
+            # cleared floor. Retention defers delivery; it never discards.
+            self._freeze_round_clocks()
+            for floor in list(self._floors.values()):
+                if floor.round is not None:
+                    self._flush_round(floor)
             stop = self.control_signal("stop")
             for client in self._clients.values():
                 # Ring-buffer-safe so a backed-up peer still receives the stop.
@@ -2794,6 +3407,8 @@ class HubState:
                 self._push_floor_ui()
         else:  # RUNNING
             self._transmit.set()
+            if previous is ControlMode.PAUSED:
+                self._thaw_round_clocks()
         self._push_ui({"type": "mode", "mode": mode.value})
         self._announce_system(f"control: {mode.value}")
 

@@ -35,12 +35,13 @@ def test_peer_info_has_full_dashboard_shape() -> None:
     assert info["msg_count"] == 0
     assert isinstance(info["uptime"], float)
     assert info["quiet"] is False  # a just-registered peer is never quiet
+    assert info["waiting_turn"] is False  # no round is running
     assert info["status_stale"] is False  # no status reported -> not stale
     # Every contract key is present.
     assert set(info) == {
         "name", "state", "listening", "paused", "status",
-        "status_age", "last_seen_age", "quiet", "status_stale",
-        "uptime", "msg_count",
+        "status_age", "last_seen_age", "quiet", "waiting_turn",
+        "status_stale", "uptime", "msg_count",
     }
 
 
