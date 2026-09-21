@@ -116,6 +116,15 @@ REAP_INTERVAL_SECONDS = 15.0
 # rich peer roster) out to every connected UI listener.
 HEALTH_INTERVAL_SECONDS = 1.5
 
+# How often the background sweep advances rounds whose turn has run out. Far
+# tighter than the 15s reaper on purpose: a reaper miss costs one stale row in
+# the roster, whereas an expired turn blocks the *whole ring* — nobody may speak
+# until the stick moves on, so every second of slop is dead air for everyone and
+# a 15s gap reads as a hung hub rather than a rotation. The sweep itself is
+# O(active rounds), and that is 0 on almost every tick, so the tighter cadence
+# buys responsiveness for very nearly nothing.
+ROUND_TICK_SECONDS = 2.0
+
 # Hard ceiling on an inbound HTTP request body, in bytes. FastAPI/Starlette
 # buffers and parses the whole body before our handlers (and their Pydantic
 # validation) run, so an oversized POST — e.g. to the unauthenticated
@@ -384,7 +393,7 @@ def _prune_register_buckets() -> None:
 # hub is the single source of truth: clients only carry a version number.
 # When PROTOCOL_TEXT changes, also update the human-readable mirror
 # caucus-protocol.md (drift-guarded by tests/test_protocol_md.py).
-PROTOCOL_VERSION = 24
+PROTOCOL_VERSION = 25
 
 # The protocol agents must follow once in the room. Fetched by a connector when
 # it arms (on its first tool call) and delivered on ``join``. This is the
@@ -508,8 +517,13 @@ Private channels (side rooms):
 The talking stick: something grave getting drowned in a busy room? Freeze one
 lane so only you can speak there: floor(action="take", reason=..., scope=...).
 A say() refused with floor_held (HTTP 423) means another peer holds that
-lane — do NOT retry it in a loop. Fetch protocol_section("talking-stick") for
-scopes, queueing, passing, release.
+lane — do NOT retry it in a loop. A lane may instead run a ROUND: the hub
+WITHHOLDS that scope from you until your turn, then hands you the whole
+backlog at once with a deadline. Read it all, then say() ONCE; speaking
+passes the stick on. Nothing to add: turn="pass". Still thinking:
+turn="extend", which reaches nobody. A quiet scope may be a round, not an
+empty room. Fetch protocol_section("talking-stick") for scopes, rounds,
+queueing, release.
 """
 
 # On-demand protocol sections, keyed by the name agents pass to
@@ -568,6 +582,11 @@ never let formatting bury the one ask.
 The talking stick — full mechanics
 ==================================
 
+A lane runs in one of two modes: an EXCLUSIVE stick, described first, or a
+rotating ROUND, described at the end. Never both at once. If you try to take a
+stick on a lane that is running a round, you are refused with
+round_in_progress and told where you already stand in the rotation.
+
 Grab it with floor(action="take", reason=..., scope=...). It locks one
 conversation lane so only you can speak there; every other peer's send to that
 scope is refused by the hub until you let go. Use it sparingly — it is for
@@ -599,6 +618,51 @@ hostage.
     kicked, or times out, the hub automatically hands the stick to the next hand
     or puts it away. The human operator can always speak regardless of any stick,
     and can force a stick closed at any time — their word is final.
+
+Rotating rounds: the stick goes round the table
+-----------------------------------------------
+
+floor(action="round", scope=..., reason=...) opens a round instead of a single
+hold. Use it when several peers each need to weigh in on the same question and
+you want considered answers rather than a pile-up: a design decision, a
+retrospective, a go/no-go.
+
+  - Order is room-join order, and it is a live ring. A peer that joins later
+    takes the tail, so it speaks after everyone already in this lap; a peer that
+    leaves drops out; a peer the operator paused is skipped and rejoins the
+    rotation when it is resumed, without losing its place. The human operator is
+    never in the ring and can always speak.
+  - While it is not your turn the hub WITHHOLDS that scope's messages from you.
+    This is the part that surprises agents, so read it twice: you are not being
+    ignored and the room is not empty. You are being kept from composing a reply
+    to half an exchange. A lane that has gone quiet may well be a round in
+    progress. Your direct messages and every other scope keep flowing normally
+    throughout, so you are never cut off from the room, only from that one lane.
+  - When the stick reaches you the hub delivers the whole backlog in one batch,
+    followed by a notice saying you have the floor and how long you have. Read
+    all of it BEFORE you compose. That is the entire point of the mode: your
+    answer is supposed to account for what the peers before you actually said.
+  - You rotate the stick by SPEAKING. One say() routes your message and hands
+    the stick to the next peer; there is no second call, and the new state comes
+    back in the say() result. Two variants when you are not ready to speak:
+      * say(content="", to=..., turn="pass") — "nothing to add". Rotates
+        immediately. content is ignored; this is a rotation, not a message.
+      * say(content="", to=..., turn="extend") — "still thinking". Buys you more
+        time and is sent to NOBODY. Do not use it to tell peers you are working
+        on it: they will never see it. Extensions are unlimited, but each one
+        holds the whole table, and the operator is told when you keep taking
+        them.
+  - A turn lasts 300s by default and an extension adds 180s (both configurable
+    per hub). Let the deadline lapse and the stick moves on without you; the
+    answer you never sent is simply lost. If one full lap passes with nobody
+    speaking, the round closes on its own.
+  - floor(action="pass", scope=...) gives up your turn, same as
+    say(turn="pass"). floor(action="drop", scope=...) ends the round outright
+    and reopens the lane; the holder or whoever opened the round may do that.
+    floor(action="status") shows the ring, the current holder and the deadline,
+    and works before you have joined.
+  - Do NOT raise a hand during a round. There is no hand queue to join, the ring
+    already has you, and the hub will bring you the stick on its own.
 """,
     "channels": """\
 Private channels — full mechanics
@@ -713,6 +777,31 @@ async def _health_loop() -> None:
             logger.exception("health tick failed")
 
 
+async def _round_loop() -> None:
+    """Periodically move the talking stick on rounds whose turn has expired.
+
+    A round is the only part of the floor protocol with a clock: a turn ends
+    when its holder speaks, passes, or simply runs out of time, and only this
+    loop can notice the third case. Nothing else in the hub is scheduled, so
+    without it an absent holder would freeze its ring until an operator
+    force-advanced it by hand. Runs every :data:`ROUND_TICK_SECONDS`, which is
+    much tighter than the reaper's cadence because an expired turn blocks every
+    peer in the scope, not just the one that went away.
+
+    ``HubState.sweep_rounds`` is a no-op while the room is not RUNNING and
+    returns only the scopes it actually moved, so a hub with no round up does
+    nothing here. The module global ``state`` is resolved each tick so a
+    swapped-in instance (e.g. in tests) is honored.
+    """
+    while True:
+        await asyncio.sleep(ROUND_TICK_SECONDS)
+        try:
+            for scope in state.sweep_rounds():
+                logger.info("round turn expired scope=%s", scope)
+        except Exception:  # pragma: no cover - never let the sweep die
+            logger.exception("round sweep failed")
+
+
 # Disk-log writer, created in the lifespan when --log-file/CAUCUS_LOG_FILE is set.
 disk_log: DiskLog | None = None
 
@@ -817,7 +906,7 @@ def _broadcast_agents() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Run the reaper, the health tick, and (opt-in) the disk-log + MCP manager.
+    """Run the reaper, health tick, round sweep, and (opt-in) disk-log + MCP.
 
     The disk log and the Streamable HTTP MCP session manager are wired here, not
     at import time, so the ``state`` global the disk log feeds is the live one
@@ -834,6 +923,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     tasks = [
         asyncio.create_task(_reaper_loop()),
         asyncio.create_task(_health_loop()),
+        asyncio.create_task(_round_loop()),
     ]
     if disk_log is not None:
         state.set_log_sink(disk_log.enqueue)
@@ -1763,8 +1853,14 @@ async def leave(req: LeaveRequest) -> dict[str, object]:
 async def send(req: SendRequest) -> SendResponse | JSONResponse:
     """Accept a message from an agent and route it.
 
-    Rejected with 409 when the room is stopped, and 429 when the sender
-    exceeds its rate limit.
+    Rejected with 409 when the room is stopped, 429 when the sender exceeds its
+    rate limit, and 423 when a talking stick bars the target scope — either
+    ``floor_held`` (an exclusive lock, raise a hand) or ``round_in_progress``
+    (a rotating round, just wait for the stick).
+
+    In a round the sender's own turn ends *with* this call: the reply's
+    ``stick`` field says where the stick went next (see
+    :meth:`~caucus.state.HubState.speak_turn`).
     """
     client = state.client_for(req.token)
     if client is None:
@@ -1775,17 +1871,49 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     # other sender is barred from it (423 Locked) and must raise a hand instead.
     blocking = state.floor_blocks(client.project, req.to)
     if blocking is not None:
+        rnd = blocking.round
+        if rnd is None:
+            return JSONResponse(
+                status_code=423,
+                content={
+                    "error": "floor_held",
+                    "scope": blocking.scope,
+                    "held_by": blocking.holder,
+                    "reason": blocking.reason or None,
+                    "hint": (
+                        f"{blocking.holder} holds the talking stick for "
+                        f"{blocking.scope}; floor(action=\"raise\") to claim the "
+                        "next turn."
+                    ),
+                },
+            )
+        # A round refuses for a different reason than an exclusive lock, so it
+        # gets its own error code and its own advice. Under the lock the right
+        # move is to raise a hand; in a round the ring already holds a seat for
+        # this peer, a raised hand would be dropped, and retrying only burns
+        # tokens against a refusal that will not lift until the stick arrives.
+        # The deadline and the seat number make the wait finite and legible
+        # instead of a blind 423.
+        position = (
+            rnd.ring.index(client.project) + 1
+            if client.project in rnd.ring
+            else None
+        )
         return JSONResponse(
             status_code=423,
             content={
-                "error": "floor_held",
+                "error": "round_in_progress",
                 "scope": blocking.scope,
                 "held_by": blocking.holder,
                 "reason": blocking.reason or None,
+                "deadline": rnd.deadline,
+                "position": position,
                 "hint": (
-                    f"{blocking.holder} holds the talking stick for "
-                    f"{blocking.scope}; floor(action=\"raise\") to claim the "
-                    "next turn."
+                    f"a round-table is running on {blocking.scope}; "
+                    f"{blocking.holder} has the stick. Do NOT retry in a loop "
+                    "and do not raise a hand — the ring already has you, and "
+                    "the hub will hand you the stick together with everything "
+                    "said meanwhile. Just keep listening."
                 ),
             },
         )
@@ -1814,6 +1942,14 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
         kind=MessageKind.MESSAGE,
     )
     delivered = state.route(msg)
+    # The stick moves *because* the holder spoke: in a round, speaking IS
+    # spending your turn, so one /send both delivers the message and rotates.
+    # Returning the outcome here rather than making the agent poll /floor is
+    # the whole point — the sender learns in this very response that its turn
+    # is over and who holds the stick now, instead of burning a second
+    # round-trip (and, on a passive bridge, a second turn) to find out.
+    # A None means no round on that scope, or the sender was not the holder.
+    stick = state.speak_turn(client.project, req.to)
     logger.info("msg %s %s -> %s", msg.id, msg.sender, req.to)
     # A direct send that reaches nobody means the named peer is truly absent
     # (past its grace window, or never registered) — route() has no other way
@@ -1862,6 +1998,7 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
         missed=missed,
         warning=warning,
         hint=hint,
+        stick=stick,
     )
 
 
@@ -2421,9 +2558,18 @@ async def floor_list() -> dict[str, dict[str, dict[str, object]]]:
 
     Open (no token), unlike the agent-key-gated ``/peers``, ``/ping``,
     ``/channels`` and ``/forms``. Each entry is
-    ``{"scope", "holder", "reason", "hands": [...], "since"}``. An empty map
-    means no stick is up and every scope is open. Lets an agent scout whether the
-    floor it is about to use is held before it speaks.
+    ``{"scope", "holder", "reason", "hands": [...], "since", "mode", "round"}``.
+    ``mode`` is ``"exclusive"`` or ``"round"``; ``round`` is ``None`` under the
+    exclusive lock and otherwise carries the rotation order, the turn deadline,
+    the per-turn budget and each ring member's withheld backlog depth. An empty
+    map means no stick is up and every scope is open. Lets an agent scout
+    whether the floor it is about to use is held before it speaks.
+
+    A round exposes more than the lock ever did — the whole ring and where the
+    turn clock stands — and this endpoint stays deliberately open all the same,
+    for the reason already documented above: it reveals who may speak, never
+    what anybody said, and an agent that cannot read it would be reduced to
+    discovering the stick by having a ``say`` bounce.
     """
     return {"floors": state.floors_public()}
 
@@ -2432,19 +2578,27 @@ async def floor_list() -> dict[str, dict[str, dict[str, object]]]:
 async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     """Run one verb of the talking-stick protocol.
 
-    Dispatches on ``req.action``: ``take`` / ``pass`` / ``drop`` / ``raise`` /
-    ``lower`` (see :class:`~caucus.models.FloorRequest`). The hub mutates floor
-    state and routes the relevant SYSTEM notices; the JSON body returned carries
-    ``ok`` plus an ``error`` describing any refusal (``floor_held``,
-    ``not_holder``, ``no_floor``, ``bad_scope``, ``not_a_member``). An unknown
-    token is rejected with 401 and an unknown action with 400.
+    Dispatches on ``req.action`` (see :class:`~caucus.models.FloorRequest`).
+    ``take`` / ``raise`` / ``lower`` drive the exclusive lock, ``round`` /
+    ``extend`` drive a rotating round, and ``pass`` / ``drop`` serve both modes
+    (hand the stick on / put it away, which in a round means spend your turn /
+    end the round). The hub mutates floor state and routes the relevant SYSTEM
+    notices; the JSON body returned carries ``ok`` plus an ``error`` describing
+    any refusal (``floor_held``, ``not_holder``, ``no_floor``, ``bad_scope``,
+    ``not_a_member``, ``round_in_progress``, ``not_a_round``,
+    ``not_enough_peers``). An unknown token is rejected with 401 and an unknown
+    action with 400.
     """
     handlers = {
         "take": lambda: state.take_floor(req.token, req.scope, req.reason),
+        "round": lambda: state.start_round(
+            req.token, req.scope, req.reason, turn_seconds=req.turn_seconds
+        ),
         "pass": lambda: state.pass_floor(req.token, req.scope),
         "drop": lambda: state.drop_floor(req.token, req.scope),
         "raise": lambda: state.raise_hand(req.token, req.scope),
         "lower": lambda: state.lower_hand(req.token, req.scope),
+        "extend": lambda: state.extend_turn(req.token, req.scope),
     }
     handler = handlers.get(req.action)
     if handler is None:
@@ -2791,13 +2945,49 @@ def _apply_ui_command(data: dict[str, object]) -> None:
     elif "close_channel" in data:
         state.close_channel(str(data["close_channel"]))
     elif "floor" in data:
+        # One key, four operator verbs, because the console already sends a
+        # {"floor": {...}} envelope and splitting rounds off into their own
+        # command key would leave the operator's floor controls straddling two
+        # wire shapes. Each branch validates its own payload and a frame that
+        # does not match any of them is ignored, like every other command here.
         floor_cmd = data["floor"]
-        if (
-            isinstance(floor_cmd, dict)
-            and floor_cmd.get("action") == "clear"
-            and isinstance(floor_cmd.get("scope"), str)
-        ):
-            state.clear_floor(floor_cmd["scope"])
+        if isinstance(floor_cmd, dict) and isinstance(floor_cmd.get("scope"), str):
+            floor_action = floor_cmd.get("action")
+            scope = floor_cmd["scope"]
+            if floor_action == "clear":
+                # Mode-agnostic override: clear_floor ends a round exactly as it
+                # puts an exclusive stick away, flushing every withheld backlog
+                # on the way out, so no peer is left holding gated traffic.
+                state.clear_floor(scope)
+            elif floor_action == "advance":
+                state.force_advance(scope)
+            elif floor_action == "start":
+                # The operator is not in the ring (see start_round_as_operator),
+                # so the first turn goes to the first peer in join order. A
+                # missing or unusable turn_seconds falls back to the hub default
+                # rather than refusing the round.
+                raw_turn = floor_cmd.get("turn_seconds")
+                turn_seconds: float | None
+                try:
+                    turn_seconds = None if raw_turn is None else float(raw_turn)
+                except (TypeError, ValueError):
+                    turn_seconds = None
+                reason = floor_cmd.get("reason")
+                state.start_round_as_operator(
+                    scope,
+                    str(reason) if isinstance(reason, str) else "",
+                    turn_seconds=turn_seconds,
+                )
+            elif floor_action == "retune":
+                # Retuning a live round: set_turn_seconds validates the number
+                # itself and is a strict no-op on reject, so a bad value can
+                # only be ignored, never half-applied.
+                try:
+                    seconds = float(floor_cmd["turn_seconds"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    state.set_turn_seconds(scope, seconds)
     elif "answer" in data:
         answer = data["answer"]
         if isinstance(answer, dict):
@@ -2840,7 +3030,15 @@ async def ui_socket(ws: WebSocket) -> None:
     * ``{"heartbeat": "<name>"}`` — probe one peer; replies ``heartbeat_result``.
     * ``{"close_channel": "<name>"}`` — force-close a channel (non-sticky).
     * ``{"floor": {"action": "clear", "scope": "<scope>"}}`` — force a talking
-      stick closed regardless of who holds it (operator override).
+      stick closed regardless of who holds it (operator override); ends a round
+      just as it puts an exclusive stick away.
+    * ``{"floor": {"action": "start", "scope": "<scope>", "reason": "...",
+      "turn_seconds": <n>}}`` — open a rotating round on that scope. ``reason``
+      and ``turn_seconds`` are optional; the operator is not in the ring.
+    * ``{"floor": {"action": "advance", "scope": "<scope>"}}`` — take the stick
+      off the current holder now and pass it to the next peer in the ring.
+    * ``{"floor": {"action": "retune", "scope": "<scope>", "turn_seconds": <n>}}``
+      — change a live round's per-turn budget and re-baseline the current turn.
     * ``{"answer": {"id": "<form_id>", "answers": {...}}}`` — submit a form's
       answers; routed to the form's audience as an ``answer`` message.
     * ``{"cancel_form": "<form_id>"}`` — cancel a pending form.
@@ -3335,6 +3533,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--round-turn-seconds",
+        type=float,
+        default=state.round_turn_seconds,
+        help=(
+            "per-peer turn budget when the talking stick goes round the table "
+            "(default: %(default)s); a round opened without its own value "
+            "takes this one. Env: CAUCUS_ROUND_TURN_SECONDS"
+        ),
+    )
+    parser.add_argument(
+        "--round-extend-seconds",
+        type=float,
+        default=state.round_extend_seconds,
+        help=(
+            "seconds a holder buys with say(turn=\"extend\") when it is still "
+            "thinking (default: %(default)s); extensions are unlimited, so "
+            "this only sets their grain. Env: CAUCUS_ROUND_EXTEND_SECONDS"
+        ),
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="do not open the operator console in a browser on startup",
@@ -3606,6 +3824,8 @@ def main() -> None:
             Path(args.log_file), retention_hours=args.log_retention_hours
         )
     state.client_ttl = args.client_ttl
+    state.round_turn_seconds = args.round_turn_seconds
+    state.round_extend_seconds = args.round_extend_seconds
     # Build and attach the in-process Streamable HTTP MCP endpoint before uvicorn
     # binds, so the existing lifespan runs its session manager (A4).
     if _resolve_mcp_http(args.mcp_http, args.host):
