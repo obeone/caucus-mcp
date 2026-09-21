@@ -467,10 +467,19 @@ class Round:
             rotation. Unlimited by design — this counter exists so a filibuster
             is visible, not so it can be refused.
         total_extensions: Extensions taken across the whole round, never reset.
-        silent_turns: Consecutive turns that produced no message (passed, timed
-            out, force-advanced, or vacated by a departure). Reset to 0 the
-            moment anyone speaks. The round ends once this reaches the number of
-            peers still able to speak — one full lap of silence.
+        declined: Peers that have had a turn and said nothing since the last
+            time anybody spoke (passed, timed out, force-advanced, or vacated
+            by a departure). Emptied the moment anyone speaks. The round ends
+            once every peer still able to speak is in this set.
+
+            A *set* rather than a counter, and that distinction is load
+            bearing. Counting turns and comparing against the eligible count
+            looks equivalent but closes the round on a peer that joined
+            mid-lap: three silent turns taken by two old members satisfies a
+            count of three without the newcomer ever having held the stick.
+            Asking "has everyone declined?" cannot make that mistake, and it
+            stays correct as peers come and go without tracking where the lap
+            began.
         started_by: Project that opened the round, or ``"operator"``. May end it
             even while it is not holding the stick.
         started_at: When the round opened.
@@ -488,7 +497,7 @@ class Round:
     turn_seconds: float = ROUND_TURN_SECONDS
     extensions: int = 0
     total_extensions: int = 0
-    silent_turns: int = 0
+    declined: set[str] = field(default_factory=set)
     started_by: str = ""
     started_at: float = field(default_factory=time.time)
     paused_at: float | None = None
@@ -1110,6 +1119,14 @@ class HubState:
         # A departing peer must never freeze a floor it held: hand the stick on
         # (or put it away), and drop it from any hand queue it was waiting in.
         self._relinquish_floors(client.project)
+        # Release anything a round was holding back for it. Done here, with the
+        # client object already in hand, because a terminal drop (leave, kick)
+        # is in neither the roster nor the graveyard by now, so the lookup
+        # inside _relinquish_floor would find nobody and the backlog would be
+        # lost. Retention defers delivery; it must never destroy it. A reaped
+        # peer's flushed queue is what _revive replays on reconnect.
+        for scope in list(client.held):
+            self._flush_held(client, scope)
 
     def _revive(self, client: Client) -> Client | None:
         """Resurrect a reaped ``client`` back onto the active roster.
@@ -2019,7 +2036,10 @@ class HubState:
                 "turn_seconds": rnd.turn_seconds,
                 "extensions": rnd.extensions,
                 "total_extensions": rnd.total_extensions,
-                "silent_turns": rnd.silent_turns,
+                # How many peers have had a turn and said nothing since anyone
+                # last spoke. Reaching the ring size closes the round.
+                "silent_turns": len(rnd.declined),
+                "declined": sorted(rnd.declined),
                 "started_by": rnd.started_by,
                 "started_at": rnd.started_at,
                 "paused": rnd.paused_at is not None,
@@ -2901,7 +2921,10 @@ class HubState:
         if rnd is None:  # pragma: no cover - guarded by _advance_floor
             return None
         prev = floor.holder
-        rnd.silent_turns = rnd.silent_turns + 1 if silent else 0
+        if silent:
+            rnd.declined.add(prev)
+        else:
+            rnd.declined.clear()
         # Rotate the outgoing holder to the TAIL so a peer appended mid-lap
         # still speaks after everyone who was already in it. Guarded because
         # _relinquish_floor may have removed the holder already, in which case
@@ -2912,11 +2935,13 @@ class HubState:
         if not eligible:
             self._release_floor(floor, by="hub", note="nobody left to speak")
             return None
-        # Recomputed against the *current* eligible count, not a lap marker: a
-        # marker breaks the moment the peer that set it leaves, whereas this
-        # stays correct as peers join and go. A newcomer raises the bar and so
-        # still gets its first turn; a departure can close the lap immediately.
-        if rnd.silent_turns >= len(eligible):
+        # "Has everyone still able to speak already declined?" — asked against
+        # the current roster on every rotation, so it needs no lap marker (which
+        # would break the moment the peer that set it left) and cannot close the
+        # round over a newcomer's head. A peer that joined mid-lap is simply not
+        # in the set yet; a peer that left stops being asked about.
+        rnd.declined.intersection_update(rnd.ring)
+        if all(name in rnd.declined for name in eligible):
             self._release_floor(
                 floor, by="hub", note="a full lap with nobody speaking"
             )
