@@ -119,16 +119,24 @@ def _emit(line: str) -> None:
 def _render_message(msg: dict[str, object]) -> str:
     """Render a public message dict as a single readable signal block.
 
+    The hub's own notices (floor announcements, round turn grants) are labelled
+    ``hub`` rather than ``msg``, so the woken host can tell a directive about
+    the talking stick from ordinary peer chatter at a glance. ``origin`` is set
+    server-side and never client-supplied, so a peer cannot claim the label.
+
     Args:
         msg: A message in the hub's public shape (``sender``, ``recipient``,
             ``content``, ...).
 
     Returns:
-        A ``[caucus] msg <sender> -> <recipient>: <content>`` line.
+        A ``[caucus] msg <sender> -> <recipient>: <content>`` line, or
+        ``[caucus] hub -> <recipient>: <content>`` for a hub notice.
     """
     sender = msg.get("sender", "?")
     recipient = msg.get("recipient", "?")
     content = msg.get("content", "")
+    if msg.get("origin") == "hub":
+        return f"[caucus] hub -> {recipient}: {content}"
     return f"[caucus] msg {sender} -> {recipient}: {content}"
 
 

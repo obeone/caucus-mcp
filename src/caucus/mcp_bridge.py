@@ -592,6 +592,85 @@ def _cleanup_token_file() -> None:
     _token_file_token = None
 
 
+#: The ``say(turn=...)`` verbs that are rotations rather than messages, and so
+#: are routed to ``/floor`` instead of ``/send``. Keeping them off the send path
+#: is what makes "an extension reaches nobody" a property of the wiring rather
+#: than of a filter a later edit could quietly drop.
+_FLOOR_TURNS = ("pass", "extend")
+
+
+def _turn_result(turn: str, scope: str, reply: dict[str, object]) -> dict[str, object]:
+    """Normalise a ``/floor`` pass/extend reply into ``say``'s own result shape.
+
+    ``say(turn="pass"|"extend")`` never touches ``/send``, but from the calling
+    agent's side it is still one ``say`` call, so it must not come back wearing
+    a second result schema. The ``/floor`` reply is rebuilt here into exactly
+    what the ``speak`` path returns: the delivery fields, empty because nothing
+    was delivered, plus the ``stick`` block that carries the sentence the agent
+    actually reads.
+
+    A refusal is passed straight through: the hub's ``{"ok": False, "error":
+    ...}`` already names what went wrong (``no_floor``, ``not_a_round``,
+    ``not_holder``), and dressing it up as an empty delivery would read as a
+    success.
+
+    Args:
+        turn: The verb that was sent: ``"pass"`` or ``"extend"``.
+        scope: The scope the verb was aimed at (``say``'s ``to``).
+        reply: The decoded ``/floor`` response body.
+
+    Returns:
+        A dict shaped like a successful ``say`` (``message_id``,
+        ``delivered_to``, ``missed``, ``warning``, ``hint``, ``stick``), or
+        ``reply`` unchanged when the hub refused the verb.
+    """
+    if not reply.get("ok"):
+        return reply
+    raw_ring = reply.get("ring")
+    ring = [str(name) for name in raw_ring] if isinstance(raw_ring, list) else []
+    deadline_in = reply.get("deadline_in")
+    # ``pass`` names the new holder in ``passed_to``; ``extend`` reports the
+    # unchanged holder (the caller) in ``holder``. Neither is present when a
+    # pass emptied the ring and closed the round.
+    holder = reply.get("passed_to") or reply.get("holder")
+    you_hold = turn == "extend"
+    if turn == "extend":
+        note = (
+            f"extension granted: you still hold {scope}, deadline in "
+            f"{deadline_in}s. NOTHING was sent to your peers: this was a "
+            '"still thinking" marker, not a message. Read the backlog, then '
+            "say() for real."
+        )
+    elif holder is None:
+        note = (
+            "passed without speaking; any content was ignored. The round on "
+            f"{scope} is over and the lane is open again."
+        )
+    else:
+        order = " > ".join(ring)
+        note = (
+            "passed without speaking; any content was ignored (a pass is a "
+            f"rotation, not a message). The stick is now with {holder} "
+            f"(scope {scope}, {deadline_in}s)."
+            + (f" Ring: {order}." if order else "")
+        )
+    return {
+        "message_id": None,
+        "delivered_to": [],
+        "missed": [],
+        "warning": None,
+        "hint": None,
+        "stick": {
+            "scope": reply.get("scope", scope),
+            "holder": holder,
+            "ring": ring,
+            "deadline_in": deadline_in,
+            "you_hold": you_hold,
+            "note": note,
+        },
+    }
+
+
 @mcp.tool()
 def join(
     project: str | None = None, force_protocol: bool = False
@@ -835,15 +914,41 @@ def peek() -> dict[str, object]:
 
 @mcp.tool()
 @_resilient_hub_call
-def say(content: str, to: str) -> dict[str, object]:
-    """Send `content` (required) to `to` (required: a peer, "#channel", or "all"). Saying to a channel joins it. `to="all"` hits EVERY peer, even outside your channels: an announcement, never a reply. Errors: rate_limited, stopped, floor_held, not_joined."""
+def say(content: str, to: str, turn: str = "speak") -> dict[str, object]:
+    """Send `content` (required) to `to` (required: a peer, "#channel", or "all"). A channel send joins it. `to="all"` hits EVERY peer: announcements only. In a round, saying passes the stick; `turn`=pass|extend. Errors: rate_limited, stopped, floor_held, not_joined."""
     gate = _ensure_armed()
     if gate is not None:
         return gate
+    if turn != "speak" and turn not in _FLOOR_TURNS:
+        return {
+            "error": "invalid_turn",
+            "hint": 'turn must be "speak", "pass" or "extend"',
+        }
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
+    if turn in _FLOOR_TURNS:
+        # A rotation verb, not a message: it goes to /floor and never near
+        # /send. `content` is ignored on this path by construction, which is
+        # also why SendRequest.content can keep its min_length=1.
+        with _client() as http:
+            resp = http.post(
+                "/floor", json={"token": _token, "action": turn, "scope": to}
+            )
+            resp.raise_for_status()
+            return _turn_result(turn, to, dict(resp.json()))
     with _client() as http:
         resp = http.post("/send", json={"token": _token, "to": to, "content": content})
+        if resp.status_code == 422:
+            # The hub's request model refused the body. Without this branch
+            # raise_for_status() raises into _resilient_hub_call, which reports
+            # hub_unreachable. That is a lie: the hub answered, it said no.
+            return {
+                "error": "invalid_say",
+                "hint": (
+                    "the hub refused the body: `content` must be 1 to 8192 "
+                    "characters and `to` at most 64"
+                ),
+            }
         if resp.status_code == 429:
             body = resp.json()
             return {"error": "rate_limited", "retry_after": body.get("retry_after")}
@@ -851,8 +956,11 @@ def say(content: str, to: str) -> dict[str, object]:
             return {"stopped": True, "note": "room is stopped; halt the exchange"}
         if resp.status_code == 423:
             body = resp.json()
+            # Keep the hub's own error string: 423 covers both stick modes, and
+            # "round_in_progress" tells the agent to wait its turn where
+            # "floor_held" would have it raise a hand it must not raise.
             return {
-                "error": "floor_held",
+                "error": body.get("error") or "floor_held",
                 "held_by": body.get("held_by"),
                 "scope": body.get("scope"),
                 "reason": body.get("reason"),
@@ -967,7 +1075,7 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
 def floor(
     action: str, scope: str = "all", reason: str | None = None
 ) -> dict[str, object]:
-    """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+    """Talking-stick: `action` (required) take|round|pass|drop|raise|status; `scope` (default "all") or a "#channel"; `reason` (take/round). round opens a rotation; status is pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, invalid_action."""
     gate = _ensure_armed()
     if gate is not None:
         return gate
@@ -977,10 +1085,10 @@ def floor(
             resp = http.get("/floor")
             resp.raise_for_status()
             return {"floors": dict(resp.json().get("floors", {}))}
-    if action not in ("take", "pass", "drop", "raise"):
+    if action not in ("take", "round", "pass", "drop", "raise"):
         return {
             "error": "invalid_action",
-            "hint": "action must be take|pass|drop|raise|status",
+            "hint": "action must be take|round|pass|drop|raise|status",
         }
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
