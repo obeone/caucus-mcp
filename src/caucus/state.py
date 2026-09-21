@@ -85,6 +85,24 @@ Bounds :attr:`Floor.hands`. A peer already in the queue re-raising its hand is
 idempotent and never counts against the cap.
 """
 
+MAX_ROUND_RING = 128
+"""Maximum number of peers in one rotating round's ring.
+
+Bounds :attr:`Round.ring`. Matches :data:`MAX_HANDS_PER_FLOOR` because both
+answer the same question — how many peers may queue behind one scope — and a
+ring larger than this is a room nobody could follow anyway.
+"""
+
+MAX_HELD_PER_SCOPE = 200
+"""Maximum number of messages withheld from one peer for one round scope.
+
+Bounds a single entry of :attr:`Client.held`. Same ring-buffer rationale as
+:data:`MAX_QUEUE_SIZE`: the oldest held message is dropped to make room rather
+than the send being refused, since the *sender* must not be penalised for a
+*recipient* that is waiting its turn. A round normally produces one message per
+turn, so reaching this cap means something else has gone wrong.
+"""
+
 MAX_QUEUE_SIZE = 1000
 """Maximum number of undelivered messages buffered per client.
 
@@ -282,6 +300,11 @@ class Client:
             demand from ``queue.qsize() + priority_queue.qsize()``, which is
             exact under asyncio's single-threaded cooperative scheduling — no
             parallel counter to drift.
+        held: Scope chatter withheld from this peer while a rotating round runs
+            on that scope and the stick is elsewhere, keyed by scope. Held, not
+            dropped: flushed into :attr:`queue` in one burst when the turn
+            opens, when the peer leaves the ring, and when the round ends. See
+            the field comment for why this is not a queue.
     """
 
     project: str
@@ -323,6 +346,20 @@ class Client:
     msg_count: int = 0
     paused: bool = False
     last_pending: Message | None = None
+    # Scope chatter withheld from this peer because a rotating round is running
+    # there and it is not this peer's turn. Keyed by round scope, since a peer
+    # can be parked in several rounds at once (the room's and a channel's).
+    #
+    # Deliberately NOT a queue: nothing in here can wake a ``/receive``
+    # long-poll, which is the entire point. A parked watcher must keep polling
+    # quietly rather than exit with a partial transcript, so the messages have
+    # to sit somewhere the poll cannot see. They are flushed into ``queue`` in
+    # one synchronous burst when the stick arrives, when this peer leaves the
+    # ring, or when the round ends — never silently destroyed. Bounded per
+    # scope by :data:`MAX_HELD_PER_SCOPE`, drop-oldest like ``queue``, and
+    # invisible to :meth:`HubState.peek` (a parked peer that saw ``pending > 0``
+    # would burn a turn on a ``/receive`` that returns nothing).
+    held: dict[str, deque[Message]] = field(default_factory=dict)
 
 
 class RegisterOutcome(str, Enum):
@@ -353,6 +390,101 @@ class Registration:
     client: Client | None  # None only when outcome is CONTESTED
 
 
+# --- rotating round timings ---------------------------------------------
+
+ROUND_TURN_SECONDS = 300.0
+"""Seconds each peer gets when the talking stick goes round the table.
+
+Sized for an agent that has to *read* before it answers: a round withholds the
+scope's traffic until your turn opens, so the budget has to cover taking in the
+whole backlog and composing against it, not just typing. Override per
+deployment with ``CAUCUS_ROUND_TURN_SECONDS`` or ``--round-turn-seconds``.
+"""
+
+ROUND_EXTEND_SECONDS = 180.0
+"""Seconds added to the current turn by one ``extend``.
+
+Deliberately unlimited in count: an agent that genuinely needs longer should not
+have to choose between a half-formed answer and losing its turn. The cost is
+that a holder *can* hold the room indefinitely, so the count is surfaced to the
+operator rather than capped — see :data:`ROUND_EXTENSION_WARN`.
+"""
+
+ROUND_EXTENSION_WARN = 3
+"""Extensions by a single holder after which the room is told once.
+
+Not a limit. Extensions stay unlimited, but a filibuster the operator cannot see
+is the real failure mode, so crossing this threshold announces itself and the
+running count rides every ``floor`` event to the console.
+"""
+
+ROUND_PICKUP_GRACE = 45.0
+"""Seconds a holder may leave a granted turn untouched before it is skipped.
+
+Guards the case of a peer that is registered but no longer polling: without it
+the stick sits on a corpse for a whole :data:`ROUND_TURN_SECONDS` per lap. The
+window comfortably exceeds one ``LONG_POLL_SECONDS`` (25s) cycle, so a live
+watcher always refreshes ``last_seen`` in time and is never skipped.
+"""
+
+
+@dataclass(slots=True)
+class Round:
+    """The rotating mode of a :class:`Floor` — a stick that goes round a table.
+
+    A round replaces the exclusive lock's hand queue with a ring. Everyone
+    present when it opens is in the ring, in join order; the stick walks the
+    ring and each peer gets a bounded turn. The point is not merely to stop
+    peers talking over each other — the exclusive :class:`Floor` already does
+    that — it is to stop them *pre-composing*. While it is not your turn the hub
+    withholds that scope's traffic from you (see :attr:`Client.held`) instead of
+    delivering it, so there is no half-read exchange to answer; the whole
+    backlog lands in one batch the instant the stick reaches you.
+
+    Attributes:
+        ring: Rotation order, head first. ``ring[0]`` is **always** the owning
+            :attr:`Floor.holder` — the one invariant every mutator here
+            maintains. A peer joining mid-round is appended at the tail, so it
+            speaks after everyone already in this lap; a peer that leaves, is
+            kicked, or is reaped is removed.
+        deadline: Absolute epoch time at which this turn expires. Absolute
+            rather than a remaining count so the operator console extrapolates
+            its own countdown and the hub pushes an event only on real change.
+        turn_seconds: Budget granted to each fresh turn in this round. Seeded
+            from :attr:`HubState.round_turn_seconds`; retunable per round by the
+            operator.
+        extensions: Extensions the *current* holder has taken; reset on every
+            rotation. Unlimited by design — this counter exists so a filibuster
+            is visible, not so it can be refused.
+        total_extensions: Extensions taken across the whole round, never reset.
+        silent_turns: Consecutive turns that produced no message (passed, timed
+            out, force-advanced, or vacated by a departure). Reset to 0 the
+            moment anyone speaks. The round ends once this reaches the number of
+            peers still able to speak — one full lap of silence.
+        started_by: Project that opened the round, or ``"operator"``. May end it
+            even while it is not holding the stick.
+        started_at: When the round opened.
+        paused_at: When the room was paused, or ``None`` while it runs. The turn
+            clock stops while the room is paused — a peer whose queue is gated
+            cannot read its turn, so it must not burn it — and every deadline is
+            shifted forward by the paused duration on resume.
+        granted_seen: The holder's ``last_seen`` at the moment the turn was
+            granted. If it has not moved by :data:`ROUND_PICKUP_GRACE`, the peer
+            is not listening and the stick moves on early.
+    """
+
+    ring: list[str] = field(default_factory=list)
+    deadline: float = 0.0
+    turn_seconds: float = ROUND_TURN_SECONDS
+    extensions: int = 0
+    total_extensions: int = 0
+    silent_turns: int = 0
+    started_by: str = ""
+    started_at: float = field(default_factory=time.time)
+    paused_at: float | None = None
+    granted_seen: float = 0.0
+
+
 @dataclass(slots=True)
 class Floor:
     """An active talking stick over one conversation scope.
@@ -377,7 +509,15 @@ class Floor:
         reason: Why the stick was taken — the crisis the holder needs heard.
         hands: FIFO queue of project names waiting to speak next. Deduplicated
             and never contains the current holder; emptied as the stick passes.
+            Always empty in round mode — a round has a ring, not a queue.
         since: When the current holder took (or was handed) the stick.
+        round: The rotating round running on this scope, or ``None`` for the
+            exclusive lock described above. A scope has one or the other, never
+            both: ``take`` is refused while a round is up, and a round cannot
+            open on a scope that is already locked. Keeping both modes in one
+            record is what lets ``floor_blocks``, ``clear_floor``,
+            ``close_channel``, ``set_mode(STOPPED)`` and ``_relinquish_floors``
+            stay mode-agnostic.
     """
 
     scope: str
@@ -385,6 +525,7 @@ class Floor:
     reason: str
     hands: list[str] = field(default_factory=list)
     since: float = field(default_factory=time.time)
+    round: Round | None = None
 
 
 # --- liveness thresholds ------------------------------------------------
@@ -402,6 +543,32 @@ per deployment with the ``CAUCUS_QUIET_AFTER_SECONDS`` environment variable.
 """
 
 
+def _positive_float_env(name: str, fallback: float) -> float:
+    """Read ``name`` from the environment as a positive float, or fall back.
+
+    A missing, malformed, or non-positive value yields ``fallback``, so a bad
+    env var can never silently disable the knob it configures — it degrades to
+    the documented default instead of to zero or to a crash at import time.
+
+    Args:
+        name: The environment variable to read.
+        fallback: The value to use when the variable is absent or unusable.
+
+    Returns:
+        The parsed value when it is a finite positive float, else ``fallback``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    if not math.isfinite(value):
+        return fallback
+    return value if value > 0.0 else fallback
+
+
 def _quiet_after_from_env() -> float:
     """Read ``CAUCUS_QUIET_AFTER_SECONDS`` (positive float) or fall back.
 
@@ -409,14 +576,17 @@ def _quiet_after_from_env() -> float:
     :data:`QUIET_AFTER_SECONDS` default, so a bad env var can never silently
     disable the liveness signal.
     """
-    raw = os.environ.get("CAUCUS_QUIET_AFTER_SECONDS")
-    if raw is None:
-        return QUIET_AFTER_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return QUIET_AFTER_SECONDS
-    return value if value > 0.0 else QUIET_AFTER_SECONDS
+    return _positive_float_env("CAUCUS_QUIET_AFTER_SECONDS", QUIET_AFTER_SECONDS)
+
+
+def _round_turn_from_env() -> float:
+    """Read ``CAUCUS_ROUND_TURN_SECONDS`` (positive float) or fall back."""
+    return _positive_float_env("CAUCUS_ROUND_TURN_SECONDS", ROUND_TURN_SECONDS)
+
+
+def _round_extend_from_env() -> float:
+    """Read ``CAUCUS_ROUND_EXTEND_SECONDS`` (positive float) or fall back."""
+    return _positive_float_env("CAUCUS_ROUND_EXTEND_SECONDS", ROUND_EXTEND_SECONDS)
 
 
 class HubState:
@@ -437,6 +607,8 @@ class HubState:
         client_ttl: float = 300.0,
         reaped_grace: float = 1800.0,
         quiet_after: float | None = None,
+        round_turn_seconds: float | None = None,
+        round_extend_seconds: float | None = None,
     ) -> None:
         self._clients: dict[str, Client] = {}  # project -> Client
         self._by_token: dict[str, Client] = {}  # token -> Client
@@ -501,6 +673,20 @@ class HubState:
             quiet_after if quiet_after is not None else _quiet_after_from_env()
         )
         self._status_dim_after = 0.66 * self._quiet_after
+        # Rotating-round budgets. Public (not underscored) because the CLI
+        # assigns them after construction, exactly like ``client_ttl`` above;
+        # a fresh round copies ``round_turn_seconds`` into its own field, so
+        # retuning the hub never reaches back into a round already in flight.
+        self.round_turn_seconds = (
+            round_turn_seconds
+            if round_turn_seconds is not None
+            else _round_turn_from_env()
+        )
+        self.round_extend_seconds = (
+            round_extend_seconds
+            if round_extend_seconds is not None
+            else _round_extend_from_env()
+        )
 
     # --- properties ------------------------------------------------------
 
@@ -1480,6 +1666,63 @@ class HubState:
             )
             client.queue.put_nowait(msg)
 
+    @staticmethod
+    def _hold(client: Client, scope: str, msg: Message) -> None:
+        """Withhold ``msg`` from ``client`` until its turn on ``scope`` opens.
+
+        The mirror of :meth:`_safe_put` for a peer parked in a rotating round.
+        Same ring-buffer discipline and the same reason for it: the *sender*
+        must not be refused because a *recipient* is waiting its turn. The
+        buffer is a plain deque rather than a queue precisely so that nothing
+        here can wake the peer's ``/receive`` long-poll — see
+        :attr:`Client.held`.
+
+        Args:
+            client: The parked peer.
+            scope: The round scope the message belongs to.
+            msg: The message to hold, already stamped with its ``seq``.
+        """
+        buffer = client.held.get(scope)
+        if buffer is None:
+            buffer = deque(maxlen=MAX_HELD_PER_SCOPE)
+            client.held[scope] = buffer
+        if len(buffer) == MAX_HELD_PER_SCOPE:
+            logger.warning(
+                "held backlog full for %s on %s (cap=%d) — dropped oldest message",
+                client.project,
+                scope,
+                MAX_HELD_PER_SCOPE,
+            )
+        # maxlen makes the drop-oldest automatic; the log above is what makes it
+        # visible, matching _safe_put's contract.
+        buffer.append(msg)
+
+    def _flush_held(self, client: Client, scope: str) -> int:
+        """Move everything held for ``scope`` into ``client``'s delivery queue.
+
+        Strictly synchronous, and deliberately so: the caller
+        (:meth:`_grant_turn`) must not ``await`` between this flush and the turn
+        marker it routes afterwards, or the batch splits across two polls and
+        the agent wakes twice on half a conversation. The deque is FIFO and
+        ``seq`` was stamped at routing time, so popping it in order restores the
+        room's real ordering.
+
+        Args:
+            client: The peer whose backlog is being released.
+            scope: The round scope to flush.
+
+        Returns:
+            How many messages were released. Zero when nothing was held.
+        """
+        buffer = client.held.pop(scope, None)
+        if not buffer:
+            return 0
+        count = len(buffer)
+        for msg in buffer:
+            self._safe_put(client, msg)
+        client.last_pending = buffer[-1]
+        return count
+
     def route(self, msg: Message) -> list[str]:
         """Deliver ``msg`` to the right queue(s) and the UI feed.
 
@@ -1550,12 +1793,38 @@ class HubState:
             targets = [target] if target is not None else []
 
         priority = msg.sender == "human" or msg.kind is MessageKind.CONTROL
+        # Retention fork. While a rotating ROUND runs on this scope, ordinary
+        # peer chatter is withheld from everyone but the current holder — held
+        # in ``Client.held``, never dropped — so a parked peer cannot compose
+        # against an exchange it has not finished reading. It is keyed on
+        # MessageKind.MESSAGE on purpose: hub SYSTEM notices (the round opened,
+        # the round closed) and CONTROL commands still reach parked peers,
+        # because those are exactly the moments they must wake for.
+        #
+        # This lives here rather than in ``/receive`` because ``Client.queue``
+        # is a single FIFO carrying DMs, other channels and hub notices
+        # together: a poll-side gate would have to drain and partition the whole
+        # queue on every poll, and would hot-spin (the chatter getter completes
+        # the instant a withheld message lands). Withholding at routing time
+        # leaves the parked peer's queue genuinely empty for this scope, so its
+        # watcher long-polls quietly and its ``last_seen`` stays fresh.
+        retaining = (
+            None
+            if priority or msg.kind is not MessageKind.MESSAGE
+            else self._round_floor(msg.recipient)
+        )
         for client in targets:
             if priority:
                 # Operator/human traffic goes on the ungated priority queue so it
                 # reaches even a paused peer. It is unbounded (trusted source,
                 # always draining), so a plain put_nowait cannot overflow.
                 client.priority_queue.put_nowait(msg)
+            elif retaining is not None and client.project != retaining.holder:
+                # Parked: hold it for this peer's turn. Deliberately does NOT
+                # touch ``last_pending`` — ``peek`` must not tell a parked peer
+                # it has mail it cannot collect.
+                self._hold(client, retaining.scope, msg)
+                continue
             else:
                 # Peer chatter takes the gated, bounded queue. Drop-oldest on
                 # overflow (ring buffer) so a stuck recipient can never crash
@@ -1565,6 +1834,9 @@ class HubState:
             # computed on demand there from the queues' own qsize(), so no
             # parallel counter needs updating here.
             client.last_pending = msg
+        # Held targets stay in ``delivered``: the message *is* queued for them,
+        # just in another buffer. Reporting them as undelivered would trip
+        # ``/send``'s no_recipients warning on a perfectly healthy round.
         delivered = [c.project for c in targets]
         # Feed the optional disk-log sink last, once routing is settled. The
         # sink only enqueues onto an asyncio.Queue, so this never blocks.
@@ -1662,15 +1934,60 @@ class HubState:
         """Human-readable name for a floor scope (``"all"`` → "the whole room")."""
         return "the whole room" if scope == BROADCAST else scope
 
+    def _round_floor(self, scope: str) -> Floor | None:
+        """Return the floor on ``scope`` when it is running a round, else ``None``.
+
+        The single predicate the retention fork in :meth:`route` consults, and
+        the only place the "exclusive or rotating, never both" distinction is
+        read on the hot path. An exclusive floor answers ``None`` here: it bars
+        sends, but it does not withhold delivery.
+        """
+        floor = self._floors.get(scope)
+        return floor if floor is not None and floor.round is not None else None
+
     def _floor_public(self, floor: Floor) -> dict[str, object]:
-        """Serialise a :class:`Floor` to a JSON-friendly dict for clients/UI."""
-        return {
+        """Serialise a :class:`Floor` to a JSON-friendly dict for clients/UI.
+
+        Additive by design: every key the exclusive floor always carried is
+        still there and unchanged, with ``mode`` and ``round`` appended. A
+        console that predates rounds keeps working; one that knows about them
+        reads ``round`` for the ring, the deadline and the backlog depths.
+        """
+        public: dict[str, object] = {
             "scope": floor.scope,
             "holder": floor.holder,
             "reason": floor.reason or None,
             "hands": list(floor.hands),
             "since": floor.since,
+            "mode": "round" if floor.round is not None else "exclusive",
+            "round": None,
         }
+        rnd = floor.round
+        if rnd is not None:
+            public["round"] = {
+                "ring": list(rnd.ring),
+                # Absolute, so the console extrapolates its own countdown and
+                # the hub pushes an event only when something really changes.
+                "deadline": rnd.deadline,
+                "remaining": max(0.0, rnd.deadline - time.time()),
+                "turn_seconds": rnd.turn_seconds,
+                "extensions": rnd.extensions,
+                "total_extensions": rnd.total_extensions,
+                "silent_turns": rnd.silent_turns,
+                "started_by": rnd.started_by,
+                "started_at": rnd.started_at,
+                "paused": rnd.paused_at is not None,
+                # Backlog depth per ring member. This is what makes a round
+                # legible to the human: they can see the traffic piling up
+                # behind each peer that is waiting its turn, and tell a parked
+                # peer apart from a dead one.
+                "held": {
+                    name: len(client.held.get(floor.scope, ()))
+                    for name in rnd.ring
+                    if (client := self._clients.get(name)) is not None
+                },
+            }
+        return public
 
     def floors_public(self) -> dict[str, dict[str, object]]:
         """Return every active floor keyed by scope, sorted by scope name.
