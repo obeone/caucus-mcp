@@ -456,6 +456,23 @@ class SendResponse(BaseModel):
     the sender to confirm the audience with ``list_channels``/``list_peers``
     before saying it again, since no later joiner will see the lost message.
     """
+    stick: dict[str, object] | None = None
+    """Talking-stick state *after* this send, or ``None`` outside a round.
+
+    Only a rotating round fills this in. In a round the stick moves when the
+    holder speaks -- one ``say()`` routes the message *and* hands the stick
+    on -- so the sender needs to learn where it went without a second call.
+    That is what this field is for.
+
+    Keys: ``scope`` (the lane the round runs on), ``holder`` (who has the
+    stick now), ``ring`` (the rotation order, holder first), ``deadline_in``
+    (seconds the new holder has), ``you_hold`` (whether the *caller* still
+    holds it, true only for a granted extension) and ``note`` (one
+    agent-facing sentence the connectors surface verbatim).
+
+    Kept separate from ``warning``/``hint``: those report that nobody heard
+    the message, which can perfectly well happen on a turn that was spent.
+    """
 
 
 class LeaveRequest(BaseModel):
@@ -575,21 +592,47 @@ class StatusRequest(BaseModel):
 class FloorRequest(BaseModel):
     """Body for ``POST /floor`` — one verb of the talking-stick protocol.
 
-    ``action`` selects the operation: ``take`` (claim the stick for ``scope``),
-    ``pass`` (hand it to the next raised hand or put it away), ``drop`` (put it
-    away outright, crisis over), ``raise`` (queue to speak next), or ``lower``
-    (withdraw from the queue). ``lower`` is reachable only through this HTTP
-    endpoint — it is not exposed as an MCP ``floor`` action (the MCP enum is
-    take|pass|drop|raise|status). ``scope`` is the conversation lane the stick
-    governs — :data:`BROADCAST` (the whole room) or a ``#``-prefixed channel;
-    its 64-char ceiling matches a channel/peer name. ``reason`` carries the
-    crisis description and is only meaningful for ``take``.
+    ``action`` selects the operation. A scope runs in one of two modes and the
+    verbs split accordingly.
+
+    *Exclusive lock* — ``take`` (claim the stick for ``scope``), ``raise``
+    (queue to speak next), ``lower`` (withdraw from the queue).
+
+    *Rotating round* — ``round`` (open a round on ``scope``; the caller speaks
+    first) and ``extend`` (push the current holder's deadline out without
+    saying anything to anyone).
+
+    *Shared by both* — ``pass`` (exclusive: hand the stick to the next raised
+    hand, else put it away; round: give up your turn and rotate) and ``drop``
+    (exclusive: put it away outright, crisis over; round: end the round and
+    reopen the lane).
+
+    ``lower`` and ``extend`` are reachable only through this HTTP endpoint —
+    neither is an MCP ``floor`` action (the MCP enum is
+    take|round|pass|drop|raise|status). ``extend`` is spelled
+    ``say(turn="extend")`` on the agent surface, so that "I am still thinking"
+    costs one call and can never be mistaken for a message: it is routed to
+    nobody, by construction, because it never touches ``/send``.
+
+    ``scope`` is the conversation lane the stick governs — :data:`BROADCAST`
+    (the whole room) or a ``#``-prefixed channel; its 64-char ceiling matches a
+    channel/peer name. ``reason`` carries the crisis description (``take``) or
+    the round's subject (``round``).
     """
 
     token: str
-    action: str  # take | pass | drop | raise | lower
+    action: str  # take | round | pass | drop | raise | lower | extend
     scope: str = PydField(default=BROADCAST, max_length=64)
     reason: str = PydField(default="", max_length=280)
+    turn_seconds: float | None = PydField(default=None, ge=15.0, le=3600.0)
+    """Per-turn budget for ``round``, or ``None`` to take the hub's default.
+
+    Bounded on both sides so a malformed body cannot wedge a round on a
+    one-second turn nobody can answer or a one-week turn nobody can escape.
+    Ignored by every other action. The MCP ``floor`` tool does not expose it
+    (the tool-description budget is full); agents get the hub default and the
+    operator retunes a live round from the console.
+    """
 
     @field_validator("scope")
     @classmethod
