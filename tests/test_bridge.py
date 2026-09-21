@@ -9,7 +9,9 @@ so stop-mode tests don't leak into their neighbours.
 
 from __future__ import annotations
 
+import contextlib
 import time
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -1561,3 +1563,307 @@ def test_join_returns_name_in_use_when_live_listener_holds_name(
     # Bridge must not have updated its own membership on a refused join.
     assert bridge._token is None
     assert bridge._joined_as is None
+
+
+# --- rotating round: say(turn=...) and floor(action="round") ---------------
+
+
+@contextlib.contextmanager
+def _request_log(module) -> Iterator[list[str]]:
+    """Yield a growing list of the hub paths the bridge's client actually hits.
+
+    ``say(turn="pass"|"extend")`` must never touch ``/send``: that is what
+    makes "an extension reaches nobody" a property of the wiring rather than
+    of a filter. Asserting on the reply alone cannot see the difference, so
+    these tests watch the requests themselves through an httpx event hook on
+    the very client :func:`caucus.mcp_bridge._client` lends out. The hook is
+    taken back off on the way out, because that client is shared by every
+    later test in this module.
+    """
+    paths: list[str] = []
+
+    def record(request: httpx.Request) -> None:
+        paths.append(request.url.path)
+
+    hooks = module._open_client().event_hooks["request"]
+    hooks.append(record)
+    try:
+        yield paths
+    finally:
+        hooks.remove(record)
+
+
+def _open_round_on_channel(
+    bridge, live_hub: str, channel: str, *, peer: str
+) -> str:
+    """Seat ``peer`` and the joined bridge in ``channel`` and open a round there.
+
+    A channel scope keeps the ring at exactly two named peers, which the
+    module-scoped ``live_hub`` (where every earlier test's peer is still
+    registered) could never give a ``"all"`` round. The bridge opens it, so it
+    takes the first turn and may end it later even after the stick moved on.
+
+    Returns the raw peer's token, for driving it straight against the hub.
+    """
+    token = _register_peer(live_hub, peer)
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": token, "channel": channel})
+    bridge.join_channel(channel)
+    opened = bridge.floor(action="round", scope=channel, reason="round-table")
+    assert opened["ok"] is True, opened
+    return token
+
+
+def _peer_inbox(live_hub: str, token: str) -> list[str]:
+    """Drain one ``/receive`` batch for ``token`` and return the contents."""
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        got = http.get("/receive", params={"token": token, "timeout": 1}).json()
+    return [str(m["content"]) for m in got["messages"]]
+
+
+def test_say_defaults_to_speak_and_still_posts_to_send(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``turn`` defaults to ``"speak"``, and a speak still goes to ``/send``.
+
+    The rotation verbs were wired onto ``/floor``; the ordinary send path must
+    be exactly where it was, reached by exactly one request.
+    """
+    _register_peer(live_hub, "turn-default-rx")
+    monkeypatch.setattr(bridge, "PROJECT", "turn-default-tx")
+    bridge.join()
+
+    with _request_log(bridge) as paths:
+        result = bridge.say("plain speech", to="turn-default-rx")
+
+    assert paths == ["/send"]
+    assert result["delivered_to"] == ["turn-default-rx"]
+
+
+def test_say_turn_pass_posts_to_the_floor_and_never_to_send(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass is a rotation, so it reaches ``/floor`` and nothing else.
+
+    The reply still wears ``say``'s own result shape: empty delivery fields
+    plus the ``stick`` block naming the peer the turn went to.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "pass-turn-tx")
+    bridge.join()
+    _open_round_on_channel(bridge, live_hub, "#br-pass", peer="pass-turn-rx")
+    try:
+        with _request_log(bridge) as paths:
+            result = bridge.say("", to="#br-pass", turn="pass")
+
+        assert paths == ["/floor"]
+        assert result["message_id"] is None
+        assert result["delivered_to"] == []
+        assert result["missed"] == []
+        stick = result["stick"]
+        assert stick["scope"] == "#br-pass"
+        assert stick["holder"] == "pass-turn-rx"
+        assert stick["you_hold"] is False
+        assert stick["ring"] == ["pass-turn-rx", "pass-turn-tx"]
+        assert "passed without speaking" in str(stick["note"])
+    finally:
+        bridge.floor(action="drop", scope="#br-pass")
+
+
+def test_say_turn_pass_ignores_a_non_empty_content(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass rotates and delivers nothing, whatever ``content`` holds.
+
+    ``content`` stays a required argument of the tool, so an agent will pass
+    something; the hub must never see it, and no peer may read it.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "pass-content-tx")
+    bridge.join()
+    peer = _open_round_on_channel(
+        bridge, live_hub, "#br-pass-content", peer="pass-content-rx"
+    )
+    try:
+        result = bridge.say("SECRET-PAYLOAD", to="#br-pass-content", turn="pass")
+
+        assert result["stick"]["holder"] == "pass-content-rx"
+        assert result["delivered_to"] == []
+        # The peer heard the round's own notices and nothing else.
+        assert not any("SECRET-PAYLOAD" in line for line in _peer_inbox(live_hub, peer))
+    finally:
+        bridge.floor(action="drop", scope="#br-pass-content")
+
+
+def test_say_turn_extend_reaches_nobody_and_says_so(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extension buys the clock and delivers to no one, in the note too.
+
+    An agent that mistook it for a message would sit waiting for an answer to
+    something nobody was sent, so the reply has to say it in words.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "extend-tx")
+    bridge.join()
+    peer = _open_round_on_channel(bridge, live_hub, "#br-extend", peer="extend-rx")
+    try:
+        with _request_log(bridge) as paths:
+            result = bridge.say("still thinking", to="#br-extend", turn="extend")
+
+        assert paths == ["/floor"]
+        assert result["message_id"] is None
+        assert result["delivered_to"] == []
+        stick = result["stick"]
+        assert stick["you_hold"] is True
+        assert stick["holder"] == "extend-tx"
+        note = str(stick["note"])
+        assert "NOTHING was sent" in note
+        assert "extension granted" in note
+        assert not any("still thinking" in line for line in _peer_inbox(live_hub, peer))
+    finally:
+        bridge.floor(action="drop", scope="#br-extend")
+
+
+def test_say_rejects_an_unknown_turn_without_touching_the_hub(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd verb is refused locally: no ``/send``, no ``/floor``, no state."""
+    monkeypatch.setattr(bridge, "PROJECT", "bad-turn")
+    bridge.join()
+
+    with _request_log(bridge) as paths:
+        result = bridge.say("hi", to="all", turn="nonsense")
+
+    assert result == {
+        "error": "invalid_turn",
+        "hint": 'turn must be "speak", "pass" or "extend"',
+    }
+    assert paths == []
+
+
+def test_holder_say_passes_the_whole_send_response_through(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bridge returns ``dict(resp.json())``, so ``stick`` must ride along.
+
+    Nothing is filtered on this path: the holder's send both delivers and
+    hands the stick on, and the caller learns where its turn went from the
+    same reply.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "speak-turn-tx")
+    bridge.join()
+    _open_round_on_channel(bridge, live_hub, "#br-speak", peer="speak-turn-rx")
+    try:
+        result = bridge.say("my turn, my words", to="#br-speak")
+
+        assert set(result) == {
+            "message_id",
+            "delivered_to",
+            "missed",
+            "warning",
+            "hint",
+            "stick",
+        }
+        assert result["delivered_to"] == ["speak-turn-rx"]
+        stick = result["stick"]
+        assert stick["holder"] == "speak-turn-rx"
+        assert stick["you_hold"] is False
+        assert "turn spent" in str(stick["note"])
+    finally:
+        bridge.floor(action="drop", scope="#br-speak")
+
+
+def test_say_during_a_round_surfaces_the_hubs_round_error_and_hint(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 423 in a round is ``round_in_progress``, with the hub's own advice.
+
+    The bridge used to build its own ``floor_held`` string here, which would
+    send the refused peer off to raise a hand the round will simply drop.
+    """
+    holder = _register_peer(live_hub, "round-holder")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": holder, "channel": "#br-round"})
+    monkeypatch.setattr(bridge, "PROJECT", "round-barred")
+    bridge.join()
+    bridge.join_channel("#br-round")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        opened = http.post(
+            "/floor",
+            json={
+                "token": holder,
+                "action": "round",
+                "scope": "#br-round",
+                "reason": "wait your turn",
+            },
+        ).json()
+    assert opened["ok"] is True, opened
+    try:
+        result = bridge.say("let me in", to="#br-round")
+
+        assert result["error"] == "round_in_progress"
+        assert result["held_by"] == "round-holder"
+        hint = str(result["hint"])
+        assert "Do NOT retry in a loop" in hint
+        assert "do not raise a hand" in hint
+        # Not the exclusive-lock wording, which advises exactly the wrong move.
+        assert 'floor(action="raise")' not in hint
+    finally:
+        with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+            http.post(
+                "/floor",
+                json={"token": holder, "action": "drop", "scope": "#br-round"},
+            )
+
+
+def test_say_with_an_empty_body_reports_invalid_say(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 422 from ``/send`` is the hub refusing the body, not an outage.
+
+    Without the explicit branch ``raise_for_status`` would raise into
+    ``_resilient_hub_call`` and the agent would be told the hub is down.
+    """
+    monkeypatch.setattr(bridge, "PROJECT", "empty-say")
+    bridge.join()
+
+    result = bridge.say("", to="all")
+
+    assert result["error"] == "invalid_say"
+    assert "1 to 8192" in str(result["hint"])
+
+
+def test_floor_action_round_opens_a_rotation(
+    bridge, live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``round`` is a real action on the bridge, not a proxied unknown one."""
+    monkeypatch.setattr(bridge, "PROJECT", "round-opener")
+    bridge.join()
+    token = _register_peer(live_hub, "round-member")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": token, "channel": "#br-open"})
+    bridge.join_channel("#br-open")
+    try:
+        opened = bridge.floor(action="round", scope="#br-open", reason="design review")
+
+        assert opened["ok"] is True
+        assert opened["holder"] == "round-opener"
+        assert opened["ring"] == ["round-opener", "round-member"]
+        assert opened["turn_seconds"] > 0
+        # A rotation, not an exclusive stick: status says so and carries the ring.
+        held = bridge.floor(action="status")["floors"]["#br-open"]
+        assert held["mode"] == "round"
+        assert held["round"]["ring"] == ["round-opener", "round-member"]
+    finally:
+        bridge.floor(action="drop", scope="#br-open")
+
+
+def test_floor_invalid_action_hint_lists_round(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal has to name every action, or ``round`` stays undiscoverable."""
+    monkeypatch.setattr(bridge, "PROJECT", "round-bad-action")
+    bridge.join()
+
+    result = bridge.floor(action="nonsense")
+
+    assert result["error"] == "invalid_action"
+    assert result["hint"] == "action must be take|round|pass|drop|raise|status"

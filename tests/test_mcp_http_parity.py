@@ -275,3 +275,142 @@ async def test_duplicate_name_yields_name_in_use_both_paths(
     bridge_res = mcp_bridge.join("dup")
     assert bridge_res["error"] == "name_in_use"
     assert bridge_res["project"] == "dup"
+
+
+# --- rotating round: the two connectors must answer with the same words ----
+
+
+def _register_peer(base: str, project: str) -> str:
+    """Register a peer straight against the hub and return its token."""
+    with httpx.Client(base_url=base, timeout=5.0) as http:
+        return str(http.post("/register", json={"project": project}).json()["token"])
+
+
+def _reset_bridge(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """Point the stdio bridge at ``url`` with a clean, disarmed slate.
+
+    Every global is monkeypatched, so the module is handed back untouched to
+    whatever test runs next in this process.
+    """
+    monkeypatch.setattr(mcp_bridge, "HUB_URL", url)
+    monkeypatch.setattr(mcp_bridge, "_token", None)
+    monkeypatch.setattr(mcp_bridge, "_armed", False)
+    monkeypatch.setattr(mcp_bridge, "_joined_as", None)
+    monkeypatch.setattr(mcp_bridge, "_known_protocol_version", None)
+    monkeypatch.setattr(mcp_bridge, "_protocol_text", None)
+    monkeypatch.setattr(mcp_bridge, "_protocol_delivered", False)
+    monkeypatch.setattr(mcp_bridge, "_listen_lease", None)
+
+
+async def test_round_refusal_is_identical_on_both_transports(
+    mcp_hub: tuple[str, HubState], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round's 423 must read the same whichever connector asked.
+
+    Each connector used to word a held floor itself, in opposite directions:
+    one called every 423 ``floor_held``, the other built its own hint. Both now
+    surface the hub's ``error`` and ``hint`` verbatim, and this is what proves
+    the two agree — a round refusal that told one agent to raise a hand and the
+    other to wait is exactly the drift worth pinning.
+    """
+    url, _ = mcp_hub
+    async with _session(url) as a, _session(url) as b:
+        await _call(a, "join", project="alpha")
+        await _call(b, "join", project="beta")
+        opened = await _call(a, "floor", action="round", scope="all", reason="review")
+        assert opened["ok"] is True, opened
+
+        over_mcp = await _call(b, "say", content="barging in", to="all")
+
+        _reset_bridge(monkeypatch, url)
+        mcp_bridge.join("gamma")
+        over_bridge = mcp_bridge.say("barging in", to="all")
+
+    assert over_mcp["error"] == "round_in_progress"
+    assert over_mcp == over_bridge
+
+
+async def test_say_turn_pass_is_identical_on_both_transports(
+    mcp_hub: tuple[str, HubState], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass comes back wearing the same shape on stdio and on /mcp.
+
+    Neither connector routes a pass through ``/send``; each rebuilds ``say``'s
+    result from the ``/floor`` reply, by hand, in its own module. Running the
+    same two-peer round twice under the same names is what makes the two
+    replies comparable byte for byte.
+    """
+    url, _ = mcp_hub
+
+    async with _session(url) as a, _session(url) as b:
+        await _call(a, "join", project="pa")
+        await _call(b, "join", project="pb")
+        await _call(a, "join_channel", channel="#pp")
+        await _call(b, "join_channel", channel="#pp")
+        opened = await _call(a, "floor", action="round", scope="#pp", reason="review")
+        assert opened["ok"] is True, opened
+        over_mcp = await _call(a, "say", content="ignored", to="#pp", turn="pass")
+        await _call(a, "floor", action="drop", scope="#pp")
+        await _call(a, "leave")
+        await _call(b, "leave")
+
+    _reset_bridge(monkeypatch, url)
+    peer = _register_peer(url, "pb")
+    with httpx.Client(base_url=url, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": peer, "channel": "#pp"})
+    mcp_bridge.join("pa")
+    mcp_bridge.join_channel("#pp")
+    opened = mcp_bridge.floor(action="round", scope="#pp", reason="review")
+    assert opened["ok"] is True, opened
+    try:
+        over_bridge = mcp_bridge.say("ignored", to="#pp", turn="pass")
+    finally:
+        mcp_bridge.floor(action="drop", scope="#pp")
+
+    assert over_mcp["stick"]["holder"] == "pb"
+    assert over_mcp["delivered_to"] == []
+    assert over_mcp == over_bridge
+
+
+async def test_holder_say_hands_the_stick_on_identically_on_both_transports(
+    mcp_hub: tuple[str, HubState], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Speaking spends the turn the same way on stdio and on /mcp.
+
+    The stdio bridge returns the hub's ``/send`` body whole; the /mcp path
+    rebuilds it field by field. ``stick`` is the newest field and therefore the
+    likeliest to be left out of that hand-written dict, so the two are compared
+    on a real handover rather than on a schema.
+    """
+    url, _ = mcp_hub
+
+    async with _session(url) as a, _session(url) as b:
+        await _call(a, "join", project="pa")
+        await _call(b, "join", project="pb")
+        await _call(a, "join_channel", channel="#hh")
+        await _call(b, "join_channel", channel="#hh")
+        opened = await _call(a, "floor", action="round", scope="#hh", reason="review")
+        assert opened["ok"] is True, opened
+        over_mcp = await _call(a, "say", content="the same words", to="#hh")
+        await _call(a, "floor", action="drop", scope="#hh")
+        await _call(a, "leave")
+        await _call(b, "leave")
+
+    _reset_bridge(monkeypatch, url)
+    peer = _register_peer(url, "pb")
+    with httpx.Client(base_url=url, timeout=5.0) as http:
+        http.post("/channels/join", json={"token": peer, "channel": "#hh"})
+    mcp_bridge.join("pa")
+    mcp_bridge.join_channel("#hh")
+    opened = mcp_bridge.floor(action="round", scope="#hh", reason="review")
+    assert opened["ok"] is True, opened
+    try:
+        over_bridge = mcp_bridge.say("the same words", to="#hh")
+    finally:
+        mcp_bridge.floor(action="drop", scope="#hh")
+
+    # Same field set, same delivery, same handover — only the message id differs.
+    assert set(over_mcp) == set(over_bridge)
+    assert over_mcp["delivered_to"] == over_bridge["delivered_to"] == ["pb"]
+    assert over_mcp["stick"] == over_bridge["stick"]
+    assert over_mcp["stick"]["holder"] == "pb"

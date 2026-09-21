@@ -327,3 +327,126 @@ def test_redeem_ticket_sends_the_agent_key(
 def test_redeem_ticket_returns_none_when_the_hub_is_unreachable() -> None:
     """A transport failure is fatal like a refusal, not a traceback."""
     assert watch_module.redeem_ticket("http://127.0.0.1:1", "tk") is None
+
+
+# --- hub-origin notices and round turn grants ----------------------------
+
+
+def _grant(recipient: str = "alpha") -> dict[str, object]:
+    """A hub-origin turn grant, shaped as the hub routes one to the new holder."""
+    return {
+        "sender": "hub",
+        "recipient": recipient,
+        "content": "🪄 The talking stick for the room is yours for 300s.",
+        "kind": "system",
+        "origin": "hub",
+        "meta": {"floor": {"scope": "all", "turn": "yours", "deadline_in": 300}},
+    }
+
+
+def test_render_message_labels_a_hub_notice() -> None:
+    """A hub notice is labelled ``hub``, not ``msg``, so a directive stands out.
+
+    The woken host reads only what the watcher left on stdout, and a turn grant
+    it mistook for ordinary peer chatter is a turn it will not take. ``origin``
+    is server-set, so a peer cannot claim the label for itself.
+    """
+    line = watch_module._render_message(_grant("alpha"))
+    assert line == (
+        "[caucus] hub -> alpha: 🪄 The talking stick for the room is yours "
+        "for 300s."
+    )
+
+
+def test_drain_emits_a_turn_grant_as_a_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grant is ``kind == "system"``, so the control filter must not eat it.
+
+    Only ``control``/``stop`` is filtered. If a grant were swallowed the watcher
+    would keep polling, the host would never wake, and the round would sit
+    waiting on a peer that was never told it held the stick.
+    """
+    emitted: list[str] = []
+    monkeypatch.setattr(watch_module, "_emit", emitted.append)
+
+    did_emit, stop = watch_module._drain({"messages": [_grant()]})
+
+    assert did_emit is True
+    assert stop is False
+    assert len(emitted) == 1
+    assert emitted[0].startswith("[caucus] hub -> alpha:")
+
+
+def test_drain_emits_every_chatter_plus_the_grant_in_one_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The withheld backlog and the grant arrive together, and wake the host once.
+
+    A round hands over the whole backlog in the same ``/receive`` body as the
+    grant, so the watcher must print all of it and exit exactly once — not once
+    per message, and not on the backlog while leaving the grant behind.
+    """
+    emitted: list[str] = []
+    monkeypatch.setattr(watch_module, "_emit", emitted.append)
+    backlog = [
+        {"sender": "b", "recipient": "all", "content": f"said {i}", "kind": "message"}
+        for i in range(4)
+    ]
+
+    did_emit, stop = watch_module._drain({"messages": [*backlog, _grant()]})
+
+    assert did_emit is True
+    assert stop is False
+    assert len(emitted) == len(backlog) + 1
+    assert emitted[:4] == [f"[caucus] msg b -> all: said {i}" for i in range(4)]
+    assert emitted[4].startswith("[caucus] hub -> alpha:")
+
+
+def test_watch_wakes_and_exits_zero_on_a_turn_grant(
+    live_hub: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a real grant makes ``watch()`` return 0 and wake the host.
+
+    The grant is queued before the watcher starts, so the first poll carries
+    the round's opening notice, the backlog the round withheld, and the grant
+    itself — one wake for the lot.
+    """
+    speaker = _register_peer(live_hub, "grant-speaker")
+    listener = _register_peer(live_hub, "grant-listener")
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        for token in (speaker, listener):
+            http.post(
+                "/channels/join", json={"token": token, "channel": "#grant-lane"}
+            )
+        opened = http.post(
+            "/floor",
+            json={
+                "token": speaker,
+                "action": "round",
+                "scope": "#grant-lane",
+                "reason": "round-table",
+            },
+        ).json()
+        assert opened["ok"] is True, opened
+        # Speaking spends the speaker's turn and hands the stick to the listener.
+        http.post(
+            "/send",
+            json={"token": speaker, "to": "#grant-lane", "content": "over to you"},
+        )
+
+    emitted: list[str] = []
+    monkeypatch.setattr(watch_module, "_emit", emitted.append)
+    try:
+        assert watch_module.watch(live_hub, listener, 1.0) == 0
+    finally:
+        with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+            http.post(
+                "/floor",
+                json={"token": listener, "action": "drop", "scope": "#grant-lane"},
+            )
+
+    hub_lines = [line for line in emitted if line.startswith("[caucus] hub -> ")]
+    assert any("talking stick" in line for line in hub_lines)
+    assert any("over to you" in line for line in emitted)
+    assert not any("STOP" in line for line in emitted)
