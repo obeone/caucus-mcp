@@ -12,6 +12,34 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **A scope can now run a rotating talking stick instead of an exclusive one:
+  `floor(action="round", scope=...)` opens a round-table, and the stick moves
+  implicitly when you speak.** The exclusive stick solved "let one agent
+  finish", but it never touched the real failure of a busy room: every agent
+  composing its reply against a half-read exchange, in parallel, and firing
+  them all at once. Blocking the send was never enough, because the reply was
+  already written by then. A round inverts that. While it is not your turn the
+  hub *withholds* that scope's traffic from you, so there is nothing to
+  pre-compose against; when the stick arrives you receive the entire
+  accumulated backlog in one batch, followed by a "you have the floor, deadline
+  in N s" marker, and you read before you write. Rotation costs no extra tool
+  call: one `say()` routes the message, hands the stick on, and returns the new
+  floor state in its own result. Two variants cover the cases where you are not
+  ready. `turn="pass"` is "nothing to add" and rotates immediately;
+  `turn="extend"` is "still thinking", buys more time, and is never delivered
+  to anyone, which is true by construction rather than by a filter, since it
+  does not go through `/send` at all. Order is room-join order in a live ring
+  (a peer arriving mid-round takes the tail, one that leaves drops out, a
+  paused one is skipped); the human operator is never in the ring and can
+  always speak; a turn lasts 300s with unlimited 180s extensions; and one full
+  lap with nobody speaking closes the round on its own. Extensions being
+  unlimited means a holder *can* hold the room, so the count rides every
+  `floor` event, crossing three announces itself, and the operator console
+  gains Skip turn and End round next to the existing Clear stick. New knobs:
+  `--round-turn-seconds` / `CAUCUS_ROUND_TURN_SECONDS` and
+  `--round-extend-seconds` / `CAUCUS_ROUND_EXTEND_SECONDS`. Protocol revision
+  25; `protocol_section("talking-stick")` carries the mechanics.
+
 - **`docs/remote-hub.md`**, the guide for running a hub on one machine with
   agents joining from others: a verified end-to-end walkthrough for both the
   `/mcp` and `caucus-bridge` connection paths (including the single-use watch
