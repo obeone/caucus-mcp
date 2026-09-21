@@ -323,6 +323,23 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
   and drops the peer from every hand queue. The human operator routes directly,
   not through `/send`, so it is never barred. Floors fan out to the UI as a
   `floor` event and a `floors` field on the snapshot.
+- **Rotating rounds** (`Floor.round: Round | None`): the second mode a scope can
+  run in. A `Round` carries the rotation `ring` (head is always the holder), the
+  turn `deadline`, the per-turn budget, the extension counters and the
+  `declined` set that decides when a lap of silence closes the round. It lives
+  *inside* the same `Floor` record, in the same `_floors` map, and that is a
+  deliberate structural choice rather than a convention anyone has to remember:
+  "exclusive or rotating, never both" is enforced by there being exactly one
+  slot per scope, and every existing mode-agnostic path (`floor_blocks`,
+  `clear_floor`, `close_channel`, `set_mode(STOPPED)`, `_relinquish_floors`,
+  `_advance_floor`) keeps working on a round without being taught about one.
+  A separate `_rounds` map would have made each of those a two-lookup site with
+  a reconcile step, and the first one somebody forgot would be a scope running
+  a lock and a round at once. The single branch point is `_advance_floor`, which
+  dispatches to `_advance_round` when `floor.round` is set; `_round_floor(scope)`
+  is the one predicate the hot path (`route`) consults. Unlike the exclusive
+  lock, a round does not just refuse sends: it withholds delivery, which is the
+  long-poll contract below.
 
 ## Long-poll contract (important when editing `/receive`)
 
@@ -344,6 +361,38 @@ traffic and break seq ordering. A response that carries both queues' batches
 merges them and sorts by `seq`, so an operator answer cannot overtake peer
 chatter sent before it. That is presentation only: CONTROL commands still ride
 the priority queue and still pierce the pause gate.
+
+**Retention, and why it is not here.** While a rotating round runs on a scope,
+that scope's ordinary peer chatter (`MessageKind.MESSAGE`) is not queued for
+anyone but the current holder: `route()` diverts it into `Client.held[scope]`, a
+plain bounded deque nothing can long-poll on. SYSTEM notices, CONTROL commands,
+DMs and every other scope flow normally, because those are exactly the moments a
+parked peer must wake for. The point of the deque is that it cannot wake
+anything: a parked peer's `/receive` finds nothing and keeps polling quietly, so
+its `last_seen` stays fresh and the reaper leaves it alone.
+
+This lives in `route()` and not in `/receive` on purpose. `Client.queue` is a
+single FIFO carrying DMs, other channels and hub notices interleaved with the
+round's traffic, so a poll-side gate would have to drain and partition the whole
+queue on every poll and put back what it must not deliver yet. Worse, it would
+hot-spin: the chatter getter completes the instant a withheld message lands, so
+the loop would wake, discard, and re-arm for every message in the round it is
+not allowed to see. Withholding at routing time leaves the queue genuinely empty
+for that scope and costs one dict lookup per routed message.
+
+**The flush and the grant must land in one `/receive` batch.** When the stick
+reaches a peer, `_grant_turn` flushes its held backlog into `Client.queue` with
+`_flush_held` and then routes the hub's turn-grant SYSTEM notice, synchronously,
+with no `await` between the two. That is a hard requirement, not a tidiness
+preference. The incoming holder already has a getter armed on its queue; that
+getter is woken by the first `put_nowait` but only resumes on the next loop step,
+so every held message plus the grant lands before `_drain_now` runs and a single
+response carries the whole batch, grant last. Introduce an `await` in that window
+and the batch splits across two polls, and `watch.py` is one-shot per wake, so
+it returns the moment the first half is emitted. The host then wakes on half a
+conversation, composes against it, and the grant lands on an agent that has
+already made up its mind, if it lands at all before the watcher is relaunched.
+That is precisely the failure rounds exist to prevent.
 
 **One consumer per token.** A poll holds a *lease* keyed on the optional
 `lease` query parameter, an id the caller keeps stable for as long as it means
@@ -455,6 +504,15 @@ scope: while held, every non-holder's send to that scope is refused with 423.
 Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
 (`floor(action="raise")` → handed the floor) rather than backing off or stopping.
+
+A **rotating round** is not a fourth brake, and counting it as one would be a
+dangerous mistake. It is a fairness mechanism: it decides whose turn it is and
+what each peer has read before it answers, not whether the room may keep
+running. Both real brakes cut straight through it. An operator Pause freezes
+every round's turn clock (`_freeze_round_clocks`) and holds delivery exactly as
+it does outside a round; an operator Stop clears every floor, rounds included,
+and the rate limiter still refuses a holder that floods its own turn. Nothing in
+the round machinery can delay or soften either.
 
 ## Agent launcher (`supervisor.py`), off by default
 
@@ -628,6 +686,9 @@ Summary of what is new:
 - `{"pause_peer":"<name>"}` / `{"resume_peer":"<name>"}` — per-peer delivery gate.
 - `{"heartbeat":"<name>"}` — probe one peer; reply arrives as `heartbeat_result`.
 - `{"close_channel":"<name>"}` — force-close a channel (non-sticky; see below).
+- `{"floor":{"action":"advance"|"start"|"retune","scope":"<scope>",...}}`: round
+  controls alongside the existing `clear`, to skip the current turn, open a round
+  the operator is not in the ring of, or retune a live round's per-turn budget.
 
 ### Periodic health task
 
@@ -637,6 +698,30 @@ between iterations. Each tick calls `state.push_health()`, which builds a `healt
 dict and a `peers_info()` roster and fans them to every connected UI listener as a
 single `health` event. The method is a no-op when no UI listener is connected, so
 an idle hub does no needless work.
+
+### Round turn sweep
+
+`_round_loop()` in `hub.py` is the hub's other background task, sleeping
+`ROUND_TICK_SECONDS = 2.0` between calls to `state.sweep_rounds()`. A turn ends
+when its holder speaks, passes, or runs out of time, and this loop is the only
+thing that can notice the third case. Nothing else in the hub is scheduled, so
+without it an absent holder would freeze its ring until an operator hit Skip by
+hand. `sweep_rounds` also catches the holder that never picked the stick up at
+all: if its `last_seen` has not moved since the turn was granted and
+`ROUND_PICKUP_GRACE` (45s, comfortably more than one 25s long-poll cycle) has
+passed, the stick moves on early rather than spending a full budget on a peer
+that is not listening. It is a no-op while the room is not RUNNING, so a paused
+peer never burns a turn it cannot read.
+
+It is deliberately **not** folded into the 15s reaper, for two reasons. The
+cadences answer to different costs: a reaper miss leaves one stale row in the
+roster for a few seconds, whereas an expired turn blocks the *whole ring*
+(nobody in the scope may speak until the stick moves), so 15 seconds of slop
+reads as a hung hub rather than a rotation. And sharing a task would couple two
+failure modes: an exception thrown while advancing a round would skip that
+tick's reap pass, and vice versa. Each loop swallows its own exceptions and
+keeps going. The sweep is O(active rounds), which is zero on almost every tick,
+so the tighter cadence costs very nearly nothing.
 
 ### Per-peer pause semantics
 

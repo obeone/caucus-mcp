@@ -63,6 +63,8 @@ last 500 messages in memory, lost on restart.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8765` | Listen port. |
 | `--client-ttl` | `300` | Seconds a peer may be idle before the reaper drops it. |
+| `--round-turn-seconds` | `300` | Per-peer turn budget when the talking stick goes round the table. A round opened without its own value takes this one. Env: `CAUCUS_ROUND_TURN_SECONDS`. |
+| `--round-extend-seconds` | `180` | Seconds a holder buys with `say(turn="extend")`. Extensions are unlimited, so this only sets their grain. Env: `CAUCUS_ROUND_EXTEND_SECONDS`. |
 | `--log-level` | `INFO` | Python logging level for hub output. |
 | `--no-browser` | off | Suppress automatic browser launch. |
 
@@ -126,6 +128,7 @@ Fields per peer:
 | **last_seen_age** | Seconds since the peer last touched the hub (sent, received, registered, etc.). |
 | **uptime** | Seconds since the peer first registered. Survives a reap/revival cycle (the record is reused). |
 | **msg_count** | Total messages this peer has *sent* since it first registered. |
+| **waiting_turn** | `true` while the peer sits in a rotating round's ring without holding the stick. Its traffic for that scope is withheld, so it polls silently on purpose and is exempt from the `quiet` flag. Shown as "waiting its turn". |
 
 ### Flow / Messages panel
 
@@ -210,6 +213,47 @@ regardless of who holds it. The scope reopens immediately and pending sends
 are unblocked. The operator can always speak into any scope regardless of any
 active floor.
 
+The same button ends a **rotating round** on that scope (the floor strip labels
+it `end round` while one is running). Ending a round releases every peer's
+withheld backlog into its queue before the closing notice, so nobody is left
+holding traffic the hub accepted but never delivered. Retention is a deferral,
+never a deletion.
+
+### Skip turn
+
+Round mode only (the `skip` button next to `end round` on the floor strip).
+Takes the stick off the current holder immediately and hands it to the next
+eligible peer in the ring, which flushes *that* peer's backlog and grants it a
+fresh turn. Use it when the holder is clearly not going to answer and you do not
+want to wait out its deadline.
+
+A skip counts as a silent turn, exactly like a timeout or a `pass`. That matters:
+it means repeatedly skipping a table where nobody is answering still closes the
+round on its own after one full lap, rather than spinning forever.
+
+### Running a round from the console
+
+| Control | Where | Effect |
+|---|---|---|
+| **Skip turn** | floor strip, round mode only | Hand the stick to the next peer in the ring now. Counts as a silent turn. |
+| **End round** | floor strip (the clear button, relabelled in round mode) | Close the round, flush every withheld backlog, reopen the lane. |
+
+Two more operator verbs exist on the `/ui` WebSocket and have **no button in the
+dashboard yet**. Drive them from a WebSocket client if you need them:
+
+- `{"floor":{"action":"start","scope":"all","reason":"<text>","turn_seconds":300}}`
+  opens a round you are not in the ring of. You speak regardless of any stick,
+  so a seat for you would only block the table while you were away from the
+  keyboard; the first turn goes to the first peer in join order instead.
+  `reason` and `turn_seconds` are optional, and a scope needs at least two peers
+  before a round can open in it.
+- `{"floor":{"action":"retune","scope":"all","turn_seconds":120}}` changes a live
+  round's per-turn budget (15s to 3600s) and re-baselines the current turn from
+  now. An out-of-range value is ignored outright rather than half-applied.
+
+Turn budgets default to 300s per peer with unlimited 180s extensions; set other
+defaults at launch with `--round-turn-seconds` / `--round-extend-seconds`.
+
 ### Forms: fill or reject
 
 When a form card appears in the Forms panel, click to open the wizard. Work
@@ -258,6 +302,40 @@ when a holder leaves, is kicked, or is reaped — but only at reap time
 for the next reap sweep. If you need to unblock immediately, use Clear stick
 (floor clear) from the dashboard or wait for the reaper to drop the holder
 (which triggers `_relinquish_floors` automatically).
+
+### A round is running and nobody is talking
+
+**Read this before you kick anyone.** Peers in a round are *withheld*, not
+stuck. While it is not your turn the hub holds that scope's traffic for you
+instead of delivering it, so a peer waiting its turn polls in complete silence,
+by design, for however long the table takes to come round to it. That is why the
+roster says **waiting its turn** for those peers rather than flagging them
+quiet, and why this is not the reaper case above: nothing is wrong, and kicking
+one of them throws away its place in the ring and its backlog's destination.
+
+What to read, in order:
+
+1. **The turn countdown** on the floor strip. If it is ticking, the round is
+   healthy and you are simply watching an agent think. A round paused by a
+   global Pause shows its clock frozen: the turn does not burn while the room
+   is paused, because a peer whose queue is gated cannot read its turn.
+2. **The extension count** (`+N` next to the countdown). Extensions are
+   unlimited on purpose, so a climbing count on one holder is the only
+   filibuster signal there is. The room announces itself once when a single
+   holder crosses three.
+3. **The withheld-backlog figure** (the inbox count on the floor strip, with a
+   per-peer breakdown in its tooltip). A non-zero number means the conversation
+   is still moving and parked peers have something real waiting. A round where
+   that figure stays at zero lap after lap is a table with nothing to say, and
+   it will close itself.
+
+If one holder is genuinely not answering, use **Skip turn** once: it hands the
+stick on immediately and the next peer gets its backlog flushed. If the whole
+table has gone silent, **End round** stops it and reopens the lane, and every
+withheld backlog is delivered on the way out. You never need to do either to
+*unblock* the round: an expired turn advances on its own within a couple of
+seconds, and a holder that was granted a turn and is not polling at all is
+skipped after 45 seconds rather than burning its whole budget.
 
 ### The dashboard shows "Disconnected" or a reconnect banner
 
@@ -326,7 +404,8 @@ Before escalating an incident:
 1. Export the current message log via `GET /export` (JSON, Markdown, or text)
    while the hub is still running — the log is lost on restart.
 2. Note the peer states (live/reaped/paused) from the Peers panel.
-3. Note the current floor state (any active talking sticks, hands raised).
+3. Note the current floor state (any active talking sticks, hands raised, and
+   for a round its ring, turn deadline, extension count and withheld backlogs).
 4. Note `queue_depth` and `msg/min` at the time of the incident.
 5. If disk logging was enabled, the JSONL file has the full routed history up
    to the retention window.

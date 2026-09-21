@@ -158,6 +158,11 @@ class SendResult:
     ``delivered_to``; a 429 sets ``rate_limited`` with ``retry_after``; a 409
     sets ``stopped``; a 423 sets ``floor_held`` with holder/reason/scope details.
 
+    A 423 covers both talking-stick modes, the exclusive lock and the rotating
+    round, since the caller's obligation is identical (hold this message). The
+    two are still told apart by ``floor_error``, and the hub's own per-mode
+    advice rides along in ``floor_hint``.
+
     Attributes:
         ok: ``True`` when the message was accepted and routed.
         message_id: The hub-assigned id of the delivered message, if any.
@@ -176,6 +181,21 @@ class SendResult:
         floor_reason: The reason the holder took the stick, when floor_held.
         floor_scope: The scope (``"all"`` or ``"#channel"``) where the stick is
             held, when floor_held.
+        floor_error: The raw error string behind a 423 (``"floor_held"`` for an
+            exclusive lock, ``"round_in_progress"`` for a rotating round), or
+            ``None``. Both set :attr:`floor_held`, because the caller's move is
+            the same either way (you may not speak in this scope yet); this
+            field is what lets a caller that *does* care tell them apart, e.g.
+            to raise a hand on the first but never on the second.
+        floor_hint: The hub's own agent-facing sentence for a 423, or ``None``.
+            The hub words it per mode (an exclusive lock suggests raising a
+            hand, a round tells the peer to wait its turn and *not* retry), so
+            a connector should surface this verbatim rather than mint its own.
+        stick: Talking-stick state *after* a successful send, or ``None``
+            outside a round. In a round the stick moves when the holder speaks,
+            so a caller learns from this where its turn went without a second
+            call. Keys: ``scope``, ``holder``, ``ring``, ``deadline_in``,
+            ``you_hold`` and ``note`` (one sentence meant for the agent).
     """
 
     ok: bool
@@ -191,6 +211,9 @@ class SendResult:
     floor_holder: str | None = None
     floor_reason: str | None = None
     floor_scope: str | None = None
+    floor_error: str | None = None
+    floor_hint: str | None = None
+    stick: dict[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -476,7 +499,9 @@ class HubConnector:
         Returns:
             A :class:`SendResult`: ``ok`` on success, ``rate_limited`` on 429,
             ``stopped`` on 409, ``floor_held`` on 423 (a talking-stick holder
-            bars this sender in the target scope).
+            bars this sender in the target scope, or a round has not reached it
+            yet). A successful send inside a round also carries
+            :attr:`SendResult.stick`, since speaking is what moves the stick on.
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -492,11 +517,18 @@ class HubConnector:
             return SendResult(ok=False, stopped=True)
         if resp.status_code == 423:
             body = resp.json()
+            # One flag for both stick modes: ``floor_held`` (an exclusive lock)
+            # and ``round_in_progress`` (it is not your turn yet) both mean the
+            # same thing to a caller, so they share ``floor_held``. The raw
+            # error and the hub's per-mode hint are kept alongside for the
+            # callers that want to word their refusal differently.
             return SendResult(
                 ok=False, floor_held=True,
                 floor_holder=body.get("held_by"),
                 floor_reason=body.get("reason"),
                 floor_scope=body.get("scope"),
+                floor_error=body.get("error"),
+                floor_hint=body.get("hint"),
             )
         resp.raise_for_status()
         body = resp.json()
@@ -507,6 +539,9 @@ class HubConnector:
             missed=list(body.get("missed", [])),
             warning=body.get("warning"),
             hint=body.get("hint"),
+            # Present only in a round: the send spent the caller's turn and
+            # this says where the stick went next.
+            stick=body.get("stick"),
         )
 
     async def receive(
@@ -922,11 +957,99 @@ class HubConnector:
         resp.raise_for_status()
         return dict(resp.json())
 
+    async def start_round(
+        self,
+        token: str,
+        scope: str,
+        reason: str,
+        *,
+        turn_seconds: float | None = None,
+    ) -> dict[str, object]:
+        """Open a rotating round on a scope; the caller takes the first turn.
+
+        The other mode of the talking stick. Where :meth:`take_floor` hands one
+        peer an exclusive lock until it lets go, a round walks the stick around
+        a ring of everyone present, one bounded turn each. While it is not a
+        peer's turn the hub *withholds* that scope's traffic from it and hands
+        over the whole backlog the moment the stick arrives, so nobody answers
+        half an exchange. The stick then moves on its own when the holder
+        speaks: one :meth:`send` routes the message and rotates the ring.
+
+        Args:
+            token: The caller's access token. It speaks first.
+            scope: The scope to run the round on: ``"all"`` for the whole room,
+                or a ``"#channel"`` the caller has joined.
+            reason: What the round is about, shown in the opening notice.
+            turn_seconds: Per-turn budget in seconds, or ``None`` to take the
+                hub's default. Omitted from the request body entirely when
+                ``None``, so the hub applies its own default rather than
+                reading a null as a value.
+
+        Returns:
+            The hub's response dict, e.g. ``{"ok": True, "scope": "all",
+            "holder": ..., "ring": [...], "deadline": ..., "turn_seconds": ...}``
+            on success, or ``{"ok": False, "error": ...}`` for a refusal
+            (``floor_held`` when an exclusive stick is up, ``round_in_progress``
+            when one is already running, ``not_enough_peers`` for a ring of one,
+            ``bad_scope``, ``not_a_member``).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        payload: dict[str, object] = {
+            "token": token,
+            "action": "round",
+            "scope": scope,
+            "reason": reason,
+        }
+        if turn_seconds is not None:
+            payload["turn_seconds"] = turn_seconds
+        resp = await http.post("/floor", json=payload)
+        resp.raise_for_status()
+        return dict(resp.json())
+
+    async def extend_turn(self, token: str, scope: str) -> dict[str, object]:
+        """Push the current round turn's deadline out; tell nobody but yourself.
+
+        The "still thinking" marker. It routes **nothing**: no peer is woken and
+        no message is delivered, so an agent that uses this must not believe it
+        has communicated anything. Only the caller (through this return value)
+        and the operator console learn of it.
+
+        Only the current holder of a *round* may extend; an exclusive stick has
+        no deadline and the hub refuses with ``not_a_round``.
+
+        Args:
+            token: The caller's access token (must be the current holder).
+            scope: The scope whose turn to extend: ``"all"`` or a ``"#channel"``.
+
+        Returns:
+            The hub's response dict, e.g. ``{"ok": True, "scope": ..., "holder":
+            ..., "deadline": ..., "deadline_in": ..., "extensions": 1}``, or
+            ``{"ok": False, "error": ...}`` (``no_floor``, ``not_a_round``,
+            ``not_holder``).
+
+        Raises:
+            httpx.HTTPError: On transport failures or unexpected status codes.
+        """
+        http = self._require_http()
+        resp = await http.post(
+            "/floor",
+            json={"token": token, "action": "extend", "scope": scope},
+        )
+        resp.raise_for_status()
+        return dict(resp.json())
+
     async def pass_floor(self, token: str, scope: str) -> dict[str, object]:
         """Pass the talking stick to the next queued peer (or release it if empty).
 
         Only the current holder may call this.  If peers have raised their hand
         the stick moves to the first in the queue; otherwise it is released.
+
+        In a *round* this is the "nothing to add" verb: the caller gives up its
+        turn without sending anything, the stick moves to the next ring member,
+        and a full lap of such turns ends the round.
 
         Args:
             token: The caller's access token (must be the current holder).
@@ -1030,7 +1153,13 @@ class HubConnector:
         Returns:
             A mapping ``{scope: {...}}`` describing each active floor hold,
             e.g. ``{"all": {"holder": "peer-x", "reason": "...", "hands": [...],
-            "since": ...}}``. Empty dict when no stick is held anywhere.
+            "since": ..., "mode": "exclusive", "round": None}}``. Empty dict
+            when no stick is held anywhere. ``mode`` is ``"exclusive"`` or
+            ``"round"``; in a round, ``round`` carries the rotation state
+            (``ring``, ``deadline``, ``remaining``, ``turn_seconds``,
+            ``extensions``, ``silent_turns``, ``started_by``, ``paused``, and
+            ``held``: the withheld backlog depth per ring member) and ``hands``
+            is always empty, since a round has a ring rather than a queue.
 
         Raises:
             httpx.HTTPError: If the hub is unreachable or returns an error.

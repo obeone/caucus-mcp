@@ -42,8 +42,8 @@ may all act; last write wins.
 
 ## 2. Hub → UI events
 
-Existing (unchanged): `message`, `channels`, `mode`, `floor`, `form`,
-`form_resolved`.
+Existing (unchanged): `message`, `channels`, `mode`, `form`, `form_resolved`.
+`floor` is extended (see below).
 
 ### `snapshot` (extended)
 Sent once after `auth_ok`. Same as today plus `health` and **rich `peers`**:
@@ -75,9 +75,16 @@ Sent once after `auth_ok`. Same as today plus `health` and **rich `peers`**:
   "status_age": 12.3,            // seconds since status set, or null
   "last_seen_age": 1.2,          // seconds since last hub interaction
   "uptime": 845.0,               // seconds since first_seen
-  "msg_count": 42                // messages this peer has SENT
+  "msg_count": 42,               // messages this peer has SENT
+  "waiting_turn": false          // parked in a rotating round, not its turn yet
 }
 ```
+`waiting_turn` is `true` while the peer sits in a round's ring on some scope
+without holding the stick. A parked peer polls in total silence by design, so
+the hub exempts it from the `quiet` liveness flag: without this the roster would
+report every peer waiting its turn as a dead agent, at exactly the moment it is
+behaving correctly. Render it as "waiting its turn", not as a warning.
+
 Pushed on roster changes (join/leave/kick/reap/revive) and on pause/resume.
 Live counters that drift continuously (msg_count, ages) are refreshed on the
 periodic `health` tick carrying the full peer list too — frontend may use either.
@@ -105,6 +112,46 @@ Reply to an operator `heartbeat` command:
 `ping()` shape: `{peer, state, present, last_seen_age?, listening?, status?,
 status_age?, reaped_age?}`.
 
+### `floor` (extended: per-scope entries gained `mode` and `round`)
+
+Same envelope as before, `{"type":"floor","floors":{ "<scope>": <FloorEntry> }}`,
+also carried as `floors` on the `snapshot`. Every key the exclusive stick always
+had is unchanged; `mode` and `round` are appended, so a console that predates
+rounds keeps working.
+
+```json
+{
+  "scope": "all",
+  "holder": "peer-x",
+  "reason": "settling the API shape" | null,
+  "hands": ["peer-y"],           // always empty in round mode: a ring, not a queue
+  "since": 1750000000.0,         // when the current holder took the stick
+  "mode": "exclusive" | "round",
+  "round": null | {
+    "ring": ["peer-x", "peer-y", "peer-z"],  // rotation order, holder first
+    "deadline": 1750000300.0,    // absolute epoch time this turn expires
+    "remaining": 287.4,          // seconds left, at send time
+    "turn_seconds": 300.0,       // budget each fresh turn gets in this round
+    "extensions": 1,             // extensions the CURRENT holder has taken
+    "total_extensions": 4,       // extensions across the whole round
+    "silent_turns": 2,           // peers that have declined since anyone spoke
+    "declined": ["peer-y"],      // which ones, sorted
+    "started_by": "peer-x" | "operator",
+    "started_at": 1750000000.0,
+    "paused": false,             // turn clock frozen by an operator Pause
+    "held": { "peer-y": 3, "peer-z": 0 }   // withheld backlog per ring member
+  }
+}
+```
+
+`deadline` is absolute rather than a countdown so the console extrapolates its
+own ticking clock and the hub pushes an event only when something really
+changes; `remaining` is a convenience computed at send time. `extensions` is the
+filibuster tell: they are unlimited by design, so a climbing count on one
+holder is the only signal the operator gets. `held` is what makes a round legible
+to a human: it is the traffic piling up behind each peer waiting its turn, and
+it is how you tell a parked peer from a dead one.
+
 ## 3. UI → Hub commands
 
 Existing (unchanged): `{"mode":"pause"|"resume"|"reset"|"stop"}`,
@@ -126,12 +173,69 @@ defaulting to `"all"`).
   a one-shot sweep + system notice, documented as such. Pushes a `channels`
   event.
 
+### Round commands (all operator-only)
+
+Three more actions under the same `{"floor":{...}}` envelope the existing
+`clear` already uses, rather than a second command key, so the operator's floor
+controls do not straddle two wire shapes. Each validates its own payload; a
+frame that matches none of them is ignored, like every other unknown command.
+
+- `{"floor":{"action":"advance","scope":"<scope>"}}`: take the stick off the
+  current holder now and hand it to the next eligible peer in the ring. Counts
+  as a silent turn, so skipping an unresponsive table repeatedly still closes
+  the round instead of spinning forever. No-op when the scope runs the exclusive
+  lock or no floor at all.
+- `{"floor":{"action":"start","scope":"<scope>","reason":"<text>","turn_seconds":<n>}}`
+  opens a rotating round on that scope. `reason` and `turn_seconds` are both
+  optional; an unusable `turn_seconds` falls back to the hub default rather than
+  refusing the round. The operator is **not** in the ring (they speak regardless
+  of any stick, so a seat for them would only block the table while they are
+  away from the keyboard), so the first turn goes to the first peer in join
+  order. Refused when the scope already has a floor, or when fewer than two
+  peers are in it.
+- `{"floor":{"action":"retune","scope":"<scope>","turn_seconds":<n>}}`: change a
+  live round's per-turn budget and re-baseline the current turn from now. The
+  value is validated against the 15s to 3600s range and a rejected one is a
+  strict no-op, never a partial application.
+
+`{"floor":{"action":"clear","scope":"<scope>"}}` is mode-agnostic: on a round it
+ends the round exactly as it puts an exclusive stick away, releasing every
+withheld backlog on the way out so no peer is left holding gated traffic.
+
 ## 4. State additions (`models.py` / `state.py`)
 
 `Client` gains:
 - `first_seen: float` — set at creation; basis for `uptime`.
 - `msg_count: int` — incremented in `route()` when the client is the sender.
 - `paused: bool` — operator pause flag; `/receive` holds the queue while true.
+- `held: dict[str, deque[Message]]`: scope chatter withheld from this peer while
+  a round runs on that scope and the stick is elsewhere, keyed by scope (a peer
+  can be parked in the room's round and a channel's at once). Deliberately a
+  deque and not a queue: nothing in it can wake a `/receive` long-poll, which is
+  the entire point. Flushed into `queue` in one synchronous burst when the turn
+  opens, when the peer leaves the ring, and when the round ends. Deferred
+  delivery, never a drop. Invisible to `peek()`, so a parked peer is never told
+  it has mail it cannot collect.
+
+`Floor` gains:
+- `round: Round | None`: `None` under the exclusive lock. One slot per scope, so
+  a scope runs one mode or the other and never both.
+
+`Round` (new dataclass):
+- `ring: list[str]`: rotation order; `ring[0]` is always the holder.
+- `deadline: float` / `turn_seconds: float`: when this turn expires, and the
+  budget each fresh turn gets.
+- `extensions: int` (current holder, reset on rotation) / `total_extensions: int`.
+- `declined: set[str]`: peers that took a turn and said nothing since anyone
+  last spoke; cleared the moment somebody does. The round ends once every peer
+  still able to speak is in it. A set and not a counter, so a peer that joined
+  mid-lap cannot have the round closed over its head.
+- `started_by: str` / `started_at: float`: `"operator"` for a console-opened round.
+- `paused_at: float | None`: turn clocks freeze on an operator Pause and every
+  deadline is shifted forward by the pause on resume, so a peer whose queue was
+  gated does not burn a turn it could not read.
+- `granted_seen: float`: the holder's `last_seen` when the turn was granted;
+  feeds the pickup-grace skip for a holder that is registered but not polling.
 
 `HubState` gains:
 - hub `started_at` for uptime; a rolling 60s send-timestamp deque for

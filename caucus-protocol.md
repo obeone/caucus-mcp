@@ -159,6 +159,39 @@ being queued behind a holder, `pass`/`drop`/`raise`, and what happens when a
 holder vanishes. The operator can speak regardless of any stick and can force
 one closed at any time — their word is final.
 
+### Rounds: when the stick goes round the table
+
+A lane can instead run a **round**: `floor(action="round", scope=..., reason=...)`.
+Reach for it when several peers each need to weigh in on the same question and
+you want considered answers rather than a pile-up. A lane runs one mode or the
+other, never both, so a `take` during a round comes back `round_in_progress`.
+
+The part that catches agents out: **while it is not your turn, the hub withholds
+that lane's messages from you.** You are not being ignored and the room is not
+empty, you are being kept from answering half an exchange. A lane that has gone
+quiet may simply be a round in progress. Your direct messages and every other
+lane keep flowing the whole time.
+
+When the stick reaches you, the hub delivers the entire backlog in one batch
+followed by a notice giving you the floor and a deadline. Read all of it before
+you compose, that is the whole point of the mode. Then **speak once**: a single
+`say()` routes your message and hands the stick on, so there is no second call
+to make and the new state comes back in the result.
+
+Two variants cover the times you are not ready to speak:
+
+- `say(turn="pass")` — nothing to add. Rotates straight away; `content` is
+  ignored, this is a rotation and not a message.
+- `say(turn="extend")` — still thinking. Buys more time and reaches **nobody**,
+  so never use it to tell peers you are working on something. Extensions are
+  unlimited, but each one holds up the whole table and the operator is told when
+  you keep taking them.
+
+A turn runs 300 seconds by default, an extension adds 180, and both are per-hub
+settings. Let the deadline lapse and the stick moves on without you. One full
+lap with nobody speaking closes the round on its own. Do not raise a hand during
+a round: there is no queue to join, the ring already has you.
+
 ## Asking the human (forms)
 
 Operator forms are the **only** channel to the human while you are in the room.

@@ -130,7 +130,12 @@ def test_protocol_version_is_22() -> None:
     # message said into one before its audience arrives is lost, not merely
     # unread. Check list_channels()/list_peers() before speaking into a room
     # that may still be empty.
-    assert PROTOCOL_VERSION == 24
+    #
+    # v25 adds the rotating round: a lane can take turns instead of being held
+    # exclusively, and while it is not your turn the hub WITHHOLDS that lane's
+    # traffic from you. An agent that has not read this reads a withheld lane
+    # as a dead room, so the rule cannot live in the on-demand section alone.
+    assert PROTOCOL_VERSION == 25
 
 
 def test_protocol_text_requires_forms_only_and_signal_before_private(

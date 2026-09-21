@@ -1063,3 +1063,124 @@ async def test_sweep_reaps_idle_unjoined_sessions(state: HubState) -> None:
     # fresh by the watcher's /receive polls), not last_active. A joined agent
     # that calls no tool for an hour while its watcher listens must survive.
     assert (await _tool(server, "whoami")(joiner))["joined"] is True
+
+
+# --- rotating round: say(turn=...) and floor(action="round") ---------------
+
+
+async def test_say_returns_the_stick_alongside_delivered_to(state: HubState) -> None:
+    """The hub's "the stick moved on" signal must survive the /mcp connector.
+
+    The sibling of ``test_say_returns_missed_alongside_delivered_to``, and the
+    same failure mode: this path rebuilds the result dict by hand, so a field
+    the hub added is dropped unless it is named there. In a round the send
+    spent the caller's turn, and ``stick`` is the only place it learns where
+    that turn went.
+    """
+    server = _build()
+    alpha, beta = _ctx("alpha"), _ctx("beta")
+    await _tool(server, "join")(alpha, project="alpha")
+    await _tool(server, "join")(beta, project="beta")
+    opened = await _tool(server, "floor")(alpha, action="round", reason="review")
+    assert opened["ok"] is True
+
+    res = await _tool(server, "say")(alpha, content="my turn", to="all")
+
+    assert res["delivered_to"] == ["beta"]
+    stick = res["stick"]
+    assert stick["holder"] == "beta"
+    assert stick["you_hold"] is False
+    assert stick["ring"] == ["beta", "alpha"]
+    assert "turn spent" in str(stick["note"])
+
+    # Outside a round the field is present and null, not absent.
+    await _tool(server, "floor")(beta, action="drop")
+    plain = await _tool(server, "say")(alpha, content="lane is open", to="beta")
+    assert plain["stick"] is None
+
+
+async def test_round_refusal_carries_the_hubs_own_error_and_hint(
+    state: HubState,
+) -> None:
+    """A 423 in a round must not be re-worded by the connector.
+
+    This path had a locally hardcoded ``floor_held`` sentence telling the
+    refused peer to raise a hand — the one move a round drops on the floor.
+    The hub distinguishes the two modes; the connector has to pass that on.
+    """
+    server = _build()
+    alpha, beta = _ctx("alpha"), _ctx("beta")
+    await _tool(server, "join")(alpha, project="alpha")
+    await _tool(server, "join")(beta, project="beta")
+    await _tool(server, "floor")(alpha, action="round", reason="review")
+
+    res = await _tool(server, "say")(beta, content="barging in", to="all")
+
+    assert res["error"] == "round_in_progress"
+    assert res["held_by"] == "alpha"
+    hint = str(res["hint"])
+    assert "Do NOT retry in a loop" in hint
+    assert "do not raise a hand" in hint
+    assert 'floor(action="raise")' not in hint
+
+
+async def test_exclusive_refusal_still_gets_the_raise_a_hand_advice(
+    state: HubState,
+) -> None:
+    """Deferring to the hub must not cost the exclusive lock its own wording."""
+    server = _build()
+    alpha, beta = _ctx("alpha"), _ctx("beta")
+    await _tool(server, "join")(alpha, project="alpha")
+    await _tool(server, "join")(beta, project="beta")
+    await _tool(server, "floor")(alpha, action="take", reason="prod is down")
+
+    res = await _tool(server, "say")(beta, content="barging in", to="all")
+
+    assert res["error"] == "floor_held"
+    assert 'floor(action="raise")' in str(res["hint"])
+
+
+async def test_floor_action_round_is_not_swallowed_by_the_drop_fall_through(
+    state: HubState,
+) -> None:
+    """``round`` needs its own branch: the trailing ``return`` is ``drop``.
+
+    The dispatch ends in an unguarded ``drop_floor`` fall-through, so a new
+    action that nobody named above would silently release the floor instead of
+    opening a round — and the reply (``no_floor``) would not even look like a
+    dispatch bug.
+    """
+    server = _build()
+    alpha, beta = _ctx("alpha"), _ctx("beta")
+    await _tool(server, "join")(alpha, project="alpha")
+    await _tool(server, "join")(beta, project="beta")
+
+    res = await _tool(server, "floor")(alpha, action="round", reason="review")
+
+    assert res["ok"] is True
+    assert res["holder"] == "alpha"
+    assert res["ring"] == ["alpha", "beta"]
+    assert res["turn_seconds"] > 0
+    # What a fall-through to drop_floor would have produced instead.
+    assert res.get("released") is not True
+    assert res.get("error") is None
+    held = (await _tool(server, "floor")(alpha, action="status"))["floors"]["all"]
+    assert held["mode"] == "round"
+
+
+async def test_say_turn_is_optional_and_defaults_to_speak_on_both_connectors(
+    state: HubState,
+) -> None:
+    """``to`` stays required; ``turn`` arrives optional with a ``"speak"`` default.
+
+    The model learns both facts only from the schema. A required ``turn``
+    would break every existing caller, and a ``to`` that drifted back to
+    optional would make a forgotten field the widest possible send again.
+    """
+    http_tools = {t.name: t for t in await _build().list_tools()}
+    bridge_tools = {t.name: t for t in await mcp_bridge.mcp.list_tools()}
+    for tools in (http_tools, bridge_tools):
+        schema = tools["say"].inputSchema
+        assert schema["required"] == ["content", "to"]
+        assert "default" not in schema["properties"]["to"]
+        assert schema["properties"]["turn"]["default"] == "speak"

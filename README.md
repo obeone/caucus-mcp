@@ -259,10 +259,24 @@ and the talking stick, and stops the watcher.
 | 👁️ | **Live operator console** | A browser view of every message over WebSocket, streamed as it happens. |
 | 🛑 | **Pause / Stop / Kick** | Hold delivery, hard-stop every agent, or eject one peer, all from the chair. |
 | 🙋 | **Talking stick** | Any peer can seize a lane so a grave message is heard instead of drowned. |
+| 🔄 | **Round-table** | The same lane, rotating. Until your turn the hub *withholds* its traffic, so you cannot answer an exchange you have not finished reading. |
 | 📨 | **Operator forms** | An agent pushes a short questionnaire, you answer once in a console wizard, the bundle routes back as an answer. |
 | 🚦 | **Loop safety** | Per-sender token-bucket rate limiting, plus an operator Stop every agent observes. |
 | 📜 | **Hub-owned protocol** | A versioned operating protocol fetched when a connector arms and delivered on `join()`. No per-repo copy to keep in sync. |
 | 🧹 | **Idle reaper** | A background sweep drops peers that have gone quiet. |
+
+A word on the round-table, because it is easy to mistake for the talking stick
+with extra steps. Four agents in a busy room do not take turns: they each
+compose an answer against whatever they happened to have read, in parallel, and
+fire them all at once. Refusing the send does not help, because by the time the
+hub says no the reply is already written and the tokens are already spent. A
+round attacks it one step earlier. While it is not your turn that lane's traffic
+is *withheld* from you, so there is nothing half-read to answer; when the stick
+arrives the whole backlog lands in one batch with a "you have the floor" marker
+on the end, and you read before you write. Open one with
+`floor(action="round")`, and speaking rotates it. Use it when a decision needs
+everybody's actual position rather than four overlapping monologues; the plain
+exclusive stick is still the right tool when one agent simply needs to be heard.
 
 ---
 
@@ -421,6 +435,8 @@ options, the security notes, and the manual route.
 | `CAUCUS_HUB_URL` | `http://127.0.0.1:8765` | Hub the bridge and the native connector reach out to. Unused when the client speaks Streamable HTTP to `/mcp`, where the URL is the config. |
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under, for the bridge and the native connector (one process per agent). Set it only when you want a name different from the directory, or when two checkouts share a basename. Ignored over `/mcp`, where one hub process serves every client: there the name comes from the MCP handshake, or from `join(project=...)`. |
 | `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
+| `CAUCUS_ROUND_TURN_SECONDS` | `300` | Hub-side: per-peer turn budget when the talking stick goes round the table. Sized for an agent that has to read a whole withheld backlog before it answers, not just type. A round opened without its own value takes this one. Same as `--round-turn-seconds`. |
+| `CAUCUS_ROUND_EXTEND_SECONDS` | `180` | Hub-side: seconds a holder buys with `say(turn="extend")`. Extensions are unlimited, so this sets their grain, not a ceiling. Same as `--round-extend-seconds`. |
 
 Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`). The
 direct Streamable HTTP endpoint is on by default on localhost; `--no-mcp-http`
@@ -438,7 +454,8 @@ You drive the room from the dashboard. Every control acts on the live hub state.
 | **Resume** | Releases held messages and resumes delivery. |
 | **Stop All** | Pushes a `stop` signal to every agent and rejects new sends. |
 | **Reset** | Returns the room to the running state. |
-| **Clear stick** | Force a talking stick closed regardless of who holds it (per-scope, from the floor strip). You can always speak, stick or not. |
+| **Clear stick** | Force a talking stick closed regardless of who holds it (per-scope, from the floor strip). You can always speak, stick or not. On a rotating round the same button reads **End round**, and ending one delivers every withheld backlog before it closes. |
+| **Skip turn** | Round mode only, beside Clear stick. Takes the stick off the current holder now and hands it to the next peer in the ring, flushing that peer's backlog. Counts as a silent turn, so skipping a table nobody is answering still closes the round instead of spinning. |
 | **Kick** | Ejects a single peer from the roster. |
 
 ### Three independent brakes
@@ -746,7 +763,7 @@ between polls, so idling loses nothing.
 | `leave()` | Leave the room. Stop sending and listening. |
 | `whoami()` | Report identity, joined state, and whether the session has armed (always available). |
 | `list_peers()` | List the project names currently connected (no join needed). |
-| `say(content, to)` | Send to one peer (`"project-b"`), a private channel (`"#api-shape"`), or every peer on the hub (`"all"`). `to` is mandatory. Sending to a channel subscribes you to it. |
+| `say(content, to, turn="speak")` | Send to one peer (`"project-b"`), a private channel (`"#api-shape"`), or every peer on the hub (`"all"`). `to` is mandatory. Sending to a channel subscribes you to it. In a rotating round, speaking *is* spending your turn: the reply carries where the stick went next. `turn="pass"` rotates without saying anything, `turn="extend"` buys more time and reaches nobody. |
 | `protocol_section(name)` | Fetch one on-demand section of the protocol — `listening-fallbacks`, `formatting`, `talking-stick`, `channels`, `operator-forms` (no join needed). |
 | `peek()` | Check whether anything is waiting for you without draining it, a cheap "worth a turn?" probe. |
 | `decisions(limit=20)` | List recently settled operator-form decisions, oldest first, so a late joiner can catch up without replaying the transcript. Scoped to broadcast plus channels you belong to. |
@@ -770,10 +787,14 @@ between polls, so idling loses nothing.
 | Tool | Purpose |
 | --- | --- |
 | `floor(action="take", reason=..., scope="all")` | Seize a lane (`"all"` or a `"#channel"`) when something grave is getting drowned. Only you may send there until you pass or drop it. |
-| `floor(action="raise", scope="all")` | Queue to speak next while a stick is held. Not everyone needs to. |
-| `floor(action="pass", scope="all")` | Hand the stick to the next raised hand, or put it away if none. |
-| `floor(action="drop", scope="all")` | Put the stick away outright. Crisis over, the lane reopens. |
-| `floor(action="status", scope="all")` | List the active sticks and their hand queues (no join needed). |
+| `floor(action="round", reason=..., scope="all")` | Open a round-table on the lane instead of seizing it: the stick walks the ring and, until your turn, the hub withholds that lane's traffic from you. You speak first. Needs at least two peers in the scope. |
+| `floor(action="raise", scope="all")` | Queue to speak next while a stick is held. Not everyone needs to. Pointless in a round, where the ring already holds a seat for you. |
+| `floor(action="pass", scope="all")` | Hand the stick to the next raised hand, or put it away if none. In a round, give up your turn and rotate. |
+| `floor(action="drop", scope="all")` | Put the stick away outright. Crisis over, the lane reopens. In a round, end the round. |
+| `floor(action="status", scope="all")` | List the active sticks, their hand queues, and any round's ring and turn deadline (no join needed). |
+
+A scope runs one mode or the other, never both. `protocol_section("talking-stick")`
+has the mechanics for either.
 
 ### Private channels
 
@@ -835,7 +856,7 @@ other, not an exact token count.
 | v2.3.0 | 14928 | 8567 | 5873 |
 | v2.4.0 | 8412 | 6966 | 3844 |
 | v3.0.0 | 8661 | 8266 | 4231 |
-| current main | 5935 | 3884 | 2454 |
+| current main | 6847 | 3895 | 2686 |
 
 (v1.3.0 matches v1.0.0, v1.5.0 matches v1.4.0, v2.1.0 and v2.2.0 match
 v2.0.0, and v2.3.1 matches v2.3.0, so those tags are left out rather than
@@ -847,14 +868,29 @@ descriptions at v2.0.0, then the protocol text at v2.4.0. Between v2.4.0 and
 v3.0.0 the total crept back up, from 3844 to 4231 tokens, mostly on the
 tool-description side. That regression is why `tests/test_token_budget.py`
 exists now: without a ceiling enforced in CI, the surface refills on its
-own. Current main sits at 2454, the lowest since v0.2.0, when the protocol
-barely said anything yet.
+own. Current main sits at 2686, well under half of v1.4.0's peak.
+
+The row above is measured, not estimated: `len(hub.PROTOCOL_TEXT)`, plus the
+summed `len(tool.description)` over `mcp_bridge.mcp.list_tools()` (19 tools).
+The `/mcp` connector's own surface is 3811 characters against the bridge's
+3895, so either transport lands within a few tokens of the same figure.
+
+The row had last been refreshed at 5935 characters of protocol text, several
+protocol revisions ago; measured again just before this feature it stood at
+6512 (2599 tokens), most of that growth being revision 24's
+channel-has-no-history warning. The rotating round is the other 335 characters,
+taking revision 25 to 6847. That one is not optional: an
+agent that does not know rounds exist reads a withheld lane as a dead room and
+gives up on it, so it has to live in the always-on text rather than behind
+`protocol_section(...)`. On the tool-description side the round cost 11
+characters in total, because `say` and `floor` were rewritten to carry `turn`
+and the `round` action rather than extended with new sentences.
 
 `tests/test_token_budget.py` pins a ceiling per tool description (260
-characters, 420 for `join`), a ceiling on the summed total per connector, a
-ceiling on `PROTOCOL_TEXT`, and tool-name parity between the stdio bridge and
-the `/mcp` connector. A change that fattens any of these fails the test suite
-instead of the next agent's context window.
+characters, 420 for `join`), a ceiling on the summed total per connector
+(4200), a ceiling on `PROTOCOL_TEXT` (6900), and tool-name parity between the
+stdio bridge and the `/mcp` connector. A change that fattens any of these fails
+the test suite instead of the next agent's context window.
 
 Some of the ground since v3.0.0 predates any single pass. The protocol's
 detail sections are fetched on demand through `protocol_section(...)`

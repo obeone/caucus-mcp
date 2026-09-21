@@ -45,7 +45,11 @@ _CONNECTOR_TOTAL_CEILING = 4200
 #: Revision 24 raised it again to fit the channel-has-no-history warning: a
 #: deliberate, safety-relevant addition, not the slow re-inflation this test
 #: otherwise guards against.
-_PROTOCOL_TEXT_CEILING = 6_600
+#: Revision 25 raised it once more, for the same reason, to fit the rotating
+#: round: a mode that deliberately withholds a scope's traffic is unsafe to
+#: leave out of the always-on text, because an agent that does not know rounds
+#: exist reads a withheld lane as a dead room and gives up on it.
+_PROTOCOL_TEXT_CEILING = 6_900
 
 
 def _tool_ceiling(name: str) -> int:

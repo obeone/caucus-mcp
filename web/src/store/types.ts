@@ -32,6 +32,14 @@ export interface PeerInfo {
    * status-stale threshold. Dims the status text; purely advisory.
    */
   status_stale: boolean;
+  /**
+   * True when the peer sits in a round-mode rotation but is not the current
+   * holder. Such a peer polls in total silence by design, so it must read as
+   * healthy (calm, not a warning) even though it looks idle.
+   *
+   * Optional: older hubs never send it.
+   */
+  waiting_turn?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -50,12 +58,51 @@ export type ChannelsMap = Record<string, ChannelInfo>;
 // Floor (talking stick)
 // ---------------------------------------------------------------------------
 
+/** Floor arbitration mode for a scope. Absent on hubs predating round mode. */
+export type FloorMode = "exclusive" | "round";
+
+/**
+ * Round-table state, present only when a scope runs in `"round"` mode.
+ *
+ * Sent by the hub as the nested `round` object of a floor entry; `null` while
+ * the scope runs the classic exclusive talking stick.
+ */
+export interface RoundInfo {
+  /** Rotation order, current holder first. */
+  ring: string[];
+  /** Absolute epoch seconds at which the current turn expires. */
+  deadline: number | null;
+  /** Seconds left at push time only. Does NOT tick; extrapolate from deadline. */
+  remaining: number | null;
+  /** Nominal length of one turn, in seconds. */
+  turn_seconds: number;
+  /** Extensions taken by the CURRENT holder. */
+  extensions: number;
+  /** Extensions taken since the round started, all holders. */
+  total_extensions: number;
+  /** Consecutive turns that produced no message. */
+  silent_turns: number;
+  /** Peer that opened the round, or "operator". */
+  started_by: string;
+  /** Epoch seconds at which the round started. */
+  started_at: number;
+  /** True when the room is paused: the turn clock is frozen. */
+  paused: boolean;
+  /** Withheld backlog depth per peer, for everyone but the holder. */
+  held: Record<string, number>;
+}
+
 export interface FloorEntry {
   scope: string;
   holder: string;
   reason: string | null;
+  /** Raised hands; always empty in round mode. */
   hands: string[];
   since: number;
+  /** Arbitration mode. Optional: older hubs omit it, and it reads as exclusive. */
+  mode?: FloorMode;
+  /** Round-table state; null or absent outside round mode. */
+  round?: RoundInfo | null;
 }
 
 export type FloorsMap = Record<string, FloorEntry>;
@@ -396,7 +443,13 @@ export interface DashboardState {
   sendCloseChannel: (name: string) => void;
   sendAnswer: (id: string, answers: Record<string, string | string[]>) => void;
   sendCancelForm: (id: string, reason?: string) => void;
+  /**
+   * Drop the scope's floor entirely. In round mode this is what "end round"
+   * does, so there is no separate end-round command.
+   */
   sendFloorClear: (scope: string) => void;
+  /** Skip the current turn: hand the stick to the next peer in the ring. */
+  sendFloorAdvance: (scope: string) => void;
   /** Send operator message. Wire format: {"say":"<text>","to":"<scope>"}. */
   sendChat: (to: string, content: string) => void;
   /**

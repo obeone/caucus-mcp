@@ -250,6 +250,91 @@ def _channel_failure(
     return {"error": rejected_error, "channel": channel, "hint": rejected_hint}
 
 
+#: The ``say(turn=...)`` verbs that are rotations rather than messages, and so
+#: are routed to ``/floor`` instead of ``/send``. Keeping them off the send path
+#: is what makes "an extension reaches nobody" a property of the wiring rather
+#: than of a filter a later edit could quietly drop.
+_FLOOR_TURNS = ("pass", "extend")
+
+
+def _turn_result(turn: str, scope: str, reply: dict[str, object]) -> dict[str, object]:
+    """Normalise a ``/floor`` pass/extend reply into ``say``'s own result shape.
+
+    ``say(turn="pass"|"extend")`` never touches ``/send``, but from the calling
+    agent's side it is still one ``say`` call, so it must not come back wearing
+    a second result schema. The ``/floor`` reply is rebuilt here into exactly
+    what the ``speak`` path returns: the delivery fields, empty because nothing
+    was delivered, plus the ``stick`` block that carries the sentence the agent
+    actually reads.
+
+    A refusal is passed straight through: the hub's ``{"ok": False, "error":
+    ...}`` already names what went wrong (``no_floor``, ``not_a_round``,
+    ``not_holder``), and dressing it up as an empty delivery would read as a
+    success.
+
+    This is a deliberate twin of :func:`caucus.mcp_bridge._turn_result`. The two
+    connectors cannot share one implementation (the bridge drives a synchronous
+    ``httpx.Client``, this module goes through :class:`HubConnector`), so the
+    behaviour is kept identical by hand and guarded by
+    ``tests/test_mcp_http_parity.py``.
+
+    Args:
+        turn: The verb that was sent: ``"pass"`` or ``"extend"``.
+        scope: The scope the verb was aimed at (``say``'s ``to``).
+        reply: The decoded ``/floor`` response body.
+
+    Returns:
+        A dict shaped like a successful ``say`` (``message_id``,
+        ``delivered_to``, ``missed``, ``warning``, ``hint``, ``stick``), or
+        ``reply`` unchanged when the hub refused the verb.
+    """
+    if not reply.get("ok"):
+        return reply
+    raw_ring = reply.get("ring")
+    ring = [str(name) for name in raw_ring] if isinstance(raw_ring, list) else []
+    deadline_in = reply.get("deadline_in")
+    # ``pass`` names the new holder in ``passed_to``; ``extend`` reports the
+    # unchanged holder (the caller) in ``holder``. Neither is present when a
+    # pass emptied the ring and closed the round.
+    holder = reply.get("passed_to") or reply.get("holder")
+    you_hold = turn == "extend"
+    if turn == "extend":
+        note = (
+            f"extension granted: you still hold {scope}, deadline in "
+            f"{deadline_in}s. NOTHING was sent to your peers: this was a "
+            '"still thinking" marker, not a message. Read the backlog, then '
+            "say() for real."
+        )
+    elif holder is None:
+        note = (
+            "passed without speaking; any content was ignored. The round on "
+            f"{scope} is over and the lane is open again."
+        )
+    else:
+        order = " > ".join(ring)
+        note = (
+            "passed without speaking; any content was ignored (a pass is a "
+            f"rotation, not a message). The stick is now with {holder} "
+            f"(scope {scope}, {deadline_in}s)."
+            + (f" Ring: {order}." if order else "")
+        )
+    return {
+        "message_id": None,
+        "delivered_to": [],
+        "missed": [],
+        "warning": None,
+        "hint": None,
+        "stick": {
+            "scope": reply.get("scope", scope),
+            "holder": holder,
+            "ring": ring,
+            "deadline_in": deadline_in,
+            "you_hold": you_hold,
+            "note": note,
+        },
+    }
+
+
 # Type of an async MCP tool body: takes any args, returns the result dict.
 _AsyncToolFn = Callable[..., Awaitable[dict[str, object]]]
 
@@ -967,27 +1052,62 @@ def build_mcp_server(
 
     @mcp.tool()
     @_resilient
-    async def say(ctx: _Ctx, content: str, to: str) -> dict[str, object]:
-        """Send `content` (required) to `to` (required: a peer, "#channel", or "all"). Saying to a channel joins it. `to="all"` hits EVERY peer, even outside your channels: an announcement, never a reply. Errors: rate_limited, stopped, floor_held, not_joined."""
+    async def say(
+        ctx: _Ctx, content: str, to: str, turn: str = "speak"
+    ) -> dict[str, object]:
+        """Send `content` (required) to `to` (required: a peer, "#channel", or "all"). A channel send joins it. `to="all"` hits EVERY peer: announcements only. In a round, saying passes the stick; `turn`=pass|extend. Errors: rate_limited, stopped, floor_held, not_joined."""
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
         assert member is not None
+        if turn != "speak" and turn not in _FLOOR_TURNS:
+            return {
+                "error": "invalid_turn",
+                "hint": 'turn must be "speak", "pass" or "extend"',
+            }
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         connector = await _connector()
-        result = await connector.send(member.token, to, content)
+        if turn in _FLOOR_TURNS:
+            # A rotation verb, not a message: it goes to /floor and never near
+            # /send. `content` is ignored on this path by construction, which
+            # is also why SendRequest.content can keep its min_length=1.
+            reply = (
+                await connector.extend_turn(member.token, to)
+                if turn == "extend"
+                else await connector.pass_floor(member.token, to)
+            )
+            return _turn_result(turn, to, reply)
+        try:
+            result = await connector.send(member.token, to, content)
+        except httpx.HTTPStatusError as exc:
+            # The connector raises on any status it does not model, and the
+            # _resilient decorator would report that as hub_unreachable. For a
+            # 422 that is a lie: the hub answered, it refused the body.
+            if exc.response.status_code != 422:
+                raise
+            return {
+                "error": "invalid_say",
+                "hint": (
+                    "the hub refused the body: `content` must be 1 to 8192 "
+                    "characters and `to` at most 64"
+                ),
+            }
         if result.rate_limited:
             return {"error": "rate_limited", "retry_after": result.retry_after}
         if result.stopped:
             return {"stopped": True, "note": "room is stopped; halt the exchange"}
         if result.floor_held:
+            # Prefer the hub's own error and advice: a round refusal tells the
+            # peer to wait its turn, where the exclusive-lock wording below
+            # would send it to raise a hand it must not raise.
             return {
-                "error": "floor_held",
+                "error": result.floor_error or "floor_held",
                 "held_by": result.floor_holder,
                 "scope": result.floor_scope,
                 "reason": result.floor_reason,
-                "hint": (
+                "hint": result.floor_hint
+                or (
                     f"{result.floor_holder} holds the talking stick for "
                     f"{result.floor_scope}; floor(action=\"raise\") to claim the "
                     "next turn."
@@ -996,13 +1116,16 @@ def build_mcp_server(
         # Carry ``missed``/``warning``/``hint`` through like the stdio bridge
         # does: they are the hub's "nobody heard this" signals, and dropping
         # them left an agent on /mcp believing a message landed when it
-        # reached an absent peer or an empty channel/broadcast.
+        # reached an absent peer or an empty channel/broadcast. ``stick`` is
+        # here for the same reason: in a round the send spent the caller's
+        # turn, and this is where it learns the stick moved on.
         return {
             "message_id": result.message_id,
             "delivered_to": result.delivered_to,
             "missed": result.missed,
             "warning": result.warning,
             "hint": result.hint,
+            "stick": result.stick,
         }
 
     @mcp.tool()
@@ -1106,7 +1229,7 @@ def build_mcp_server(
     async def floor(
         ctx: _Ctx, action: str, scope: str = "all", reason: str | None = None
     ) -> dict[str, object]:
-        """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+        """Talking-stick: `action` (required) take|round|pass|drop|raise|status; `scope` (default "all") or a "#channel"; `reason` (take/round). round opens a rotation; status is pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, invalid_action."""
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
@@ -1115,15 +1238,20 @@ def build_mcp_server(
         # status is a read-only scout, allowed before join, like floor_status was.
         if action == "status":
             return {"floors": await connector.floors()}
-        if action not in ("take", "pass", "drop", "raise"):
+        if action not in ("take", "round", "pass", "drop", "raise"):
             return {
                 "error": "invalid_action",
-                "hint": "action must be take|pass|drop|raise|status",
+                "hint": "action must be take|round|pass|drop|raise|status",
             }
         if member.token is None:
             return {"error": "not_joined", "hint": "call join() first"}
         if action == "take":
             return await connector.take_floor(member.token, scope, reason or "")
+        if action == "round":
+            # Explicit branch on purpose: the trailing return below is a
+            # fall-through default for "drop", so a new action that is not
+            # named here would silently be dropped instead.
+            return await connector.start_round(member.token, scope, reason or "")
         if action == "raise":
             return await connector.raise_hand(member.token, scope)
         if action == "pass":

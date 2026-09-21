@@ -8,6 +8,8 @@ returns the room to RUNNING around each test so stop-mode cases don't leak.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -551,3 +553,190 @@ async def test_receive_passes_answer_meta_through(live_hub: str) -> None:
     assert answers
     assert answers[0]["meta"]["form_id"] == form.id
     assert answers[0]["meta"]["answers"] == {"ok": "yes"}
+
+
+# --- rotating round ------------------------------------------------------
+
+
+class _BodyCapture(httpx.AsyncBaseTransport):
+    """Record every request body and answer with a fixed ``ok`` reply.
+
+    ``start_round`` and ``extend_turn`` are transport-shaped: what matters is
+    the JSON they put on the wire, which a live hub's reply cannot show. A stub
+    transport is the only place to read it.
+    """
+
+    def __init__(self) -> None:
+        self.bodies: list[dict[str, object]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+
+async def _with_capture(capture: _BodyCapture) -> HubConnector:
+    """Return a connector bound to ``capture`` instead of a socket."""
+    connector = HubConnector("http://stub")
+    connector._http = httpx.AsyncClient(base_url="http://stub", transport=capture)
+    return connector
+
+
+async def test_send_maps_the_stick_on_a_successful_round_turn(
+    live_hub: str,
+) -> None:
+    """A holder's send carries the hub's ``stick`` block onto ``SendResult``.
+
+    Speaking is what moves the stick, so this is the caller's only chance to
+    learn where its turn went without a second round-trip.
+    """
+    async with HubConnector(live_hub) as hub:
+        first = await hub.register("conn-round-a", None)
+        second = await hub.register("conn-round-b", None)
+        for me in (first, second):
+            assert await hub.join_channel(me.token, "#conn-round") is ChannelOutcome.OK
+        opened = await hub.start_round(first.token, "#conn-round", "review")
+        assert opened["ok"] is True
+
+        result = await hub.send(first.token, "#conn-round", "my turn")
+        await hub.drop_floor(second.token, "#conn-round")
+
+    assert result.ok is True
+    assert result.stick is not None
+    assert result.stick["holder"] == "conn-round-b"
+    assert result.stick["you_hold"] is False
+
+
+async def test_send_outside_a_round_leaves_the_stick_unset(live_hub: str) -> None:
+    """``stick`` stays ``None`` on the ordinary send path."""
+    async with HubConnector(live_hub) as hub:
+        me = await hub.register("conn-nostick", None)
+        result = await hub.send(me.token, "#conn-nostick-lane", "hello?")
+    assert result.ok is True
+    assert result.stick is None
+
+
+async def test_send_flags_both_refusal_flavours_and_keeps_them_apart(
+    live_hub: str,
+) -> None:
+    """Both 423s set ``floor_held``; ``floor_error``/``floor_hint`` tell them apart.
+
+    The caller's move is the same either way (stop, do not retry), so one flag
+    covers both. What differs is what it should do next, and that advice comes
+    from the hub, not from a string the connector made up.
+    """
+    async with HubConnector(live_hub) as hub:
+        holder = await hub.register("conn-423-holder", None)
+        barred = await hub.register("conn-423-barred", None)
+        for me in (holder, barred):
+            await hub.join_channel(me.token, "#conn-exclusive")
+            await hub.join_channel(me.token, "#conn-rotating")
+
+        await hub.take_floor(holder.token, "#conn-exclusive", "prod is down")
+        exclusive = await hub.send(barred.token, "#conn-exclusive", "let me in")
+        await hub.drop_floor(holder.token, "#conn-exclusive")
+
+        await hub.start_round(holder.token, "#conn-rotating", "review")
+        rotating = await hub.send(barred.token, "#conn-rotating", "let me in")
+        await hub.drop_floor(holder.token, "#conn-rotating")
+
+    assert exclusive.floor_held is True
+    assert exclusive.floor_error == "floor_held"
+    assert exclusive.floor_holder == "conn-423-holder"
+    assert 'floor(action="raise")' in str(exclusive.floor_hint)
+
+    assert rotating.floor_held is True
+    assert rotating.floor_error == "round_in_progress"
+    assert rotating.floor_holder == "conn-423-holder"
+    assert "keep listening" in str(rotating.floor_hint)
+
+
+async def test_start_round_omits_turn_seconds_when_none() -> None:
+    """A null budget must be absent, not sent as ``None``.
+
+    The hub applies its own default for a missing field; a literal ``null``
+    would be a value, and reading it as one is how a round ends up with no
+    turn budget at all.
+    """
+    capture = _BodyCapture()
+    connector = await _with_capture(capture)
+    try:
+        await connector.start_round("tok", "all", "review")
+        await connector.start_round("tok", "all", "review", turn_seconds=42.0)
+    finally:
+        await connector._http.aclose()
+        connector._http = None
+
+    assert capture.bodies[0] == {
+        "token": "tok",
+        "action": "round",
+        "scope": "all",
+        "reason": "review",
+    }
+    assert capture.bodies[1]["turn_seconds"] == 42.0
+
+
+async def test_extend_turn_posts_the_extend_action() -> None:
+    """An extension is a ``/floor`` action, so it can never reach a peer."""
+    capture = _BodyCapture()
+    connector = await _with_capture(capture)
+    try:
+        await connector.extend_turn("tok", "#lane")
+    finally:
+        await connector._http.aclose()
+        connector._http = None
+
+    assert capture.bodies == [
+        {"token": "tok", "action": "extend", "scope": "#lane"}
+    ]
+
+
+async def test_receive_keeps_a_hub_turn_grant_as_chatter() -> None:
+    """A turn grant is a ``system`` message and must survive the control filter.
+
+    ``receive`` peels off ``kind == "control"``; the grant is ``kind ==
+    "system"``, and swallowing it would leave a native agent holding a stick it
+    never learned about while the round waits on it.
+    """
+
+    class _MockGrantTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "mode": "running",
+                    "messages": [
+                        {
+                            "sender": "hub",
+                            "recipient": "me",
+                            "content": "🪄 The talking stick is yours for 300s.",
+                            "kind": "system",
+                            "origin": "hub",
+                            "meta": {"floor": {"scope": "all", "turn": "yours"}},
+                        },
+                        {
+                            "sender": "human",
+                            "recipient": "me",
+                            "content": "interrupt",
+                            "kind": "control",
+                        },
+                    ],
+                },
+            )
+
+    connector = HubConnector("http://stub")
+    connector._http = httpx.AsyncClient(
+        base_url="http://stub", transport=_MockGrantTransport()
+    )
+    try:
+        inbound = await connector.receive("tok", 0.0)
+    finally:
+        await connector._http.aclose()
+        connector._http = None
+
+    assert len(inbound.messages) == 1
+    assert inbound.messages[0]["origin"] == "hub"
+    assert inbound.messages[0]["meta"]["floor"]["turn"] == "yours"
+    assert inbound.stop is False
+    assert inbound.commands == ["interrupt"]
