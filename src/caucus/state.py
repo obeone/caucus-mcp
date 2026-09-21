@@ -2222,13 +2222,30 @@ class HubState:
             }
         return None
 
-    def _advance_floor(self, floor: Floor) -> str | None:
-        """Pass ``floor`` to its next raised hand, or release it if none remain.
+    def _advance_floor(self, floor: Floor, *, silent: bool = True) -> str | None:
+        """Pass ``floor`` on, or release it — in whichever mode it is running.
 
-        Returns the new holder's name, or ``None`` when the stick was put away
-        (no hands waiting). Always announces the change to the scope and pushes
-        the refreshed floor map to the UI.
+        The one branch point between the two modes, and the reason every
+        existing caller (``pass_floor``, ``_relinquish_floor``, and anything
+        added later) is round-correct for free: they all funnel through here.
+
+        In *exclusive* mode the stick goes to the next raised hand, or is put
+        away when the queue empties. In *round* mode it walks the ring — see
+        :meth:`_advance_round`, which is where the interesting invariants live.
+
+        Args:
+            silent: Whether the outgoing holder's turn produced no message.
+                Only meaningful in round mode, where it feeds the silent-lap
+                counter that ends a round nobody is contributing to. Defaults to
+                ``True`` because every caller that is *not* the send path — a
+                pass, a timeout, a force-advance, a departure — is silence by
+                definition.
+
+        Returns:
+            The new holder's name, or ``None`` when the stick was put away.
         """
+        if floor.round is not None:
+            return self._advance_round(floor, silent=silent)
         prev = floor.holder
         label = self._scope_label(floor.scope)
         if floor.hands:
@@ -2247,8 +2264,140 @@ class HubState:
         self._release_floor(floor, by=prev, note="no hands left")
         return None
 
+    def _can_hold(self, name: str) -> bool:
+        """Whether ``name`` could usefully take a turn right now.
+
+        A peer that is gone, reaped, or operator-paused cannot read the backlog
+        the hub would flush to it, so handing it the stick would spend a whole
+        turn budget on silence. Excluded from selection *and* from the
+        eligible-count the silent-lap test compares against, which is what keeps
+        those two halves consistent: a skipped peer is not counted as having
+        declined to speak.
+        """
+        client = self._clients.get(name)
+        return client is not None and not client.paused
+
+    def _advance_round(self, floor: Floor, *, silent: bool) -> str | None:
+        """Walk the stick to the next eligible ring member, or end the round.
+
+        Maintains the ring invariant (``ring[0]`` is always the holder) and the
+        silent-lap contract: the round closes once every peer still able to
+        speak has, in a row, declined to.
+
+        Args:
+            floor: The floor running the round. Must have ``floor.round`` set.
+            silent: ``False`` only when the outgoing holder actually said
+                something. Every other path into a rotation — pass, timeout,
+                force-advance, departure — is silence.
+
+        Returns:
+            The new holder's name, or ``None`` when the round ended.
+        """
+        rnd = floor.round
+        if rnd is None:  # pragma: no cover - guarded by _advance_floor
+            return None
+        prev = floor.holder
+        rnd.silent_turns = rnd.silent_turns + 1 if silent else 0
+        # Rotate the outgoing holder to the TAIL so a peer appended mid-lap
+        # still speaks after everyone who was already in it. Guarded because
+        # _relinquish_floor may have removed the holder already, in which case
+        # ring[0] is its successor and must not be moved.
+        if rnd.ring and rnd.ring[0] == prev:
+            rnd.ring.append(rnd.ring.pop(0))
+        eligible = [name for name in rnd.ring if self._can_hold(name)]
+        if not eligible:
+            self._release_floor(floor, by="hub", note="nobody left to speak")
+            return None
+        # Recomputed against the *current* eligible count, not a lap marker: a
+        # marker breaks the moment the peer that set it leaves, whereas this
+        # stays correct as peers join and go. A newcomer raises the bar and so
+        # still gets its first turn; a departure can close the lap immediately.
+        if rnd.silent_turns >= len(eligible):
+            self._release_floor(
+                floor, by="hub", note="a full lap with nobody speaking"
+            )
+            return None
+        while not self._can_hold(rnd.ring[0]):  # bounded: eligible is non-empty
+            rnd.ring.append(rnd.ring.pop(0))
+        floor.holder = rnd.ring[0]
+        floor.since = time.time()
+        rnd.deadline = floor.since + rnd.turn_seconds
+        rnd.extensions = 0
+        self._grant_turn(floor, previous=prev)
+        self._push_floor_ui()
+        return floor.holder
+
+    def _grant_turn(self, floor: Floor, *, previous: str | None) -> None:
+        """Flush the new holder's backlog and hand it the stick, in ONE batch.
+
+        **Strictly synchronous — do not introduce an await in this method.** The
+        new holder's ``/receive`` already has a getter armed on its queue; that
+        getter is woken by the first ``put_nowait`` but only resumes on the next
+        loop step, so every held message lands before it runs and a single
+        ``_drain_now`` carries the whole batch. An await here would split the
+        transcript across two polls and wake the agent twice on half a
+        conversation, which is precisely the failure this feature exists to
+        prevent.
+
+        Note this is a **direct** message to the incoming holder, not an
+        :meth:`_announce_floor` to the scope. A scope-wide announcement would
+        route into every parked peer's queue and wake every watcher on every
+        rotation — the exact opposite of what retention is for. Only opening and
+        closing a round are announced to everyone.
+        """
+        rnd = floor.round
+        if rnd is None:  # pragma: no cover - guarded by _advance_round
+            return
+        client = self._clients.get(floor.holder)
+        if client is None:  # pragma: no cover - _can_hold gated this
+            return
+        rnd.granted_seen = client.last_seen
+        backlog = self._flush_held(client, floor.scope)
+        label = self._scope_label(floor.scope)
+        seconds = int(rnd.turn_seconds)
+        waited = (
+            f"{backlog} message(s) above arrived while you waited — read them "
+            "first, then "
+            if backlog
+            else "Nothing was said while you waited. "
+        )
+        self.route(
+            Message(
+                sender="hub",
+                recipient=floor.holder,
+                kind=MessageKind.SYSTEM,
+                origin="hub",
+                content=(
+                    f"🪄 The talking stick for {label} is yours for {seconds}s. "
+                    f"{waited}say() ONCE — speaking hands the stick on. "
+                    'Nothing to add: say(turn="pass"). Need longer: '
+                    'say(turn="extend"), which reaches nobody.'
+                ),
+                meta={
+                    "floor": {
+                        "scope": floor.scope,
+                        "turn": "yours",
+                        "deadline": rnd.deadline,
+                        "deadline_in": seconds,
+                        "backlog": backlog,
+                        "ring": list(rnd.ring),
+                        "after": previous,
+                    }
+                },
+            )
+        )
+
     def _release_floor(self, floor: Floor, *, by: str, note: str) -> None:
-        """Put ``floor`` away: drop it from the registry, announce, refresh UI."""
+        """Put ``floor`` away: drop it from the registry, announce, refresh UI.
+
+        The single choke point for *every* way a floor ends — ``drop_floor``,
+        ``clear_floor``, a round's silent lap, an emptied ring — which is why
+        the held-backlog flush lives here rather than in each of those callers.
+        Flushing before the announce also means a peer reads the traffic it
+        missed *above* the "the round is over" notice, in the order it was said.
+        """
+        if floor.round is not None:
+            self._flush_round(floor)
         self._floors.pop(floor.scope, None)
         label = self._scope_label(floor.scope)
         self._announce_floor(
@@ -2258,14 +2407,56 @@ class HubState:
         )
         self._push_floor_ui()
 
+    def _flush_round(self, floor: Floor) -> None:
+        """Release every ring member's withheld backlog for ``floor``'s scope.
+
+        Retention is a deferral, never a deletion: a message the hub accepted
+        must still arrive, even if the round it was waiting on ends first. Runs
+        over the ring *and* over any peer that still carries a buffer for this
+        scope, so a peer dropped from the ring a moment ago is not stranded.
+        """
+        rnd = floor.round
+        if rnd is None:  # pragma: no cover - guarded by every caller
+            return
+        for client in self._recipients():
+            if floor.scope in client.held:
+                self._flush_held(client, floor.scope)
+
     def _relinquish_floor(self, scope: str, project: str) -> None:
         """Release/advance one scope's floor when ``project`` can no longer hold it.
 
         If ``project`` holds the scope's stick it is passed on (or put away); if
-        it was merely queued, it is dropped from the hand queue.
+        it was merely queued (exclusive mode) or merely in the ring (round
+        mode), it is dropped from that list. Either way a departing peer takes
+        its withheld backlog with it: the buffer is flushed into its queue, so a
+        reaped peer's replay on revival still carries what it missed.
         """
         floor = self._floors.get(scope)
         if floor is None:
+            return
+        rnd = floor.round
+        if rnd is not None:
+            # Flush before touching the ring: the peer is leaving the round, so
+            # whatever was being held for its turn has no turn left to wait for.
+            client = self._clients.get(project) or self._reaped_by_project.get(
+                project
+            )
+            if client is not None and scope in client.held:
+                self._flush_held(client, scope)
+            if floor.holder == project:
+                # Drop it from the ring first so _advance_round does not rotate
+                # a departed peer back to the tail, then hand the stick on.
+                if project in rnd.ring:
+                    rnd.ring.remove(project)
+                self._advance_floor(floor)
+            elif project in rnd.ring:
+                rnd.ring.remove(project)
+                if not rnd.ring:
+                    self._release_floor(
+                        floor, by="hub", note="nobody left to speak"
+                    )
+                else:
+                    self._push_floor_ui()
             return
         if floor.holder == project:
             self._advance_floor(floor)
