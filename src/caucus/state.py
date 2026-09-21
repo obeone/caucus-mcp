@@ -2476,6 +2476,7 @@ class HubState:
         reason: str,
         *,
         turn_seconds: float | None = None,
+        opened_by: str | None = None,
     ) -> dict[str, object]:
         """Open a rotating round on ``scope``; the caller speaks first.
 
@@ -2488,6 +2489,9 @@ class HubState:
             scope: ``"all"`` or a ``#``-prefixed channel the caller has joined.
             reason: What the round is about; shown in the opening notice.
             turn_seconds: Per-turn budget, or ``None`` for the hub's default.
+            opened_by: Credit the round to somebody other than the token
+                holder. Used by :meth:`start_round_as_operator`, where the
+                console opens the round but a peer takes the first turn.
 
         Returns:
             ``{"ok": True, "scope", "holder", "reason", "ring", "deadline",
@@ -2536,11 +2540,16 @@ class HubState:
         )
         cleaned = reason.strip()
         now = time.time()
+        # Who gets the credit, which is not always who takes the first turn:
+        # an operator-opened round seats a peer first but was not opened by it.
+        # Resolved here, before the announce and the UI push, so the console and
+        # the room never see a moment of wrong attribution.
+        opener = opened_by or client.project
         rnd = Round(
             ring=ring,
             deadline=now + budget,
             turn_seconds=budget,
-            started_by=client.project,
+            started_by=opener,
             started_at=now,
             granted_seen=client.last_seen,
         )
@@ -2553,7 +2562,7 @@ class HubState:
         order = " → ".join(ring)
         self._announce_floor(
             scope,
-            f"🔄 {client.project} opened a round-table for {label}{detail}. "
+            f"🔄 {opener} opened a round-table for {label}{detail}. "
             f"Order: {order}. Each peer gets {int(budget)}s. Until your turn "
             f"comes the hub HOLDS {label}'s messages for you and hands you the "
             "whole backlog at once — a quiet lane now means a round, not an "
@@ -2608,11 +2617,13 @@ class HubState:
             }
         first = members[0]
         token = self._clients[first].token
-        result = self.start_round(token, scope, reason, turn_seconds=turn_seconds)
-        floor = self._floors.get(scope)
-        if floor is not None and floor.round is not None:
-            floor.round.started_by = "operator"
-        return result
+        return self.start_round(
+            token,
+            scope,
+            reason,
+            turn_seconds=turn_seconds,
+            opened_by="operator",
+        )
 
     def extend_turn(self, token: str, scope: str) -> dict[str, object]:
         """Push the current holder's deadline out; tell nobody but the holder.
