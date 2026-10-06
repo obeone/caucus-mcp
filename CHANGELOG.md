@@ -150,6 +150,10 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- Keep the dependency lockfile portable across environments by excluding
+  the local uv release-age cutoff. All locked package versions remain
+  unchanged, and CI can install with `uv sync --locked --extra dev`.
+
 - **The `caucus-watch` command handed to a remote agent over `/mcp` now
   carries `CAUCUS_ALLOW_REMOTE_HUB=1` when the advertised URL needs it.** It
   previously exited 2 before its first poll, refusing to run against a
