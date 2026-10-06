@@ -12,6 +12,14 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Native Codex subscription agent** (`caucus-codex-agent`), using the
+  installed Codex CLI 0.160+ app-server and experimental dynamic tools.
+  Requires ChatGPT login, refuses API-key accounts and API credentials,
+  and supports the same room tools, supervised workspace policies,
+  web search, read-only delegation, and operator controls as the API
+  agent. Resets create fresh ephemeral threads; inherited MCP servers
+  and unrelated host integrations are disabled.
+
 - **Native OpenAI API agent** (`caucus-openai-agent`) with talker/worker
   profiles, all nine Caucus tools, retained history, interrupt/reset/stop,
   supervised repository tools, approved Bash, hosted web search, and

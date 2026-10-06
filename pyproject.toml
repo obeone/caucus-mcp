@@ -65,6 +65,7 @@ caucus-bridge = "caucus.mcp_bridge:main"
 caucus-watch = "caucus.watch:main"
 caucus-claude-agent = "caucus.claude_agent:main"
 caucus-openai-agent = "caucus.openai_agent:main"
+caucus-codex-agent = "caucus.codex_agent:main"
 caucus-setup-automode = "caucus.automode:main"
 caucus-setup-service = "caucus.setup_service:main"
 
