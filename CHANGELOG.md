@@ -12,6 +12,30 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Runtime selection in the operator launcher**: Claude (default),
+  OpenAI API, or Codex subscription. Spawn requests and process records
+  carry the runtime; only API children receive OpenAI credentials, and
+  only Codex children receive Codex login-directory/executable settings.
+  The console labels API and subscription usage separately and keeps
+  their form-based approval modes available.
+
+- **Native Codex subscription agent** (`caucus-codex-agent`), using the
+  installed Codex CLI 0.160+ app-server and experimental dynamic tools.
+  Requires ChatGPT login, refuses API-key accounts and API credentials,
+  and supports the same room tools, supervised workspace policies,
+  web search, read-only delegation, and operator controls as the API
+  agent. Resets create fresh ephemeral threads; inherited MCP servers
+  and unrelated host integrations are disabled.
+
+- **Native OpenAI API agent** (`caucus-openai-agent`) with talker/worker
+  profiles, all nine Caucus tools, retained history, interrupt/reset/stop,
+  supervised repository tools, approved Bash, hosted web search, and
+  read-only research delegation. Only attested operator form answers
+  authorize pending edits or shell calls. SDK tracing is disabled.
+
+- Optional `openai` extra and locked development dependency for the
+  OpenAI Agents SDK (`openai-agents>=0.22.3,<0.23`).
+
 - **`docs/remote-hub.md`**, the guide for running a hub on one machine with
   agents joining from others: a verified end-to-end walkthrough for both the
   `/mcp` and `caucus-bridge` connection paths (including the single-use watch
@@ -76,6 +100,12 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- Extract the native conversation loop and nine room handlers into an
+  SDK-independent module. Preserve Claude defaults, and propagate failed
+  driver/poller tasks instead of leaving silently failed sessions.
+
+- Ignore generated Graphify indexes and local analysis caches (`graphify-out/`).
+
 - **`caucus-hub` now refuses to start on a non-loopback bind unless both
   `--operator-token` and `--agent-key` are set** (`--allow-insecure-bind` is
   the explicit escape hatch). A hub on `0.0.0.0` used to start silently with
@@ -119,6 +149,10 @@ and rename that heading to the version when you cut the release.
   either way, so this changes nothing at runtime or in CI.
 
 ### Fixed
+
+- Keep the dependency lockfile portable across environments by excluding
+  the local uv release-age cutoff. All locked package versions remain
+  unchanged, and CI can install with `uv sync --locked --extra dev`.
 
 - **The `caucus-watch` command handed to a remote agent over `/mcp` now
   carries `CAUCUS_ALLOW_REMOTE_HUB=1` when the advertised URL needs it.** It

@@ -19,6 +19,7 @@ src/caucus/_version.py
 # Editor / agent tooling (local only)
 .cursor/
 .serena/
+graphify-out/
 
 # Local research notes, not part of the published docs
 docs/research/

@@ -7,7 +7,9 @@
  * truth — these checks are pure UX, not a security boundary.
  */
 
-import type { AgentType, PermissionMode } from "../store/types";
+import type {
+  AgentRuntime, AgentType, PermissionMode,
+} from "../store/types";
 
 /** Agent name pattern: must start with a letter or digit, then up to 63 more
  *  letters, digits, dots, underscores, or hyphens. Mirrors `AGENT_NAME_RE`. */
@@ -42,6 +44,7 @@ export const MUTE_PERMISSION_MODES: readonly PermissionMode[] = [
 
 /** Values the spawn form's fields carry, ahead of submission. */
 export interface SpawnFormValues {
+  runtime?: AgentRuntime;
   name: string;
   mission: string;
   type: AgentType;
@@ -101,7 +104,13 @@ export function spawnFormError(values: SpawnFormValues): string | null {
   if (isUnsafeWorkerCombo(values.type, values.permissionMode)) {
     return "A worker agent cannot use bypassPermissions or dontAsk: those modes remove the only guardrail around its shell and filesystem tools.";
   }
-  if (isMutePermissionMode(values.permissionMode)) {
+  if (
+    (values.runtime === "openai" || values.runtime === "codex") &&
+    !["auto", "default", "acceptEdits", "plan"].includes(values.permissionMode)
+  ) {
+    return "OpenAI and Codex support auto, default, acceptEdits, or plan.";
+  }
+  if ((values.runtime ?? "claude") === "claude" && isMutePermissionMode(values.permissionMode)) {
     return `An agent started in ${values.permissionMode} cannot speak in the room: the caucus tools are not permitted to it and no approval can reach it, so it would sit in the roster looking healthy and stay silent.`;
   }
   return null;

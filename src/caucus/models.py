@@ -528,6 +528,7 @@ class SpawnAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = PydField(min_length=1, max_length=64)
+    runtime: Literal["claude", "openai", "codex"] = "claude"
     mission: str | None = PydField(default=None, max_length=4000)
     type: str = "talker"
     permission_mode: str = "auto"

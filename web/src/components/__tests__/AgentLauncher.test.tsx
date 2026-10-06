@@ -103,6 +103,18 @@ describe("AgentLauncher — mute permission modes", () => {
     useDashStore.setState({ role: "operator", agents: [] });
   });
 
+  it.each(["openai", "codex"])("lets a %s worker use plan and resets permissions on runtime changes", (runtime) => {
+    renderWith([]);
+    fireEvent.change(screen.getByLabelText("Agent name"), { target: { value: "openai-bot" } });
+    fireEvent.change(screen.getByLabelText("Agent runtime"), { target: { value: runtime } });
+    fireEvent.change(screen.getByLabelText("Agent type"), { target: { value: "worker" } });
+    fireEvent.change(screen.getByLabelText("Agent permission mode"), { target: { value: "plan" } });
+    expect(screen.queryByText(/cannot speak in the room/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Agent permission mode")).not.toHaveTextContent("bypassPermissions");
+    fireEvent.change(screen.getByLabelText("Agent runtime"), { target: { value: "claude" } });
+    expect(screen.getByLabelText("Agent permission mode")).toHaveValue("auto");
+  });
+
   it.each(["plan", "default"])(
     "refuses %s before the round trip, naming what is lost",
     (mode) => {

@@ -95,6 +95,8 @@ AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 #: Module the child interpreter runs. ``caucus.claude_agent`` carries a
 #: ``__main__`` guard, so ``python -m caucus.claude_agent`` is a valid launch.
 AGENT_MODULE = "caucus.claude_agent"
+AGENT_RUNTIMES = ("claude", "openai", "codex")
+OPENAI_PERMISSION_MODES = ("auto", "default", "acceptEdits", "plan")
 
 # --- Constants duplicated from caucus.claude_agent (see the module docstring) --
 # Importing them would drag in claude_agent, which raises SystemExit when the
@@ -316,6 +318,8 @@ class AgentSpec:
         One of :data:`PERMISSION_MODES`.
     model:
         Optional model override; the SDK's default when ``None``.
+    runtime:
+        Native runtime: ``claude`` (default), ``openai`` (API), or ``codex`` (plan).
     """
 
     name: str
@@ -323,6 +327,7 @@ class AgentSpec:
     agent_type: str = DEFAULT_AGENT_TYPE
     permission_mode: str = DEFAULT_PERMISSION_MODE
     model: str | None = None
+    runtime: str = "claude"
 
 
 @dataclass
@@ -398,6 +403,7 @@ class AgentProcess:
         """
         row: dict[str, object] = {
             "name": self.spec.name,
+            "runtime": self.spec.runtime,
             "type": self.spec.agent_type,
             "permission_mode": self.spec.permission_mode,
             "model": self.spec.model,
@@ -414,7 +420,7 @@ class AgentProcess:
 
 
 class AgentSupervisor:
-    """Spawn, list, and kill native Claude agents on behalf of the operator.
+    """Spawn, list, and kill native Claude or OpenAI agents for the operator.
 
     One instance lives for the lifetime of a hub process (built in the hub's
     lifespan, shut down in its teardown). It owns nothing in
@@ -603,6 +609,19 @@ class AgentSupervisor:
         argv.append("--")
         return argv
 
+    def _command(self, spec: AgentSpec) -> ArgvList:
+        """Select one fixed runtime module and append the validated flags."""
+        prefix = (
+            [sys.executable, "-m", "caucus.openai_agent"]
+            if spec.runtime == "openai"
+            else (
+                [sys.executable, "-m", "caucus.codex_agent"]
+                if spec.runtime == "codex"
+                else self._launch_prefix()
+            )
+        )
+        return prefix + self._build_argv(spec)
+
     def _build_env(self, spec: AgentSpec) -> dict[str, str]:
         """Build the child environment from the allowlist, never by inheritance.
 
@@ -631,6 +650,21 @@ class AgentSupervisor:
         # more for stdout: a pipe makes stdout block-buffered by default, so a
         # wedged child would hold back the very lines explaining why.
         env["PYTHONUNBUFFERED"] = "1"
+        if spec.runtime == "openai":
+            for key in (
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "OPENAI_ORG_ID",
+                "OPENAI_PROJECT_ID",
+            ):
+                value = os.environ.get(key)
+                if value:
+                    env[key] = value
+        if spec.runtime == "codex":
+            for key in ("CODEX_HOME", "CODEX_PATH"):
+                value = os.environ.get(key)
+                if value:
+                    env[key] = value
         return env
 
     def _validate(self, spec: AgentSpec) -> None:
@@ -650,6 +684,8 @@ class AgentSupervisor:
         """
         if not self._config.enabled:
             raise LauncherDisabled("agent launcher is disabled on this hub")
+        if spec.runtime not in AGENT_RUNTIMES:
+            raise LauncherRefused("runtime must be claude, openai, or codex")
         if not AGENT_NAME_RE.match(spec.name):
             raise LauncherRefused(
                 f"invalid agent name {spec.name!r}; expected "
@@ -667,10 +703,13 @@ class AgentSupervisor:
                 f"invalid agent type {spec.agent_type!r}; expected one of "
                 f"{', '.join(AGENT_TYPES)}"
             )
-        if spec.permission_mode not in PERMISSION_MODES:
+        modes = (
+            OPENAI_PERMISSION_MODES if spec.runtime != "claude" else PERMISSION_MODES
+        )
+        if spec.permission_mode not in modes:
             raise LauncherRefused(
                 f"invalid permission mode {spec.permission_mode!r}; expected one "
-                f"of {', '.join(PERMISSION_MODES)}"
+                f"of {', '.join(modes)}"
             )
         # The child refuses this combination too, but relying on the child means
         # a process that exits nonzero and an opaque error, instead of a clean
@@ -686,7 +725,7 @@ class AgentSupervisor:
         # The other end of the same problem: a mode so tight the agent cannot
         # reach the room at all. Nothing downstream refuses this, and the
         # failure is silent by construction, so the refusal has to live here.
-        if spec.permission_mode in MUTE_PERMISSION_MODES:
+        if spec.runtime == "claude" and spec.permission_mode in MUTE_PERMISSION_MODES:
             raise LauncherRefused(
                 f"an agent started in {spec.permission_mode!r} cannot speak in the "
                 "room: the caucus tools are not permitted to it and no approval "
@@ -775,7 +814,7 @@ class AgentSupervisor:
             cwd = self._config.cwd
             if cwd is None:  # pragma: no cover - LauncherConfig forbids this
                 raise LauncherRefused("agent launcher has no working directory")
-            argv = self._launch_prefix() + self._build_argv(spec)
+            argv = self._command(spec)
             env = self._build_env(spec)
             try:
                 process = await self._spawn_process(argv, env, cwd)

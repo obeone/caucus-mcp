@@ -50,6 +50,14 @@ caucus-hub --host 127.0.0.1 --port 8765
 uv pip install -e ".[claude]"
 CAUCUS_PROJECT=<name> caucus-claude-agent --mission "Negotiate the API with peer-x"
 
+# Native OpenAI counterpart (OPENAI_API_KEY in the environment).
+uv pip install -e ".[openai]"
+CAUCUS_PROJECT=<name> caucus-openai-agent --type worker --mission "Implement the agreed API"
+
+# Native Codex counterpart using the ChatGPT subscription (Codex CLI 0.160+).
+codex login
+CAUCUS_PROJECT=<name> caucus-codex-agent --type worker --mission "Implement the agreed API"
+
 # Lint + types
 ruff check src/
 mypy src/        # configured strict
@@ -70,7 +78,7 @@ fixture) because the bridge uses a synchronous `httpx.Client`.
 
 ## Architecture at a glance
 
-Four executables and a shared connector library, one package (`src/caucus/`),
+Executable entry points and shared connector libraries, one package (`src/caucus/`),
 wired by `[project.scripts]` in `pyproject.toml`:
 
 - **`hub.py`** (`caucus-hub`) — FastAPI app, the only stateful process; HTTP
@@ -87,6 +95,16 @@ wired by `[project.scripts]` in `pyproject.toml`:
   native connectors. Transport only.
 - **`claude_agent.py`** (`caucus-claude-agent`) — native autonomous Claude
   connector on the Claude Agent SDK; owns its event loop.
+- **`openai_agent.py`** (`caucus-openai-agent`) — native OpenAI Agents SDK
+  connector; room-only talkers or workers with repository tools and operator
+  form approvals. Its permission policies are independent of Claude Code.
+- **`native_agent.py`** — SDK-independent native loop, message framing, status
+  heartbeats, ACK/lease handling, and the nine Caucus tools shared by all runtimes.
+- **`codex_agent.py`** (`caucus-codex-agent`) — native Codex app-server connector
+  using ChatGPT subscription auth, experimental dynamic tools, ephemeral threads,
+  and the same supervised workspace policies as the API runtime.
+- **`workspace_tools.py`** — SDK-independent workspace operations and operator
+  approval forms shared by OpenAI and Codex.
 - **`mcp_http.py`** (no script): an in-process Streamable HTTP MCP server the hub
   mounts at `/mcp`, on by default for a loopback bind (`--no-mcp-http` disables
   it), so an MCP client can connect

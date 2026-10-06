@@ -97,6 +97,16 @@ describe("spawnFormError", () => {
     expect(spawnFormError(base)).toBeNull();
   });
 
+  it.each(["openai", "codex"] as const)("allows %s plan with operator form approvals", (runtime) => {
+    for (const permissionMode of ["plan", "default"] as const) {
+      expect(spawnFormError({ ...base, runtime, permissionMode })).toBeNull();
+    }
+  });
+
+  it("rejects OpenAI bypass permissions even for talkers", () => {
+    expect(spawnFormError({ ...base, runtime: "openai", permissionMode: "dontAsk" })).toMatch(/OpenAI and Codex support/);
+  });
+
   it("flags an empty name before checking the pattern", () => {
     expect(spawnFormError({ ...base, name: "" })).toBe("Name is required.");
   });

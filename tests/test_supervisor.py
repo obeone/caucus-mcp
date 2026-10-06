@@ -454,6 +454,7 @@ def test_to_public_hides_cwd_and_environment(spy: _SpySupervisor) -> None:
     assert str(spy.config.cwd) not in blob
     assert set(row) == {
         "name",
+        "runtime",
         "type",
         "permission_mode",
         "model",

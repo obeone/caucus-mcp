@@ -126,6 +126,39 @@ denominator; everything else is a connector to it.
   membership state beyond the token the caller keeps, and never decides *when*
   to talk. Network failures raise `httpx.HTTPError`; the `/send` brakes (429/409)
   come back as `SendResult` flags rather than exceptions.
+- **`native_agent.py`** — shared native conversation loop and room tools, with no
+  model SDK imports. All runtimes use its poller/driver, message framing,
+  ACK/lease contract, status heartbeat and nine room handlers. The supervisor
+  also observes driver/poller failures and propagates them on session exit.
+- **`openai_agent.py`** — `caucus-openai-agent`, built on `openai-agents` (optional
+  `openai` extra). Adapts `Runner.run` to the native loop, keeping the returned
+  input history between turns and creating a fresh client on reset. Interrupt
+  cancels the active Runner task; stop cancels immediately, including a tool
+  awaiting an operator form. Workers have repository read/write/edit/search,
+  approved Bash, hosted web search and read-only research delegation. Approval
+  answers are resolved by the poller out of band so a waiting tool never blocks
+  receipt of its approval. Only hub-attested operator answers for the pending
+  form can authorize execution. File tools enforce the workspace root; Bash is
+  a host process and always needs approval. Its process group is killed on
+  cancellation/timeout, its output is bounded, and its environment excludes
+  model/room credentials. OpenAI policies (`auto`, `default`, `acceptEdits`,
+  `plan`) are deterministic, independent of Claude's classifier. SDK tracing
+  is disabled; API credentials come from `OPENAI_API_KEY`.
+- **`codex_agent.py`** — `caucus-codex-agent`. Drives the installed Codex CLI's
+  app-server over stdio JSON-RPC, using ChatGPT subscription authentication.
+  Verifies the account type before creating an ephemeral thread; refuses API
+  accounts and strips API credentials. Experimental dynamic tools bind the nine
+  room handlers and supervised workspace tools. A dedicated reader routes
+  responses and notifications without waiting for tools, letting operator forms
+  and interrupts complete while a tool is blocked. Failed turns and disconnects
+  terminate the session. Reset rebuilds the process/thread with the mission.
+  Built-in execution, hooks, apps, plugins and MCP servers are disabled, and
+  Codex's sandbox is read-only without escalation. Web search is available to
+  workers; delegation starts a separate read-only researcher with no room tools.
+- **`workspace_tools.py`** — SDK-independent repository tools and approval forms
+  shared by the API and subscription runtimes. File operations are rooted in the
+  workspace; shell commands require an attested operator answer and run as host
+  processes with bounded output and process-group cleanup.
 - **`claude_agent.py`** — `caucus-claude-agent`. The native autonomous connector
   for Claude, built on the **Claude Agent SDK** (`claude-agent-sdk`, the optional
   `claude` extra). It owns its event loop: it registers via `HubConnector`,
