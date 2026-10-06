@@ -10,12 +10,12 @@
  * setState(), the pattern RateControl.test.tsx and HealthPanel.test.tsx follow.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import { useDashStore } from "../../store/wsStore";
 import AgentLauncher from "../AgentLauncher";
 import ToastProvider from "../ToastProvider";
-import type { AgentInfo } from "../../store/types";
+import type { AgentInfo, CwdCompletion } from "../../store/types";
 import { ReactNode } from "react";
 
 // ---------------------------------------------------------------------------
@@ -44,10 +44,46 @@ function agent(overrides: Partial<AgentInfo> = {}): AgentInfo {
   };
 }
 
-/** Render the panel as the operator, with `agents` seeded. */
-function renderWith(agents: AgentInfo[]) {
-  useDashStore.setState({ role: "operator", agents });
+/** Render the panel as the operator, with `agents` and any overrides seeded. */
+function renderWith(
+  agents: AgentInfo[],
+  overrides: Record<string, unknown> = {}
+) {
+  useDashStore.setState({ role: "operator", agents, ...overrides });
   return render(<AgentLauncher />, { wrapper: Wrapper });
+}
+
+/** The working-directory input. */
+function cwdField(): HTMLInputElement {
+  return screen.getByLabelText("Agent working directory") as HTMLInputElement;
+}
+
+/** The completion dropdown, or null when it is closed. */
+function suggestions(): HTMLElement | null {
+  return screen.queryByRole("listbox", { name: "Directory suggestions" });
+}
+
+/** Type `value` into the working-directory field. */
+function typeCwd(value: string) {
+  fireEvent.change(cwdField(), { target: { value } });
+}
+
+/**
+ * Let the completion debounce elapse and the fetch promise settle.
+ *
+ * Fake timers alone are not enough: the handler awaits the store action, so
+ * the pending microtasks have to flush inside the same `act` as the tick.
+ */
+async function flushCompletion(ms = 150) {
+  await act(async () => {
+    vi.advanceTimersByTime(ms);
+  });
+}
+
+/** A store whose completion endpoint answers with `result`. */
+function withCompletions(result: CwdCompletion | null) {
+  const fetchCwdCompletions = vi.fn().mockResolvedValue(result);
+  return { fetchCwdCompletions };
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +92,7 @@ function renderWith(agents: AgentInfo[]) {
 
 describe("AgentLauncher — roster row room state", () => {
   beforeEach(() => {
-    useDashStore.setState({ role: "operator", agents: [] });
+    useDashStore.setState({ role: "operator", agents: [], agentCwd: null });
   });
 
   it("shows a healthy agent as joined, with its send count", () => {
@@ -100,7 +136,7 @@ describe("AgentLauncher — roster row room state", () => {
 
 describe("AgentLauncher — mute permission modes", () => {
   beforeEach(() => {
-    useDashStore.setState({ role: "operator", agents: [] });
+    useDashStore.setState({ role: "operator", agents: [], agentCwd: null });
   });
 
   it.each(["openai", "codex"])("lets a %s worker use plan and resets permissions on runtime changes", (runtime) => {
@@ -141,5 +177,315 @@ describe("AgentLauncher — mute permission modes", () => {
     expect(
       screen.getByRole("button", { name: "Spawn agent" })
     ).not.toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-spawn working directory
+// ---------------------------------------------------------------------------
+
+describe("AgentLauncher — working directory field", () => {
+  /** Seed the store and fill in a valid name, returning the spawn spy. */
+  function renderForm(overrides: Record<string, unknown> = {}) {
+    const sendSpawnAgent = vi.fn().mockResolvedValue(true);
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions(null),
+      sendSpawnAgent,
+      ...overrides,
+    });
+    fireEvent.change(screen.getByLabelText("Agent name"), {
+      target: { value: "alpha" },
+    });
+    return sendSpawnAgent;
+  }
+
+  /** Click Spawn and let the async handler settle. */
+  async function spawn() {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Spawn agent" }));
+    });
+  }
+
+  beforeEach(() => {
+    useDashStore.setState({ role: "operator", agents: [], agentCwd: null });
+  });
+
+  it("pre-fills the hub's default working directory", () => {
+    renderForm({ agentCwd: "/srv/projects" });
+    expect(cwdField()).toHaveValue("/srv/projects");
+  });
+
+  it("pre-fills when the snapshot lands after the panel mounts", () => {
+    // The /ui snapshot is not guaranteed to arrive before the first render.
+    renderForm({ agentCwd: null });
+    expect(cwdField()).toHaveValue("");
+
+    act(() => {
+      useDashStore.setState({ agentCwd: "/srv/late" });
+    });
+
+    expect(cwdField()).toHaveValue("/srv/late");
+  });
+
+  it("keeps an operator's edit when a later snapshot arrives", () => {
+    // A reconnect replays the snapshot; it must not reach into the field and
+    // overwrite the directory the operator just typed.
+    renderForm({ agentCwd: "/srv/projects" });
+    typeCwd("/srv/elsewhere");
+
+    act(() => {
+      useDashStore.setState({ agentCwd: "/srv/another-default" });
+    });
+
+    expect(cwdField()).toHaveValue("/srv/elsewhere");
+  });
+
+  it("sends an edited working directory in the spawn request", async () => {
+    const sendSpawnAgent = renderForm({ agentCwd: "/srv/projects" });
+    typeCwd("/srv/elsewhere");
+
+    await spawn();
+
+    expect(sendSpawnAgent).toHaveBeenCalledTimes(1);
+    expect(sendSpawnAgent.mock.calls[0][0]).toMatchObject({
+      cwd: "/srv/elsewhere",
+    });
+  });
+
+  it("omits cwd when the field is empty, so the hub uses its default", async () => {
+    const sendSpawnAgent = renderForm({ agentCwd: null });
+
+    await spawn();
+
+    expect(sendSpawnAgent.mock.calls[0][0].cwd).toBeUndefined();
+  });
+
+  it("resets the field to the hub default after a successful spawn", async () => {
+    renderForm({ agentCwd: "/srv/projects" });
+    typeCwd("/srv/elsewhere");
+
+    await spawn();
+
+    expect(cwdField()).toHaveValue("/srv/projects");
+  });
+
+  it("refuses a relative path before the round trip", () => {
+    renderForm();
+    typeCwd("projects/alpha");
+
+    expect(screen.getByText(/must be an absolute path/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Spawn agent" })).toBeDisabled();
+  });
+
+  it("refuses a path containing a '..' segment before the round trip", () => {
+    renderForm();
+    typeCwd("/srv/../etc");
+
+    expect(screen.getByText(/must not contain/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Spawn agent" })).toBeDisabled();
+  });
+
+  it("accepts a path whose existence only the hub can judge", () => {
+    // Client validation must never block a submit the server would accept.
+    renderForm();
+    typeCwd("/srv/does/not/exist/here");
+
+    expect(
+      screen.getByRole("button", { name: "Spawn agent" })
+    ).not.toBeDisabled();
+  });
+});
+
+describe("AgentLauncher — working directory completion", () => {
+  const dirs = ["/srv/projects/alpha", "/srv/projects/beta"];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    useDashStore.setState({ role: "operator", agents: [], agentCwd: null });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("debounces the completion fetch and does not fire on an empty field", async () => {
+    const { fetchCwdCompletions } = withCompletions({ dirs, truncated: false });
+    renderWith([], { agentCwd: null, fetchCwdCompletions });
+
+    typeCwd("/srv/pro");
+    expect(fetchCwdCompletions).not.toHaveBeenCalled();
+
+    await flushCompletion();
+    expect(fetchCwdCompletions).toHaveBeenCalledTimes(1);
+    expect(fetchCwdCompletions).toHaveBeenCalledWith("/srv/pro");
+
+    typeCwd("");
+    await flushCompletion();
+    expect(fetchCwdCompletions).toHaveBeenCalledTimes(1);
+    expect(suggestions()).toBeNull();
+  });
+
+  it("collapses a burst of keystrokes into one request", async () => {
+    const { fetchCwdCompletions } = withCompletions({ dirs, truncated: false });
+    renderWith([], { agentCwd: null, fetchCwdCompletions });
+
+    typeCwd("/s");
+    typeCwd("/sr");
+    typeCwd("/srv");
+    await flushCompletion();
+
+    expect(fetchCwdCompletions).toHaveBeenCalledTimes(1);
+    expect(fetchCwdCompletions).toHaveBeenCalledWith("/srv");
+  });
+
+  it("renders the candidates in the shared dropdown", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs, truncated: false }),
+    });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+
+    const list = suggestions();
+    expect(list).not.toBeNull();
+    const options = within(list as HTMLElement).getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual(dirs);
+    expect(options[0]).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("moves the selection with the arrow keys and accepts with Enter", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs, truncated: false }),
+    });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+
+    fireEvent.keyDown(cwdField(), { key: "ArrowDown" });
+    const options = within(suggestions() as HTMLElement).getAllByRole("option");
+    expect(options[1]).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(cwdField(), { key: "ArrowUp" });
+    expect(
+      within(suggestions() as HTMLElement).getAllByRole("option")[0]
+    ).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(cwdField(), { key: "ArrowDown" });
+    fireEvent.keyDown(cwdField(), { key: "Enter" });
+
+    // Accepted with a trailing slash, so the next segment completes straight away.
+    expect(cwdField()).toHaveValue("/srv/projects/beta/");
+  });
+
+  it("accepts with Tab as well", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs, truncated: false }),
+    });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+    fireEvent.keyDown(cwdField(), { key: "Tab" });
+
+    expect(cwdField()).toHaveValue("/srv/projects/alpha/");
+  });
+
+  it("accepts a clicked candidate", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs, truncated: false }),
+    });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+    const options = within(suggestions() as HTMLElement).getAllByRole("option");
+    fireEvent.mouseDown(options[1]);
+
+    expect(cwdField()).toHaveValue("/srv/projects/beta/");
+  });
+
+  it("completes the next segment after an acceptance", async () => {
+    const { fetchCwdCompletions } = withCompletions({ dirs, truncated: false });
+    renderWith([], { agentCwd: null, fetchCwdCompletions });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+    fireEvent.keyDown(cwdField(), { key: "Enter" });
+    await flushCompletion();
+
+    expect(fetchCwdCompletions).toHaveBeenLastCalledWith("/srv/projects/alpha/");
+  });
+
+  it("closes on Escape and stays closed until the next edit", async () => {
+    const { fetchCwdCompletions } = withCompletions({ dirs, truncated: false });
+    renderWith([], { agentCwd: null, fetchCwdCompletions });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+    expect(suggestions()).not.toBeNull();
+
+    fireEvent.keyDown(cwdField(), { key: "Escape" });
+    expect(suggestions()).toBeNull();
+
+    // No new request while dismissed, and the field keeps what was typed.
+    await flushCompletion();
+    expect(fetchCwdCompletions).toHaveBeenCalledTimes(1);
+    expect(cwdField()).toHaveValue("/srv/pro");
+
+    // The next edit arms completion again.
+    typeCwd("/srv/proj");
+    await flushCompletion();
+    expect(suggestions()).not.toBeNull();
+  });
+
+  it("shows the truncation flag as a muted line, not an error", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs, truncated: true }),
+    });
+
+    typeCwd("/srv/pro");
+    await flushCompletion();
+
+    const list = suggestions() as HTMLElement;
+    expect(list).toHaveTextContent("more…");
+    // Informational only: it is not an option, so it is not selectable.
+    expect(within(list).getAllByRole("option")).toHaveLength(dirs.length);
+  });
+
+  it("leaves the field usable when the fetch fails", async () => {
+    // A refused or broken completion must degrade to "no suggestions".
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions(null),
+      sendSpawnAgent: vi.fn().mockResolvedValue(true),
+    });
+
+    fireEvent.change(screen.getByLabelText("Agent name"), {
+      target: { value: "alpha" },
+    });
+    typeCwd("/srv/projects/alpha");
+    await flushCompletion();
+
+    expect(suggestions()).toBeNull();
+    expect(cwdField()).toHaveValue("/srv/projects/alpha");
+    expect(
+      screen.getByRole("button", { name: "Spawn agent" })
+    ).not.toBeDisabled();
+  });
+
+  it("closes the dropdown on an empty result list", async () => {
+    renderWith([], {
+      agentCwd: null,
+      ...withCompletions({ dirs: [], truncated: false }),
+    });
+
+    typeCwd("/srv/zzz");
+    await flushCompletion();
+
+    expect(suggestions()).toBeNull();
   });
 });

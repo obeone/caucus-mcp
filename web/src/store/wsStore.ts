@@ -27,6 +27,7 @@ import type {
   UserRole,
   AgentInfo,
   SpawnAgentSpec,
+  CwdCompletion,
 } from "./types";
 
 // Maximum messages kept in memory (client-side ring buffer).
@@ -138,6 +139,27 @@ async function agentApiErrorDetail(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
+/**
+ * Build the `POST /agents` body, dropping an empty working directory.
+ *
+ * The hub reads an absent, null or empty `cwd` as "use the configured
+ * default", so all three are equivalent on the wire. Sending the key as an
+ * empty string anyway would still work, but it reads like a request for the
+ * empty path; omitting it says what the operator meant.
+ *
+ * @param spec - The spawn spec as the launcher form produced it.
+ */
+function spawnRequestBody(spec: SpawnAgentSpec): SpawnAgentSpec {
+  const cwd = spec.cwd?.trim();
+  const body: SpawnAgentSpec = { ...spec };
+  if (cwd) {
+    body.cwd = cwd;
+  } else {
+    delete body.cwd;
+  }
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -170,6 +192,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
   health: null as HealthInfo | null,
   rate: null as RateInfo | null,
   agents: [] as AgentInfo[],
+  agentCwd: null as string | null,
   messages: [],
   selectedPeer: null,
   selectedChannel: null as string | null,
@@ -253,6 +276,9 @@ export const useDashStore = create<InternalState>()((set, get) => ({
           health: evt.health ?? null,
           rate: evt.rate ?? null,
           agents: evt.agents ?? [],
+          // Absent for an observer and for a hub with the launcher off; in
+          // both cases there is no default to pre-fill, hence null.
+          agentCwd: evt.agent_cwd ?? null,
           messages: msgs.slice(-MAX_MESSAGES),
         });
         break;
@@ -451,7 +477,7 @@ export const useDashStore = create<InternalState>()((set, get) => ({
       const res = await fetch("/agents", {
         method: "POST",
         headers: agentApiHeaders(get()._authToken, true),
-        body: JSON.stringify(spec),
+        body: JSON.stringify(spawnRequestBody(spec)),
       });
       if (!res.ok) {
         const detail = await agentApiErrorDetail(res);
@@ -497,6 +523,31 @@ export const useDashStore = create<InternalState>()((set, get) => ({
         variant: "error",
       });
       return false;
+    }
+  },
+
+  // GET /agents/cwd-complete?prefix=… with the same bearer token as the spawn
+  // request (hub.py `complete_agent_cwd`). Deliberately toast-free and
+  // null-on-failure: the operator can always type the path by hand, so a
+  // refusal, a network blip or a body in an unexpected shape must degrade to
+  // "no suggestions" rather than to an error the operator has to dismiss.
+  fetchCwdCompletions: async (prefix: string): Promise<CwdCompletion | null> => {
+    try {
+      const url = `/agents/cwd-complete?prefix=${encodeURIComponent(prefix)}`;
+      const res = await fetch(url, {
+        headers: agentApiHeaders(get()._authToken, false),
+      });
+      if (!res.ok) return null;
+      const body: unknown = await res.json();
+      if (!body || typeof body !== "object") return null;
+      const raw = body as { dirs?: unknown; truncated?: unknown };
+      if (!Array.isArray(raw.dirs)) return null;
+      return {
+        dirs: raw.dirs.filter((d): d is string => typeof d === "string"),
+        truncated: raw.truncated === true,
+      };
+    } catch {
+      return null;
     }
   },
 }));

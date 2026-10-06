@@ -119,6 +119,142 @@ describe("wsStore — sendSpawnAgent", () => {
     expect(mockFireToast).toHaveBeenCalledTimes(1);
     expect(mockFireToast.mock.calls[0][0].description).toBe("network down");
   });
+
+  it("sends a non-empty per-spawn cwd in the body", async () => {
+    setAuthToken("op-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useDashStore
+      .getState()
+      .sendSpawnAgent({ ...spec, cwd: "/srv/projects/alpha" });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).cwd).toBe("/srv/projects/alpha");
+  });
+
+  it("trims a per-spawn cwd before sending it", async () => {
+    setAuthToken("op-token");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useDashStore.getState().sendSpawnAgent({ ...spec, cwd: "  /srv/alpha  " });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).cwd).toBe("/srv/alpha");
+  });
+
+  it.each([undefined, "", "   "])(
+    "omits cwd entirely when the field is %p, so the hub uses its default",
+    async (cwd) => {
+      setAuthToken("op-token");
+      const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      await useDashStore.getState().sendSpawnAgent({ ...spec, cwd });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body).not.toHaveProperty("cwd");
+    }
+  );
+});
+
+describe("wsStore — fetchCwdCompletions", () => {
+  beforeEach(() => {
+    mockFireToast.mockClear();
+  });
+
+  it("GETs /agents/cwd-complete with the prefix and the bearer token", async () => {
+    setAuthToken("op-token");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ dirs: ["/srv/a", "/srv/b"], truncated: false }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await useDashStore.getState().fetchCwdCompletions("/srv/");
+
+    expect(result).toEqual({ dirs: ["/srv/a", "/srv/b"], truncated: false });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/agents/cwd-complete?prefix=%2Fsrv%2F");
+    expect(init.headers).toMatchObject({ Authorization: "Bearer op-token" });
+    expect(init.headers).not.toHaveProperty("Content-Type");
+  });
+
+  it("omits the Authorization header when no token is known", async () => {
+    setAuthToken(null);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ dirs: [], truncated: false }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await useDashStore.getState().fetchCwdCompletions("/srv/");
+
+    expect(fetchMock.mock.calls[0][1].headers).not.toHaveProperty("Authorization");
+  });
+
+  it("carries the truncated flag through", async () => {
+    setAuthToken("op-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ dirs: ["/srv/a"], truncated: true }),
+      })
+    );
+
+    const result = await useDashStore.getState().fetchCwdCompletions("/srv/");
+
+    expect(result?.truncated).toBe(true);
+  });
+
+  // Completion is a convenience: every failure mode has to degrade to "no
+  // suggestions" with no toast, or a refused completion would nag an operator
+  // who can still type the path by hand.
+  it.each([403, 400, 500])("resolves null and stays silent on HTTP %i", async (status) => {
+    setAuthToken("op-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: false, status, json: async () => ({}) })
+    );
+
+    expect(await useDashStore.getState().fetchCwdCompletions("/srv/")).toBeNull();
+    expect(mockFireToast).not.toHaveBeenCalled();
+  });
+
+  it("resolves null and stays silent when fetch itself rejects", async () => {
+    setAuthToken("op-token");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+
+    expect(await useDashStore.getState().fetchCwdCompletions("/srv/")).toBeNull();
+    expect(mockFireToast).not.toHaveBeenCalled();
+  });
+
+  it("resolves null when the body carries no dirs array", async () => {
+    setAuthToken("op-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ dirs: "nope" }) })
+    );
+
+    expect(await useDashStore.getState().fetchCwdCompletions("/srv/")).toBeNull();
+  });
+
+  it("drops non-string entries rather than rendering them", async () => {
+    setAuthToken("op-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ dirs: ["/srv/a", 7, null], truncated: false }),
+      })
+    );
+
+    expect(await useDashStore.getState().fetchCwdCompletions("/srv/")).toEqual({
+      dirs: ["/srv/a"],
+      truncated: false,
+    });
+  });
 });
 
 describe("wsStore — sendKillAgent", () => {
@@ -180,6 +316,37 @@ describe("wsStore — auth_ok promotes the handshake token", () => {
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((useDashStore.getState() as any)._authToken).toBe("handshake-token");
+  });
+});
+
+describe("wsStore — snapshot agent_cwd", () => {
+  /** Feed a minimal snapshot through the real event path. */
+  function snapshot(extra: Record<string, unknown>) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (useDashStore.getState() as any)._handleEvent({
+      type: "snapshot",
+      mode: "running",
+      peers: [],
+      channels: {},
+      floors: {},
+      forms: [],
+      log: [],
+      health: null,
+      ...extra,
+    });
+  }
+
+  it("stores the hub's default working directory for the form to pre-fill", () => {
+    snapshot({ agent_cwd: "/srv/projects" });
+    expect(useDashStore.getState().agentCwd).toBe("/srv/projects");
+  });
+
+  // The hub withholds the field from an observer and from a launcher-less hub;
+  // either way there is no default, which must not linger from a past snapshot.
+  it("falls back to null when the field is absent", () => {
+    snapshot({ agent_cwd: "/srv/projects" });
+    snapshot({});
+    expect(useDashStore.getState().agentCwd).toBeNull();
   });
 });
 
