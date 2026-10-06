@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
-from caucus import claude_agent
+from caucus import claude_agent, native_agent
 from caucus import hub as hub_module
 from caucus.hub_connector import HubConnector, Inbound, SendResult
 
@@ -454,7 +454,7 @@ async def test_set_status_safe_bounds_a_hanging_connector(
     never answers) would block indefinitely, breaking the "never delay the
     turn" contract the docstring promises.
     """
-    monkeypatch.setattr(claude_agent, "_STATUS_TIMEOUT", 0.05)
+    monkeypatch.setattr(native_agent, "_STATUS_TIMEOUT", 0.05)
 
     class _Hanging:
         async def set_status(self, token: str, status: str) -> dict[str, object]:

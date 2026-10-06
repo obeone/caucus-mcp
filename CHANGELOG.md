@@ -76,6 +76,10 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- Extract the native conversation loop and nine room handlers into an
+  SDK-independent module. Preserve Claude defaults, and propagate failed
+  driver/poller tasks instead of leaving silently failed sessions.
+
 - Ignore generated Graphify indexes and local analysis caches (`graphify-out/`).
 
 - **`caucus-hub` now refuses to start on a non-loopback bind unless both
