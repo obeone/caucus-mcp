@@ -86,6 +86,15 @@ MAX_MISSION_CHARS = 4000
 #: How many *exited* records stay visible so the operator can read a post-mortem.
 MAX_EXITED_RECORDS = 16
 
+#: Most directory candidates one working-directory completion may return. A
+#: dropdown is a convenience, not a directory listing tool. This bounds the
+#: *response* only: the parent is scanned and the matches are sorted in full
+#: before the cap trims the alphabetical tail, because knowing a directory's
+#: entries means reading them all, and stopping early would make the candidates
+#: an arbitrary slice instead of the first N by name. Acceptable: the route is
+#: operator-gated, and nobody has a directory that big by accident.
+MAX_CWD_COMPLETIONS = 50
+
 #: Agent names accepted by :meth:`AgentSupervisor.spawn`. Deliberately narrow:
 #: the name becomes a ``--project=<name>`` value, a hub peer identity, and a URL
 #: path segment, so it may not contain a slash, a space, an equals sign, or a
@@ -196,34 +205,49 @@ class LauncherRefused(LauncherError):
 
 
 def validate_agent_cwd(raw: str | os.PathLike[str]) -> Path:
-    """Validate and resolve the fixed working directory for spawned agents.
+    """Validate and resolve a working directory for spawned agents.
 
-    The hub configures exactly one working directory at boot. It is not an
-    allowlist and not a per-spawn field, because an allowlist would imply a
-    containment guarantee that a ``worker`` with Bash defeats with a single
-    ``cd ..``. What is still worth enforcing is that the operator gets the
-    directory they named: an absolute, traversal-free, non-redirecting path.
+    This is the single gate for *every* working directory the hub will ever hand
+    a child: the one configured at boot (``--agent-cwd``) and the optional
+    per-spawn override an operator types into the console form. It is not an
+    allowlist, because an allowlist would imply a containment guarantee that a
+    ``worker`` with Bash defeats with a single ``cd ..``. What is still worth
+    enforcing, and what this function enforces on every path, is that the
+    operator gets the directory they named: an absolute, traversal-free,
+    non-redirecting path.
 
     Parameters
     ----------
     raw:
-        Path as typed on the hub command line.
+        Path as typed on the hub command line or in the spawn form.
+
+    The returned path, not the caller's input, is the one that may be used:
+    this function strips surrounding whitespace, so ``"/srv/x "`` and
+    ``"/srv/x"`` validate as the *same* directory while naming two different
+    ones on disk. A caller that validates one string and launches another gives
+    up every guarantee below, the "resolves elsewhere" rule included.
 
     Returns
     -------
     pathlib.Path
-        The validated, resolved directory.
+        The validated, resolved directory. Use this, never the input.
 
     Raises
     ------
     LauncherRefused
-        If the path is empty, relative, contains a ``..`` component, does not
-        exist, is not a directory, or resolves somewhere other than where it
-        points (a symlink walking out of the named location).
+        If the path is empty, holds a NUL byte, is relative, contains a ``..``
+        component, does not exist, is not a directory, or resolves somewhere
+        other than where it points (a symlink walking out of the named
+        location).
     """
     text = str(raw).strip()
     if not text:
         raise LauncherRefused("agent working directory must not be empty")
+    # A NUL truncates the string at the execve boundary, exactly as it does in a
+    # mission, and every path syscall below raises ValueError (not OSError) on
+    # one, which would leave the hub answering 500 instead of refusing.
+    if "\x00" in text:
+        raise LauncherRefused("agent working directory must not contain a NUL byte")
     candidate = Path(text)
     if not candidate.is_absolute():
         raise LauncherRefused(
@@ -250,6 +274,100 @@ def validate_agent_cwd(raw: str | os.PathLike[str]) -> Path:
             "pass the resolved path explicitly"
         )
     return resolved
+
+
+def complete_agent_cwd(prefix: str | None = None) -> tuple[list[str], bool]:
+    """List the immediate subdirectories matching a partial absolute path.
+
+    Type-ahead for the operator's working-directory field, and nothing more.
+    The last segment of ``prefix`` is treated as a partial directory name and
+    matched case-insensitively against the entries of its parent; a ``prefix``
+    ending in a separator means "every subdirectory of this directory". Only
+    directory *names* are ever produced, never file names and never file
+    contents, and the walk never recurses.
+
+    An unreadable, missing, or non-directory parent yields no candidates rather
+    than an error: completion is a convenience on a field the operator may
+    perfectly well finish typing by hand, so it must never turn a half-typed
+    path into a failure.
+
+    Every candidate is a path :func:`validate_agent_cwd` would accept, which is
+    the property worth keeping: a dropdown that suggests a directory the spawn
+    then refuses is worse than no dropdown. That is why symlinked entries are
+    skipped. It hides nothing reachable, since any path traversing a symlink
+    resolves elsewhere and is refused, so the whole subtree under one is
+    unspawnable whether or not it is offered here.
+
+    Parameters
+    ----------
+    prefix:
+        Absolute path, possibly partial. ``None`` or empty means ``/``.
+
+    Returns
+    -------
+    tuple of (list of str, bool)
+        The matching absolute directory paths, sorted ascending and capped at
+        :data:`MAX_CWD_COMPLETIONS`, and whether the cap dropped any.
+
+    Raises
+    ------
+    LauncherRefused
+        If ``prefix`` is neither empty nor absolute, or if it holds a NUL byte.
+        A relative prefix has no meaning here: the hub's own process cwd is not
+        the operator's, so completing against it would offer directories the
+        operator never named.
+    """
+    text = str(prefix or "").strip() or "/"
+    if not text.startswith("/"):
+        raise LauncherRefused(
+            f"completion prefix must be an absolute path, got {text!r}"
+        )
+    # ``os.scandir`` raises ValueError, not OSError, on an embedded NUL, so the
+    # handler below would not catch it and the operator would get a 500.
+    if "\x00" in text:
+        raise LauncherRefused("completion prefix must not contain a NUL byte")
+    # Split on the raw text, not through :class:`Path`: pathlib normalises a
+    # trailing ``.`` away, which would silently turn "show me the hidden
+    # entries of this directory" into "complete the directory's own name".
+    #
+    # A ``..`` in the prefix is deliberately NOT normalised away either, so the
+    # candidates keep it and the spawn then refuses them all. Rewriting what the
+    # operator typed would be the worse surprise of the two, and an operator
+    # putting ``..`` in an absolute-path field has already left the happy path.
+    parent_text, _, partial = text.rpartition("/")
+    parent = Path(parent_text or "/")
+    folded = partial.casefold()
+    # Hidden entries stay out of the way until the operator asks for them by
+    # typing the dot, which is how every shell completion behaves.
+    want_hidden = partial.startswith(".")
+    matches: list[str] = []
+    try:
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                if entry.name.startswith(".") and not want_hidden:
+                    continue
+                if not entry.name.casefold().startswith(folded):
+                    continue
+                try:
+                    # Cached from this same scandir call, so it costs nothing.
+                    # A linked directory is a candidate the spawn would refuse
+                    # ("resolves elsewhere"), and suggesting it would tell the
+                    # operator to pass the resolved path while the dropdown is
+                    # what stopped them typing it.
+                    if entry.is_symlink():
+                        continue
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    # A dangling symlink or a race with a removal costs this one
+                    # candidate, never the whole response.
+                    continue
+                matches.append(str(parent / entry.name))
+    except OSError:
+        return [], False
+    matches.sort()
+    truncated = len(matches) > MAX_CWD_COMPLETIONS
+    return matches[:MAX_CWD_COMPLETIONS], truncated
 
 
 @dataclass(frozen=True)
@@ -301,9 +419,17 @@ class AgentSpec:
     """A validated request to launch one agent.
 
     Every field is a typed value this module renders into a flag. There is no
-    ``cwd`` field and no ``extra_args`` field, by design: the working directory
-    is hub policy, and free argv would hand an operator the ability to pass
-    flags this module has never reviewed.
+    ``extra_args`` field, by design: free argv would hand an operator the
+    ability to pass flags this module has never reviewed.
+
+    There *is* a ``cwd`` field, and it costs no containment. The hub's
+    ``--agent-cwd`` was never a boundary (see :func:`validate_agent_cwd`: a
+    ``worker`` with Bash leaves any directory with one ``cd ..``); what it
+    carried was operator *intent*, and a directory the operator types into the
+    spawn form carries exactly the same intent. The rule that does the work is
+    unchanged and non-negotiable: the value is pushed through
+    :func:`validate_agent_cwd` server-side, on every single spawn, in
+    :meth:`AgentSupervisor._validate`.
 
     Attributes
     ----------
@@ -320,6 +446,9 @@ class AgentSpec:
         Optional model override; the SDK's default when ``None``.
     runtime:
         Native runtime: ``claude`` (default), ``openai`` (API), or ``codex`` (plan).
+    cwd:
+        Per-spawn working directory. ``None`` means the hub's configured
+        default; anything else is validated by :func:`validate_agent_cwd`.
     """
 
     name: str
@@ -328,6 +457,7 @@ class AgentSpec:
     permission_mode: str = DEFAULT_PERMISSION_MODE
     model: str | None = None
     runtime: str = "claude"
+    cwd: Path | None = None
 
 
 @dataclass
@@ -667,7 +797,7 @@ class AgentSupervisor:
                     env[key] = value
         return env
 
-    def _validate(self, spec: AgentSpec) -> None:
+    def _validate(self, spec: AgentSpec) -> Path | None:
         """Run every spawn precondition, cheapest and most decisive first.
 
         Parameters
@@ -675,12 +805,23 @@ class AgentSupervisor:
         spec:
             The requested launch.
 
+        Returns
+        -------
+        pathlib.Path or None
+            The *vetted* per-spawn working directory as
+            :func:`validate_agent_cwd` resolved it, or ``None`` when the spec
+            carried none and the hub default applies. Returning it is not a
+            convenience: validation normalises the path (whitespace stripped,
+            symlinks compared), so launching anything else would validate one
+            directory and start the child in another.
+
         Raises
         ------
         LauncherDisabled
             If the launcher is off.
         LauncherRefused
-            If any field or capacity rule fails.
+            If any field or capacity rule fails, or if a per-spawn working
+            directory fails :func:`validate_agent_cwd`.
         """
         if not self._config.enabled:
             raise LauncherDisabled("agent launcher is disabled on this hub")
@@ -751,6 +892,16 @@ class AgentSupervisor:
             raise LauncherRefused(
                 f"agent ceiling reached ({self._config.max_agents} running)"
             )
+        # Last, because it is the only check that touches the filesystem. This
+        # call is the one non-negotiable rule behind the per-spawn working
+        # directory: the operator-supplied path is validated *here*, server-side,
+        # on every spawn, by the same function that gates ``--agent-cwd`` at boot.
+        # A console-side check is a convenience; this is the authority. Its
+        # return value is handed back to the caller rather than dropped: see the
+        # Returns section above, a dropped one reopens the symlink hole.
+        if spec.cwd is None:
+            return None
+        return validate_agent_cwd(spec.cwd)
 
     async def _spawn_process(
         self, argv: ArgvList, env: dict[str, str], cwd: Path
@@ -810,8 +961,15 @@ class AgentSupervisor:
             If validation fails, or the process could not be started.
         """
         async with self._lock:
-            self._validate(spec)
-            cwd = self._config.cwd
+            vetted = self._validate(spec)
+            # ``vetted`` is what ``validate_agent_cwd`` returned, never
+            # ``spec.cwd``. The two can name different directories: validation
+            # strips whitespace, so a submitted "/srv/x " is approved as
+            # "/srv/x" while "/srv/x " may be a symlink pointing elsewhere.
+            # Launching the raw value would approve one directory and start the
+            # child in another, which is exactly what the "resolves elsewhere"
+            # rule exists to prevent.
+            cwd = vetted or self._config.cwd
             if cwd is None:  # pragma: no cover - LauncherConfig forbids this
                 raise LauncherRefused("agent launcher has no working directory")
             argv = self._command(spec)
