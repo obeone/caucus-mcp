@@ -335,7 +335,7 @@ CLIs once so they live on your `PATH`.
 
 Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**. It
 ships every CLI: `caucus-hub`, `caucus-bridge`, `caucus-watch` and
-`caucus-claude-agent`, plus the `caucus-setup-service` and
+`caucus-claude-agent` and `caucus-openai-agent`, plus the `caucus-setup-service` and
 `caucus-setup-automode` setup helpers.
 
 ```bash
@@ -548,6 +548,84 @@ Two agent profiles, picked with `--type`:
 | **`talker`** (default) | Caucus tools only. The built-in Claude Code tools (Bash/Read/Edit/...) are disabled, so it stays a pure conversational peer. |
 | **`worker`** | Also wields the built-in tools, so it can act on the repo it represents. `--permission-mode` (default `auto`) chooses how the SDK gates tool calls. |
 
+### Run the native OpenAI connector
+
+The [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) runtime
+uses the same hub, protocol, nine room tools, acknowledgements and operator
+controls as Claude. Install the `openai` extra and set `OPENAI_API_KEY` in the
+environment; authentication is through the API, independently of a Codex login.
+
+```bash
+uv pip install -e ".[openai]"
+caucus-openai-agent --project openai-planner --mission "Negotiate the event schema"
+caucus-openai-agent --project openai-worker --type worker --cwd /path/to/repo --mission "Implement the agreed schema and run tests"
+```
+
+`talker` (the default) has only Caucus tools. `worker` adds workspace
+read/write/edit/search tools, Bash, hosted web search and a read-only research
+subagent. The model reads `AGENTS.md`/`CLAUDE.md` before working. File tools reject
+paths and symlinks outside `--cwd`; the Bash tool is a host process, not a sandbox.
+Every shell command requires approval of the exact command through an operator
+form. Shell children do not inherit OpenAI API or Caucus credentials.
+
+OpenAI permissions are explicit policies, not Claude Code's auto-approval
+classifier:
+
+| Mode | File edits | Shell |
+| --- | --- | --- |
+| `auto` / `default` | Operator approval for each exact edit | Operator approval |
+| `acceptEdits` | Allowed | Operator approval |
+| `plan` | Unavailable | Unavailable |
+
+Approval details and forms appear in a dedicated channel. Only a matching answer
+with hub-attested operator provenance authorizes a call; rejection, cancellation
+or a five-minute timeout denies it. `interrupt` aborts the current run, `reset`
+rebuilds an empty conversation, and **Stop** cancels work immediately. Edits
+already completed before cancellation remain on disk. Model failures are logged
+and end the session. SDK tracing is disabled for both the parent and its subagent.
+
+Flags: `--hub`, `--project`, `--mission`, `--model`, `--type`, `--permission-mode`,
+`--cwd`, `--poll-timeout` (at most 25 seconds), `--max-turns` (default 30 per
+inbound turn). Shared `CAUCUS_*` variables work as with Claude. `--model` defaults
+to the SDK's model; `OPENAI_BASE_URL` can select an API-compatible endpoint, though
+hosted web search needs a provider/model that supports it.
+
+### Run the native Codex subscription connector
+
+Use `caucus-codex-agent` to run on your ChatGPT plan instead of separately billed
+API calls. Install Codex CLI 0.160 or later on the same machine, then authenticate
+with ChatGPT using `codex login`. Caucus uses the official
+[app-server interface](https://learn.chatgpt.com/docs/app-server); its dynamic
+tool API is experimental. The Python Codex SDK currently does not expose the
+server-request callbacks this connector needs, so this adapter speaks JSON-RPC
+directly to the installed CLI. No additional Python model SDK is required.
+
+```bash
+codex login
+caucus-codex-agent --project codex-worker --type worker --cwd /path/to/repo --mission "Implement the agreed schema and run tests"
+```
+
+The API and subscription runtimes remain separate: `caucus-openai-agent` uses
+`OPENAI_API_KEY`; `caucus-codex-agent` requires a ChatGPT-authenticated Codex
+account, refuses API-key accounts and does not inherit API credentials. Codex
+owns the stored login and token refresh; Caucus does not copy or store tokens.
+Usage counts against the signed-in account's plan limits. There is no automatic
+fallback from subscription usage to API billing.
+
+Both profiles expose the nine Caucus tools. Workers also have the same workspace
+tools and operator-form policies as the API runtime, web search, and read-only
+research delegation. Codex's built-in execution is disabled and its sandbox is
+read-only with escalation refused; approved edits and shell commands run through
+the shared Caucus tools. User-configured MCP servers, apps, plugins and hooks are
+disabled for this child. The approved Bash tool remains a host process, as above.
+
+Conversation history stays on one ephemeral Codex thread. Interrupt cancels the
+active turn and pending tool calls; reset creates a fresh process and thread,
+retaining the mission; Stop ends the session. Runtime disconnects and failed
+turns end the session. Flags match the API agent, except `--max-turns`; use
+`--codex-path` (or `CODEX_PATH`) to select the executable and `CODEX_HOME` to select
+an existing Codex login directory.
+
 ### Spawn agents from the console (opt-in)
 
 The hub can also start those agents itself, so the human watching a room can add
@@ -567,6 +645,16 @@ every caller is graded as operator in that state, so without a token the
 launcher would let anything that can reach the port start processes on the
 machine. Once up, `GET /agents`, `POST /agents` and `DELETE /agents/{name}`
 serve the roster, each requiring the operator token.
+
+Select **Claude**, **OpenAI — API key**, or **Codex — ChatGPT subscription** in the
+launcher (`runtime`: `claude`, `openai`, or `codex`); an omitted runtime continues
+to mean Claude. Install the Claude/OpenAI extra in the hub's Python environment,
+or install and sign in to Codex CLI on the hub machine. OpenAI children receive
+`OPENAI_API_KEY` (and optional
+`OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`) from the hub environment;
+Claude and Codex children never receive these variables. Codex children receive
+only their optional `CODEX_HOME` and `CODEX_PATH` settings. OpenAI and Codex
+approvals use the console's forms, so `default` and `plan` remain usable.
 
 Read this before enabling it:
 
