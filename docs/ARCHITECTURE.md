@@ -567,18 +567,28 @@ enable the launcher without a token is what makes the request-time check real.
   sweep: an exit must be recorded the moment asyncio observes it, because once a
   child is reaped its pid can be reused and a stale "running" record is a record
   a kill would signal at somebody else's process.
-- REST only: `GET /agents`, `POST /agents`, `DELETE /agents/{name}`, each gated
-  exactly like `POST /control` (Origin, bearer token, `operator` role). There is
+- REST only: `GET /agents`, `POST /agents`, `DELETE /agents/{name}` and
+  `GET /agents/cwd-complete`, each gated exactly like `POST /control` (Origin,
+  bearer token, `operator` role). There is
   no inbound `/ui` command, because a socket authenticates once at handshake
   time and then accepts frames for as long as it stays open, which is a wider
   window than process creation deserves.
+- `GET /agents/cwd-complete` backs the console's path field. It returns the
+  immediate subdirectory **names** of a prefix, never file contents and never a
+  recursive walk, capped with a `truncated` flag. It reads the operator's own
+  filesystem, so it is operator-gated like the rest, even though it grants no
+  capability its caller lacks: anyone who can reach it can already spawn a
+  `worker` with shell access.
 - Outbound only on `/ui`: an `{"type": "agents", "agents": [...]}` event on every
   roster change, and the same roster inside `snapshot`. Observers see these, so
   they never carry child output; the `stdout` and `stderr` tails are served from
   the operator-gated `GET /agents` alone, under separate keys so a wedged child's
-  own account of itself stays readable apart from its diagnostics, and no payload
-  ever carries the working
-  directory or the child environment.
+  own account of itself stays readable apart from its diagnostics. The child
+  environment never leaves the hub, and no roster row ever carries a working
+  directory. Exactly one `/ui` payload does: an operator's `snapshot` carries
+  `agent_cwd`, the launcher's configured default, so the console can pre-fill its
+  path field. It is sent on the graded role, so an observer's snapshot omits it,
+  and it is the one configured default rather than any agent's actual directory.
 - **Reconciliation is one-directional and read-only.** Process facts are never
   written into `HubState`: tests swap that state wholesale and `/control reset`
   wipes it, so an OS side effect keyed on either would orphan a real process.
