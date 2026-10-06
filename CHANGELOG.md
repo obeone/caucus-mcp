@@ -76,6 +76,8 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- Ignore generated Graphify indexes and local analysis caches (`graphify-out/`).
+
 - **`caucus-hub` now refuses to start on a non-loopback bind unless both
   `--operator-token` and `--agent-key` are set** (`--allow-insecure-bind` is
   the explicit escape hatch). A hub on `0.0.0.0` used to start silently with
