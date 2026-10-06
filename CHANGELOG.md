@@ -12,6 +12,27 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Per-launch working directory in the operator launcher.** The spawn form
+  carries a `cwd` field, pre-filled with the hub's configured `--agent-cwd`
+  and editable per launch, so one hub can start agents in different projects
+  without a restart. `POST /agents` accepts an optional `cwd`; the hub
+  validates every value with the same rules as the boot-time flag and refuses
+  a relative path, a `..` component, a missing directory, a file, or a symlink
+  that resolves elsewhere. The configured default reaches the console in the
+  `/ui` snapshot as `agent_cwd`, sent to operators only.
+
+- **`GET /agents/cwd-complete`**, operator-gated path completion backing that
+  field. Returns the immediate subdirectories of a prefix, directory names
+  only and never file contents, capped with a `truncated` flag. The console
+  completes the field inline with the same dropdown it already uses for peer,
+  channel and command completion.
+
+- **Agent-launcher flags on `caucus-setup-service`**: `--enable-agent-launcher`,
+  `--agent-cwd` and `--agent-max`, so an installed service unit can carry the
+  launcher configuration. The installer applies the hub's own three-way gate at
+  install time (operator token, absolute working directory, loopback bind) and
+  refuses rather than writing a unit that would fail to boot.
+
 - **Runtime selection in the operator launcher**: Claude (default),
   OpenAI API, or Codex subscription. Spawn requests and process records
   carry the runtime; only API children receive OpenAI credentials, and
