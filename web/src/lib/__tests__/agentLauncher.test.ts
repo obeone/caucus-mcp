@@ -13,6 +13,7 @@ import {
   isMissionTooLong,
   isUnsafeWorkerCombo,
   isMutePermissionMode,
+  cwdError,
   spawnFormError,
   MAX_MISSION_CHARS,
   MUTE_PERMISSION_MODES,
@@ -85,6 +86,47 @@ describe("isUnsafeWorkerCombo", () => {
   });
 });
 
+describe("cwdError", () => {
+  it("accepts an empty value, which means the hub default", () => {
+    expect(cwdError("")).toBeNull();
+  });
+
+  it("accepts a whitespace-only value as empty", () => {
+    expect(cwdError("   ")).toBeNull();
+  });
+
+  it("accepts an absolute path", () => {
+    expect(cwdError("/Users/op/projects/alpha")).toBeNull();
+  });
+
+  it("rejects a relative path", () => {
+    expect(cwdError("projects/alpha")).toMatch(/absolute path/);
+  });
+
+  it("rejects a bare tilde, which the hub does not expand", () => {
+    expect(cwdError("~/projects")).toMatch(/absolute path/);
+  });
+
+  it("rejects a '..' segment", () => {
+    expect(cwdError("/Users/op/../root")).toMatch(/must not contain/);
+  });
+
+  it("rejects a trailing '..' segment", () => {
+    expect(cwdError("/Users/op/..")).toMatch(/must not contain/);
+  });
+
+  it("accepts '..' inside a directory name, matching the hub's parts check", () => {
+    // The hub refuses a '..' *component*; '..hidden' is an ordinary name.
+    expect(cwdError("/Users/op/..hidden")).toBeNull();
+  });
+
+  it("leaves existence and symlink resolution to the hub", () => {
+    // A browser cannot know either; claiming otherwise would block a submit
+    // the server would have accepted.
+    expect(cwdError("/nonexistent/but/absolute")).toBeNull();
+  });
+});
+
 describe("spawnFormError", () => {
   const base: SpawnFormValues = {
     name: "agent-a",
@@ -125,6 +167,30 @@ describe("spawnFormError", () => {
     expect(
       spawnFormError({ ...base, type: "worker", permissionMode: "bypassPermissions" })
     ).toMatch(/guardrail/);
+  });
+
+  it("accepts an absent working directory", () => {
+    expect(spawnFormError(base)).toBeNull();
+  });
+
+  it("accepts an empty working directory", () => {
+    expect(spawnFormError({ ...base, cwd: "" })).toBeNull();
+  });
+
+  it("accepts an absolute working directory", () => {
+    expect(spawnFormError({ ...base, cwd: "/srv/projects/alpha" })).toBeNull();
+  });
+
+  it("flags a relative working directory", () => {
+    expect(spawnFormError({ ...base, cwd: "projects/alpha" })).toMatch(
+      /absolute path/
+    );
+  });
+
+  it("flags a working directory containing a '..' segment", () => {
+    expect(spawnFormError({ ...base, cwd: "/srv/../etc" })).toMatch(
+      /must not contain/
+    );
   });
 });
 

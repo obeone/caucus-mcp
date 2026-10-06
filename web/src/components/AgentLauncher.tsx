@@ -3,12 +3,14 @@
  * native Claude or OpenAI processes from the console.
  *
  * Two parts:
- *   - A spawn form (name, mission, type, permission mode, optional model)
- *     gated by client-side validation mirroring the hub's own refusals (see
- *     `lib/agentLauncher.ts`), so the operator sees a reason before the round
- *     trip rather than after a rejected request. There is no working-directory
- *     field: the hub fixes it at startup and rejects an unknown `cwd` in the
- *     request body.
+ *   - A spawn form (name, mission, type, permission mode, optional model,
+ *     working directory) gated by client-side validation mirroring the hub's
+ *     own refusals (see `lib/agentLauncher.ts`), so the operator sees a reason
+ *     before the round trip rather than after a rejected request. The working
+ *     directory is pre-filled with the hub's configured `--agent-cwd` and is
+ *     editable per launch: the hub validates whatever is submitted on every
+ *     spawn, so the field is operator intent, not a containment boundary (a
+ *     `worker` with Bash leaves any directory with one `cd ..`).
  *   - A live roster below it: one row per supervised agent with its state, how
  *     it relates to the room (`peer_known` + `msg_count`), uptime, pid, and a
  *     kill button. Those two room fields sit here rather than in the Health
@@ -27,12 +29,13 @@
  * is pure UX plus the API calls.
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useDashStore } from "../store/wsStore";
 import { cn } from "../lib/utils";
 import { fmtDuration } from "../lib/colors";
 import { spawnFormError, type SpawnFormValues } from "../lib/agentLauncher";
 import { useToast } from "./ToastProvider";
+import AutocompleteDropdown from "./AutocompleteDropdown";
 import type {
   AgentInfo,
   AgentRuntime,
@@ -64,6 +67,14 @@ const PERMISSION_MODES: PermissionMode[] = [
   "bypassPermissions",
   "dontAsk",
 ];
+
+/**
+ * Debounce before asking the hub to complete the working-directory field.
+ *
+ * Long enough that typing a path does not fire one request per character,
+ * short enough that a pause reads as instant.
+ */
+const CWD_COMPLETE_DEBOUNCE_MS = 150;
 
 // ---------------------------------------------------------------------------
 // Roster row
@@ -219,6 +230,156 @@ function AgentRow({ agent, onKill }: AgentRowProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Working-directory field
+// ---------------------------------------------------------------------------
+
+interface CwdPathInputProps {
+  /** Current field value, owned by the form so a spawn can reset it. */
+  value: string;
+  /** Called with the new value on every edit and on an accepted completion. */
+  onChange: (value: string) => void;
+  /** Id of the form's error paragraph, for `aria-describedby`. */
+  describedBy?: string;
+}
+
+/**
+ * The working-directory text input, with hub-backed directory completion.
+ *
+ * Completion is a convenience and is built so it can never get in the way: it
+ * never fires on an empty field, a failed or empty response simply closes the
+ * list, and nothing here gates the submit. The hub remains the authority on
+ * whether a path is acceptable.
+ *
+ * Keyboard semantics are the operator composer's, because it is the same
+ * interaction: Arrow keys move, Enter or Tab accepts, Escape closes, a click
+ * accepts. Accepting appends a `/` so the next segment completes immediately,
+ * which is also why the debounced fetch re-runs on an accepted value rather
+ * than being suppressed.
+ *
+ * Escape has to both close the list and remember that it was closed, or the
+ * next keystroke would reopen it with the previous candidates still in hand.
+ */
+function CwdPathInput({ value, onChange, describedBy }: CwdPathInputProps) {
+  const fetchCwdCompletions = useDashStore((s) => s.fetchCwdCompletions);
+
+  const [candidates, setCandidates] = useState<string[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [index, setIndex] = useState(0);
+  // Set by Escape, cleared by the next edit: "the operator asked for silence".
+  const [dismissed, setDismissed] = useState(false);
+
+  const open = !dismissed && candidates.length > 0;
+
+  // Debounced completion fetch. `live` guards against a response from a stale
+  // prefix landing after a newer keystroke already superseded it.
+  useEffect(() => {
+    if (dismissed) return;
+    if (value.trim().length === 0) {
+      setCandidates([]);
+      setTruncated(false);
+      return;
+    }
+
+    let live = true;
+    const timer = setTimeout(() => {
+      void (async () => {
+        const result = await fetchCwdCompletions(value);
+        if (!live) return;
+        if (!result || result.dirs.length === 0) {
+          setCandidates([]);
+          setTruncated(false);
+          return;
+        }
+        setCandidates(result.dirs);
+        setTruncated(result.truncated);
+        setIndex(0);
+      })();
+    }, CWD_COMPLETE_DEBOUNCE_MS);
+
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [value, dismissed, fetchCwdCompletions]);
+
+  /** Take a candidate into the field, with a trailing slash for the next segment. */
+  function accept(dir: string) {
+    onChange(dir.endsWith("/") ? dir : `${dir}/`);
+    // Drop the current list: the value change re-runs the fetch for the new
+    // prefix, so the operator gets that directory's children next.
+    setCandidates([]);
+    setTruncated(false);
+  }
+
+  /** Close the list and keep it closed until the next edit. */
+  function dismiss() {
+    setDismissed(true);
+    setCandidates([]);
+    setTruncated(false);
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (!open) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setIndex((i) => Math.min(i + 1, candidates.length - 1));
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setIndex((i) => Math.max(i - 1, 0));
+      return;
+    }
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      accept(candidates[Math.min(index, candidates.length - 1)]);
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      dismiss();
+    }
+  }
+
+  return (
+    <div className="relative">
+      {open && (
+        <AutocompleteDropdown
+          candidates={candidates}
+          selectedIndex={index}
+          onAccept={accept}
+          onSetIndex={setIndex}
+          placement="below"
+          ariaLabel="Directory suggestions"
+          className="w-[22rem]"
+          footer={truncated ? "more…" : undefined}
+        />
+      )}
+
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => {
+          setDismissed(false);
+          onChange(e.target.value);
+        }}
+        onKeyDown={handleKeyDown}
+        placeholder="working directory"
+        aria-label="Agent working directory"
+        aria-describedby={describedBy}
+        aria-autocomplete="list"
+        className={cn(
+          "w-56 bg-bg text-ink border border-line rounded-sm",
+          "text-xs font-mono px-2 py-1 focus:outline-none focus:border-cyan",
+          "placeholder:text-dim"
+        )}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -231,6 +392,7 @@ function AgentRow({ agent, onKill }: AgentRowProps) {
 export default function AgentLauncher() {
   const role = useDashStore((s) => s.role);
   const agents = useDashStore((s) => s.agents);
+  const agentCwd = useDashStore((s) => s.agentCwd);
   const sendSpawnAgent = useDashStore((s) => s.sendSpawnAgent);
   const sendKillAgent = useDashStore((s) => s.sendKillAgent);
   const { toast } = useToast();
@@ -241,8 +403,19 @@ export default function AgentLauncher() {
   const [runtime, setRuntime] = useState<AgentRuntime>("claude");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("auto");
   const [model, setModel] = useState("");
+  const [cwd, setCwd] = useState(agentCwd ?? "");
   // True while the spawn request is in flight, to prevent a double submit.
   const [spawning, setSpawning] = useState(false);
+
+  // The hub's default arrives with the /ui snapshot, which can land after this
+  // panel mounts, so pre-fill on arrival rather than only at mount. Once only:
+  // a later snapshot must not overwrite a directory the operator has typed.
+  const prefilled = useRef(agentCwd !== null);
+  useEffect(() => {
+    if (agentCwd === null || prefilled.current) return;
+    prefilled.current = true;
+    setCwd(agentCwd);
+  }, [agentCwd]);
 
   // Operator-only guard.
   if (role !== "operator") return null;
@@ -252,7 +425,7 @@ export default function AgentLauncher() {
   // ---------------------------------------------------------------------------
 
   const formValues: SpawnFormValues = {
-    name, mission, type, permissionMode, runtime,
+    name, mission, type, permissionMode, runtime, cwd,
   };
   const error = spawnFormError(formValues);
   const isValid = error === null;
@@ -272,6 +445,7 @@ export default function AgentLauncher() {
         type,
         permission_mode: permissionMode,
         model: model || undefined,
+        cwd: cwd || undefined,
       });
       // A failed request already surfaced its own error toast from the
       // store; only confirm success and reset the form here.
@@ -280,6 +454,9 @@ export default function AgentLauncher() {
       setName("");
       setMission("");
       setModel("");
+      // Back to the hub's default rather than to empty: the next launch most
+      // likely wants it, and a one-off directory should not become sticky.
+      setCwd(agentCwd ?? "");
     } finally {
       setSpawning(false);
     }
@@ -385,6 +562,12 @@ export default function AgentLauncher() {
               "text-xs font-mono px-2 py-1 focus:outline-none focus:border-cyan",
               "placeholder:text-dim"
             )}
+          />
+
+          <CwdPathInput
+            value={cwd}
+            onChange={setCwd}
+            describedBy={error ? "agent-launcher-error" : undefined}
           />
         </div>
 

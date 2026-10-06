@@ -1,10 +1,11 @@
 /**
  * Client-side validation for the operator agent-launcher spawn form.
  *
- * Mirrors the server-side refusals in `AgentSupervisor.spawn()` (see
- * `src/caucus/supervisor.py`) so the operator sees a reason before the round
- * trip, rather than after a rejected request. The hub is still the source of
- * truth — these checks are pure UX, not a security boundary.
+ * Mirrors the server-side refusals in `AgentSupervisor.spawn()` and
+ * `validate_agent_cwd()` (see `src/caucus/supervisor.py`) so the operator sees
+ * a reason before the round trip, rather than after a rejected request. The
+ * hub is still the source of truth — these checks are pure UX, not a security
+ * boundary, and they never claim a rule the hub does not enforce.
  */
 
 import type {
@@ -49,6 +50,11 @@ export interface SpawnFormValues {
   mission: string;
   type: AgentType;
   permissionMode: PermissionMode;
+  /**
+   * Per-spawn working directory as typed. Empty (or absent) means "use the
+   * hub's configured default", which is not an error.
+   */
+  cwd?: string;
 }
 
 /** Whether `name` matches the agent-name pattern the hub requires. */
@@ -77,6 +83,37 @@ export function isUnsafeWorkerCombo(
 /** Whether `permissionMode` is one the agent could never speak in. */
 export function isMutePermissionMode(permissionMode: PermissionMode): boolean {
   return MUTE_PERMISSION_MODES.includes(permissionMode);
+}
+
+/**
+ * Check a per-spawn working directory the way `validate_agent_cwd` does, as
+ * far as a browser can.
+ *
+ * Two of the hub's five rules are decidable here: the path must be absolute,
+ * and it must carry no `..` segment. The other three (the directory exists, it
+ * is a directory, and it does not resolve somewhere else through a symlink)
+ * need the hub's filesystem, so they stay server-side and the console learns
+ * about them from the 400's `detail`. The wording mirrors the server's so an
+ * operator who trips the same rule twice reads the same rule twice.
+ *
+ * An empty value is not an error: it means "use the hub's configured default".
+ *
+ * @param cwd - The working-directory field's value, as typed.
+ * @returns A user-facing error string, or `null` when the value is acceptable
+ *   as far as the client can tell.
+ */
+export function cwdError(cwd: string): string | null {
+  const text = cwd.trim();
+  if (text.length === 0) return null;
+  if (!text.startsWith("/")) {
+    return `Agent working directory must be an absolute path, got "${text}".`;
+  }
+  // A '..' *segment*, matching the hub's check on the path's parts: '/a/../b'
+  // is refused, '/a/..b' is an ordinary name and is not.
+  if (text.split("/").includes("..")) {
+    return `Agent working directory must not contain "..", got "${text}".`;
+  }
+  return null;
 }
 
 /**
@@ -112,6 +149,10 @@ export function spawnFormError(values: SpawnFormValues): string | null {
   }
   if ((values.runtime ?? "claude") === "claude" && isMutePermissionMode(values.permissionMode)) {
     return `An agent started in ${values.permissionMode} cannot speak in the room: the caucus tools are not permitted to it and no approval can reach it, so it would sit in the roster looking healthy and stay silent.`;
+  }
+  const cwd = cwdError(values.cwd ?? "");
+  if (cwd) {
+    return cwd;
   }
   return null;
 }

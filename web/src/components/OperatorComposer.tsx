@@ -3,7 +3,9 @@
  *
  * Features:
  *  - Scope selector (all / #channel / peer) synced with `selectedChannel`.
- *  - Autocomplete inline dropdown anchored above the textarea.
+ *  - Autocomplete inline dropdown anchored above the textarea, rendered by the
+ *    shared `AutocompleteDropdown` (also used by the agent launcher's working
+ *    directory field, so both completions look and feel like one feature).
  *  - Trigger chars: `@` → peer names, `#` → channel names, `/` → commands.
  *  - `/` commands execute immediately (pause/resume/stop/reset/export).
  *  - Keyboard: ArrowUp/Down to navigate, Enter/Tab to accept, Esc to close.
@@ -21,6 +23,7 @@ import {
 import { useDashStore } from "../store/wsStore";
 import { cn } from "../lib/utils";
 import { useToast } from "./ToastProvider";
+import AutocompleteDropdown from "./AutocompleteDropdown";
 import { Send, ChevronDown } from "lucide-react";
 import {
   parseAutocompleteTrigger,
@@ -54,75 +57,31 @@ function exportMessages(msgs: Message[]) {
 }
 
 // ---------------------------------------------------------------------------
-// Autocomplete dropdown
+// Autocomplete presentation
 // ---------------------------------------------------------------------------
 
-interface DropdownProps {
-  candidates: string[];
-  trigger: AutocompleteToken["trigger"];
-  selectedIndex: number;
-  onAccept: (candidate: string) => void;
-  onSetIndex: (i: number) => void;
+/**
+ * Format a candidate for display in the dropdown.
+ *
+ * Peer names travel bare, so they need their `@` back; `#channel` and
+ * `/command` candidates already carry their own prefix.
+ *
+ * @param trigger   - The active trigger character.
+ * @param candidate - The candidate string as produced by `getCandidates`.
+ */
+function displayLabel(
+  trigger: AutocompleteToken["trigger"],
+  candidate: string
+): string {
+  if (trigger === "@") return `@${candidate}`;
+  return candidate;
 }
 
-/**
- * Inline completion dropdown rendered ABOVE the textarea.
- * Position is controlled by the parent via relative/absolute CSS.
- */
-function AutocompleteDropdown({
-  candidates,
-  trigger,
-  selectedIndex,
-  onAccept,
-  onSetIndex,
-}: DropdownProps) {
-  if (candidates.length === 0) return null;
-
-  /** Format a candidate for display (add '@' prefix for peer names). */
-  function displayLabel(c: string): string {
-    if (trigger === "@") return `@${c}`;
-    return c; // '#channel' and '/command' already have their prefix
-  }
-
-  return (
-    <div
-      role="listbox"
-      aria-label="Autocomplete suggestions"
-      className={cn(
-        "absolute bottom-full left-0 mb-1 z-50",
-        "w-64 max-h-48 overflow-y-auto",
-        "bg-panel-2 border border-line rounded-sm shadow-xl",
-        "flex flex-col"
-      )}
-    >
-      {candidates.map((c, i) => (
-        <div
-          key={c}
-          role="option"
-          aria-selected={i === selectedIndex}
-          onMouseDown={(e) => {
-            // Prevent textarea blur before the click registers.
-            e.preventDefault();
-            onAccept(c);
-          }}
-          onMouseEnter={() => onSetIndex(i)}
-          className={cn(
-            "px-3 py-1.5 text-xs font-mono cursor-pointer transition-colors",
-            i === selectedIndex
-              ? "bg-cyan/20 text-cyan"
-              : "text-ink hover:bg-panel"
-          )}
-        >
-          {displayLabel(c)}
-          {trigger === "/" && (
-            <span className="ml-2 text-[10px] text-dim/60">
-              {c === "/export" ? "download transcript" : `hub ${c.slice(1)}`}
-            </span>
-          )}
-        </div>
-      ))}
-    </div>
-  );
+/** One-line description of a slash-command, shown muted beside its name. */
+function commandHint(candidate: string): string {
+  return candidate === "/export"
+    ? "download transcript"
+    : `hub ${candidate.slice(1)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -483,10 +442,13 @@ export default function OperatorComposer() {
           {dropdownOpen && (
             <AutocompleteDropdown
               candidates={acCandidates}
-              trigger={acToken!.trigger}
               selectedIndex={acIndex}
               onAccept={(c) => acceptSuggestion(acCandidates.indexOf(c))}
               onSetIndex={setAcIndex}
+              renderLabel={(c) => displayLabel(acToken!.trigger, c)}
+              renderHint={
+                acToken!.trigger === "/" ? commandHint : undefined
+              }
             />
           )}
 

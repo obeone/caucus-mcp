@@ -177,11 +177,16 @@ export interface AgentInfo {
 /**
  * Body for `POST /agents` — the operator launches one native agent.
  *
- * There is no `cwd` field: the working directory is fixed hub policy set at
- * startup (`--agent-cwd`), and the endpoint rejects an unrecognised field with
- * a 422. `mission` and `model` are omitted from the JSON body when unset
+ * `mission`, `model` and `cwd` are omitted from the JSON body when unset
  * (rather than sent as `null`), matching `JSON.stringify`'s handling of
  * `undefined` object fields.
+ *
+ * `cwd` is the per-spawn working directory. Absent means "use the hub's
+ * configured `--agent-cwd`", which stays required at boot and is what the
+ * console pre-fills the field with. A value that is present is validated
+ * server-side on every spawn and refused with a 400 when it is not an
+ * absolute, traversal-free, non-redirecting directory: the client-side check
+ * in `lib/agentLauncher.ts` is a courtesy, never the gate.
  */
 export interface SpawnAgentSpec {
   name: string;
@@ -190,6 +195,21 @@ export interface SpawnAgentSpec {
   type: AgentType;
   permission_mode: PermissionMode;
   model?: string;
+  cwd?: string;
+}
+
+/**
+ * Response body of `GET /agents/cwd-complete` — directory completion for the
+ * launcher's working-directory field.
+ *
+ * `dirs` holds absolute paths of the immediate subdirectories matching the
+ * requested prefix, never file names and never file contents. `truncated` is
+ * true when the hub capped the list, and the console shows that as a muted
+ * "more…" line rather than an error: a capped list is still usable.
+ */
+export interface CwdCompletion {
+  dirs: string[];
+  truncated: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +251,15 @@ export interface SnapshotEvent {
   rate?: RateInfo;
   /** Supervised agent roster; present when the agent launcher is enabled. */
   agents?: AgentInfo[];
+  /**
+   * The hub's configured `--agent-cwd`, for pre-filling the launcher form.
+   *
+   * Present only when the launcher is enabled *and* the connection is graded
+   * `operator`. It is a filesystem path on the operator's machine, which the
+   * hub never shows an observer (same reasoning as `AgentProcess.to_public`
+   * withholding the cwd from the roster).
+   */
+  agent_cwd?: string;
 }
 
 export interface RawMessage {
@@ -364,6 +393,12 @@ export interface DashboardState {
   rate: RateInfo | null;
   /** Supervised agent-launcher roster; empty when the launcher is disabled. */
   agents: AgentInfo[];
+  /**
+   * The hub's configured default agent working directory, or `null` when the
+   * launcher is disabled, the connection is an observer's, or no snapshot has
+   * arrived yet. Pre-fills the launcher's working-directory field.
+   */
+  agentCwd: string | null;
   messages: Message[];
 
   // UI cross-link
@@ -428,4 +463,17 @@ export interface DashboardState {
    * `false`.
    */
   sendKillAgent: (name: string) => Promise<boolean>;
+  /**
+   * Ask the hub which directories complete `prefix`, for the launcher's
+   * working-directory field.
+   *
+   * `GET /agents/cwd-complete?prefix=…` with the same bearer token as
+   * {@link DashboardState.sendSpawnAgent}. Resolves to `null` on any failure
+   * and fires no toast: completion is a convenience, and a hub that refuses it
+   * (launcher off, observer connection, unreadable parent) must leave the
+   * operator typing a path by hand rather than staring at an error.
+   *
+   * @param prefix - The field's current value, an absolute path or a partial one.
+   */
+  fetchCwdCompletions: (prefix: string) => Promise<CwdCompletion | null>;
 }
