@@ -324,8 +324,32 @@ async def test_fast_operator_answer_is_buffered_until_form_id_is_known():
     await approvals.close()
 
 
+@pytest.mark.parametrize("runtime,mode", [("openai", "plan"), ("openai", "default")])
+def test_supervisor_accepts_openai_form_approval_modes(tmp_path, runtime, mode):
+    from caucus.supervisor import AgentSpec, AgentSupervisor, LauncherConfig
+
+    sup = AgentSupervisor(
+        LauncherConfig(enabled=True, cwd=tmp_path), "http://127.0.0.1:8765"
+    )
+    sup._validate(AgentSpec(name="bot", runtime=runtime, permission_mode=mode))
 
 
+@pytest.mark.parametrize(
+    "runtime,mode", [("openai", "bypassPermissions"), ("other", "auto")]
+)
+def test_supervisor_refuses_invalid_runtime_or_openai_mode(tmp_path, runtime, mode):
+    from caucus.supervisor import (
+        AgentSpec,
+        AgentSupervisor,
+        LauncherConfig,
+        LauncherRefused,
+    )
+
+    sup = AgentSupervisor(
+        LauncherConfig(enabled=True, cwd=tmp_path), "http://127.0.0.1:8765"
+    )
+    with pytest.raises(LauncherRefused):
+        sup._validate(AgentSpec(name="bot", runtime=runtime, permission_mode=mode))
 
 
 async def test_approval_requires_operator_provenance_and_matching_form():
@@ -405,3 +429,14 @@ async def test_plan_has_no_write_or_shell_tools(tmp_path):
     names = {t.name for t in tools}
     assert "read_file" in names
     assert not names & {"write_file", "edit_file", "run_shell"}
+
+
+def test_openai_launcher_selects_runtime_without_leaking_key_to_claude(monkeypatch):
+    from caucus.supervisor import AgentSpec, AgentSupervisor, LauncherConfig
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    sup = AgentSupervisor(LauncherConfig(), hub_url="http://127.0.0.1:8765")
+    spec = AgentSpec(name="bot", runtime="openai")
+    assert sup._command(spec)[1:3] == ["-m", "caucus.openai_agent"]
+    assert sup._build_env(spec)["OPENAI_API_KEY"] == "test-key"
+    assert "OPENAI_API_KEY" not in sup._build_env(AgentSpec(name="claude"))

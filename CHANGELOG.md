@@ -12,6 +12,13 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Runtime selection in the operator launcher**: Claude (default),
+  OpenAI API, or Codex subscription. Spawn requests and process records
+  carry the runtime; only API children receive OpenAI credentials, and
+  only Codex children receive Codex login-directory/executable settings.
+  The console labels API and subscription usage separately and keeps
+  their form-based approval modes available.
+
 - **Native Codex subscription agent** (`caucus-codex-agent`), using the
   installed Codex CLI 0.160+ app-server and experimental dynamic tools.
   Requires ChatGPT login, refuses API-key accounts and API credentials,

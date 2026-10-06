@@ -1,6 +1,6 @@
 /**
  * AgentLauncher — operator-only panel to spawn, list, and kill supervised
- * `caucus-claude-agent` processes from the console.
+ * native Claude or OpenAI processes from the console.
  *
  * Two parts:
  *   - A spawn form (name, mission, type, permission mode, optional model)
@@ -33,7 +33,12 @@ import { cn } from "../lib/utils";
 import { fmtDuration } from "../lib/colors";
 import { spawnFormError, type SpawnFormValues } from "../lib/agentLauncher";
 import { useToast } from "./ToastProvider";
-import type { AgentInfo, AgentType, PermissionMode } from "../store/types";
+import type {
+  AgentInfo,
+  AgentRuntime,
+  AgentType,
+  PermissionMode,
+} from "../store/types";
 import {
   Bot,
   Rocket,
@@ -146,6 +151,7 @@ function AgentRow({ agent, onKill }: AgentRowProps) {
         </span>
         <span className="text-[9px] font-mono text-dim uppercase">
           {agent.type}
+          {` · ${agent.runtime ?? "claude"}`}
         </span>
         <span className={cn("text-[9px] font-mono ml-auto", stateColor(agent))}>
           {agent.state}
@@ -232,6 +238,7 @@ export default function AgentLauncher() {
   const [name, setName] = useState("");
   const [mission, setMission] = useState("");
   const [type, setType] = useState<AgentType>("talker");
+  const [runtime, setRuntime] = useState<AgentRuntime>("claude");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("auto");
   const [model, setModel] = useState("");
   // True while the spawn request is in flight, to prevent a double submit.
@@ -244,7 +251,9 @@ export default function AgentLauncher() {
   // Validation
   // ---------------------------------------------------------------------------
 
-  const formValues: SpawnFormValues = { name, mission, type, permissionMode };
+  const formValues: SpawnFormValues = {
+    name, mission, type, permissionMode, runtime,
+  };
   const error = spawnFormError(formValues);
   const isValid = error === null;
 
@@ -258,6 +267,7 @@ export default function AgentLauncher() {
     try {
       const ok = await sendSpawnAgent({
         name,
+        runtime,
         mission: mission || undefined,
         type,
         permission_mode: permissionMode,
@@ -301,6 +311,19 @@ export default function AgentLauncher() {
       {/* Spawn form */}
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-2 flex-wrap">
+          <select
+            value={runtime}
+            onChange={(e) => {
+              setRuntime(e.target.value as AgentRuntime);
+              setPermissionMode("auto");
+            }}
+            aria-label="Agent runtime"
+            className="bg-bg text-ink border border-line rounded-sm text-xs font-mono px-2 py-1"
+          >
+            <option value="claude">Claude</option>
+            <option value="openai">OpenAI — API key</option>
+            <option value="codex">Codex — ChatGPT subscription</option>
+          </select>
           <input
             type="text"
             value={name}
@@ -342,7 +365,9 @@ export default function AgentLauncher() {
               "cursor-pointer"
             )}
           >
-            {PERMISSION_MODES.map((m) => (
+            {PERMISSION_MODES.filter(
+              (m) => runtime === "claude" || !["bypassPermissions", "dontAsk"].includes(m)
+            ).map((m) => (
               <option key={m} value={m}>
                 {m}
               </option>

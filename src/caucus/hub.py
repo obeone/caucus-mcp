@@ -2616,6 +2616,7 @@ async def spawn_agent(
     sup = _require_launcher()
     spec = AgentSpec(
         name=req.name,
+        runtime=req.runtime,
         mission=req.mission,
         agent_type=req.type,
         permission_mode=req.permission_mode,

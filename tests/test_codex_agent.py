@@ -253,6 +253,22 @@ async def test_session_deregisters_after_auth_failure(state, tmp_path, monkeypat
     assert "codex" not in state._clients
 
 
+def test_launcher_keeps_api_and_subscription_runtime_environments_separate(monkeypatch):
+    from caucus.models import SpawnAgentRequest
+    from caucus.supervisor import AgentSpec, AgentSupervisor, LauncherConfig
+
+    monkeypatch.setenv("OPENAI_API_KEY", "api-only")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/subscription-home")
+    sup = AgentSupervisor(LauncherConfig(), hub_url="http://127.0.0.1:8765")
+    spec = AgentSpec(name="codex", runtime="codex")
+    assert SpawnAgentRequest(name="codex", runtime="codex").runtime == "codex"
+    assert sup._command(spec)[1:3] == ["-m", "caucus.codex_agent"]
+    assert "OPENAI_API_KEY" not in sup._build_env(spec)
+    assert sup._build_env(spec)["CODEX_HOME"] == "/tmp/subscription-home"
+    assert (
+        sup._build_env(AgentSpec(name="api", runtime="openai"))["OPENAI_API_KEY"]
+        == "api-only"
+    )
 
 
 async def test_operator_stop_aborts_a_codex_tool_waiting_for_approval(state, tmp_path):

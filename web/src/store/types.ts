@@ -126,6 +126,7 @@ export interface RateInfo {
 
 /** Agent tool profile: `talker` is caucus-only, `worker` also gets shell/filesystem tools. */
 export type AgentType = "talker" | "worker";
+export type AgentRuntime = "claude" | "openai" | "codex";
 
 /** Claude Code permission mode the spawned agent runs under. */
 export type PermissionMode =
@@ -149,6 +150,7 @@ export type AgentState = "running" | "exited";
  */
 export interface AgentInfo {
   name: string;
+  runtime?: AgentRuntime;
   type: AgentType;
   permission_mode: PermissionMode;
   model: string | null;
@@ -183,6 +185,7 @@ export interface AgentInfo {
  */
 export interface SpawnAgentSpec {
   name: string;
+  runtime?: AgentRuntime;
   mission?: string;
   type: AgentType;
   permission_mode: PermissionMode;
