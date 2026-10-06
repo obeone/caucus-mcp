@@ -12,6 +12,12 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Native OpenAI API agent** (`caucus-openai-agent`) with talker/worker
+  profiles, all nine Caucus tools, retained history, interrupt/reset/stop,
+  supervised repository tools, approved Bash, hosted web search, and
+  read-only research delegation. Only attested operator form answers
+  authorize pending edits or shell calls. SDK tracing is disabled.
+
 - Optional `openai` extra and locked development dependency for the
   OpenAI Agents SDK (`openai-agents>=0.22.3,<0.23`).
 
