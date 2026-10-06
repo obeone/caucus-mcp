@@ -46,6 +46,7 @@ from . import export as export_mod
 from .disklog import DiskLog
 from .models import (
     BROADCAST,
+    MAX_PATH_CHARS,
     AckRequest,
     AskRequest,
     AskResponse,
@@ -84,6 +85,7 @@ from .supervisor import (
     LauncherConfig,
     LauncherDisabled,
     LauncherRefused,
+    complete_agent_cwd,
     validate_agent_cwd,
 )
 from .urlguard import (
@@ -806,6 +808,26 @@ def _agent_roster() -> list[dict[str, object]]:
     # quote file contents or credentials, so they are served only from the
     # operator-gated GET /agents.
     return supervisor.roster()
+
+
+def _agent_default_cwd() -> str | None:
+    """Return the launcher's configured working directory, for form pre-fill.
+
+    Operator-only by construction: the caller decides who may see it (only the
+    ``/ui`` snapshot sends it, and only on an ``operator`` connection). It is a
+    filesystem path on the machine running the hub, which is the same reason
+    :meth:`caucus.supervisor.AgentProcess.to_public` keeps the cwd out of the
+    roster an observer receives.
+
+    Returns
+    -------
+    str or None
+        The configured default, or ``None`` when the launcher is off.
+    """
+    if supervisor is None or not supervisor.enabled:
+        return None
+    cwd = supervisor.config.cwd
+    return None if cwd is None else str(cwd)
 
 
 def _broadcast_agents() -> None:
@@ -2599,6 +2621,11 @@ async def spawn_agent(
     supervisor renders them into flags, and refuses anything it does not
     recognise before a process exists (see :mod:`caucus.supervisor`).
 
+    An absent, ``null`` or empty ``cwd`` means the hub's configured default. A
+    value that is present is handed to the supervisor as a path and validated
+    there by :func:`~caucus.supervisor.validate_agent_cwd`, which refuses with
+    ``LauncherRefused`` and therefore surfaces here as a 400.
+
     Args:
         req: The validated spawn body.
         authorization: ``Authorization: Bearer <token>`` header, required (and
@@ -2621,6 +2648,7 @@ async def spawn_agent(
         agent_type=req.type,
         permission_mode=req.permission_mode,
         model=req.model,
+        cwd=Path(req.cwd) if req.cwd else None,
     )
     try:
         record = await sup.spawn(spec)
@@ -2629,6 +2657,47 @@ async def spawn_agent(
     except LauncherRefused as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"agent": record.to_public()}
+
+
+@app.get("/agents/cwd-complete")
+async def complete_agent_cwd_endpoint(
+    prefix: str = Query(default="/", max_length=MAX_PATH_CHARS),
+    authorization: str | None = Header(default=None),
+    origin: str | None = Header(default=None),
+) -> dict[str, object]:
+    """Complete a partial working directory for the spawn form.
+
+    Type-ahead only. The response carries directory **names** only, never file
+    names and never file contents, and it grants the operator no capability they
+    did not already have: anyone who can reach this endpoint can reach
+    ``POST /agents`` and spawn a ``worker`` with shell access on this very
+    machine. It is still gated like the rest of ``/agents``, because the hub's
+    own filesystem layout is nobody's business but the operator's, least of all
+    a read-only observer's.
+
+    Args:
+        prefix: Absolute path, possibly partial. Missing means ``/``, and
+            anything past :data:`~caucus.models.MAX_PATH_CHARS` is refused here
+            rather than carried to a syscall.
+        authorization: ``Authorization: Bearer <token>`` header, required (and
+            graded as operator) when :attr:`AuthConfig.enabled`.
+        origin: Optional handshake-style ``Origin`` header.
+
+    Returns:
+        ``{"dirs": [...], "truncated": bool}``: the matching absolute directory
+        paths, sorted and capped, plus whether the cap dropped any.
+
+    Raises:
+        HTTPException: 403 when the launcher is disabled, 400 when ``prefix`` is
+            not absolute or holds a NUL byte, 422 when it is oversized.
+    """
+    _gate_operator_request(authorization, origin)
+    _require_launcher()
+    try:
+        dirs, truncated = complete_agent_cwd(prefix)
+    except LauncherRefused as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"dirs": dirs, "truncated": truncated}
 
 
 @app.delete("/agents/{name}")
@@ -2880,6 +2949,14 @@ async def ui_socket(ws: WebSocket) -> None:
                 # than in HubState.add_ui because the roster is a process fact,
                 # and the output-free projection is what observers may see.
                 event = {**event, "agents": _agent_roster()}
+                # The launcher's default working directory pre-fills the spawn
+                # form, so it goes to an operator and to nobody else: it is a
+                # path on this machine, and an observer never gets to learn the
+                # hub's filesystem layout. Omitted entirely when the launcher is
+                # off, so a console can tell "no launcher" from "no default".
+                default_cwd = _agent_default_cwd()
+                if role == "operator" and default_cwd is not None:
+                    event["agent_cwd"] = default_cwd
             await ws.send_json(event)
 
     pump_task = asyncio.create_task(pump())

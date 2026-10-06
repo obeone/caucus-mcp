@@ -25,6 +25,15 @@ CHANNEL_PREFIX = "#"
 """Recipient prefix marking a private channel — a named side room whose traffic
 reaches only its members (plus the always-watching operator)."""
 
+MAX_PATH_CHARS = 4096
+"""Longest filesystem path accepted in a request body or query string.
+
+Matches the common ``PATH_MAX`` and sits far above any real path on a developer
+machine. An oversized path already degrades cleanly further down (the syscall
+returns ``ENAMETOOLONG``, which the launcher reports as a refusal); this bound
+is what keeps the promise that no oversized value reaches the filesystem at all.
+"""
+
 RESERVED_NAMES: frozenset[str] = frozenset({"human", "hub", "system"})
 """Project names that are permanently reserved for the operator and hub itself.
 
@@ -513,12 +522,19 @@ class ControlRequest(BaseModel):
 class SpawnAgentRequest(BaseModel):
     """Body for ``POST /agents`` — the operator launches one native agent.
 
-    Deliberately small. There is no working-directory field and no free-form
-    argument list: the working directory is hub policy fixed at startup, and
-    raw argv would hand an operator flags the supervisor has never reviewed.
-    Unknown keys are rejected rather than ignored, so a console sending a field
-    this hub does not implement gets a clear ``422`` instead of a silently
-    dropped setting.
+    Deliberately small. There is no free-form argument list: raw argv would
+    hand an operator flags the supervisor has never reviewed. Unknown keys are
+    rejected rather than ignored, so a console sending a field this hub does not
+    implement gets a clear ``422`` instead of a silently dropped setting.
+
+    ``cwd`` is the one path-shaped field, and it is optional: absent, ``null``
+    or empty means "use the hub's configured ``--agent-cwd``" (bounded by
+    :data:`MAX_PATH_CHARS`, like every other string here). A value that is
+    present is validated server-side by
+    :func:`caucus.supervisor.validate_agent_cwd` on every spawn, which is what
+    keeps the operator's intent honest; the field widens no capability, since
+    the fixed directory was never a containment boundary for a ``worker`` with
+    shell access.
 
     Every value here is re-validated by
     :meth:`caucus.supervisor.AgentSupervisor.spawn`; the bounds below only keep
@@ -533,6 +549,7 @@ class SpawnAgentRequest(BaseModel):
     type: str = "talker"
     permission_mode: str = "auto"
     model: str | None = PydField(default=None, max_length=100)
+    cwd: str | None = PydField(default=None, max_length=MAX_PATH_CHARS)
 
 
 class AckRequest(BaseModel):
