@@ -12,6 +12,9 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- Optional `openai` extra and locked development dependency for the
+  OpenAI Agents SDK (`openai-agents>=0.22.3,<0.23`).
+
 - **`docs/remote-hub.md`**, the guide for running a hub on one machine with
   agents joining from others: a verified end-to-end walkthrough for both the
   `/mcp` and `caucus-bridge` connection paths (including the single-use watch

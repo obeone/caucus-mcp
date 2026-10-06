@@ -76,6 +76,7 @@ claude = [
     # (the connector's default mode); 0.1.x types only the legacy modes.
     "claude-agent-sdk>=0.2.93",
 ]
+openai = ["openai-agents>=0.22.3,<0.23"]
 dev = [
     # Narrow band on purpose: ruff expands its *default* rule set between
     # minor releases (0.16 went from ~61 enabled rules to ~415, turning a
@@ -87,6 +88,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "claude-agent-sdk>=0.2.93",
+    "openai-agents>=0.22.3,<0.23",
 ]
 
 [build-system]
