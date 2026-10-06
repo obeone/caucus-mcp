@@ -676,3 +676,236 @@ def test_confirm_refuses_by_default_on_non_interactive_stdin(
     """A non-interactive stdin (a pipe, an agent's Bash tool) never grants consent."""
     monkeypatch.setattr(setup_service.sys.stdin, "isatty", lambda: False)
     assert setup_service.confirm() is False
+
+
+# ---------------------------------------------------------------------------
+# agent launcher
+# ---------------------------------------------------------------------------
+
+
+def test_render_unit_launchd_enables_the_launcher_with_cwd_and_max(
+    tmp_path: Path,
+) -> None:
+    """A launcher unit carries the flag as an argument and cwd/max as env."""
+    plist = plistlib.loads(
+        _render_launchd(
+            enable_agent_launcher=True, agent_cwd=tmp_path, agent_max=3
+        ).encode("utf-8")
+    )
+
+    assert plist["ProgramArguments"][-2:] == ["--no-browser", "--enable-agent-launcher"]
+    assert plist["EnvironmentVariables"]["CAUCUS_AGENT_CWD"] == str(tmp_path)
+    assert plist["EnvironmentVariables"]["CAUCUS_AGENT_MAX"] == "3"
+
+
+def test_render_unit_launchd_omits_launcher_and_max_by_default() -> None:
+    """Without the opt-in the plist carries no launcher trace at all."""
+    rendered = _render_launchd()
+    assert "--enable-agent-launcher" not in rendered
+    assert "CAUCUS_AGENT_CWD" not in rendered
+    assert "CAUCUS_AGENT_MAX" not in rendered
+
+
+def test_render_unit_launchd_omits_max_when_only_cwd_given(tmp_path: Path) -> None:
+    """``--agent-max`` is rendered only when it was passed."""
+    rendered = _render_launchd(enable_agent_launcher=True, agent_cwd=tmp_path)
+    assert "CAUCUS_AGENT_CWD" in rendered
+    assert "CAUCUS_AGENT_MAX" not in rendered
+
+
+def test_render_unit_systemd_enables_the_launcher() -> None:
+    """The systemd ExecStart gains the flag only when the launcher is on."""
+    common: dict[str, object] = {
+        "kind": "systemd",
+        "binary": Path("/usr/local/bin/caucus-hub"),
+        "host": "127.0.0.1",
+        "port": 8765,
+        "logfile": Path("/tmp/hub.log"),
+    }
+    on = setup_service.render_unit(enable_agent_launcher=True, **common)  # type: ignore[arg-type]
+    off = setup_service.render_unit(**common)  # type: ignore[arg-type]
+    assert "--no-browser --enable-agent-launcher\n" in on
+    assert "--enable-agent-launcher" not in off
+
+
+def test_write_env_file_carries_the_agent_cwd_and_max(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The systemd env file gains the launcher defaults when they are set."""
+    target = tmp_path / "hub.env"
+    monkeypatch.setattr(setup_service, "env_file_path", lambda: target)
+    setup_service.write_env_file("op123", None, agent_cwd=tmp_path, agent_max=2)
+    text = target.read_text(encoding="utf-8")
+    assert f"CAUCUS_AGENT_CWD={tmp_path}" in text
+    assert "CAUCUS_AGENT_MAX=2" in text
+
+
+def _check_launcher(**overrides: object) -> Path | None:
+    """Call ``check_launcher`` with a valid launcher config, overridable."""
+    kwargs: dict[str, object] = {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "operator_token": "op123",
+        "agent_cwd": "/tmp",
+        "agent_max": None,
+    }
+    kwargs.update(overrides)
+    return setup_service.check_launcher(**kwargs)  # type: ignore[arg-type]
+
+
+def test_check_launcher_disabled_returns_none() -> None:
+    """With the launcher off there is nothing to validate."""
+    assert _check_launcher(enabled=False, agent_cwd=None, operator_token=None) is None
+
+
+@pytest.mark.parametrize("stray", [{"agent_cwd": "/tmp"}, {"agent_max": 2}])
+def test_check_launcher_refuses_launcher_options_without_the_flag(
+    stray: dict[str, object],
+) -> None:
+    """A cwd or ceiling with no launcher would be silently ignored by the hub."""
+    overrides: dict[str, object] = {"enabled": False, "agent_cwd": None, **stray}
+    with pytest.raises(setup_service.SetupError, match="--enable-agent-launcher"):
+        _check_launcher(**overrides)
+
+
+def test_check_launcher_requires_an_operator_token() -> None:
+    """Without a token every caller is an operator, so the install is refused."""
+    with pytest.raises(setup_service.SetupError, match="--operator-token"):
+        _check_launcher(operator_token=None)
+
+
+def test_check_launcher_requires_a_loopback_bind() -> None:
+    """Process creation must not be reachable from the network."""
+    with pytest.raises(setup_service.SetupError, match="loopback"):
+        _check_launcher(host="0.0.0.0")
+
+
+def test_check_launcher_requires_an_agent_cwd() -> None:
+    """The hub refuses to boot without a default directory, so the installer does."""
+    with pytest.raises(setup_service.SetupError, match="--agent-cwd"):
+        _check_launcher(agent_cwd=None)
+
+
+@pytest.mark.parametrize("bad", ["relative/dir", "/tmp/../etc", "/nonexistent/zzz"])
+def test_check_launcher_reuses_the_hub_path_validation(bad: str) -> None:
+    """Relative, traversing and missing paths fail through validate_agent_cwd."""
+    with pytest.raises(setup_service.SetupError, match="agent working directory"):
+        _check_launcher(agent_cwd=bad)
+
+
+def test_check_launcher_rejects_a_path_the_unit_files_cannot_carry(
+    tmp_path: Path,
+) -> None:
+    """A space would need different escaping in the plist and the env file."""
+    spaced = tmp_path / "with space"
+    spaced.mkdir()
+    with pytest.raises(setup_service.SetupError, match="may only contain"):
+        _check_launcher(agent_cwd=str(spaced))
+
+
+def test_check_launcher_rejects_a_ceiling_below_one(tmp_path: Path) -> None:
+    """The hub's LauncherConfig refuses a ceiling under 1; so does the installer."""
+    with pytest.raises(setup_service.SetupError, match="--agent-max"):
+        _check_launcher(agent_cwd=str(tmp_path), agent_max=0)
+
+
+def test_check_launcher_returns_the_resolved_directory(tmp_path: Path) -> None:
+    """A valid launcher config returns the path the hub would resolve to."""
+    assert _check_launcher(agent_cwd=str(tmp_path), agent_max=2) == tmp_path.resolve()
+
+
+def _launcher_main(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str
+) -> int:
+    """Run ``main --dry-run`` with a fake binary and the given extra flags."""
+    monkeypatch.setattr(setup_service.os, "getuid", lambda: 501)
+    binary = tmp_path / "caucus-hub"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    return setup_service.main(["--dry-run", "--binary", str(binary), *extra])
+
+
+def test_main_dry_run_prints_a_launcher_enabled_unit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With the three-way gate satisfied the dry run shows flag, cwd and ceiling."""
+    work = tmp_path / "work"
+    work.mkdir()
+
+    rc = _launcher_main(
+        monkeypatch,
+        tmp_path,
+        "--enable-agent-launcher",
+        "--operator-token",
+        "op123",
+        "--agent-cwd",
+        str(work),
+        "--agent-max",
+        "4",
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "--enable-agent-launcher" in out
+    assert "CAUCUS_AGENT_CWD" in out
+    assert "CAUCUS_AGENT_MAX" in out
+
+
+@pytest.mark.parametrize(
+    ("extra", "needle"),
+    [
+        (["--agent-cwd", "{work}"], "--enable-agent-launcher"),
+        (["--enable-agent-launcher", "--agent-cwd", "{work}"], "--operator-token"),
+        (["--enable-agent-launcher", "--operator-token", "op123"], "--agent-cwd"),
+    ],
+)
+def test_main_refuses_an_unbootable_launcher_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra: list[str],
+    needle: str,
+) -> None:
+    """Each missing precondition fails the install, with nothing written."""
+    work = tmp_path / "work"
+    work.mkdir()
+
+    rc = _launcher_main(monkeypatch, tmp_path, *[a.format(work=work) for a in extra])
+
+    assert rc == 1
+    assert needle in capsys.readouterr().err
+    assert not isolated_home.exists() or not any(isolated_home.rglob("*"))
+
+
+def test_main_refuses_a_launcher_on_a_non_loopback_bind(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A credentialed wildcard bind passes check_bind but still cannot spawn."""
+    work = tmp_path / "work"
+    work.mkdir()
+
+    rc = _launcher_main(
+        monkeypatch,
+        tmp_path,
+        "--host",
+        "0.0.0.0",
+        "--public-url",
+        "https://hub.example.net",
+        "--operator-token",
+        "op123",
+        "--agent-key",
+        "key123",
+        "--enable-agent-launcher",
+        "--agent-cwd",
+        str(work),
+    )
+
+    assert rc == 1
+    assert "loopback" in capsys.readouterr().err

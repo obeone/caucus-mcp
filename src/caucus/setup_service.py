@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from .supervisor import LauncherRefused, validate_agent_cwd
 from .urlguard import is_loopback_host, validate_public_url
 
 DEFAULT_LABEL = "com.github.obeone.caucus-hub"
@@ -73,6 +74,12 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 #: for ``https://hub.example.net:8443`` and ``[2001:db8::1]:8765``.
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9._~:/\[\]-]+$")
 
+#: The agent working directory travels the same plist and env-file route as the
+#: tokens, so it gets a charset neither format treats specially. Spaces are
+#: refused on purpose: an env-file value is shell-sourced and a plist value is
+#: XML, and one bound that is safe in both beats escaping for each.
+PATH_RE = re.compile(r"^[A-Za-z0-9._~/-]+$")
+
 Platform = Literal["launchd", "systemd"]
 
 
@@ -99,7 +106,7 @@ LAUNCHD_TEMPLATE = """\
     <string>--port</string>
     <string>{port}</string>
     <string>--no-browser</string>
-  </array>
+{launcher_args}  </array>
 
   <!-- Tokens live here rather than on the command line so they stay out of
        `ps` output. This file is written with mode 0600. -->
@@ -151,7 +158,7 @@ EnvironmentFile=-{envfile}
 
 # --no-browser is not optional: without it the hub tries to open the operator
 # console on every start and after every automatic restart.
-ExecStart={binary} --host {host} --port {port} --no-browser
+ExecStart={binary} --host {host} --port {port} --no-browser{launcher_args}
 
 # Restart on crash, but not on a clean exit: a restart wipes the hub's
 # in-memory state, so every peer loses its token and must join again.
@@ -438,6 +445,78 @@ def check_bind(
     )
 
 
+def check_launcher(
+    *,
+    enabled: bool,
+    host: str,
+    operator_token: str | None,
+    agent_cwd: str | None,
+    agent_max: int | None,
+) -> Path | None:
+    """Refuse a launcher install the hub would itself refuse to boot.
+
+    ``caucus-hub --enable-agent-launcher`` demands an operator token, an
+    absolute ``--agent-cwd`` and a loopback bind, and exits at startup when any
+    is missing. As a service that exit is silent: the unit loads, dies, and the
+    operator finds out from a log. Mirroring the three-way gate here moves the
+    failure to install time. The path rule is :func:`caucus.supervisor.
+    validate_agent_cwd` itself, not a second copy of it.
+
+    Args:
+        enabled: Whether ``--enable-agent-launcher`` was passed.
+        host: Address the hub would bind to.
+        operator_token: Token that would gate operator access, if any.
+        agent_cwd: Operator-supplied default working directory, if any.
+        agent_max: Operator-supplied concurrent-agent ceiling, if any.
+
+    Returns:
+        The validated, resolved working directory, or ``None`` when the
+        launcher is not being enabled.
+
+    Raises:
+        SetupError: When ``--agent-cwd`` or ``--agent-max`` is given without the
+            launcher, when the launcher lacks a token, a loopback bind or a
+            valid directory, or when the directory or ceiling cannot be carried
+            by the unit files.
+    """
+    if not enabled:
+        for name, value in (("--agent-cwd", agent_cwd), ("--agent-max", agent_max)):
+            if value is not None:
+                raise SetupError(
+                    f"{name} only means something with --enable-agent-launcher"
+                )
+        return None
+    if not operator_token:
+        raise SetupError(
+            "--enable-agent-launcher requires --operator-token: without it every\n"
+            "caller is graded as operator and the launcher would let anyone who\n"
+            "can reach this hub start processes on this machine.\n"
+            'Generate one with:  openssl rand -hex 24'
+        )
+    if not is_loopback_host(host):
+        raise SetupError(
+            f"--enable-agent-launcher requires a loopback bind, got --host {host}:\n"
+            "process creation must not be reachable from the network."
+        )
+    if not agent_cwd:
+        raise SetupError(
+            "--enable-agent-launcher requires --agent-cwd: it is the directory\n"
+            "spawned agents start in unless the operator picks another one."
+        )
+    try:
+        cwd = validate_agent_cwd(agent_cwd)
+    except LauncherRefused as exc:
+        raise SetupError(str(exc)) from exc
+    if not PATH_RE.match(str(cwd)):
+        raise SetupError(
+            f"--agent-cwd {str(cwd)!r} may only contain letters, digits and . _ ~ - /\n"
+            "It is written into a plist and a shell-sourced env file."
+        )
+    if agent_max is not None and agent_max < 1:
+        raise SetupError(f"--agent-max must be at least 1, got {agent_max}")
+    return cwd
+
+
 def service_environment(
     operator_token: str | None = None,
     observer_token: str | None = None,
@@ -445,6 +524,8 @@ def service_environment(
     public_url: str | None = None,
     allowed_hosts: list[str] | None = None,
     mcp_http: bool = False,
+    agent_cwd: Path | None = None,
+    agent_max: int | None = None,
 ) -> list[tuple[str, str]]:
     """Build the environment the installed hub reads its configuration from.
 
@@ -464,6 +545,10 @@ def service_environment(
             accepts; joined with commas, which is the form the hub splits on.
         mcp_http: Force the in-process MCP endpoint on. Needed on a non-loopback
             bind, where it is off by default.
+        agent_cwd: Default working directory for spawned agents, already
+            validated by :func:`check_launcher`, or ``None``.
+        agent_max: Ceiling on concurrent agents, or ``None`` for the hub's own
+            default.
 
     Returns:
         The ``(name, value)`` pairs to write, in a stable order, with every
@@ -478,6 +563,8 @@ def service_environment(
         # Only ever written as the opt-in: absent means "let the hub decide",
         # which is on for loopback and off elsewhere.
         ("CAUCUS_MCP_HTTP", "1" if mcp_http else None),
+        ("CAUCUS_AGENT_CWD", str(agent_cwd) if agent_cwd else None),
+        ("CAUCUS_AGENT_MAX", str(agent_max) if agent_max is not None else None),
     ]
     return [(name, value) for name, value in pairs if value]
 
@@ -497,6 +584,9 @@ def render_unit(
     public_url: str | None = None,
     allowed_hosts: list[str] | None = None,
     mcp_http: bool = False,
+    enable_agent_launcher: bool = False,
+    agent_cwd: Path | None = None,
+    agent_max: int | None = None,
 ) -> str:
     """Render the service definition for ``kind``.
 
@@ -517,6 +607,13 @@ def render_unit(
         allowed_hosts: Extra ``Host`` values for the ``/mcp`` guard; same
             treatment.
         mcp_http: Force the in-process MCP endpoint on; same treatment.
+        enable_agent_launcher: Add ``--enable-agent-launcher`` to the command
+            line. A flag, not an environment variable: the hub has no env
+            fallback for it.
+        agent_cwd: Default working directory for spawned agents; same
+            treatment as ``operator_token`` (``CAUCUS_AGENT_CWD``).
+        agent_max: Concurrent-agent ceiling; same treatment
+            (``CAUCUS_AGENT_MAX``).
 
     Returns:
         The complete file contents, ready to write.
@@ -528,6 +625,7 @@ def render_unit(
             port=port,
             logfile=logfile,
             envfile=env_file_path(),
+            launcher_args=" --enable-agent-launcher" if enable_agent_launcher else "",
         )
 
     environment = ""
@@ -538,6 +636,8 @@ def render_unit(
         public_url,
         allowed_hosts,
         mcp_http,
+        agent_cwd,
+        agent_max,
     ):
         environment += f"    <key>{name}</key>\n    <string>{value}</string>\n"
 
@@ -549,6 +649,11 @@ def render_unit(
         logfile=logfile,
         environment=environment,
         run_at_load="true" if at_login else "false",
+        launcher_args=(
+            "    <string>--enable-agent-launcher</string>\n"
+            if enable_agent_launcher
+            else ""
+        ),
     )
 
 
@@ -747,6 +852,8 @@ def write_env_file(
     public_url: str | None = None,
     allowed_hosts: list[str] | None = None,
     mcp_http: bool = False,
+    agent_cwd: Path | None = None,
+    agent_max: int | None = None,
 ) -> Path | None:
     """Write the systemd environment file, or ``None`` when there is nothing to.
 
@@ -761,12 +868,21 @@ def write_env_file(
         public_url: Base URL advertised to agents, or ``None``.
         allowed_hosts: Extra ``Host`` values for the ``/mcp`` guard, or ``None``.
         mcp_http: Force the in-process MCP endpoint on.
+        agent_cwd: Default working directory for spawned agents, or ``None``.
+        agent_max: Ceiling on concurrent agents, or ``None``.
 
     Returns:
         The path written, or ``None`` when nothing had to be configured.
     """
     env = service_environment(
-        operator, observer, agent, public_url, allowed_hosts, mcp_http
+        operator,
+        observer,
+        agent,
+        public_url,
+        allowed_hosts,
+        mcp_http,
+        agent_cwd,
+        agent_max,
     )
     if not env:
         return None
@@ -880,6 +996,9 @@ def describe_plan(
     public_url: str | None = None,
     allowed_hosts: list[str] | None = None,
     mcp_http: bool = False,
+    agent_cwd: Path | None = None,
+    agent_max: int | None = None,
+    enable_agent_launcher: bool = False,
 ) -> str:
     """Build the human-readable summary shown before anything is written.
 
@@ -900,6 +1019,11 @@ def describe_plan(
             the bind one.
         allowed_hosts: Extra ``Host`` values the ``/mcp`` guard will accept.
         mcp_http: Whether the in-process MCP endpoint is forced on.
+        agent_cwd: Default directory spawned agents start in, when the launcher
+            is enabled.
+        agent_max: Concurrent-agent ceiling, when given.
+        enable_agent_launcher: Whether operators can spawn agents from the
+            console.
 
     Returns:
         A multi-line block, ending without a trailing newline.
@@ -926,6 +1050,15 @@ def describe_plan(
         lines.append(f"  hosts    /mcp also accepts {', '.join(allowed_hosts)}")
     if mcp_http:
         lines.append("  mcp      in-process /mcp endpoint forced on")
+    if enable_agent_launcher:
+        lines.append(
+            f"  launcher operators can spawn agents; default cwd {agent_cwd}"
+            + (f", at most {agent_max}" if agent_max is not None else "")
+        )
+        lines.append(
+            "           a spawned worker runs as you, with shell access: the cwd is"
+        )
+        lines.append("           a starting point, not a sandbox")
     if hook_path is not None:
         verb = {"created": "create", "updated": "update", "unchanged": "leave"}
         lines.append(
@@ -1076,6 +1209,29 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-agent-launcher",
+        action="store_true",
+        help=(
+            "let an authenticated operator spawn agents from the console. "
+            "Requires --operator-token, --agent-cwd and a loopback --host; "
+            "refused here rather than at first boot when any is missing"
+        ),
+    )
+    parser.add_argument(
+        "--agent-cwd",
+        metavar="PATH",
+        help=(
+            "absolute directory spawned agents start in by default (required "
+            "with --enable-agent-launcher). A starting point, not a sandbox"
+        ),
+    )
+    parser.add_argument(
+        "--agent-max",
+        type=int,
+        metavar="N",
+        help="most agent processes that may run at once (hub default applies)",
+    )
+    parser.add_argument(
         "--at-login",
         action="store_true",
         help="start the hub at login and keep it up, instead of on demand",
@@ -1134,6 +1290,13 @@ def main(argv: list[str] | None = None) -> int:
         validate_addresses(args.public_url, args.allowed_host)
         check_port(args.port)
         check_bind(args.host, args.operator_token, args.agent_key, args.public_url)
+        agent_cwd = check_launcher(
+            enabled=args.enable_agent_launcher,
+            host=args.host,
+            operator_token=args.operator_token,
+            agent_cwd=args.agent_cwd,
+            agent_max=args.agent_max,
+        )
         binary = resolve_binary(args.binary)
         logfile = (
             Path(args.log_file).expanduser() if args.log_file else default_log_path(kind)
@@ -1153,6 +1316,9 @@ def main(argv: list[str] | None = None) -> int:
             public_url=args.public_url,
             allowed_hosts=args.allowed_host,
             mcp_http=args.mcp_http,
+            enable_agent_launcher=args.enable_agent_launcher,
+            agent_cwd=agent_cwd,
+            agent_max=args.agent_max,
         )
 
         command = hook_command(kind, args.label)
@@ -1183,6 +1349,9 @@ def main(argv: list[str] | None = None) -> int:
                 public_url=args.public_url,
                 allowed_hosts=args.allowed_host,
                 mcp_http=args.mcp_http,
+                agent_cwd=agent_cwd,
+                agent_max=args.agent_max,
+                enable_agent_launcher=args.enable_agent_launcher,
             )
         )
 
@@ -1205,6 +1374,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.public_url,
                 args.allowed_host,
                 args.mcp_http,
+                agent_cwd,
+                args.agent_max,
             )
         if hook_path is not None:
             apply_hook(hook_path, command)
