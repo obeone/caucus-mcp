@@ -825,13 +825,22 @@ def _launcher_main(
     return setup_service.main(["--dry-run", "--binary", str(binary), *extra])
 
 
+@pytest.mark.parametrize("kind", ["launchd", "systemd"])
 def test_main_dry_run_prints_a_launcher_enabled_unit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     isolated_home: Path,
     capsys: pytest.CaptureFixture[str],
+    kind: setup_service.Platform,
 ) -> None:
-    """With the three-way gate satisfied the dry run shows flag, cwd and ceiling."""
+    """With the gate satisfied the dry run shows flag, cwd and ceiling.
+
+    Pinned to each service manager rather than the host's: a launchd plist
+    carries the cwd and ceiling inline, while a systemd unit leaves them to the
+    env file (covered by ``test_write_env_file_carries_the_agent_cwd_and_max``)
+    and shows only the flag in ``ExecStart``. Both print them in the plan.
+    """
+    monkeypatch.setattr(setup_service, "detect_platform", lambda: kind)
     work = tmp_path / "work"
     work.mkdir()
 
@@ -850,8 +859,13 @@ def test_main_dry_run_prints_a_launcher_enabled_unit(
     out = capsys.readouterr().out
     assert rc == 0
     assert "--enable-agent-launcher" in out
-    assert "CAUCUS_AGENT_CWD" in out
-    assert "CAUCUS_AGENT_MAX" in out
+    assert f"default cwd {work.resolve()}, at most 4" in out
+    if kind == "launchd":
+        assert "CAUCUS_AGENT_CWD" in out
+        assert "CAUCUS_AGENT_MAX" in out
+    else:
+        assert "--no-browser --enable-agent-launcher\n" in out
+        assert "CAUCUS_AGENT_CWD" not in out
 
 
 @pytest.mark.parametrize(
