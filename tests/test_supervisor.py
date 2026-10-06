@@ -29,6 +29,7 @@ from caucus.supervisor import (
     AGENT_NAME_RE,
     AGENT_TYPES,
     CHILD_ENV_ALLOWLIST,
+    MAX_CWD_COMPLETIONS,
     MAX_EXITED_RECORDS,
     MAX_MISSION_CHARS,
     MUTE_PERMISSION_MODES,
@@ -42,6 +43,7 @@ from caucus.supervisor import (
     LauncherConfig,
     LauncherDisabled,
     LauncherRefused,
+    complete_agent_cwd,
     validate_agent_cwd,
 )
 
@@ -178,6 +180,220 @@ def test_enabled_config_rejects_zero_ceiling(workdir: Path) -> None:
     """A non-positive agent ceiling is refused."""
     with pytest.raises(LauncherRefused, match="at least 1"):
         LauncherConfig(enabled=True, cwd=workdir, max_agents=0)
+
+
+# --- working directory completion -------------------------------------------
+
+
+@pytest.fixture
+def tree(tmp_path: Path) -> Path:
+    """A small directory tree to complete against.
+
+    Holds two matching subdirectories, one non-matching, one regular file whose
+    name matches, one hidden directory, and one nested child that must never
+    show up because completion does not recurse.
+    """
+    root = (tmp_path / "tree").resolve()
+    (root / "alpha" / "nested").mkdir(parents=True)
+    (root / "alphabet").mkdir()
+    (root / "beta").mkdir()
+    (root / ".hidden").mkdir()
+    (root / "alpha-file.txt").write_text("x")
+    return root
+
+
+def test_complete_lists_only_directories(tree: Path) -> None:
+    """A trailing separator lists every visible subdirectory, files excluded."""
+    dirs, truncated = complete_agent_cwd(f"{tree}/")
+    assert dirs == [
+        str(tree / "alpha"),
+        str(tree / "alphabet"),
+        str(tree / "beta"),
+    ]
+    assert truncated is False
+
+
+def test_complete_filters_on_the_partial_segment(tree: Path) -> None:
+    """The last segment narrows the candidates and never recurses."""
+    dirs, _ = complete_agent_cwd(str(tree / "alph"))
+    assert dirs == [str(tree / "alpha"), str(tree / "alphabet")]
+    assert str(tree / "alpha" / "nested") not in dirs
+
+
+def test_complete_skips_symlinked_directories(tmp_path: Path) -> None:
+    """A linked directory is not offered, because the spawn would refuse it.
+
+    ``validate_agent_cwd`` rejects any path that resolves elsewhere, so offering
+    a ``current``-style symlink would hand the operator a candidate whose only
+    possible outcome is a 400 telling them to pass the resolved path. Nothing
+    reachable is hidden: the whole subtree under a symlink is unspawnable.
+    """
+    root = (tmp_path / "root").resolve()
+    root.mkdir()
+    (root / "release-1").mkdir()
+    (root / "current").symlink_to(root / "release-1")
+    dirs, _ = complete_agent_cwd(f"{root}/")
+    assert dirs == [str(root / "release-1")]
+    assert str(root / "current") not in dirs
+    # The spawn's own gate agrees, which is the invariant being pinned.
+    with pytest.raises(LauncherRefused, match="resolves elsewhere"):
+        validate_agent_cwd(root / "current")
+    assert validate_agent_cwd(dirs[0]) == root / "release-1"
+
+
+def test_complete_matches_case_insensitively(tree: Path) -> None:
+    """An operator typing the wrong case still gets their directory."""
+    dirs, _ = complete_agent_cwd(str(tree / "ALPHAB"))
+    assert dirs == [str(tree / "alphabet")]
+
+
+def test_complete_hides_dotted_entries_until_asked(tree: Path) -> None:
+    """Hidden directories stay out of the way until the dot is typed."""
+    visible, _ = complete_agent_cwd(f"{tree}/")
+    assert str(tree / ".hidden") not in visible
+    # Built as text, not through ``Path``, which would normalise the dot away.
+    asked, _ = complete_agent_cwd(f"{tree}/.")
+    assert asked == [str(tree / ".hidden")]
+
+
+def test_complete_caps_and_flags_truncation(tmp_path: Path) -> None:
+    """A huge parent yields a capped list with ``truncated`` set."""
+    root = (tmp_path / "many").resolve()
+    root.mkdir()
+    for index in range(MAX_CWD_COMPLETIONS + 5):
+        (root / f"dir{index:03d}").mkdir()
+    dirs, truncated = complete_agent_cwd(f"{root}/")
+    assert len(dirs) == MAX_CWD_COMPLETIONS
+    assert truncated is True
+    # Still sorted ascending, so the cap drops the tail and not a random slice.
+    assert dirs == sorted(dirs)
+    assert dirs[0] == str(root / "dir000")
+
+
+def test_complete_returns_empty_for_a_missing_parent(tmp_path: Path) -> None:
+    """A half-typed path whose parent does not exist is not an error."""
+    assert complete_agent_cwd(str(tmp_path / "ghost" / "part")) == ([], False)
+
+
+def test_complete_returns_empty_when_the_parent_is_a_file(tmp_path: Path) -> None:
+    """A parent that is not a directory yields nothing, quietly."""
+    target = tmp_path / "file.txt"
+    target.write_text("x")
+    assert complete_agent_cwd(f"{target}/") == ([], False)
+
+
+def test_complete_refuses_a_relative_prefix() -> None:
+    """A relative prefix has no meaning: the hub's cwd is not the operator's."""
+    with pytest.raises(LauncherRefused, match="absolute"):
+        complete_agent_cwd("relative/dir")
+
+
+def test_complete_refuses_a_nul_byte(tmp_path: Path) -> None:
+    """A NUL is refused rather than raising ``ValueError`` out of ``scandir``."""
+    with pytest.raises(LauncherRefused, match="NUL byte"):
+        complete_agent_cwd(f"{tmp_path}/a\x00b/")
+
+
+@pytest.mark.parametrize("prefix", [None, "", "   "])
+def test_complete_treats_an_empty_prefix_as_root(prefix: str | None) -> None:
+    """Nothing typed yet means the filesystem root, not a refusal.
+
+    The only case in this file that reads the real root rather than a fixture
+    tree, kept as a cheap smoke check. The non-emptiness assertion is what gives
+    the two ``all(...)`` lines below any force: over an empty list they are both
+    vacuously true, so a regression returning no candidates for an empty partial
+    segment (which is the branch ``prefix="/"`` takes, and where the
+    no-hidden-entries rule lives) would otherwise sail straight through.
+    """
+    dirs, _ = complete_agent_cwd(prefix)
+    assert dirs, "the filesystem root must yield at least one candidate"
+    assert all(item.startswith("/") for item in dirs)
+    assert all(Path(item).parent == Path("/") for item in dirs)
+
+
+# --- per-spawn working directory --------------------------------------------
+
+
+async def test_per_spawn_cwd_reaches_the_launch_step(
+    spy: _SpySupervisor, tmp_path: Path
+) -> None:
+    """A validated per-spawn directory is what the child would start in."""
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    # The spy raises from the launch step, which means validation let it through.
+    with pytest.raises(AssertionError):
+        await spy.spawn(AgentSpec(name="alpha", cwd=elsewhere))
+    assert [call[2] for call in spy.calls] == [elsewhere]
+
+
+async def test_absent_per_spawn_cwd_falls_back_to_the_hub_default(
+    spy: _SpySupervisor, workdir: Path
+) -> None:
+    """``cwd=None`` keeps the hub's configured default, as before."""
+    with pytest.raises(AssertionError):
+        await spy.spawn(AgentSpec(name="alpha"))
+    assert [call[2] for call in spy.calls] == [workdir]
+
+
+async def test_per_spawn_cwd_must_be_absolute(spy: _SpySupervisor) -> None:
+    """A relative per-spawn directory is refused before any launch."""
+    with pytest.raises(LauncherRefused, match="absolute"):
+        await spy.spawn(AgentSpec(name="alpha", cwd=Path("relative/dir")))
+    assert spy.calls == []
+
+
+async def test_per_spawn_cwd_must_not_contain_dotdot(
+    spy: _SpySupervisor, workdir: Path
+) -> None:
+    """``..`` is refused per spawn exactly as it is at boot."""
+    with pytest.raises(LauncherRefused, match=r"\.\."):
+        await spy.spawn(AgentSpec(name="alpha", cwd=workdir / ".." / "work"))
+    assert spy.calls == []
+
+
+async def test_per_spawn_cwd_must_exist(spy: _SpySupervisor, tmp_path: Path) -> None:
+    """A directory that is not there is refused, not silently ignored."""
+    with pytest.raises(LauncherRefused, match="does not resolve"):
+        await spy.spawn(AgentSpec(name="alpha", cwd=tmp_path / "nope"))
+    assert spy.calls == []
+
+
+async def test_per_spawn_cwd_must_be_a_directory(
+    spy: _SpySupervisor, tmp_path: Path
+) -> None:
+    """A regular file is refused per spawn."""
+    target = tmp_path / "file.txt"
+    target.write_text("x")
+    with pytest.raises(LauncherRefused, match="not a directory"):
+        await spy.spawn(AgentSpec(name="alpha", cwd=target.resolve()))
+    assert spy.calls == []
+
+
+async def test_per_spawn_cwd_with_a_nul_byte_is_refused(
+    spy: _SpySupervisor, tmp_path: Path
+) -> None:
+    """A NUL in the path is refused, not left to raise out of a syscall.
+
+    Every path syscall raises ``ValueError`` on an embedded NUL, which is not an
+    ``OSError``, so without this rule the refusal would escape every handler and
+    reach the operator as a 500.
+    """
+    with pytest.raises(LauncherRefused, match="NUL byte"):
+        await spy.spawn(AgentSpec(name="alpha", cwd=Path(f"{tmp_path}/a\x00b")))
+    assert spy.calls == []
+
+
+async def test_per_spawn_cwd_symlink_elsewhere_is_refused(
+    spy: _SpySupervisor, tmp_path: Path
+) -> None:
+    """A symlink that walks out of the named location is refused per spawn."""
+    real = (tmp_path / "real").resolve()
+    real.mkdir()
+    link = (tmp_path / "link").resolve()
+    link.symlink_to(real)
+    with pytest.raises(LauncherRefused, match="resolves elsewhere"):
+        await spy.spawn(AgentSpec(name="alpha", cwd=link))
+    assert spy.calls == []
 
 
 # --- refusals: nothing is ever spawned --------------------------------------
@@ -675,6 +891,103 @@ async def test_spawn_lists_and_kill_takes_down_the_process_group(
         assert not record.running
         assert await _wait_for(lambda: not _alive(grandchild))
         assert not _alive(record.pid)
+    finally:
+        await sup.shutdown()
+
+
+async def test_child_really_starts_in_the_per_spawn_directory(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """A real child reports the per-spawn directory, not the hub default.
+
+    The argv and the policy can both look right while the process still lands
+    somewhere else, so this one asks the child itself where it woke up.
+    """
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    script = tmp_path / "where_am_i_agent.py"
+    script.write_text("import os, sys\nprint(os.getcwd())\nsys.exit(0)\n")
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha", cwd=elsewhere))
+        assert await _wait_for(lambda: bool(record.stdout_tail))
+        assert record.stdout_tail[-1] == str(elsewhere)
+        assert record.stdout_tail[-1] != str(workdir)
+    finally:
+        await sup.shutdown()
+
+
+async def test_child_starts_in_the_validated_path_not_the_submitted_one(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """The directory the child wakes up in is the one validation approved.
+
+    ``validate_agent_cwd`` strips surrounding whitespace, so ``"/srv/x "`` is
+    approved as ``"/srv/x"`` while naming a different entry on disk. Here that
+    other entry is a symlink into a directory the operator never authorised: a
+    supervisor that validates the stripped string and launches the raw one
+    passes every rule above and still starts the child in the decoy. Asserting
+    against :func:`validate_agent_cwd`'s own return value is what makes the
+    divergence visible; comparing to a hand-written path would not.
+    """
+    decoy = (tmp_path / "decoy").resolve()
+    decoy.mkdir()
+    approved = (tmp_path / "x").resolve()
+    approved.mkdir()
+    # Same name plus one trailing space, pointing somewhere else entirely.
+    submitted = Path(f"{approved} ")
+    submitted.symlink_to(decoy)
+    assert validate_agent_cwd(submitted) == approved
+
+    script = tmp_path / "where_am_i_agent.py"
+    script.write_text("import os, sys\nprint(os.getcwd())\nsys.exit(0)\n")
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha", cwd=submitted))
+        assert await _wait_for(lambda: bool(record.stdout_tail))
+        assert record.stdout_tail[-1] == str(validate_agent_cwd(submitted))
+        assert record.stdout_tail[-1] == str(approved)
+        assert record.stdout_tail[-1] != str(decoy)
+    finally:
+        await sup.shutdown()
+
+
+async def test_submitted_whitespace_is_normalised_before_the_child_starts(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """A padded path is launched as validation normalised it, or not at all.
+
+    ``"  /srv/x  "`` is not even an absolute path, so handing the raw value to
+    the subprocess would fail to launch. The vetted path is the usable one.
+    """
+    elsewhere = (tmp_path / "elsewhere").resolve()
+    elsewhere.mkdir()
+    submitted = Path(f"  {elsewhere}  ")
+    assert not submitted.is_absolute()
+
+    script = tmp_path / "where_am_i_agent.py"
+    script.write_text("import os, sys\nprint(os.getcwd())\nsys.exit(0)\n")
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha", cwd=submitted))
+        assert await _wait_for(lambda: bool(record.stdout_tail))
+        assert record.stdout_tail[-1] == str(validate_agent_cwd(submitted))
+        assert record.stdout_tail[-1] == str(elsewhere)
+    finally:
+        await sup.shutdown()
+
+
+async def test_child_really_starts_in_the_hub_default_without_an_override(
+    tmp_path: Path, workdir: Path
+) -> None:
+    """With no override the child still wakes up in the configured default."""
+    script = tmp_path / "where_am_i_agent.py"
+    script.write_text("import os, sys\nprint(os.getcwd())\nsys.exit(0)\n")
+    sup = _make_supervisor(script, workdir)
+    try:
+        record = await sup.spawn(AgentSpec(name="alpha"))
+        assert await _wait_for(lambda: bool(record.stdout_tail))
+        assert record.stdout_tail[-1] == str(workdir)
     finally:
         await sup.shutdown()
 
