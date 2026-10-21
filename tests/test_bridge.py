@@ -9,6 +9,7 @@ so stop-mode tests don't leak into their neighbours.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import httpx
@@ -979,6 +980,25 @@ def test_take_floor_then_status_reports_it(
     assert status["floors"]["all"]["holder"] == "stick-holder"
     # Release so the module-scoped hub does not carry the stick into the next test.
     assert bridge.floor(action="drop")["released"] is True
+
+
+def test_floor_surfaces_rate_limit(client, state, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bridge reports the floor brake instead of hub_unreachable."""
+    token = str(client.post("/register", json={"project": "floor-rate-limited"}).json()["token"])
+    state.set_rate_limit(refill_rate=0.001, capacity=2.0)
+    monkeypatch.setattr(bridge_module, "_armed", True)
+    monkeypatch.setattr(bridge_module, "_token", token)
+    monkeypatch.setattr(bridge_module, "_joined_as", "floor-rate-limited")
+    monkeypatch.setattr(
+        bridge_module, "_client", lambda: contextlib.nullcontext(client)
+    )
+
+    assert bridge_module.floor(action="take", reason="x")["ok"] is True
+    assert bridge_module.floor(action="drop")["released"] is True
+    blocked = bridge_module.floor(action="take", reason="x")
+
+    assert blocked["error"] == "rate_limited"
+    assert "retry_after" in blocked
 
 
 def test_say_is_blocked_while_another_holds_the_floor(

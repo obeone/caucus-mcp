@@ -870,6 +870,21 @@ async def test_floor_action_drop(state: HubState) -> None:
     assert (await _tool(server, "floor")(ctx, action="status"))["floors"] == {}
 
 
+async def test_floor_action_surfaces_rate_limit(state: HubState) -> None:
+    """Streamable MCP preserves the hub's structured floor throttle error."""
+    server = _build()
+    ctx = _ctx("s1")
+    await _tool(server, "join")(ctx, project="alice")
+    state.set_rate_limit(refill_rate=0.001, capacity=2.0)
+
+    assert (await _tool(server, "floor")(ctx, action="take", reason="x"))["ok"]
+    assert (await _tool(server, "floor")(ctx, action="drop"))["released"]
+    blocked = await _tool(server, "floor")(ctx, action="take", reason="x")
+
+    assert blocked["error"] == "rate_limited"
+    assert "retry_after" in blocked
+
+
 async def test_floor_action_status_works_before_join(state: HubState) -> None:
     server = _build()
     ctx = _ctx("s1")  # armed only, never joined

@@ -601,6 +601,32 @@ def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
         assert "retry_after" in flooded.json()
 
 
+def test_floor_actions_spend_the_chatter_rate_limit(
+    client: TestClient, state: HubState
+) -> None:
+    """A take/drop loop cannot bypass the peer's normal write budget."""
+    token = _register(client, "floor-flooder")
+    state.set_rate_limit(refill_rate=0.001, capacity=2.0)
+
+    taken = client.post(
+        "/floor",
+        json={"token": token, "action": "take", "scope": "all", "reason": "x"},
+    )
+    dropped = client.post(
+        "/floor", json={"token": token, "action": "drop", "scope": "all"}
+    )
+    blocked = client.post(
+        "/floor",
+        json={"token": token, "action": "take", "scope": "all", "reason": "x"},
+    )
+
+    assert taken.status_code == 200
+    assert dropped.status_code == 200
+    assert blocked.status_code == 429
+    assert "retry_after" in blocked.json()
+    assert state.floors_public() == {}
+
+
 # --- channels ------------------------------------------------------------
 
 
@@ -924,6 +950,24 @@ def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
     assert channels_event["channels"] == {
         "#x": {"topic": None, "members": ["alpha"]}
     }
+
+
+def test_agent_roster_fanout_uses_the_ui_overflow_policy(
+    client: TestClient, state: HubState
+) -> None:
+    """Launcher events cannot bypass the bounded dashboard queue policy."""
+    queue = state.add_ui()
+    queue.get_nowait()  # drop the priming snapshot
+    hub_module._ui_queues.add(queue)
+    try:
+        assert queue.maxsize > 0
+        for _ in range(queue.maxsize + 1):
+            hub_module._broadcast_agents()
+        assert queue.qsize() <= queue.maxsize
+        assert queue.get_nowait() == {"type": "overflow"}
+    finally:
+        hub_module._ui_queues.discard(queue)
+        state.remove_ui(queue)
 
 
 # --- duplicate-join detection --------------------------------------------
