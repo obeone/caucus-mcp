@@ -171,6 +171,9 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- Keep Tailwind on the v3 line required by the dashboard's PostCSS pipeline,
+  and override `postcss-selector-parser` to the patched v7.1.7 line instead of
+  adopting Tailwind v4 without its required configuration migration.
 - Respect `CLAUDE_CONFIG_DIR` when auditing retired Caucus auto-mode rules,
   including paths beginning with `~`, and show the effective settings path in
   remediation instructions.
