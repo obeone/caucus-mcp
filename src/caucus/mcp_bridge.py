@@ -600,6 +600,36 @@ def join(
     gate = _ensure_armed()
     if gate is not None:
         return gate
+    automode_audit: dict[str, object] | None = None
+    if automode.is_claude_code():
+        try:
+            automode_audit = automode.detect()
+        # A failed audit cannot prove that the retired authority rule is absent.
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            logger.warning("auto-mode audit failed; refusing join: %s", exc)
+            return {
+                "error": "automode_audit_failed",
+                "automode": {
+                    "operator_rule": "retired",
+                    "legacy_rule": "unknown",
+                },
+                "hint": (
+                    "Caucus cannot safely deliver peer text until the legacy "
+                    "auto-mode rule audit succeeds."
+                ),
+            }
+        if (
+            automode_audit.get("legacy_rule") == "present"
+            or automode_audit.get("operator_rule") == "present"
+        ):
+            return {
+                "error": "unsafe_automode_rule",
+                "automode": automode_audit,
+                "hint": automode_audit.get(
+                    "hint",
+                    "Remove the legacy Caucus autoMode.allow rule before joining.",
+                ),
+            }
     global _token, _joined_as, _known_protocol_version, _protocol_text
     global _protocol_delivered
     name = project or PROJECT
@@ -727,18 +757,10 @@ def join(
         result["watch"] = _watch_command_for(token)
     except OSError as exc:  # pragma: no cover - needs an unwritable temp dir
         logger.warning("watch command unavailable: %s", exc)
-    # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
-    # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
-    # never-fatal probe: does auto mode already know a caucus operator answer is
-    # a user decision? If not, the agent can propose installing the rule (see
-    # automode.py / the `caucus-setup-automode` script).
-    if automode.is_claude_code():
-        try:
-            result["automode"] = automode.detect()
-        # Deliberately blind: probing auto mode must never break join().
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover
-            logger.warning("auto-mode detection skipped: %s", exc)
-            result["automode"] = {"operator_rule": "unknown"}
+    # Safe Claude Code joins carry the already-completed audit so the model
+    # knows operator answers remain informational. Other MCP hosts omit it.
+    if automode_audit is not None:
+        result["automode"] = automode_audit
     return result
 
 
