@@ -1502,9 +1502,11 @@ async def export(
     # token the live feed does — otherwise auth on /ui is trivially bypassed by
     # downloading the same data here.
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) not in ("operator", "observer"):
-            raise HTTPException(status_code=401, detail="operator/observer token required")
+            raise HTTPException(
+                status_code=401, detail="operator/observer token required"
+            )
     body, media_type, filename = export_mod.render(state.recent(), format)
     return Response(
         content=body,
@@ -1685,14 +1687,12 @@ async def register(
     The current channel directory (names, topics, members) ships in the response
     so a late-joining peer learns the open rooms without a follow-up call.
 
-    When the project name is already held by a live listener **and** no valid
-    token is presented, the hub refuses the request with HTTP 409 so the caller
-    knows it looks like a duplicate process.
+    When a live or revivable identity already owns the project name and no
+    matching token is presented, the hub refuses the request with HTTP 409.
 
     When a valid ``token`` is presented and matches the existing record, the
-    registration is silently re-affirmed (REAFFIRMED outcome). When the prior
-    listener is gone (dead process / timed-out watcher), the slot is taken over
-    (REPLACED outcome) and a human-readable ``note`` advises the caller.
+    registration is silently re-affirmed (REAFFIRMED outcome), including across
+    polling gaps and while reviving an idle-reaped record inside its grace window.
 
     A peer holds no per-peer token yet, so this is the door the shared agent key
     guards: when one is configured, the caller must present it as
@@ -1737,19 +1737,13 @@ async def register(
                 "error": "name_in_use",
                 "project": req.project,
                 "note": (
-                    "an active listener already holds this name; you look like"
-                    " a duplicate process — re-join under a different name."
+                    "an existing identity already owns this name; present its"
+                    " token or re-join under a different name."
                 ),
             },
         )
-    client = reg.client  # not None for FRESH / REAFFIRMED / REPLACED
+    client = reg.client  # not None for FRESH / REAFFIRMED
     assert client is not None
-    note = (
-        "you may be replacing a timed-out session and could be joining"
-        " mid-conversation."
-        if reg.outcome is RegisterOutcome.REPLACED
-        else None
-    )
     stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
     logger.info(
         "registered project=%s outcome=%s (protocol_version=%s, stale=%s)",
@@ -1765,7 +1759,6 @@ async def register(
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
         channels=state.channels(),
-        note=note,
     )
 
 
@@ -1891,27 +1884,6 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     )
 
 
-def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:
-    """Resolve the ``/receive`` access token: ``Authorization`` header, then query.
-
-    The header form is preferred because ``/receive`` is a long-poll ``GET``:
-    its token would otherwise ride in the URL query string, where httpx and the
-    server's own access logs record it in clear, leaking the secret. The query
-    parameter is kept as a **deprecated** fallback so a peer running an
-    older watcher keeps working through a hub upgrade; new callers must use the
-    header.
-
-    Args:
-        authorization: Raw ``Authorization`` header value, if any.
-        token: The deprecated ``?token=`` query parameter, if any.
-
-    Returns:
-        The bearer token from the header when present and well-formed, else the
-        query token, else ``None``.
-    """
-    return _bearer_from_header(authorization) or token
-
-
 @app.post("/ask", response_model=None)
 async def ask(req: AskRequest) -> AskResponse | JSONResponse:
     """Open an operator form on behalf of an agent.
@@ -1989,7 +1961,6 @@ async def forms(
 async def decisions(
     limit: int = Query(default=20, ge=1, le=500),
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, list[dict[str, object]]]:
     """List recently settled operator-form decisions, oldest first.
 
@@ -1998,8 +1969,8 @@ async def decisions(
     replaying the whole transcript. Unlike ``/forms`` (which only ever lists
     still-*pending* questions), a settled decision can carry a channel's
     private answer text, so this endpoint requires a token — no more
-    "works before join". The token is resolved exactly like ``/receive`` (see
-    :func:`_resolve_receive_token`) and tried two ways:
+    "works before join". The bearer token is read only from the
+    ``Authorization`` header and tried two ways:
 
     * A known **peer token** (:meth:`~caucus.state.HubState.client_for`) scopes
       the result to broadcast decisions plus those addressed to a channel the
@@ -2016,16 +1987,21 @@ async def decisions(
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
+        authorization: ``Authorization: Bearer <token>`` for a peer or console
+            role.
 
     Returns:
         ``{"decisions": [{"ts", "asker", "title", "status", "answer_summary"},
         ...]}`` — see :meth:`~caucus.state.HubState.decisions`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is not None:
         return {"decisions": state.decisions(limit, channels=client.channels)}
-    if auth_config.enabled and auth_config.role_for(resolved) in ("operator", "observer"):
+    if auth_config.enabled and auth_config.role_for(resolved) in (
+        "operator",
+        "observer",
+    ):
         return {"decisions": state.decisions(limit, channels=None)}
     raise HTTPException(status_code=401, detail="unknown token")
 
@@ -2153,17 +2129,15 @@ def _chatter_open(client: Client) -> bool:
 async def receive(
     request: Request,
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
     ack_seq: int | None = Query(default=None),
     lease: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
-    The access token is read from the ``Authorization: Bearer <token>`` header
-    (preferred) or, as a deprecated fallback, the ``?token=`` query parameter
-    -- see :func:`_resolve_receive_token`. Prefer the header: a query token
-    leaks into httpx and access logs because this is a ``GET``.
+    The access token is read only from the ``Authorization: Bearer <token>``
+    header. Reusable credentials are never accepted from the URL query string,
+    where HTTP clients, proxies, and server access logs can retain them.
 
     Blocks up to ``timeout`` seconds. Honors the pause gate (holds messages
     while paused) and surfaces a control ``stop`` signal immediately. Returns
@@ -2177,11 +2151,10 @@ async def receive(
     one it displaced gets ``409 already_listening`` (immediately if its poll is
     still in flight, otherwise on its next poll) and must stop polling.
 
-    While this call is in flight, ``client.active_polls`` is incremented, which
-    lets :meth:`~caucus.state.HubState.register` distinguish a genuine
-    reconnect from a colliding duplicate process. That counter tracks polls, the
-    lease tracks consumers; both are needed, see
-    :attr:`~caucus.state.Client.active_polls`.
+    While this call is in flight, ``client.active_polls`` is incremented for
+    listener observability in the operator UI. Identity ownership is proved by
+    the peer token, never inferred from this transient counter. The lease tracks
+    which consumer may poll; see :attr:`~caucus.state.Client.active_polls`.
 
     Messages returned to the caller are appended to :attr:`~caucus.state.Client.unacked`
     so they can be replayed if the client disconnects before acknowledging them.
@@ -2193,6 +2166,7 @@ async def receive(
     returned goes back to the head of its queue (see :func:`_release_getter`).
 
     Args:
+        authorization: ``Authorization: Bearer <peer token>``.
         ack_seq: Optional piggyback ACK — the highest ``seq`` the caller has
             successfully processed. Equivalent to ``POST /ack`` but saves a
             round-trip by folding the ACK into the next poll.
@@ -2211,7 +2185,7 @@ async def receive(
             ``lease``, ``409 already_listening`` when another consumer holds
             (or has taken) the slot.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2364,11 +2338,8 @@ async def receive(
             _release_getter(pri_get, client.priority_queue)
             _release_getter(chat_get, client.queue)
         finally:
-            # This decrement must never be skipped. A leaked count leaves the
-            # peer looking like it holds a live listener forever, and
-            # HubState.register then refuses every re-join under that name as a
-            # colliding duplicate (CONTESTED) — the project is wedged out of its
-            # own identity for the lifetime of the hub. Cleanup failures still
+            # This decrement must never be skipped: a leaked count makes the
+            # operator UI report a live listener forever. Cleanup failures still
             # propagate; they just do not take the counter down with them.
             client.active_polls -= 1
 
@@ -2376,15 +2347,13 @@ async def receive(
 @app.get("/peek")
 async def peek(
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Report the caller's pending queue depth without draining it.
 
     The non-blocking counterpart to ``GET /receive``: a cheap "is a turn worth
     it?" check an agent can run before paying for a full receive. Authenticated
-    exactly like ``/receive`` — the token is read from the ``Authorization:
-    Bearer <token>`` header (preferred) or the deprecated ``?token=`` query
-    fallback, see :func:`_resolve_receive_token` — and resolved through
+    exactly like ``/receive`` — the token is read only from the
+    ``Authorization: Bearer <token>`` header — and resolved through
     :meth:`~caucus.state.HubState.client_for`, so it touches ``last_seen`` (and
     can revive a reaped identity) exactly the way every other authenticated
     endpoint does; no special-cased liveness bookkeeping.
@@ -2394,7 +2363,7 @@ async def peek(
         "preview_truncated", "content_chars"} | None}``; see
         :meth:`~caucus.state.HubState.peek`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2502,7 +2471,7 @@ async def control(
     otherwise an unauthenticated party (or a cross-site CSRF POST from a page in
     the operator's browser) could silently disarm the stop/pause that the human
     relies on. The bearer token is parsed the same way as ``/receive`` (see
-    :func:`_resolve_receive_token`) and must resolve to the ``operator`` role;
+    :func:`_bearer_from_header`) and must resolve to the ``operator`` role;
     when auth is disabled the endpoint stays open (the documented localhost
     default). As defense-in-depth, a present-but-disallowed browser ``Origin`` is
     also refused (blocks a simple cross-site form/fetch POST).
@@ -2540,7 +2509,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
 
     The same three checks in the same order: a present-but-disallowed browser
     ``Origin`` first (CSRF defense-in-depth, refused before anything happens),
-    then the bearer token parsed exactly as ``/receive`` parses it, then the
+    then the bearer token parsed from ``Authorization``, then the
     ``operator`` role. Factored out so ``/control`` and the ``/agents``
     endpoints cannot drift apart.
 
@@ -2557,7 +2526,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
     ):
         raise HTTPException(status_code=403, detail="origin not allowed")
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) != "operator":
             raise HTTPException(status_code=401, detail="operator token required")
 

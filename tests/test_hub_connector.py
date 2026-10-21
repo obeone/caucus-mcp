@@ -429,8 +429,8 @@ async def test_register_raises_name_in_use_error_on_409() -> None:
     "note": "..."}``.
     """
     note_text = (
-        "an active listener already holds this name; you look like a duplicate"
-        " process — re-join under a different name."
+        "an existing identity already owns this name; present its token or"
+        " re-join under a different name."
     )
 
     class _Mock409Transport(httpx.AsyncBaseTransport):
@@ -447,7 +447,7 @@ async def test_register_raises_name_in_use_error_on_409() -> None:
         base_url="http://stub", transport=_Mock409Transport()
     )
     try:
-        with pytest.raises(NameInUseError, match="active listener"):
+        with pytest.raises(NameInUseError, match="existing identity"):
             await connector.register("dupe", 1)
     finally:
         await connector._http.aclose()
@@ -470,23 +470,15 @@ async def test_register_reaffirmed_with_token(live_hub: str) -> None:
     assert second.project == "conn-reaffirm"
 
 
-async def test_register_note_is_populated_on_replaced(live_hub: str) -> None:
-    """The ``note`` field on :class:`Membership` carries the hub advisory.
-
-    Force a REPLACED outcome: register a peer (no active poll, so
-    ``active_polls == 0``), then re-register under the same name *without* a
-    token.  Because no poll is in flight the hub treats this as a takeover of
-    a dead/timed-out slot (REPLACED) and returns a ``note`` advising that the
-    new agent may be joining mid-conversation.
-    """
+async def test_register_without_token_is_refused_during_poll_gap(
+    live_hub: str,
+) -> None:
+    """No-token registration cannot claim an identity between receive polls."""
     async with HubConnector(live_hub) as hub:
         proto = await hub.fetch_protocol()
-        # First registration — no poll started, so active_polls stays 0.
-        await hub.register("conn-replaced-note", proto.version)
-        # Re-register without a token — REPLACED outcome, note present.
-        second = await hub.register("conn-replaced-note", proto.version)
-    assert second.note is not None
-    assert "mid-conversation" in second.note
+        await hub.register("conn-owned", proto.version)
+        with pytest.raises(NameInUseError, match="existing identity"):
+            await hub.register("conn-owned", proto.version)
 
 
 # --- operator forms ------------------------------------------------------

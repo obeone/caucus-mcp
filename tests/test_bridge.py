@@ -18,11 +18,13 @@ from caucus import mcp_bridge as bridge_module
 
 
 @pytest.fixture
-def bridge(live_hub: str, monkeypatch: pytest.MonkeyPatch):
+def bridge(live_hub: str, state, monkeypatch: pytest.MonkeyPatch):
     """Point the bridge module at the live hub with a clean, disarmed slate.
 
     ``_armed`` starts ``False`` so the first tool call arms the session against
     the live hub, exactly as production does — no explicit setup gesture.
+    The ``state`` fixture isolates identities as well as local bridge caches;
+    resetting the room mode alone does not release registered project names.
     """
     monkeypatch.setattr(bridge_module, "HUB_URL", live_hub)
     monkeypatch.setattr(bridge_module, "_token", None)
@@ -42,6 +44,11 @@ def _register_peer(base: str, project: str) -> str:
     """Register a peer straight against the hub and return its token."""
     with httpx.Client(base_url=base, timeout=5.0) as http:
         return str(http.post("/register", json={"project": project}).json()["token"])
+
+
+def _auth(token: str) -> dict[str, str]:
+    """Return the header-only peer credential transport used by clients."""
+    return {"Authorization": f"Bearer {token}"}
 
 
 # --- lazy arming & gate --------------------------------------------------
@@ -804,9 +811,7 @@ def test_say_direct_is_delivered(
     assert result["delivered_to"] == ["watcher-1"]
 
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
-        got = http.get(
-            "/receive", params={"token": watcher, "timeout": 3}
-        ).json()
+        got = http.get("/receive", params={"timeout": 3}, headers=_auth(watcher)).json()
     assert any("hello watcher" in m["content"] for m in got["messages"])
 
 
@@ -893,7 +898,7 @@ def test_listen_keeps_kind_and_meta_on_an_answer(
     from caucus import hub as hub_module
 
     monkeypatch.setattr(bridge, "PROJECT", "form-asker")
-    bridge.join()
+    assert bridge.join()["joined"] is True
 
     form_id = bridge.ask_operator(
         title="Ship it?",
@@ -1143,7 +1148,7 @@ def test_say_to_channel_reaches_member(
     assert "br-ch-rx" in result["delivered_to"]
 
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
-        got = http.get("/receive", params={"token": peer, "timeout": 3}).json()
+        got = http.get("/receive", params={"timeout": 3}, headers=_auth(peer)).json()
     assert any("hi channel" in m["content"] for m in got["messages"])
 
 
@@ -1228,7 +1233,7 @@ def _radio_field() -> dict[str, object]:
 
 def test_ask_operator_opens_form(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bridge, "PROJECT", "form-asker")
-    bridge.join()
+    assert bridge.join()["joined"] is True
     result = bridge.ask_operator("Deploy?", [_radio_field()])
     assert result["form_id"]
     assert result["to"] == "all"
@@ -1530,7 +1535,7 @@ def test_join_returns_name_in_use_when_live_listener_holds_name(
     def _hold_poll() -> None:
         with httpx.Client(base_url=live_hub, timeout=10.0) as http:
             try:
-                http.get("/receive", params={"token": token, "timeout": 5})
+                http.get("/receive", params={"timeout": 5}, headers=_auth(token))
             except Exception:
                 pass
         stop_event.set()

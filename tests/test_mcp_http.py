@@ -505,16 +505,16 @@ async def test_decisions_channel_scoped_answer_invisible_to_non_member(
     assert outsider == []
 
 
-async def test_join_name_in_use_on_contested(state: HubState) -> None:
-    """A1: a live listener holding the name yields name_in_use, no crash.
+async def test_join_name_in_use_during_poll_gap(state: HubState) -> None:
+    """A1: an owned name yields name_in_use even with no poll in flight.
 
     CONTESTED returns ``Registration(client=None)``; the shaping must not
-    dereference ``reg.client``. Seed a live listener (``active_polls > 0``) under
-    the name, then join from a fresh session with no matching token.
+    dereference ``reg.client``. Seed the identity with ``active_polls == 0``,
+    then join from a fresh session with no matching token.
     """
     reg = state.register("alpha")
     assert reg.client is not None
-    reg.client.active_polls = 1  # simulate an in-flight /receive long-poll
+    assert reg.client.active_polls == 0
 
     server = _build()
     ctx = _ctx("s1")
@@ -554,15 +554,19 @@ async def test_contested_join_releases_the_session_identity_slot(
     assert (await _tool(server, "join")(ctx, project="gamma"))["joined"] is True
 
 
-async def test_join_replaced_includes_note(state: HubState) -> None:
-    """A1: taking over a dead slot (REPLACED) carries the advisory note."""
-    state.register("alpha")  # active_polls stays 0 -> a dead/timed-out slot
+async def test_join_cannot_claim_owned_name_without_token(state: HubState) -> None:
+    """A1: zero active polls never authorizes identity takeover."""
+    incumbent = state.register("alpha")
+    assert incumbent.client is not None
+    token = incumbent.client.token
 
     server = _build()
     ctx = _ctx("s1")
     res = await _tool(server, "join")(ctx, project="alpha")
-    assert res["joined"] is True
-    assert "mid-conversation" in res["note"]
+
+    assert res["error"] == "name_in_use"
+    assert res["project"] == "alpha"
+    assert state.client_for(token) is incumbent.client
 
 
 async def test_two_default_joins_do_not_merge_into_one_identity(
@@ -595,19 +599,14 @@ async def test_two_default_joins_do_not_merge_into_one_identity(
 async def test_live_session_collision_refused_for_explicit_name(
     state: HubState,
 ) -> None:
-    """The same guard holds when both sessions name themselves explicitly.
-
-    Independent of how the default is derived: the hub cannot see that a peer
-    with no in-flight poll is alive, so the refusal has to come from this
-    process, which knows both sessions exist.
-    """
+    """The shared ownership check covers explicit names between poll calls."""
     server = _build()
     a, b = _ctx("session-A"), _ctx("session-B")
     assert (await _tool(server, "join")(a, project="alpha"))["joined"] is True
 
     res = await _tool(server, "join")(b, project="alpha")
     assert res["error"] == "name_in_use"
-    assert "explicit" in res["note"]
+    assert "token" in res["note"]
     assert state.peers() == ["alpha"]
 
 
@@ -632,6 +631,24 @@ async def test_left_session_frees_the_name(state: HubState) -> None:
     await _tool(server, "join")(a, project="alpha")
     await _tool(server, "leave")(a)
     assert (await _tool(server, "join")(b, project="alpha"))["joined"] is True
+    assert state.peers() == ["alpha"]
+
+
+async def test_operator_kick_frees_name_for_another_mcp_session(
+    state: HubState,
+) -> None:
+    """A stale local session cache cannot override an operator kick."""
+    server = _build()
+    a, b = _ctx("session-A"), _ctx("session-B")
+    first = await _tool(server, "join")(a, project="alpha")
+    assert first["joined"] is True
+    old_token = state._clients["alpha"].token
+
+    assert state.kick("alpha") is True
+    second = await _tool(server, "join")(b, project="alpha")
+
+    assert second["joined"] is True
+    assert state._clients["alpha"].token != old_token
     assert state.peers() == ["alpha"]
 
 

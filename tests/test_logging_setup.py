@@ -1,11 +1,10 @@
 """Tests for the shared connector logging configuration.
 
 The connectors poll the hub with ``httpx``, which logs every request at
-``INFO`` with the full URL -- and the access token rides in the ``/receive``
-query string. :func:`caucus.logging_setup.configure_logging` must pin the
-``httpx`` logger to ``WARNING`` so the token never reaches stderr (or the
-launching agent's transcript) and so the per-long-poll request line stops
-polluting the agent's context on every wake.
+``INFO`` with the full URL. Current clients keep credentials in the
+``Authorization`` header, while :func:`caucus.logging_setup.configure_logging`
+still pins the ``httpx`` logger to ``WARNING`` so request lines do not pollute
+the launching agent's transcript on every wake.
 
 Two layers of coverage:
 
@@ -13,8 +12,8 @@ Two layers of coverage:
   ``INFO`` records while still passing application logs, with no network.
 * **End-to-end** -- the real :func:`caucus.watch.watch` loop runs against a live
   hub over genuine HTTP; the token must not appear in the captured log stream.
-  A control test shows the same request *does* log the token without the fix,
-  so the e2e assertion is not vacuous.
+  A control test shows a deliberately unsafe external query still reaches the
+  logger without suppression, so the e2e assertion is not vacuous.
 """
 
 from __future__ import annotations
@@ -97,8 +96,9 @@ def test_watcher_does_not_leak_token_into_logs_end_to_end(live_hub: str) -> None
 
     Configures logging exactly as ``caucus-watch``'s ``main()`` does (to a
     buffer instead of stderr), runs the genuine :func:`caucus.watch.watch` loop
-    against a live hub -- which issues real ``GET /receive?token=...`` polls --
-    then asserts the token never lands in the captured log stream.
+    against a live hub -- which issues real header-authenticated
+    ``GET /receive`` polls -- then asserts the token never lands in the
+    captured log stream.
     """
     capture = io.StringIO()
     configure_logging(capture, level="INFO")
@@ -128,12 +128,15 @@ def test_watcher_does_not_leak_token_into_logs_end_to_end(live_hub: str) -> None
     assert token not in logged, "watcher leaked its token into the log stream"
 
 
-def test_httpx_logs_token_without_silencing_control(live_hub: str) -> None:
-    """Control: the same poll DOES log the token when httpx is left at INFO.
+def test_httpx_logs_deliberate_query_secret_without_silencing_control(
+    live_hub: str,
+) -> None:
+    """Control: an unsafe query secret is logged when httpx is left at INFO.
 
     Without :func:`silence_httpx`, ``coloredlogs`` at ``INFO`` lets the ``httpx``
-    request line through -- token and all. This proves the leak the fix closes
-    and that the e2e assertion above is meaningful, not vacuously true.
+    request line through -- secret and all. The hub rejects this request, but
+    the log record is emitted before the response and proves that the e2e
+    assertion above is meaningful rather than vacuously true.
     """
     capture = io.StringIO()
     # Pre-fix state: root at INFO, httpx left to inherit it (no silencing).
@@ -141,7 +144,8 @@ def test_httpx_logs_token_without_silencing_control(live_hub: str) -> None:
 
     token = _register_peer(live_hub, "leak-control-target")
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
-        http.get("/receive", params={"token": token, "timeout": 1})
+        response = http.get("/receive", params={"token": token, "timeout": 1})
 
+    assert response.status_code == 401
     logged = capture.getvalue()
     assert token in logged, "expected httpx to log the token-bearing URL at INFO"

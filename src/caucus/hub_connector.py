@@ -98,12 +98,12 @@ def _channel_outcome(status_code: int) -> ChannelOutcome | None:
 
 
 class NameInUseError(RuntimeError):
-    """Raised when ``/register`` is refused because a live peer already holds the name.
+    """Raised when ``/register`` is refused because an identity owns the name.
 
     The hub returns HTTP 409 with ``error: "name_in_use"`` when the project name
-    is currently held by an active listener and no matching token is presented.
-    The caller should either wait for the existing peer to leave, or re-launch
-    under a different ``CAUCUS_PROJECT``.
+    belongs to a live or revivable identity and no matching token is presented.
+    The caller must present that identity's token, wait for terminal removal, or
+    re-launch under a different ``CAUCUS_PROJECT``.
     """
 
 
@@ -135,9 +135,8 @@ class Membership:
         channels: The open-channel directory at registration time, so a
             late-joining agent learns the rooms up front. Maps each channel to
             ``{"topic": str | None, "members": [name, ...]}``.
-        note: Optional human-readable advisory from the hub, e.g. when this
-            registration took over a timed-out session. ``None`` on ordinary
-            joins.
+        note: Optional human-readable advisory from the hub. ``None`` on
+            ordinary joins.
     """
 
     token: str
@@ -418,8 +417,8 @@ class HubConnector:
 
         Raises:
             NameInUseError: If the hub refuses the join with HTTP 409 because
-                a live listener already holds the project name and the presented
-                token (if any) did not match.
+                a live or revivable identity owns the project name and the
+                presented token (if any) did not match.
             httpx.HTTPError: If the hub is unreachable or returns an error —
                 including HTTP 401 when the hub requires a shared agent key and
                 this connector holds none or the wrong one.
