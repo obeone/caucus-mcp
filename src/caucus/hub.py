@@ -118,6 +118,20 @@ REAP_INTERVAL_SECONDS = 15.0
 # rich peer roster) out to every connected UI listener.
 HEALTH_INTERVAL_SECONDS = 1.5
 
+# Maximum wall-clock time for the complete authenticated ``/ui`` handshake,
+# including the optional ``auth_probe`` round trip. A bounded but usable window
+# lets an operator answer the token prompt while preventing silent raw clients
+# from retaining accepted sockets forever.
+UI_AUTH_TIMEOUT_SECONDS = 30.0
+
+# Process-local ceiling for accepted ``/ui`` sockets that have not completed
+# authentication. The shipped CLI runs one Uvicorn worker, so this is the global
+# application limit for a normal deployment. It is intentionally not per-source:
+# proxies and NAT make ``ws.client.host`` unsuitable for fair source accounting.
+MAX_PENDING_UI_AUTH_CONNECTIONS = 32
+_pending_ui_auth: set[WebSocket] = set()
+_pending_ui_auth_lock = threading.Lock()
+
 # Hard ceiling on an inbound HTTP request body, in bytes. FastAPI/Starlette
 # buffers and parses the whole body before our handlers (and their Pydantic
 # validation) run, so an oversized POST — e.g. to the unauthenticated
@@ -895,7 +909,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             disk_log.close()
 
 
-app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
+app = FastAPI(
+    title="Caucus Hub",
+    version=__version__,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 
 
 class BodySizeLimitMiddleware:
@@ -1304,7 +1324,13 @@ async def index() -> FileResponse:
     """
     if not _UI_INDEX.is_file():
         raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
+    return FileResponse(
+        _UI_INDEX,
+        headers={
+            "Content-Security-Policy": CONSOLE_CSP,
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 def _require_agent_read(authorization: str | None) -> None:
@@ -2741,16 +2767,71 @@ _MUTATING_COMMANDS = frozenset(
 )
 
 
+def _reserve_ui_auth_slot(ws: WebSocket) -> bool:
+    """Reserve fail-fast capacity for one pending authenticated UI socket.
+
+    Args:
+        ws: The accepted WebSocket entering authentication.
+
+    Returns:
+        ``True`` when the socket was admitted, or ``False`` when the process-wide
+        pending-authentication cap is already full.
+    """
+    with _pending_ui_auth_lock:
+        if len(_pending_ui_auth) >= MAX_PENDING_UI_AUTH_CONNECTIONS:
+            return False
+        _pending_ui_auth.add(ws)
+        return True
+
+
+def _release_ui_auth_slot(ws: WebSocket) -> None:
+    """Release a pending-authentication reservation idempotently.
+
+    Args:
+        ws: The WebSocket leaving authentication for any reason.
+    """
+    with _pending_ui_auth_lock:
+        _pending_ui_auth.discard(ws)
+
+
+async def _ui_authenticate_enabled(ws: WebSocket) -> str | None:
+    """Run the configured-token handshake inside the caller's deadline.
+
+    Args:
+        ws: The accepted WebSocket.
+
+    Returns:
+        The granted role, or ``None`` after rejecting an invalid credential.
+    """
+    first = await ws.receive_json()
+    if isinstance(first, dict) and first.get("auth_probe") is True:
+        await ws.send_json({"type": "auth_required"})
+        first = await ws.receive_json()
+    token = first.get("auth") if isinstance(first, dict) else None
+    role = auth_config.role_for(str(token) if token is not None else None)
+    if role is None:
+        await ws.send_json({"type": "auth_error"})
+        await ws.close(code=1008)
+        return None
+    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
+    return role
+
+
 async def _ui_authenticate(ws: WebSocket) -> str | None:
     """Run the first-frame ``/ui`` auth handshake; return the granted role.
 
     When auth is disabled, replies ``auth_ok`` with ``role="operator"`` and
     ``auth=false`` immediately and returns ``"operator"`` without reading a
     frame. When an operator token is configured, reads the first frame, expects
-    ``{"auth": "<token>"}``, and grades it: a matching operator/observer token
-    gets ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
+    ``{"auth": "<token>"}``, and grades it. A dashboard with no persisted token
+    may instead send the non-secret ``{"auth_probe": true}`` frame; the hub
+    replies ``{"type":"auth_required"}`` and waits for the auth frame on the
+    same socket. A matching operator/observer token gets
+    ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
     anything else gets ``{"type":"auth_error"}``, the socket is closed (1008),
-    and ``None`` is returned.
+    and ``None`` is returned. The complete configured-token exchange has a
+    :data:`UI_AUTH_TIMEOUT_SECONDS` deadline; silence before either credential
+    receive closes the socket with code 1008.
 
     Args:
         ws: The accepted WebSocket.
@@ -2763,19 +2844,13 @@ async def _ui_authenticate(ws: WebSocket) -> str | None:
         await ws.send_json({"type": "auth_ok", "role": "operator", "auth": False})
         return "operator"
     try:
-        first = await ws.receive_json()
-    except (WebSocketDisconnect, ValueError):
+        return await asyncio.wait_for(
+            _ui_authenticate_enabled(ws), timeout=UI_AUTH_TIMEOUT_SECONDS
+        )
+    except (WebSocketDisconnect, ValueError, asyncio.TimeoutError):
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return None
-    token = first.get("auth") if isinstance(first, dict) else None
-    role = auth_config.role_for(str(token) if token is not None else None)
-    if role is None:
-        await ws.send_json({"type": "auth_error"})
-        await ws.close(code=1008)
-        return None
-    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
-    return role
 
 
 def _apply_ui_command(data: dict[str, object]) -> None:
@@ -2862,12 +2937,14 @@ async def ui_socket(ws: WebSocket) -> None:
     """Bidirectional channel for the operator UI.
 
     The first frame is an auth handshake (see :func:`_ui_authenticate`): when an
-    operator token is configured the client must send ``{"auth": "<token>"}``;
-    otherwise auth is disabled and every connection is an operator. The granted
-    role is enforced per-command — an ``observer`` may read the live feed but any
-    mutating command is refused with ``{"type":"error","reason":"forbidden",
-    "command":...}`` and left unapplied. There is no single-writer lock: multiple
-    operators may all act, last write wins.
+    operator token is configured the client may send ``{"auth": "<token>"}``
+    directly or send a non-secret ``{"auth_probe": true}`` and wait for
+    ``auth_required`` before sending the credential. Otherwise auth is disabled
+    and every connection is an operator. The granted role is enforced
+    per-command — an ``observer`` may read the live feed but any mutating command
+    is refused with ``{"type":"error","reason":"forbidden","command":...}``
+    and left unapplied. There is no single-writer lock: multiple operators may
+    all act, last write wins.
 
     Outbound: live feed events (messages, mode changes, rich peer lists, health
     ticks, heartbeat replies).
@@ -2906,7 +2983,21 @@ async def ui_socket(ws: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return  # cross-site origin; no role granted, no feed streamed
-    role = await _ui_authenticate(ws)
+    auth_slot_reserved = False
+    if auth_config.enabled:
+        if not _reserve_ui_auth_slot(ws):
+            with contextlib.suppress(Exception):
+                await ws.close(
+                    code=1013,
+                    reason="too many dashboard connections awaiting authentication",
+                )
+            return
+        auth_slot_reserved = True
+    try:
+        role = await _ui_authenticate(ws)
+    finally:
+        if auth_slot_reserved:
+            _release_ui_auth_slot(ws)
     if role is None:
         return  # handshake failed; socket already closed
     queue = state.add_ui()

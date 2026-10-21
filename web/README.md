@@ -26,9 +26,11 @@ Source maps are gitignored.
 
 ## Auth
 
-If the hub is started with `--operator-token`, pass the token as:
-- URL query param: `?token=<token>`
-- Or stored in `localStorage["caucus_token"]`
+If the hub is started with `--operator-token`, the dashboard prompts for an
+operator or observer token after connecting. The token travels only in the
+WebSocket authentication frame and is persisted to
+`localStorage["caucus_token"]` only after the hub accepts it. Tokens in URL
+query parameters are ignored.
 
 Without a token configured the dashboard connects as operator without auth.
 

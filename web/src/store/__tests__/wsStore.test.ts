@@ -1,7 +1,7 @@
 /**
  * Unit tests for store/wsStore.ts — event reducer and reconnect backoff.
  *
- * Browser globals (localStorage, WebSocket, matchMedia, history, location)
+ * Browser globals (localStorage, WebSocket, matchMedia, location)
  * are stubbed in src/test/setup.ts before any module is imported.
  *
  * We exercise _handleEvent directly (the private method is accessible via
@@ -18,6 +18,7 @@ import type { SnapshotEvent, PeerInfo } from "../types";
 
 /** Reset store to a known baseline before each test. */
 function resetStore() {
+  localStorage.removeItem("caucus_token");
   useDashStore.setState({
     connectionState: "connecting",
     role: "operator",
@@ -29,6 +30,9 @@ function resetStore() {
     health: null,
     messages: [],
     selectedPeer: null,
+    _pendingToken: null,
+    _authToken: null,
+    _authCancelled: false,
   });
 }
 
@@ -52,9 +56,145 @@ describe("wsStore — auth events", () => {
     expect(s.connectionState).toBe("connected");
   });
 
-  it("auth_error sets connectionState to disconnected", () => {
+  it("prompts on auth_required and sends the token without persisting it yet", () => {
+    const send = vi.fn();
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValue("prompted-secret");
+    useDashStore.setState({ _send: send } as never);
+
+    handle({ type: "auth_required" });
+
+    expect(send).toHaveBeenCalledWith({ auth: "prompted-secret" });
+    expect(localStorage.getItem("caucus_token")).toBeNull();
+    promptSpy.mockRestore();
+  });
+
+  it("persists a prompted token only after auth_ok", () => {
+    useDashStore.setState({ _pendingToken: "validated-secret" } as never);
+
+    handle({ type: "auth_ok", role: "operator", auth: true });
+
+    expect(localStorage.getItem("caucus_token")).toBe("validated-secret");
+  });
+
+  it("auth_error clears a stale persisted token before reconnect", () => {
+    localStorage.setItem("caucus_token", "stale-secret");
     handle({ type: "auth_error" });
     expect(useDashStore.getState().connectionState).toBe("disconnected");
+    expect(localStorage.getItem("caucus_token")).toBeNull();
+  });
+});
+
+/** WebSocket double that delivers the browser's close lifecycle event. */
+class LifecycleSocket {
+  static OPEN = 1;
+  readyState = LifecycleSocket.OPEN;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  send = vi.fn();
+
+  /** Close the socket and notify the installed production handler. */
+  close() {
+    this.readyState = 3;
+    this.onclose?.();
+  }
+}
+
+describe("wsStore authentication connection lifecycle", () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalSend = useDashStore.getState()._send;
+
+  /** Start a connection and deliver its browser open event. */
+  function connectSocket(): LifecycleSocket {
+    useDashStore.getState()._initWs();
+    const socket = useDashStore.getState()._ws as unknown as LifecycleSocket;
+    socket.onopen?.();
+    return socket;
+  }
+
+  /** Deliver a hub frame through the production message handler. */
+  function receive(socket: LifecycleSocket, event: object) {
+    socket.onmessage?.({ data: JSON.stringify(event) });
+  }
+
+  beforeEach(() => {
+    resetStore();
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", LifecycleSocket);
+    useDashStore.setState({ _backoff: 1_000, _reconnectTimer: null, _send: originalSend });
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.stubGlobal("WebSocket", originalWebSocket);
+    useDashStore.setState({ _ws: null, _reconnectTimer: null });
+  });
+
+  it.each([null, ""])("stops reconnecting when authentication is cancelled with %s", (answer) => {
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue(answer);
+    const socket = connectSocket();
+
+    receive(socket, { type: "auth_required" });
+
+    expect(socket.readyState).toBe(3);
+    expect(useDashStore.getState().connectionState).toBe("disconnected");
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(60_000);
+    expect(useDashStore.getState()._ws).toBeNull();
+    expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows an explicit connection attempt after cancelling authentication", () => {
+    const prompt = vi.spyOn(window, "prompt").mockReturnValueOnce(null).mockReturnValue("retry-token");
+    receive(connectSocket(), { type: "auth_required" });
+
+    useDashStore.getState().connect();
+    const retry = useDashStore.getState()._ws as unknown as LifecycleSocket;
+    retry.onopen?.();
+    receive(retry, { type: "auth_required" });
+
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(retry.send).toHaveBeenCalledWith(JSON.stringify({ auth: "retry-token" }));
+    retry.close();
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("reconnects automatically after a transport failure", () => {
+    const socket = connectSocket();
+    socket.onerror?.();
+
+    expect(useDashStore.getState().connectionState).toBe("disconnected");
+    vi.advanceTimersByTime(1_999);
+    expect(useDashStore.getState()._ws).toBeNull();
+    vi.advanceTimersByTime(1);
+    expect(useDashStore.getState()._ws).toBeInstanceOf(LifecycleSocket);
+    expect(useDashStore.getState()._ws).not.toBe(socket);
+  });
+
+  it.each(["stored", "prompted"])("prompts again after a rejected %s token", (source) => {
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("wrong-token");
+    if (source === "stored") localStorage.setItem("caucus_token", "wrong-token");
+    const socket = connectSocket();
+    if (source === "prompted") receive(socket, { type: "auth_required" });
+    expect(socket.send).toHaveBeenCalledWith(JSON.stringify({ auth: "wrong-token" }));
+    receive(socket, { type: "auth_error" });
+    socket.close();
+    prompt.mockReturnValue("correct-token");
+
+    vi.advanceTimersByTime(2_000);
+    const retry = useDashStore.getState()._ws as unknown as LifecycleSocket;
+    retry.onopen?.();
+    expect(retry.send).toHaveBeenCalledWith(JSON.stringify({ auth_probe: true }));
+    receive(retry, { type: "auth_required" });
+    expect(retry.send).toHaveBeenCalledWith(JSON.stringify({ auth: "correct-token" }));
+    receive(retry, { type: "auth_ok", role: "operator", auth: true });
+    expect(localStorage.getItem("caucus_token")).toBe("correct-token");
+    expect(useDashStore.getState().connectionState).toBe("connected");
   });
 });
 
@@ -354,9 +494,10 @@ describe("wsStore — sendChat wire format", () => {
   });
 });
 
-describe("wsStore — getToken() strips token from URL", () => {
-  it("history.replaceState is called to remove ?token= from address bar", () => {
-    // Simulate ?token=secret in location.search
+describe("wsStore — URL credentials", () => {
+  beforeEach(resetStore);
+
+  it("ignores ?token= and asks the hub whether authentication is required", () => {
     vi.stubGlobal("location", {
       protocol: "http:",
       host: "localhost",
@@ -364,27 +505,37 @@ describe("wsStore — getToken() strips token from URL", () => {
       pathname: "/",
       hash: "",
     });
-    const replaceSpy = vi.spyOn(globalThis.history, "replaceState");
+    localStorage.removeItem("caucus_token");
 
-    // Inline the same logic as getToken() to verify the strip behaviour.
-    const params = new URLSearchParams(globalThis.location.search);
-    const fromUrl = params.get("token");
-    if (fromUrl) {
-      globalThis.localStorage.setItem("caucus_token", fromUrl);
-      globalThis.history.replaceState(
-        {},
-        "",
-        globalThis.location.pathname + globalThis.location.hash,
-      );
-    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (useDashStore.getState() as any)._initWs();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ws = (window as any).__CAUCUS_WS__;
+    ws.onopen();
 
-    expect(replaceSpy).toHaveBeenCalledWith({}, "", "/");
-    expect(globalThis.localStorage.getItem("caucus_token")).toBe("secret123");
+    expect(globalThis.localStorage.getItem("caucus_token")).toBeNull();
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ auth_probe: true }));
 
-    // Restore
     vi.stubGlobal("location", {
       protocol: "http:", host: "localhost", search: "", pathname: "/", hash: "",
     });
+  });
+
+  it("still sends a previously validated stored token in the auth frame", () => {
+    localStorage.setItem("caucus_token", "stored-secret");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (useDashStore.getState() as any)._initWs();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ws = (window as any).__CAUCUS_WS__;
+    ws.onopen();
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({ auth: "stored-secret" }),
+    );
+    expect(ws.send).not.toHaveBeenCalledWith(
+      JSON.stringify({ auth_probe: true }),
+    );
   });
 });
 
