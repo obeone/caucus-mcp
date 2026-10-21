@@ -335,8 +335,15 @@ CLIs once so they live on your `PATH`.
 
 Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**. It
 ships every CLI: `caucus-hub`, `caucus-bridge`, `caucus-watch` and
-`caucus-claude-agent` and `caucus-openai-agent`, plus the `caucus-setup-service` and
-`caucus-setup-automode` setup helpers.
+`caucus-claude-agent` and `caucus-openai-agent`, plus `caucus-setup-service` and
+the legacy-rule audit/cleanup command `caucus-setup-automode`.
+
+If an earlier release installed the Caucus operator-answer rule in Claude Code
+auto mode, run `caucus-setup-automode --apply` in every affected project before
+reconnecting. The stdio bridge refuses to join while it finds a legacy rule or
+cannot complete the audit. A remote `/mcp` hub cannot inspect the Claude Code
+settings on the client machine, so direct HTTP MCP users must also remove any
+marker-bearing user-scope entry from `~/.claude/settings.json` themselves.
 
 ```bash
 uv tool install caucus-mcp     # recommended (with uv)
@@ -475,7 +482,8 @@ caucus-hub \
 
 Env equivalents: `CAUCUS_OPERATOR_TOKEN`, `CAUCUS_OBSERVER_TOKEN`. The dashboard
 prompts for the token on connect when auth is enabled. An observer can watch the
-live feed but cannot issue any control command.
+live feed but cannot issue any control command. Never put a console token in the
+dashboard URL; URL query credentials are ignored.
 
 <details>
 <summary><strong>Rebuild the dashboard (source checkout only)</strong></summary>
@@ -546,7 +554,7 @@ Two agent profiles, picked with `--type`:
 | Profile | What it can do |
 | --- | --- |
 | **`talker`** (default) | Caucus tools only. The built-in Claude Code tools (Bash/Read/Edit/...) are disabled, so it stays a pure conversational peer. |
-| **`worker`** | Also wields the built-in tools, so it can act on the repo it represents. `--permission-mode` (default `auto`) chooses how the SDK gates tool calls. |
+| **`worker`** | Adds bounded workspace read/search/write/edit/shell wrappers. Direct Claude Code host tools stay disabled; every sensitive wrapper call requires a matching server-attested operator approval, including under SDK `acceptEdits`. |
 
 ### Run the native OpenAI connector
 
@@ -658,12 +666,12 @@ approvals use the console's forms, so `default` and `plan` remain usable.
 
 Read this before enabling it:
 
-- A spawned agent runs **as you**, with your privileges. A `worker` reaches
-  Bash, Read, Edit and Write.
+- A spawned agent runs **as you**, with your privileges. A `worker` gets bounded
+  workspace tools; shell commands still run as you after exact operator approval.
 - `--agent-cwd` is where a child **starts**, not a boundary it is held inside. A
-  worker with a shell walks out of it with one `cd ..`. There is no sandbox
-  here.
-- `worker` combined with `bypassPermissions` or `dontAsk` is refused outright.
+  worker can leave it from an approved shell command. There is no shell sandbox.
+- Claude `worker` combined with `bypassPermissions` or `dontAsk` is still
+  refused as a defense-in-depth rule.
 - Stopping the hub normally takes its children with it. **`kill -9` on the hub
   orphans them**, since nothing runs to clean up.
 
