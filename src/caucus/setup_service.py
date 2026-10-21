@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from ._private_backup import write_private_backup
 from .supervisor import LauncherRefused, validate_agent_cwd
 from .urlguard import is_loopback_host, validate_public_url
 
@@ -67,6 +68,11 @@ WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 #: escaping for both, restrict them to characters neither treats specially;
 #: every sane generator (``openssl rand -hex``, ``uuidgen``, base64url) fits.
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+#: Visible placeholder used only in diagnostic output. Launchd credentials are
+#: replaced before XML rendering so no value-based text substitution can alter
+#: an unrelated field or leave an overlapping credential partially exposed.
+DRY_RUN_REDACTION = "[REDACTED]"
 
 #: Same idea for the values that are addresses rather than secrets: a public URL
 #: and the ``Host`` allowlist entries travel through the same plist and env-file
@@ -693,8 +699,13 @@ def _atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
             files can carry tokens.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_text(encoding="utf-8") != text:
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+    if path.exists():
+        prior = path.read_text(encoding="utf-8")
+        if prior != text:
+            try:
+                write_private_backup(path.with_suffix(path.suffix + ".bak"), prior)
+            except OSError as exc:
+                raise SetupError(f"cannot safely back up {path}: {exc}") from exc
 
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".caucus-", suffix=".tmp")
     tmp = Path(tmp_name)
@@ -1251,7 +1262,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the plan and the generated unit, change nothing",
+        help=(
+            "print the plan and a credential-redacted unit preview, change nothing"
+        ),
     )
     parser.add_argument(
         "--uninstall", action="store_true", help="stop the service and remove it"
@@ -1310,9 +1323,21 @@ def main(argv: list[str] | None = None) -> int:
             logfile=logfile,
             label=args.label,
             at_login=args.at_login,
-            operator_token=args.operator_token,
-            observer_token=args.observer_token,
-            agent_key=args.agent_key,
+            operator_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.operator_token is not None
+                else args.operator_token
+            ),
+            observer_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.observer_token is not None
+                else args.observer_token
+            ),
+            agent_key=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.agent_key is not None
+                else args.agent_key
+            ),
             public_url=args.public_url,
             allowed_hosts=args.allowed_host,
             mcp_http=args.mcp_http,

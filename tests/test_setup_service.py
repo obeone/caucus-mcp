@@ -11,6 +11,7 @@ helpers (``unit_path``, ``default_log_path``, ``env_file_path``,
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import re
 import stat
@@ -19,8 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from caucus import setup_service
-
+from caucus import _private_backup, setup_service
 
 # ---------------------------------------------------------------------------
 # validate_tokens
@@ -520,6 +520,118 @@ def test_apply_hook_backs_up_prior_content_when_it_differs(tmp_path: Path) -> No
     backup = path.with_suffix(path.suffix + ".bak")
     assert backup.exists()
     assert json.loads(backup.read_text(encoding="utf-8")) == original
+    info = backup.stat()
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_uid == os.geteuid()
+    assert stat.S_IMODE(info.st_mode) == 0o600
+
+
+def test_apply_hook_refuses_symlink_backup_without_disclosing_settings(
+    tmp_path: Path,
+) -> None:
+    """A prepared backup symlink cannot redirect the original settings."""
+    path = tmp_path / "settings.json"
+    original = json.dumps({"secret": "victim-only"})
+    path.write_text(original, encoding="utf-8")
+    attacker_target = tmp_path / "attacker-owned"
+    attacker_target.write_text("sentinel", encoding="utf-8")
+    backup = path.with_suffix(path.suffix + ".bak")
+    backup.symlink_to(attacker_target)
+
+    with pytest.raises(setup_service.SetupError, match="safely back up"):
+        setup_service.apply_hook(path, _marked_command("a"))
+
+    assert path.read_text(encoding="utf-8") == original
+    assert backup.is_symlink()
+    assert attacker_target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_apply_hook_refuses_backup_symlink_to_directory(tmp_path: Path) -> None:
+    """A directory symlink cannot receive a copy under the settings basename."""
+    path = tmp_path / "settings.json"
+    original = json.dumps({"secret": "victim-only"})
+    path.write_text(original, encoding="utf-8")
+    attacker_directory = tmp_path / "attacker-directory"
+    attacker_directory.mkdir()
+    backup = path.with_suffix(path.suffix + ".bak")
+    backup.symlink_to(attacker_directory, target_is_directory=True)
+
+    with pytest.raises(setup_service.SetupError, match="safely back up"):
+        setup_service.apply_hook(path, _marked_command("a"))
+
+    assert path.read_text(encoding="utf-8") == original
+    assert backup.is_symlink()
+    assert not (attacker_directory / path.name).exists()
+
+
+def test_apply_hook_safely_refreshes_owned_regular_backup(tmp_path: Path) -> None:
+    """A prior owner-controlled backup is rotated to the latest original."""
+    path = tmp_path / "settings.json"
+    original = {"unrelated": True}
+    path.write_text(json.dumps(original), encoding="utf-8")
+    backup = path.with_suffix(path.suffix + ".bak")
+    backup.write_text("stale", encoding="utf-8")
+
+    setup_service.apply_hook(path, _marked_command("a"))
+
+    info = backup.stat()
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_uid == os.geteuid()
+    assert stat.S_IMODE(info.st_mode) == 0o600
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+
+
+def test_private_backup_erases_content_when_hard_link_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link added after creation is detected and retains no backup contents."""
+    backup = tmp_path / "settings.json.bak"
+    attacker_alias = tmp_path / "attacker-alias"
+    real_fdopen = _private_backup.os.fdopen
+
+    def _fdopen_after_link(fd: int, *args: object, **kwargs: object):
+        handle = real_fdopen(fd, *args, **kwargs)
+        os.link(backup, attacker_alias)
+        return handle
+
+    monkeypatch.setattr(_private_backup.os, "fdopen", _fdopen_after_link)
+
+    with pytest.raises(OSError, match="hard-link aliases"):
+        _private_backup.write_private_backup(backup, "victim-secret")
+
+    assert not backup.exists()
+    assert attacker_alias.read_text(encoding="utf-8") == ""
+
+
+def test_private_backup_portable_path_refuses_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The non-POSIX fallback also refuses a prepared final symlink."""
+    backup = tmp_path / "settings.json.bak"
+    attacker_target = tmp_path / "attacker-owned"
+    attacker_target.write_text("sentinel", encoding="utf-8")
+    backup.symlink_to(attacker_target)
+    monkeypatch.setattr(_private_backup, "_supports_descriptor_backup", lambda: False)
+
+    with pytest.raises(OSError, match="regular file"):
+        _private_backup.write_private_backup(backup, "victim-secret")
+
+    assert backup.is_symlink()
+    assert attacker_target.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_private_backup_portable_path_refreshes_regular_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The non-POSIX fallback preserves ordinary backup rotation."""
+    backup = tmp_path / "settings.json.bak"
+    backup.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(_private_backup, "_supports_descriptor_backup", lambda: False)
+
+    _private_backup.write_private_backup(backup, "victim-secret")
+
+    assert backup.read_text(encoding="utf-8") == "victim-secret"
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
 
 
 def test_apply_hook_writes_file_with_mode_0600(tmp_path: Path) -> None:
@@ -823,6 +935,62 @@ def _launcher_main(
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o755)
     return setup_service.main(["--dry-run", "--binary", str(binary), *extra])
+
+
+@pytest.mark.parametrize("kind", ["launchd", "systemd"])
+def test_main_dry_run_never_prints_configured_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    kind: setup_service.Platform,
+) -> None:
+    """Dry-run output preserves the unit shape without exposing credentials."""
+    monkeypatch.setattr(setup_service, "detect_platform", lambda: kind)
+    credentials = (
+        "operator-sentinel-9b82",
+        "observer-sentinel-31d4",
+        "agent-sentinel-a761",
+    )
+
+    rc = _launcher_main(
+        monkeypatch,
+        tmp_path,
+        "--no-hook",
+        "--operator-token",
+        credentials[0],
+        "--observer-token",
+        credentials[1],
+        "--agent-key",
+        credentials[2],
+        "--public-url",
+        "https://hub.example.net",
+        "--allowed-host",
+        "hub.example.net",
+        "--mcp-http",
+    )
+
+    captured = capsys.readouterr()
+    transcript = captured.out + captured.err
+    assert rc == 0
+    assert not any(credential in transcript for credential in credentials)
+    assert captured.err == ""
+    assert "--no-browser" in captured.out
+    assert "https://hub.example.net" in captured.out
+    if kind == "launchd":
+        xml = captured.out[captured.out.index("<?xml") :]
+        xml = xml[: xml.index("</plist>") + len("</plist>")]
+        plist = plistlib.loads(xml.encode("utf-8"))
+        assert plist["EnvironmentVariables"] == {
+            "CAUCUS_OPERATOR_TOKEN": "[REDACTED]",
+            "CAUCUS_OBSERVER_TOKEN": "[REDACTED]",
+            "CAUCUS_AGENT_KEY": "[REDACTED]",
+            "CAUCUS_PUBLIC_URL": "https://hub.example.net",
+            "CAUCUS_ALLOWED_HOSTS": "hub.example.net",
+            "CAUCUS_MCP_HTTP": "1",
+        }
+    else:
+        assert "EnvironmentFile=-" in captured.out
 
 
 @pytest.mark.parametrize("kind", ["launchd", "systemd"])
