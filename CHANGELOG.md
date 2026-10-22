@@ -195,6 +195,15 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **Transcript logging no longer follows attacker-prepared filesystem links.**
+  DiskLog now walks only root- or service-owned directories that are private
+  or have sticky owner protection,
+  opens the final file relative to that verified parent with no-follow flags,
+  validates a single service-owned regular inode, and retains the descriptor
+  across appends. New logs use mode 0600, and retention swaps its verified
+  temporary descriptor into service without reopening the configured path.
+  Platforms without POSIX descriptor-relative no-follow operations fail closed
+  instead of falling back to a link-following open.
 - **Privileged GitHub Actions now execute only reviewed immutable revisions.**
   Release automation pins every third-party action and denies permissions by
   default, granting repository read, PyPI OIDC, and release write authority

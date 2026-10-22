@@ -14,13 +14,16 @@ configurable window. Write failures are logged, never fatal.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
-import tempfile
+import secrets
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from .models import Message
 
@@ -86,10 +89,12 @@ class DiskLog:
             retention_interval: Seconds between retention sweeps.
         """
         self.path = Path(path)
+        self._destination = Path(os.path.abspath(self.path))
         self.retention_hours = retention_hours
         self.dropped = 0
         self._queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=max_queue)
         self._retention_interval = retention_interval
+        self._file: BinaryIO | None = None
         # Guards the file against concurrent mutation. _append (background
         # writer) and prune (retention sweep) both run in worker threads, so a
         # threading.Lock — held only across the actual file I/O — keeps an
@@ -128,6 +133,215 @@ class DiskLog:
             except asyncio.QueueFull:  # pragma: no cover - drained concurrently
                 pass
 
+    @staticmethod
+    def _validate_trusted_directory(fd: int, path: Path) -> None:
+        """Require an opened path component to be a trusted directory.
+
+        Root-owned and service-owned directories are accepted when they are
+        private, or when the sticky bit prevents other users from replacing
+        entries they do not own. Validating every component before descending
+        prevents an attacker-writable ancestor from redirecting a later
+        component through a prepared symlink.
+
+        Args:
+            fd: Open descriptor for the directory.
+            path: Display path used in an error message.
+
+        Raises:
+            OSError: If the descriptor is not a directory or its owner/mode does
+                not establish the required local-filesystem trust boundary.
+        """
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", str(path))
+        if info.st_uid not in (0, os.geteuid()):
+            raise PermissionError(
+                errno.EPERM,
+                "disk log directory is not owned by root or the service account",
+                str(path),
+            )
+        writable_by_others = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        sticky_owner_protected = info.st_mode & stat.S_ISVTX
+        if writable_by_others and not sticky_owner_protected:
+            raise PermissionError(
+                errno.EPERM,
+                "disk log directory is writable by another local account",
+                str(path),
+            )
+
+    def _open_trusted_parent(self, *, create: bool) -> int | None:
+        """Open and validate the destination parent one component at a time.
+
+        Traversal starts at the filesystem root and uses directory-relative
+        opens. A component is validated before the next one is resolved, so a
+        path below a foreign-owned or unprotected group/world-writable directory
+        is refused. Missing components are created owner-only when ``create`` is
+        true.
+
+        Args:
+            create: Whether missing parent directories may be created.
+
+        Returns:
+            An owned descriptor for the verified parent, or ``None`` when a
+            component is absent and creation was not requested. The caller must
+            close a returned descriptor.
+
+        Raises:
+            OSError: If secure descriptor-relative operations are unavailable or
+                any component fails validation.
+        """
+        required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink)
+        if (
+            os.name != "posix"
+            or not getattr(os, "O_NOFOLLOW", 0)
+            or not getattr(os, "O_DIRECTORY", 0)
+            or any(operation not in os.supports_dir_fd for operation in required_dir_fd)
+        ):
+            raise OSError(
+                errno.ENOTSUP,
+                "secure disk logging requires POSIX descriptor-relative no-follow opens",
+            )
+        if not self._destination.name:
+            raise OSError(errno.EINVAL, "disk log path has no file name", str(self.path))
+
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        current_path = Path(self._destination.anchor)
+        current_fd = os.open(self._destination.anchor, flags)
+        try:
+            self._validate_trusted_directory(current_fd, current_path)
+            for component in self._destination.parent.parts[1:]:
+                try:
+                    child_fd = os.open(component, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not create:
+                        return None
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    child_fd = os.open(component, flags, dir_fd=current_fd)
+                child_path = current_path / component
+                try:
+                    self._validate_trusted_directory(child_fd, child_path)
+                except OSError:
+                    os.close(child_fd)
+                    raise
+                os.close(current_fd)
+                current_fd = child_fd
+                current_path = child_path
+            result = current_fd
+            current_fd = -1
+            return result
+        finally:
+            if current_fd >= 0:
+                os.close(current_fd)
+
+    def _validate_log_file(self, fd: int) -> None:
+        """Require ``fd`` to identify one service-owned regular file.
+
+        Args:
+            fd: Newly opened destination descriptor.
+
+        Raises:
+            OSError: If the descriptor is not a regular file, belongs to another
+                account, or has another hard-link alias.
+        """
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.EINVAL, "disk log destination is not a regular file")
+        if info.st_uid != os.geteuid():
+            raise PermissionError(
+                errno.EPERM,
+                "disk log destination is not owned by the service account",
+                str(self.path),
+            )
+        if info.st_nlink != 1:
+            raise OSError(
+                errno.EMLINK,
+                "disk log destination must not have hard-link aliases",
+                str(self.path),
+            )
+
+    def _ensure_open(self, *, create: bool) -> bool:
+        """Securely open and retain the configured transcript descriptor.
+
+        The final component is pre-checked without following links (avoiding a
+        blocking open of a FIFO/device), opened relative to the verified parent
+        with ``O_NOFOLLOW``, and then validated with ``fstat``. The resulting
+        descriptor is retained so later appends cannot be redirected by
+        replacing the pathname.
+
+        Args:
+            create: Whether to create the file and missing parents.
+
+        Returns:
+            ``True`` when :attr:`_file` is ready, or ``False`` when the path is
+            absent and creation was not requested.
+
+        Raises:
+            OSError: If opening or validation fails.
+        """
+        if self._file is not None:
+            return True
+        parent_fd = self._open_trusted_parent(create=create)
+        if parent_fd is None:
+            return False
+        fd = -1
+        try:
+            try:
+                entry = os.stat(
+                    self._destination.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not create:
+                    return False
+            else:
+                if not stat.S_ISREG(entry.st_mode):
+                    raise OSError(
+                        errno.EINVAL,
+                        "disk log destination is not a regular file",
+                        str(self.path),
+                    )
+
+            flags = (
+                os.O_RDWR
+                | os.O_APPEND
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            if create:
+                flags |= os.O_CREAT
+            fd = os.open(
+                self._destination.name,
+                flags,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            self._validate_log_file(fd)
+            os.fchmod(fd, 0o600)
+            self._file = os.fdopen(fd, "r+b", buffering=0)
+            fd = -1
+            return True
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(parent_fd)
+
+    @staticmethod
+    def _write_bytes(handle: BinaryIO, content: bytes) -> None:
+        """Write all of ``content`` to an unbuffered file descriptor."""
+        offset = 0
+        while offset < len(content):
+            written = handle.write(content[offset:])
+            if written is None or written <= 0:
+                raise OSError(errno.EIO, "short write to disk log")
+            offset += written
+
     def _append(self, record: dict[str, object]) -> None:
         """Append one record as a JSON line; log (never raise) on failure.
 
@@ -135,13 +349,25 @@ class DiskLog:
         concurrent :meth:`prune` rewrite (which would otherwise drop this line).
         """
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            # Serialise against prune's read-modify-replace; the critical
-            # section is just the single append write.
-            with self._file_lock, self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            content = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+            with self._file_lock:
+                if not self._ensure_open(create=True):  # pragma: no cover - create
+                    return
+                assert self._file is not None
+                self._write_bytes(self._file, content)
         except OSError:  # pragma: no cover - disk error path
             logger.exception("failed to append to disk log %s", self.path)
+
+    def close(self) -> None:
+        """Close the retained descriptor, if any, without disabling later reuse."""
+        with self._file_lock:
+            handle = self._file
+            self._file = None
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:  # pragma: no cover - close error path
+                    logger.exception("failed to close disk log %s", self.path)
 
     async def run(self) -> None:
         """Drain the queue forever, appending each record to the file.
@@ -190,9 +416,11 @@ class DiskLog:
         # slip in between the read and the swap and be dropped on the floor.
         with self._file_lock:
             try:
-                if not self.path.is_file():
+                if not self._ensure_open(create=False):
                     return 0
-                lines = self.path.read_text(encoding="utf-8").splitlines()
+                assert self._file is not None
+                self._file.seek(0)
+                lines = self._file.read().decode("utf-8").splitlines()
             except OSError:  # pragma: no cover - disk error path
                 logger.exception("failed to read disk log %s for pruning", self.path)
                 return 0
@@ -211,51 +439,119 @@ class DiskLog:
                     kept.append(line)
                 else:
                     dropped += 1
-            if dropped:
-                self._atomic_rewrite(
-                    "\n".join(kept) + ("\n" if kept else "")
-                )
+            if dropped and not self._atomic_rewrite(
+                "\n".join(kept) + ("\n" if kept else "")
+            ):
+                return 0
         return dropped
 
-    def _atomic_rewrite(self, content: str) -> None:
+    def _path_matches_open_file(self, parent_fd: int) -> bool:
+        """Return whether the configured entry is still the retained inode."""
+        if self._file is None:
+            return False
+        try:
+            entry = os.stat(
+                self._destination.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(self._file.fileno())
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(entry.st_mode)
+            and (entry.st_dev, entry.st_ino) == (opened.st_dev, opened.st_ino)
+        )
+
+    def _atomic_rewrite(self, content: str) -> bool:
         """Replace :attr:`path` with ``content`` durably and atomically.
 
-        Writes ``content`` to a sibling temp file in the same directory, flushes
-        and ``fsync``s it to disk, then :func:`os.replace`s it over the original
-        in a single atomic rename. The original is only swapped at that final
-        step, so any failure before it leaves the existing log intact; the temp
-        file is always cleaned up on error. Logged, never raised (preserves the
-        non-fatal contract of the caller).
+        Creates ``content`` through a no-follow descriptor relative to the
+        verified parent, fsyncs it, then :func:`os.replace`s it over the original
+        in a single atomic rename. The already-open temp descriptor becomes the
+        retained append target after the swap, avoiding a pathname reopen. The
+        original is only swapped at that final step, so any earlier failure
+        leaves it intact; the temp file is always cleaned up on error. Logged,
+        never raised (preserves the non-fatal contract of the caller).
 
         Args:
             content: The full file contents to atomically install in place.
+
+        Returns:
+            ``True`` after installing the replacement, or ``False`` when the
+            configured entry changed or the rewrite failed.
         """
+        parent_fd: int | None = None
+        temp_fd = -1
+        temp_name: str | None = None
+        temp_handle: BinaryIO | None = None
         try:
-            # Same directory as the target so os.replace stays on one
-            # filesystem and is therefore atomic.
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(self.path.parent), prefix=self.path.name + ".", suffix=".tmp"
+            parent_fd = self._open_trusted_parent(create=False)
+            if parent_fd is None:
+                raise FileNotFoundError(errno.ENOENT, "disk log parent disappeared")
+            if not self._path_matches_open_file(parent_fd):
+                logger.warning(
+                    "refusing to prune disk log %s after its path changed",
+                    self.path,
+                )
+                return False
+            flags = (
+                os.O_RDWR
+                | os.O_APPEND
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
             )
-        except OSError:  # pragma: no cover - disk error path
-            logger.exception("failed to create temp file for disk log %s", self.path)
-            return
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(content)
-                handle.flush()
-                # Force the data to stable storage before the swap so a crash
-                # right after os.replace can't surface an empty/partial file.
-                os.fsync(handle.fileno())
-            # Atomic on the same filesystem: readers see either the old file or
-            # the fully-written new one, never an intermediate truncated state.
-            os.replace(tmp_name, self.path)
-        except OSError:  # pragma: no cover - disk error path
+            for _attempt in range(100):
+                temp_name = f".caucus-{secrets.token_hex(12)}.tmp"
+                try:
+                    temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+                except FileExistsError:  # pragma: no cover - random collision
+                    continue
+                break
+            else:  # pragma: no cover - cryptographically implausible exhaustion
+                raise FileExistsError(errno.EEXIST, "could not allocate disk log temp")
+
+            self._validate_log_file(temp_fd)
+            temp_handle = os.fdopen(temp_fd, "r+b", buffering=0)
+            temp_fd = -1
+            self._write_bytes(temp_handle, content.encode("utf-8"))
+            os.fsync(temp_handle.fileno())
+            if not self._path_matches_open_file(parent_fd):
+                raise OSError(
+                    errno.ESTALE,
+                    "disk log path changed during retention rewrite",
+                    str(self.path),
+                )
+            os.replace(
+                temp_name,
+                self._destination.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            old_handle = self._file
+            self._file = temp_handle
+            temp_handle = None
+            if old_handle is not None:
+                old_handle.close()
+            return True
+        except (OSError, TypeError):  # pragma: no cover - disk/platform error path
             logger.exception("failed to rewrite disk log %s after pruning", self.path)
-            # The original was never touched; drop the half-written temp file.
-            try:
-                os.unlink(tmp_name)
-            except OSError:  # pragma: no cover - best-effort cleanup
-                pass
+            if temp_handle is not None:
+                temp_handle.close()
+            elif temp_fd >= 0:
+                os.close(temp_fd)
+            if temp_name is not None and parent_fd is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except OSError:  # pragma: no cover - best-effort cleanup
+                    pass
+            return False
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     async def retention_loop(self) -> None:
         """Periodically prune old lines (sibling to the hub's reaper loop)."""

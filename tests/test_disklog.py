@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import time
 from pathlib import Path
 
+import pytest
+
+import caucus.disklog as disklog_module
+from caucus import hub as hub_module
 from caucus.disklog import DiskLog
 from caucus.models import Message, MessageKind
+from caucus.state import HubState
 
 
 def _msg(content: str = "hi", *, sender: str = "alpha", seq: int = 1) -> Message:
@@ -57,6 +64,205 @@ async def test_writer_appends_jsonl_lines(tmp_path: Path) -> None:
     assert first["meta"]["delivered_to"] == ["beta"]
     # ts is UTC ISO 8601.
     assert first["ts"].endswith("+00:00")
+    assert stat.S_IMODE((tmp_path / "log.jsonl").stat().st_mode) == 0o600
+
+
+def test_append_refuses_final_symlink_without_modifying_target(tmp_path: Path) -> None:
+    target = tmp_path / "target.jsonl"
+    target.write_text("sentinel\n", encoding="utf-8")
+    path = tmp_path / "log.jsonl"
+    path.symlink_to(target)
+
+    DiskLog(path)._append({"content": "secret"})
+
+    assert target.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_append_refuses_dangling_final_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "missing-target.jsonl"
+    path = tmp_path / "log.jsonl"
+    path.symlink_to(target)
+
+    DiskLog(path)._append({"content": "secret"})
+
+    assert path.is_symlink()
+    assert not target.exists()
+
+
+def test_append_refuses_intermediate_directory_symlink(tmp_path: Path) -> None:
+    configured = tmp_path / "configured"
+    configured.mkdir(mode=0o700)
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(mode=0o700)
+    target = target_dir / "victim.jsonl"
+    target.write_text("sentinel\n", encoding="utf-8")
+    (configured / "pivot").symlink_to(target_dir, target_is_directory=True)
+
+    DiskLog(configured / "pivot" / target.name)._append({"content": "secret"})
+
+    assert target.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_append_allows_private_directory_below_sticky_root(tmp_path: Path) -> None:
+    sticky = tmp_path / "sticky"
+    sticky.mkdir(mode=0o777)
+    sticky.chmod(0o1777)
+    private = sticky / "private"
+    private.mkdir(mode=0o700)
+    path = private / "log.jsonl"
+
+    DiskLog(path)._append({"seq": 1})
+
+    assert json.loads(path.read_text(encoding="utf-8"))["seq"] == 1
+
+
+def test_append_accepts_safe_relative_parent_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    working = tmp_path / "working"
+    working.mkdir(mode=0o700)
+    monkeypatch.chdir(working)
+
+    DiskLog(Path("../logs/log.jsonl"))._append({"seq": 1})
+
+    assert json.loads((tmp_path / "logs/log.jsonl").read_text())["seq"] == 1
+
+
+def test_append_stays_bound_to_verified_file_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "log.jsonl"
+    detached = tmp_path / "detached.jsonl"
+    target = tmp_path / "target.jsonl"
+    target.write_text("sentinel\n", encoding="utf-8")
+    log = DiskLog(path)
+    log._append({"seq": 1})
+
+    path.rename(detached)
+    path.symlink_to(target)
+    log._append({"seq": 2})
+
+    assert target.read_text(encoding="utf-8") == "sentinel\n"
+    assert [json.loads(line)["seq"] for line in detached.read_text().splitlines()] == [
+        1,
+        2,
+    ]
+
+
+def test_prune_does_not_replace_successor_path(tmp_path: Path) -> None:
+    path = tmp_path / "log.jsonl"
+    rotated = tmp_path / "log.jsonl.1"
+    log = DiskLog(path, retention_hours=1.0)
+    log._append({"ts": "1970-01-01T00:00:00+00:00", "content": "expired"})
+    path.rename(rotated)
+    path.write_text("successor\n", encoding="utf-8")
+
+    dropped = log.prune(now=time.time())
+
+    assert dropped == 0
+    assert path.read_text(encoding="utf-8") == "successor\n"
+    assert "expired" in rotated.read_text(encoding="utf-8")
+
+
+def test_close_releases_descriptor_and_allows_safe_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "log.jsonl"
+    rotated = tmp_path / "log.jsonl.1"
+    log = DiskLog(path)
+    log._append({"seq": 1})
+    assert log._file is not None
+    first_handle = log._file
+
+    log.close()
+
+    assert first_handle.closed
+    assert log._file is None
+    path.rename(rotated)
+    log._append({"seq": 2})
+    assert json.loads(path.read_text(encoding="utf-8"))["seq"] == 2
+
+
+async def test_hub_lifespan_closes_disk_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log = DiskLog(tmp_path / "log.jsonl")
+    isolated_state = HubState()
+    monkeypatch.setattr(hub_module, "disk_log", log)
+    monkeypatch.setattr(hub_module, "state", isolated_state)
+    monkeypatch.setattr(hub_module, "_mcp_server", None)
+
+    async with hub_module.lifespan(hub_module.app):
+        log._append({"seq": 1})
+        assert log._file is not None
+        handle = log._file
+
+    assert handle.closed
+    assert log._file is None
+    assert isolated_state._log_sink is None
+
+
+def test_append_refuses_untrusted_writable_parent(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+    path = shared / "log.jsonl"
+
+    DiskLog(path)._append({"content": "secret"})
+
+    assert not path.exists()
+
+
+def test_append_refuses_hard_link(tmp_path: Path) -> None:
+    target = tmp_path / "target.jsonl"
+    target.write_text("sentinel\n", encoding="utf-8")
+    target.chmod(0o600)
+    path = tmp_path / "log.jsonl"
+    os.link(target, path)
+
+    DiskLog(path)._append({"content": "secret"})
+
+    assert target.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_append_refuses_wrong_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "log.jsonl"
+    path.write_text("sentinel\n", encoding="utf-8")
+    path.chmod(0o600)
+    inode = path.stat().st_ino
+    real_fstat = os.fstat
+
+    def _wrong_owner_for_log(fd: int) -> os.stat_result:
+        result = real_fstat(fd)
+        if stat.S_ISREG(result.st_mode) and result.st_ino == inode:
+            fields = list(result)
+            fields[4] = result.st_uid + 1
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(disklog_module.os, "fstat", _wrong_owner_for_log)
+
+    DiskLog(path)._append({"content": "secret"})
+
+    assert path.read_text(encoding="utf-8") == "sentinel\n"
+
+
+def test_prune_refuses_final_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.jsonl"
+    target.write_text(
+        json.dumps({"ts": "1970-01-01T00:00:00+00:00"}) + "\nsecret\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "log.jsonl"
+    path.symlink_to(target)
+
+    dropped = DiskLog(path, retention_hours=1.0).prune(now=time.time())
+
+    assert dropped == 0
+    assert path.is_symlink()
+    assert target.read_text(encoding="utf-8").endswith("\nsecret\n")
 
 
 async def test_enqueue_never_blocks_and_drops_oldest_when_full(
@@ -94,10 +300,18 @@ def test_prune_drops_lines_older_than_retention(tmp_path: Path) -> None:
 
     dropped = log.prune(now=now)
     assert dropped == 1
+    log._append({"ts": _event_ts(now), "content": "after-prune"})
     remaining = [json.loads(line)["content"] for line in path.read_text().splitlines()]
-    assert remaining == ["fresh"]
+    assert remaining == ["fresh", "after-prune"]
 
 
 def test_prune_missing_file_is_noop(tmp_path: Path) -> None:
     log = DiskLog(tmp_path / "absent.jsonl")
     assert log.prune() == 0
+
+
+def _event_ts(timestamp: float) -> str:
+    """Return a UTC timestamp in DiskLog's serialized format."""
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()

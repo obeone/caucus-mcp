@@ -880,6 +880,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 await stack.enter_async_context(_mcp_server.session_manager.run())
             yield
     finally:
+        if disk_log is not None:
+            state.set_log_sink(None)
         if supervisor is not None:
             with contextlib.suppress(Exception):
                 await supervisor.shutdown()
@@ -889,6 +891,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if disk_log is not None:
+            disk_log.close()
 
 
 app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
