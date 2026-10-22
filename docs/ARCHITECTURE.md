@@ -521,7 +521,7 @@ enable the launcher without a token is what makes the request-time check real.
   `create_subprocess_exec`.
 - **No caller-controlled flags.** Each operator value is rendered into one
   `--flag=value` argv element, so a value starting with a dash can never be read
-  as an option, and a trailing `--` terminates option parsing.
+  as an option.
 - **No inherited environment.** The child environment is rebuilt from
   `CHILD_ENV_ALLOWLIST`. `ANTHROPIC_API_KEY` and every `CAUCUS_*` variable the
   hub holds are deliberately excluded; a child authenticates through the Claude

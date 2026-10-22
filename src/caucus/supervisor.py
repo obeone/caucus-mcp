@@ -10,8 +10,7 @@ guard here is load-bearing and the module is deliberately paranoid:
   supplies *values*, never program names and never raw argv.
 * **No caller-controlled flags.** Each operator-supplied value is rendered by
   this module into a single ``--flag=value`` argv element, so an operator string
-  can never land in a position argparse would read as an option. A trailing
-  ``--`` terminates option parsing for good measure.
+  can never land in a position argparse would read as an option.
 * **No inherited environment.** The child's environment is rebuilt from the
   explicit :data:`CHILD_ENV_ALLOWLIST`, never from a copy of ``os.environ``. The
   hub process typically holds ``ANTHROPIC_API_KEY`` and one or more ``CAUCUS_*``
@@ -712,9 +711,13 @@ class AgentSupervisor:
         Every operator-supplied value is embedded in a single ``--flag=value``
         element rather than following its flag as a separate one. That way a
         value beginning with a dash can never be mistaken for an option, and no
-        operator string ever occupies an argv slot of its own. The trailing
-        ``--`` terminates option parsing, so even if the child's parser grows a
-        positional later, nothing here can drift into it.
+        operator string ever occupies an argv slot of its own.
+
+        No trailing ``--`` is appended: argparse rejects a bare ``--`` as an
+        unrecognized argument when the parser declares no positional, which is
+        the case for every runtime, so it made every launch exit before
+        connecting. The single-element form already keeps values out of option
+        position without it.
 
         Parameters
         ----------
@@ -736,7 +739,6 @@ class AgentSupervisor:
             argv.append(f"--model={spec.model}")
         if spec.mission:
             argv.append(f"--mission={spec.mission}")
-        argv.append("--")
         return argv
 
     def _command(self, spec: AgentSpec) -> ArgvList:
