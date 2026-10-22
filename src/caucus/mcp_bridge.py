@@ -967,7 +967,7 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
 def floor(
     action: str, scope: str = "all", reason: str | None = None
 ) -> dict[str, object]:
-    """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+    """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` "all" (default) or "#channel"; `reason` for take. `status` works pre-join. See protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, rate_limited, not_joined."""
     gate = _ensure_armed()
     if gate is not None:
         return gate
@@ -994,6 +994,9 @@ def floor(
                 "reason": reason or "",
             },
         )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 

@@ -404,6 +404,31 @@ async def test_ui_receives_message_and_mode_events() -> None:
     assert "mode" in types
 
 
+def test_slow_ui_queue_is_bounded_and_reconnect_gets_latest_snapshot() -> None:
+    """A blocked dashboard is cut off instead of retaining endless events."""
+    state = HubState()
+    client = state.register("floor-flooder").client
+    assert client is not None
+    queue = state.add_ui()
+    queue.get_nowait()  # drop the priming snapshot
+
+    assert queue.maxsize > 0
+    for _ in range(queue.maxsize + 1):
+        assert state.take_floor(client.token, "all", "x")["ok"] is True
+        assert state.drop_floor(client.token, "all")["ok"] is True
+
+    assert queue.qsize() <= queue.maxsize
+    assert queue.get_nowait() == {"type": "overflow"}
+
+    # Once overflowed, this stale listener ignores later events. A reconnect is
+    # primed from authoritative state and therefore sees the latest floor.
+    assert state.take_floor(client.token, "all", "latest")["ok"] is True
+    assert queue.empty()
+    snapshot = state.add_ui().get_nowait()
+    assert snapshot["floors"]["all"]["holder"] == "floor-flooder"
+    assert snapshot["floors"]["all"]["reason"] == "latest"
+
+
 async def test_remove_ui_stops_fanout() -> None:
     state = HubState()
     queue = state.add_ui()

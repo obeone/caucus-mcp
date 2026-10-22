@@ -601,6 +601,32 @@ def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
         assert "retry_after" in flooded.json()
 
 
+def test_floor_actions_spend_the_chatter_rate_limit(
+    client: TestClient, state: HubState
+) -> None:
+    """A take/drop loop cannot bypass the peer's normal write budget."""
+    token = _register(client, "floor-flooder")
+    state.set_rate_limit(refill_rate=0.001, capacity=2.0)
+
+    taken = client.post(
+        "/floor",
+        json={"token": token, "action": "take", "scope": "all", "reason": "x"},
+    )
+    dropped = client.post(
+        "/floor", json={"token": token, "action": "drop", "scope": "all"}
+    )
+    blocked = client.post(
+        "/floor",
+        json={"token": token, "action": "take", "scope": "all", "reason": "x"},
+    )
+
+    assert taken.status_code == 200
+    assert dropped.status_code == 200
+    assert blocked.status_code == 429
+    assert "retry_after" in blocked.json()
+    assert state.floors_public() == {}
+
+
 # --- channels ------------------------------------------------------------
 
 
@@ -926,26 +952,49 @@ def test_ui_socket_sees_channel_membership(client: TestClient) -> None:
     }
 
 
+def test_agent_roster_fanout_uses_the_ui_overflow_policy(
+    client: TestClient, state: HubState
+) -> None:
+    """Launcher events cannot bypass the bounded dashboard queue policy."""
+    queue = state.add_ui()
+    queue.get_nowait()  # drop the priming snapshot
+    hub_module._ui_queues.add(queue)
+    try:
+        assert queue.maxsize > 0
+        for _ in range(queue.maxsize + 1):
+            hub_module._broadcast_agents()
+        assert queue.qsize() <= queue.maxsize
+        assert queue.get_nowait() == {"type": "overflow"}
+    finally:
+        hub_module._ui_queues.discard(queue)
+        state.remove_ui(queue)
+
+
 # --- duplicate-join detection --------------------------------------------
 
 
-def test_register_duplicate_with_live_listener_is_refused(
-    client: TestClient, state: HubState
+@pytest.mark.parametrize("presented", [None, "wrong-token", "jeton-étranger"])
+def test_register_existing_project_requires_matching_token(
+    client: TestClient, state: HubState, presented: str | None
 ) -> None:
-    """A second register for a name held by a live listener returns 409."""
+    """A polling gap never lets a newcomer claim an existing identity."""
     body = client.post("/register", json={"project": "alpha"}).json()
-    assert body["token"]
-    # Simulate a live long-poll in flight on the underlying client object.
-    underlying = hub_module.state.client_for(body["token"])
+    token = body["token"]
+    underlying = hub_module.state.client_for(token)
     assert underlying is not None
-    underlying.active_polls = 1
+    assert underlying.active_polls == 0
+    payload = {"project": "alpha"}
+    if presented is not None:
+        payload["token"] = presented
 
-    resp = client.post("/register", json={"project": "alpha"})
+    resp = client.post("/register", json=payload)
 
     assert resp.status_code == 409
     data = resp.json()
     assert data["error"] == "name_in_use"
+    assert "token" not in data
     assert data["note"]
+    assert hub_module.state.client_for(token) is underlying
 
 
 def test_register_with_matching_token_is_reaffirmed(

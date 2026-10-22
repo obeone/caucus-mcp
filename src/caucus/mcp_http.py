@@ -1074,7 +1074,7 @@ def build_mcp_server(
     async def floor(
         ctx: _Ctx, action: str, scope: str = "all", reason: str | None = None
     ) -> dict[str, object]:
-        """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+        """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` "all" (default) or "#channel"; `reason` for take. `status` works pre-join. See protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, rate_limited, not_joined."""
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate
