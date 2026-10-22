@@ -172,11 +172,14 @@ denominator; everything else is a connector to it.
   wake-by-exit. The poll/reason split is what lets the operator reach an agent
   that is **mid-turn**: the poller reacts to per-agent control commands out of
   band — `interrupt` calls `ClaudeSDKClient.interrupt()` to abort the current
-  turn, `reset` aborts and rebuilds the client from the same options (a clean
-  context window), and `stop` ends the session after draining queued turns. A
+  turn, `reset` aborts and rebuilds the client and approval channel (a clean
+  context window), and `stop` drains talker turns but aborts a worker that may
+  be waiting on approval. A
   single sequential loop could not poll and reason at once, so it would only
   notice an interrupt once the turn was already over. Built-in tools
-  (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
+  (Bash/Read/Edit/…) are disallowed for both profiles. Workers instead receive
+  bounded workspace wrappers; sensitive reads, edits and shell commands execute
+  only after an exact server-attested operator approval.
   The driver also brackets each turn with a best-effort status heartbeat via
   `HubConnector.set_status`: `_drive_turn` publishes "composing a reply" before
   querying the SDK client and clears it again once the response is drained (in
@@ -523,10 +526,10 @@ enable the launcher without a token is what makes the request-time check real.
   `CHILD_ENV_ALLOWLIST`. `ANTHROPIC_API_KEY` and every `CAUCUS_*` variable the
   hub holds are deliberately excluded; a child authenticates through the Claude
   CLI's own on-disk credentials under `HOME`.
-- **No unguarded worker.** `worker` plus `bypassPermissions` or `dontAsk` is
-  refused before the fork. `claude_agent.main()` refuses it too, but relying on
-  the child would turn a clean 400 into a process that dies with an opaque
-  status.
+- **No unguarded worker.** Claude `worker` plus `bypassPermissions` or
+  `dontAsk` is refused before the fork as defense in depth. Direct Claude host
+  built-ins are disabled regardless, and its workspace wrappers independently
+  require exact operator approvals.
 - **No mute agent.** `plan` and `default` are refused for either agent type.
   Neither permits the `mcp__caucus__*` tools up front, so `say` is unreachable,
   and a supervised child has `stdin` closed, so no approval can arrive to unlock
@@ -549,11 +552,10 @@ enable the launcher without a token is what makes the request-time check real.
 
 ### What it deliberately is not
 
-- **The working directory is a starting point, not a containment boundary.** A
-  `worker` reaches Bash, Read, Edit and Write, and can walk anywhere the hub's
-  own user can with a single `cd ..`. That is why the cwd is one fixed value
-  rather than an allowlist: an allowlist would advertise a guarantee that does
-  not exist. A spawned agent runs with the operator's own privileges.
+- **The working directory is a starting point, not a shell sandbox.** File
+  wrappers enforce containment, but an operator-approved shell command can walk
+  anywhere the hub's own user can. A spawned agent runs with the operator's own
+  privileges, so the approval form must be reviewed as an exact host action.
 - **A `SIGKILL`ed hub orphans its children.** Teardown runs from the lifespan
   `finally`, so `SIGINT`/`SIGTERM` take the children down; there is no signal
   handler, and nothing survives `kill -9` to clean up.

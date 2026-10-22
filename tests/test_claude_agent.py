@@ -32,14 +32,16 @@ def test_tool_policy_talker_is_caucus_only() -> None:
     assert "Bash" in disallowed
 
 
-def test_tool_policy_worker_adds_builtins_and_blocks_nothing() -> None:
-    """A worker keeps caucus tools and additionally wields the built-ins."""
+def test_tool_policy_worker_uses_wrappers_and_blocks_builtins() -> None:
+    """A worker reaches the host only through bounded application wrappers."""
     allowed, disallowed = claude_agent.tool_policy("worker")
-    assert disallowed == []
+    assert disallowed == claude_agent._BUILTIN_TOOLS
     for caucus_tool in claude_agent._CAUCUS_TOOLS:
         assert caucus_tool in allowed
-    assert "Bash" in allowed
-    assert "Edit" in allowed
+    for workspace_tool in claude_agent._WORKSPACE_TOOLS:
+        assert workspace_tool in allowed
+    assert "Bash" not in allowed
+    assert "Edit" not in allowed
 
 
 def test_tool_policy_rejects_unknown_type() -> None:
@@ -246,6 +248,107 @@ async def test_say_omits_missed_and_warning_on_clean_delivery(
     result = SendResult(ok=True, message_id="m3", delivered_to=["peer"])
     text = await _say_reply_text(monkeypatch, result)
     assert text == "delivered (id=m3) to ['peer']"
+
+
+class _WorkspaceApproval:
+    """Record exact workspace actions and return a scripted decision."""
+
+    def __init__(self, approved: bool) -> None:
+        self.approved = approved
+        self.requests: list[tuple[str, str]] = []
+
+    async def request(self, action: str, detail: str) -> bool:
+        self.requests.append((action, detail))
+        return self.approved
+
+
+async def test_claude_worker_read_requires_operator_approval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A peer-induced read cannot expose workspace data without approval."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do-not-exfiltrate")
+    approvals = _WorkspaceApproval(False)
+    workspace = claude_agent.Workspace(tmp_path, approvals.request, "auto")
+    monkeypatch.setattr(
+        claude_agent, "create_sdk_mcp_server", lambda **kwargs: kwargs["tools"]
+    )
+
+    tools = claude_agent._build_agent_server(
+        _SendingConnector(SendResult(ok=True)),
+        "tok",
+        "worker",
+        workspace,
+        approvals.request,
+    )
+    read_file = next(tool for tool in tools if tool.name == "read_file")
+    reply = await read_file.handler(
+        {"path": "secret.txt", "start_line": 1, "lines": 200}
+    )
+
+    text = str(reply["content"][0]["text"])
+    assert "denied" in text
+    assert "do-not-exfiltrate" not in text
+    assert approvals.requests == [
+        ("read_file", "secret.txt\nstart_line=1\nlines=200")
+    ]
+
+
+async def test_claude_worker_approved_write_still_works(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The bounded worker preserves legitimate writes after exact approval."""
+    approvals = _WorkspaceApproval(True)
+    workspace = claude_agent.Workspace(tmp_path, approvals.request, "auto")
+    monkeypatch.setattr(
+        claude_agent, "create_sdk_mcp_server", lambda **kwargs: kwargs["tools"]
+    )
+
+    tools = claude_agent._build_agent_server(
+        _SendingConnector(SendResult(ok=True)),
+        "tok",
+        "worker",
+        workspace,
+        approvals.request,
+    )
+    write_file = next(tool for tool in tools if tool.name == "write_file")
+    reply = await write_file.handler({"path": "approved.txt", "content": "ok"})
+
+    assert reply["content"][0]["text"] == "wrote approved.txt"
+    assert (tmp_path / "approved.txt").read_text() == "ok"
+    assert approvals.requests == [("write_file", "approved.txt\nok")]
+
+
+async def test_claude_client_routes_approval_answers_and_closes_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live poller can release and then invalidate an approval wait."""
+
+    class SDKClient:
+        async def __aenter__(self) -> SDKClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class Approvals:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def handle_inbound(
+            self, messages: list[dict[str, object]]
+        ) -> list[dict[str, object]]:
+            return []
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(claude_agent, "ClaudeSDKClient", lambda options: SDKClient())
+    approvals = Approvals()
+    client = claude_agent._ClaudeClient(object(), approvals)  # type: ignore[arg-type]
+    async with client:
+        assert client.handle_inbound([{"kind": "answer"}]) == []
+    assert approvals.closed
 
 
 # --- loop control --------------------------------------------------------
@@ -909,15 +1012,29 @@ async def test_run_session_defaults_to_talker_with_auto_permission(
     )
     opts = captured["options"]
     assert opts.permission_mode == "auto"
+    assert opts.tools == []
+    assert opts.skills == []
+    assert opts.setting_sources == []
+    assert opts.strict_mcp_config is True
     assert "Bash" in opts.disallowed_tools
     assert "mcp__caucus__say" in opts.allowed_tools
 
 
-async def test_run_session_worker_gets_builtins_and_chosen_mode(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "permission_mode", ["auto", "acceptEdits", "bypassPermissions"]
+)
+async def test_run_session_worker_gets_wrappers_and_app_approval_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, permission_mode: str
 ) -> None:
-    """A worker session grants the built-ins and honours an explicit mode."""
+    """No SDK permission mode can bypass the application's exact-action gate."""
     captured = _capture_options(monkeypatch)
+    workspace_class = claude_agent.Workspace
+
+    def capture_workspace(root: Any, approval: Any, permission_mode: str) -> Any:
+        captured["workspace_permission_mode"] = permission_mode
+        return workspace_class(root, approval, permission_mode)
+
+    monkeypatch.setattr(claude_agent, "Workspace", capture_workspace)
     await claude_agent.run_session(
         hub_url="http://unused",
         project="alpha",
@@ -925,10 +1042,17 @@ async def test_run_session_worker_gets_builtins_and_chosen_mode(
         model=None,
         poll_timeout=0.0,
         agent_type="worker",
-        permission_mode="bypassPermissions",
+        permission_mode=permission_mode,
+        cwd=tmp_path,
     )
     opts = captured["options"]
-    assert opts.permission_mode == "bypassPermissions"
-    assert opts.disallowed_tools == []
-    assert "Bash" in opts.allowed_tools
+    assert opts.permission_mode == permission_mode
+    assert opts.tools == []
+    assert opts.skills == []
+    assert opts.setting_sources == []
+    assert opts.strict_mcp_config is True
+    assert opts.disallowed_tools == claude_agent._BUILTIN_TOOLS
+    assert "Bash" not in opts.allowed_tools
+    assert "mcp__caucus__write_file" in opts.allowed_tools
     assert "mcp__caucus__say" in opts.allowed_tools
+    assert captured["workspace_permission_mode"] == "auto"

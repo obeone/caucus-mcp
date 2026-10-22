@@ -474,7 +474,7 @@ async def test_spawn_refused_on_bad_permission_mode(spy: _SpySupervisor) -> None
 async def test_worker_with_unguarded_mode_refused(
     spy: _SpySupervisor, mode: str
 ) -> None:
-    """A tool-wielding worker may never run without the approval classifier.
+    """A worker retains the classifier refusal as a second security boundary.
 
     The child refuses this too, but this supervisor must refuse it first, so the
     operator gets a clean error instead of a process that dies with a nonzero
