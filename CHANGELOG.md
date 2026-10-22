@@ -171,6 +171,10 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- **The dashboard build works again with Tailwind CSS 4.** The web app now
+  uses the `@tailwindcss/vite` plugin and loads the existing theme through
+  `@config`, so every custom utility keeps its value.
+
 - Keep the dependency lockfile portable across environments by excluding
   the local uv release-age cutoff. All locked package versions remain
   unchanged, and CI can install with `uv sync --locked --extra dev`.
