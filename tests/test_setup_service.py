@@ -938,6 +938,62 @@ def _launcher_main(
 
 
 @pytest.mark.parametrize("kind", ["launchd", "systemd"])
+def test_main_dry_run_never_prints_configured_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_home: Path,
+    capsys: pytest.CaptureFixture[str],
+    kind: setup_service.Platform,
+) -> None:
+    """Dry-run output preserves the unit shape without exposing credentials."""
+    monkeypatch.setattr(setup_service, "detect_platform", lambda: kind)
+    credentials = (
+        "operator-sentinel-9b82",
+        "observer-sentinel-31d4",
+        "agent-sentinel-a761",
+    )
+
+    rc = _launcher_main(
+        monkeypatch,
+        tmp_path,
+        "--no-hook",
+        "--operator-token",
+        credentials[0],
+        "--observer-token",
+        credentials[1],
+        "--agent-key",
+        credentials[2],
+        "--public-url",
+        "https://hub.example.net",
+        "--allowed-host",
+        "hub.example.net",
+        "--mcp-http",
+    )
+
+    captured = capsys.readouterr()
+    transcript = captured.out + captured.err
+    assert rc == 0
+    assert not any(credential in transcript for credential in credentials)
+    assert captured.err == ""
+    assert "--no-browser" in captured.out
+    assert "https://hub.example.net" in captured.out
+    if kind == "launchd":
+        xml = captured.out[captured.out.index("<?xml") :]
+        xml = xml[: xml.index("</plist>") + len("</plist>")]
+        plist = plistlib.loads(xml.encode("utf-8"))
+        assert plist["EnvironmentVariables"] == {
+            "CAUCUS_OPERATOR_TOKEN": "[REDACTED]",
+            "CAUCUS_OBSERVER_TOKEN": "[REDACTED]",
+            "CAUCUS_AGENT_KEY": "[REDACTED]",
+            "CAUCUS_PUBLIC_URL": "https://hub.example.net",
+            "CAUCUS_ALLOWED_HOSTS": "hub.example.net",
+            "CAUCUS_MCP_HTTP": "1",
+        }
+    else:
+        assert "EnvironmentFile=-" in captured.out
+
+
+@pytest.mark.parametrize("kind", ["launchd", "systemd"])
 def test_main_dry_run_prints_a_launcher_enabled_unit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

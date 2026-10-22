@@ -69,6 +69,11 @@ WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 #: every sane generator (``openssl rand -hex``, ``uuidgen``, base64url) fits.
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
 
+#: Visible placeholder used only in diagnostic output. Launchd credentials are
+#: replaced before XML rendering so no value-based text substitution can alter
+#: an unrelated field or leave an overlapping credential partially exposed.
+DRY_RUN_REDACTION = "[REDACTED]"
+
 #: Same idea for the values that are addresses rather than secrets: a public URL
 #: and the ``Host`` allowlist entries travel through the same plist and env-file
 #: plumbing, so they get a charset neither format treats specially. Wide enough
@@ -1257,7 +1262,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the plan and the generated unit, change nothing",
+        help=(
+            "print the plan and a credential-redacted unit preview, change nothing"
+        ),
     )
     parser.add_argument(
         "--uninstall", action="store_true", help="stop the service and remove it"
@@ -1316,9 +1323,21 @@ def main(argv: list[str] | None = None) -> int:
             logfile=logfile,
             label=args.label,
             at_login=args.at_login,
-            operator_token=args.operator_token,
-            observer_token=args.observer_token,
-            agent_key=args.agent_key,
+            operator_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.operator_token is not None
+                else args.operator_token
+            ),
+            observer_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.observer_token is not None
+                else args.observer_token
+            ),
+            agent_key=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.agent_key is not None
+                else args.agent_key
+            ),
             public_url=args.public_url,
             allowed_hosts=args.allowed_host,
             mcp_http=args.mcp_http,
