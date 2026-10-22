@@ -1230,7 +1230,9 @@ def _radio_field() -> dict[str, object]:
 
 
 def test_ask_operator_opens_form(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bridge, "PROJECT", "form-asker")
+    # Distinct from "form-asker": the hub outlives a single test and refuses a
+    # tokenless re-join of a name another test already registered.
+    monkeypatch.setattr(bridge, "PROJECT", "form-opener")
     bridge.join()
     result = bridge.ask_operator("Deploy?", [_radio_field()])
     assert result["form_id"]

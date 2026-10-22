@@ -244,6 +244,16 @@ and rename that heading to the version when you cut the release.
   and `/decisions` peer routes now require `Authorization: Bearer` and reject
   query-only credentials. Current Caucus clients already use the header; raw
   HTTP integrations that still construct `?token=` URLs must be updated.
+- **Project names can no longer be claimed during a receive-poll gap.** A
+  registration without the incumbent peer token used to receive the existing
+  `Client` record whenever `active_polls == 0`, disclosing its stable bearer
+  token and transferring its private queue, acknowledgements, and channel
+  memberships. The same no-token path could replace a reaped-but-revivable
+  identity. `HubState.register` now requires the exact peer token for every
+  live or revivable name, returns `409 name_in_use` otherwise, and compares
+  UTF-8 bytes so a non-ASCII impostor token is refused instead of raising.
+  Authenticated leave and operator kick remain explicit ways to release a
+  reaped reservation.
 - **A non-loopback `--public-url` now arms the same credentials guard a
   non-loopback bind does.** The guard only ever looked at the bind address, so
   a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local

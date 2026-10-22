@@ -406,8 +406,7 @@ class RegisterResponse(BaseModel):
     told the directory (names, topics, members) up front — no extra round-trip.
     Each value is ``{"topic": str | None, "members": [name, ...]}``."""
     note: str | None = None
-    """Optional human-readable advisory, e.g. when this registration took over
-    a timed-out session."""
+    """Optional human-readable advisory reserved for compatible extensions."""
 
 
 class SendRequest(BaseModel):

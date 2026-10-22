@@ -1713,14 +1713,12 @@ async def register(
     The current channel directory (names, topics, members) ships in the response
     so a late-joining peer learns the open rooms without a follow-up call.
 
-    When the project name is already held by a live listener **and** no valid
-    token is presented, the hub refuses the request with HTTP 409 so the caller
-    knows it looks like a duplicate process.
+    When a live or revivable identity already owns the project name and no
+    matching token is presented, the hub refuses the request with HTTP 409.
 
     When a valid ``token`` is presented and matches the existing record, the
-    registration is silently re-affirmed (REAFFIRMED outcome). When the prior
-    listener is gone (dead process / timed-out watcher), the slot is taken over
-    (REPLACED outcome) and a human-readable ``note`` advises the caller.
+    registration is silently re-affirmed (REAFFIRMED outcome), including across
+    polling gaps and while reviving an idle-reaped record inside its grace window.
 
     A peer holds no per-peer token yet, so this is the door the shared agent key
     guards: when one is configured, the caller must present it as
@@ -1765,19 +1763,13 @@ async def register(
                 "error": "name_in_use",
                 "project": req.project,
                 "note": (
-                    "an active listener already holds this name; you look like"
-                    " a duplicate process — re-join under a different name."
+                    "an existing identity already owns this name; present its"
+                    " token or re-join under a different name."
                 ),
             },
         )
-    client = reg.client  # not None for FRESH / REAFFIRMED / REPLACED
+    client = reg.client  # not None for FRESH / REAFFIRMED
     assert client is not None
-    note = (
-        "you may be replacing a timed-out session and could be joining"
-        " mid-conversation."
-        if reg.outcome is RegisterOutcome.REPLACED
-        else None
-    )
     stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
     logger.info(
         "registered project=%s outcome=%s (protocol_version=%s, stale=%s)",
@@ -1793,7 +1785,6 @@ async def register(
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
         channels=state.channels(),
-        note=note,
     )
 
 
@@ -2186,11 +2177,10 @@ async def receive(
     one it displaced gets ``409 already_listening`` (immediately if its poll is
     still in flight, otherwise on its next poll) and must stop polling.
 
-    While this call is in flight, ``client.active_polls`` is incremented, which
-    lets :meth:`~caucus.state.HubState.register` distinguish a genuine
-    reconnect from a colliding duplicate process. That counter tracks polls, the
-    lease tracks consumers; both are needed, see
-    :attr:`~caucus.state.Client.active_polls`.
+    While this call is in flight, ``client.active_polls`` is incremented for
+    listener observability in the operator UI. Identity ownership is proved by
+    the peer token, never inferred from this transient counter. The lease tracks
+    which consumer may poll; see :attr:`~caucus.state.Client.active_polls`.
 
     Messages returned to the caller are appended to :attr:`~caucus.state.Client.unacked`
     so they can be replayed if the client disconnects before acknowledging them.
@@ -2374,11 +2364,8 @@ async def receive(
             _release_getter(pri_get, client.priority_queue)
             _release_getter(chat_get, client.queue)
         finally:
-            # This decrement must never be skipped. A leaked count leaves the
-            # peer looking like it holds a live listener forever, and
-            # HubState.register then refuses every re-join under that name as a
-            # colliding duplicate (CONTESTED) — the project is wedged out of its
-            # own identity for the lifetime of the hub. Cleanup failures still
+            # This decrement must never be skipped: a leaked count makes the
+            # operator UI report a live listener forever. Cleanup failures still
             # propagate; they just do not take the counter down with them.
             client.active_polls -= 1
 

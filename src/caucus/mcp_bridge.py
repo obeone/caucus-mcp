@@ -281,7 +281,7 @@ def _session_expired() -> dict[str, object]:
 # Minimum interval between automatic session_expired recoveries, in seconds,
 # regardless of outcome. Guards :func:`_attempt_auto_rejoin` against turning
 # into a retry loop when the hub keeps refusing this identity (genuinely down,
-# or the name was taken over by another live peer): one attempt per window,
+# or the name now belongs to another identity): one attempt per window,
 # never a tight loop of 401s each minting another /register call.
 _AUTO_REJOIN_COOLDOWN_SECONDS = 60.0
 
@@ -609,8 +609,8 @@ def join(
     # later tool call in this process would speak as the newcomer, and the
     # parent's peer would be left on the hub with nobody holding its token.
     # Refuse locally, before the hub is contacted, so no stray peer is minted.
-    # Re-joining under the SAME name stays allowed: that is the reaffirm /
-    # revive / replace path the protocol tells agents to use.
+    # Re-joining under the SAME name stays allowed: that is the reaffirm/revive
+    # path the protocol tells agents to use.
     if _token is not None and _joined_as != name:
         logger.warning(
             "join refused: this process already holds identity %s (requested %s)",
@@ -643,10 +643,10 @@ def join(
             resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 body = resp.json()
-                note = body.get("note", "an active listener already holds this name")
+                note = body.get("note", "an existing identity owns this name")
                 logger.warning(
-                    "join refused for project=%s — name is already held by a live"
-                    " peer; re-launch under a different CAUCUS_PROJECT",
+                    "join refused for project=%s — name is already owned; present"
+                    " its token or re-launch under a different CAUCUS_PROJECT",
                     name,
                 )
                 # The hub rejected the token we presented, so this process holds

@@ -965,9 +965,28 @@ def test_register_with_matching_token_is_reaffirmed(
     assert resp.json()["token"] == token
 
 
-def _token(client: TestClient, project: str) -> str:
-    """Re-register an already-known project to recover its (stable) token."""
-    return str(client.post("/register", json={"project": project}).json()["token"])
+def test_register_reaped_project_requires_matching_token(
+    client: TestClient, state: HubState
+) -> None:
+    """The revival grace window reserves the name for its token holder."""
+    token = _register(client, "alpha")
+    underlying = state.client_for(token)
+    assert underlying is not None
+    state.reap_stale(ttl=30.0, now=underlying.last_seen + 1000.0)
+
+    for presented in (None, "wrong-token", "jeton-étranger"):
+        payload = {"project": "alpha"}
+        if presented is not None:
+            payload["token"] = presented
+        resp = client.post("/register", json=payload)
+        assert resp.status_code == 409
+        assert "token" not in resp.json()
+
+    reaffirmed = client.post(
+        "/register", json={"project": "alpha", "token": token}
+    )
+    assert reaffirmed.status_code == 200
+    assert reaffirmed.json()["token"] == token
 
 
 # --- operator forms ------------------------------------------------------

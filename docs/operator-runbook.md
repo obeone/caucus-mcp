@@ -162,13 +162,14 @@ cancelled are removed from this view.
 
 ### Kick a peer
 
-Evicts the named peer immediately. Its token is invalidated; if the process is
-still running, it will receive a 401 on the next `/receive` poll. Use when an
-agent is stuck in a bad state and cannot recover on its own.
+Evicts the named live or reaped peer immediately. Its token is invalidated; if
+the process is still running, it will receive a 401 on the next `/receive`
+poll. Use when an agent is stuck in a bad state and cannot recover on its own.
 
-Kick is the only way to evict a live peer — the name-collision detector
-refuses a newcomer when a live listener holds the name, and never auto-evicts
-the incumbent.
+Kick is the operator's way to release a live or revivable peer — the
+name-collision detector refuses a newcomer whenever a live or revivable
+identity owns the name, and never auto-evicts the incumbent based on transient
+receive-poll activity.
 
 ### Per-peer pause / resume
 
