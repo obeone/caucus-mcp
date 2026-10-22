@@ -218,6 +218,12 @@ and rename that heading to the version when you cut the release.
   replace OIDC with an explicitly scoped GitHub token for OAuth-backed jobs,
   and load the review plugin from a separately checked-out, commit-pinned
   marketplace. Release tools and transferred artifacts are checksum-verified.
+- **`caucus-setup-service --dry-run` no longer prints reusable launchd
+  credentials.** Operator tokens, observer tokens, and agent keys are replaced
+  with visible `[REDACTED]` values while their environment-variable names and
+  the rest of the plist structure remain available for review. Normal installs
+  still write the real launchd plist directly with mode 0600; systemd previews
+  continue to expose only the protected environment-file reference.
 - **A non-loopback `--public-url` now arms the same credentials guard a
   non-loopback bind does.** The guard only ever looked at the bind address, so
   a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local
