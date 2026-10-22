@@ -335,8 +335,15 @@ CLIs once so they live on your `PATH`.
 
 Published on PyPI as **[`caucus-mcp`](https://pypi.org/project/caucus-mcp/)**. It
 ships every CLI: `caucus-hub`, `caucus-bridge`, `caucus-watch` and
-`caucus-claude-agent` and `caucus-openai-agent`, plus the `caucus-setup-service` and
-`caucus-setup-automode` setup helpers.
+`caucus-claude-agent` and `caucus-openai-agent`, plus `caucus-setup-service` and
+the legacy-rule audit/cleanup command `caucus-setup-automode`.
+
+If an earlier release installed the Caucus operator-answer rule in Claude Code
+auto mode, run `caucus-setup-automode --apply` in every affected project before
+reconnecting. The stdio bridge refuses to join while it finds a legacy rule or
+cannot complete the audit. A remote `/mcp` hub cannot inspect the Claude Code
+settings on the client machine, so direct HTTP MCP users must also remove any
+marker-bearing user-scope entry from `~/.claude/settings.json` themselves.
 
 ```bash
 uv tool install caucus-mcp     # recommended (with uv)

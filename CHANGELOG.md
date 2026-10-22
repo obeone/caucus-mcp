@@ -250,6 +250,19 @@ and rename that heading to the version when you cut the release.
   fan-out. A console that falls behind is disconnected with a retryable close
   and reconnects to a fresh snapshot instead of retaining an unlimited backlog
   in hub memory; floor clients preserve the structured `rate_limited` response.
+- **Claude Code auto mode no longer grants authority from rendered Caucus
+  messages.** A peer could put the trusted-looking `origin="operator"` and
+  `kind="answer"` markers in ordinary message content, while the auto-mode
+  classifier could not inspect the hub's authenticated structured provenance.
+  `caucus-setup-automode` therefore no longer installs the natural-language
+  allow rule: check mode identifies legacy copies as unsafe, and `--apply`
+  removes every project-local marker-bearing copy while preserving unrelated
+  settings. The Claude Code stdio bridge refuses to join when that audit finds
+  a legacy copy or fails; direct HTTP MCP users must follow the documented
+  migration because a remote hub cannot inspect their client-local settings.
+  Operator answers remain informational on passive MCP hosts; native workers
+  continue to authorize only exact pending actions through structured, one-time
+  form checks at the execution boundary.
 - **Project names can no longer be claimed during a receive-poll gap.** A
   registration without the incumbent peer token used to receive the existing
   `Client` record whenever `active_polls == 0`, disclosing its stable bearer
