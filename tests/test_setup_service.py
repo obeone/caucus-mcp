@@ -838,6 +838,68 @@ def test_render_unit_systemd_enables_the_launcher() -> None:
     off = setup_service.render_unit(**common)  # type: ignore[arg-type]
     assert "--no-browser --enable-agent-launcher\n" in on
     assert "--enable-agent-launcher" not in off
+    assert "--no-agent-launcher" not in off
+
+
+@pytest.mark.parametrize("kind", ["launchd", "systemd"])
+def test_render_unit_carries_the_launcher_opt_out(kind: str) -> None:
+    """``--no-agent-launcher`` reaches the hub's command line on both kinds."""
+    rendered = setup_service.render_unit(
+        kind=kind,  # type: ignore[arg-type]
+        binary=Path("/usr/local/bin/caucus-hub"),
+        host="127.0.0.1",
+        port=8765,
+        logfile=Path("/tmp/hub.log"),
+        disable_agent_launcher=True,
+    )
+    assert "--no-agent-launcher" in rendered
+    assert "--enable-agent-launcher" not in rendered
+
+
+def _plan(**overrides: object) -> str:
+    """Render ``describe_plan`` for a loopback hub with an operator token."""
+    kwargs: dict[str, object] = {
+        "kind": "systemd",
+        "binary": Path("/usr/local/bin/caucus-hub"),
+        "host": "127.0.0.1",
+        "port": 8765,
+        "logfile": Path("/tmp/hub.log"),
+        "unit": Path("/tmp/unit"),
+        "at_login": False,
+        "operator_token": "op123",
+        "hook_path": None,
+        "hook_action": "unchanged",
+    }
+    kwargs.update(overrides)
+    return setup_service.describe_plan(**kwargs)  # type: ignore[arg-type]
+
+
+def test_plan_shows_the_default_launcher_in_the_systemd_home() -> None:
+    """A systemd user unit runs in the home directory, so the launcher is on."""
+    plan = _plan()
+    assert "default cwd your home directory" in plan
+    assert "--no-agent-launcher keeps it off" in plan
+
+
+def test_plan_shows_the_default_launcher_off_under_launchd() -> None:
+    """launchd runs the hub in ``/``, which the hub refuses as a default cwd."""
+    plan = _plan(kind="launchd")
+    assert "launcher off: launchd starts the hub in /" in plan
+
+
+def test_plan_shows_an_explicit_default_launcher_cwd(tmp_path: Path) -> None:
+    """``--agent-cwd`` without the flag still names where agents start."""
+    plan = _plan(kind="launchd", agent_cwd=tmp_path)
+    assert f"default cwd {tmp_path}" in plan
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"operator_token": None}, {"host": "0.0.0.0"}, {"disable_agent_launcher": True}],
+)
+def test_plan_has_no_launcher_where_it_stays_off(overrides: dict[str, object]) -> None:
+    """No token, a network bind or the opt-out: nothing can spawn agents."""
+    assert "operators can spawn agents" not in _plan(**overrides)
 
 
 def test_write_env_file_carries_the_agent_cwd_and_max(
@@ -871,13 +933,56 @@ def test_check_launcher_disabled_returns_none() -> None:
 
 
 @pytest.mark.parametrize("stray", [{"agent_cwd": "/tmp"}, {"agent_max": 2}])
-def test_check_launcher_refuses_launcher_options_without_the_flag(
-    stray: dict[str, object],
+@pytest.mark.parametrize(
+    "blocked", [{"operator_token": None}, {"host": "0.0.0.0"}]
+)
+def test_check_launcher_refuses_launcher_options_where_it_cannot_run(
+    stray: dict[str, object], blocked: dict[str, object]
 ) -> None:
-    """A cwd or ceiling with no launcher would be silently ignored by the hub."""
-    overrides: dict[str, object] = {"enabled": False, "agent_cwd": None, **stray}
+    """Without a token or off loopback the hub would silently ignore them."""
+    overrides: dict[str, object] = {
+        "enabled": False,
+        "agent_cwd": None,
+        **stray,
+        **blocked,
+    }
     with pytest.raises(setup_service.SetupError, match="--enable-agent-launcher"):
         _check_launcher(**overrides)
+
+
+def test_check_launcher_accepts_options_for_the_default_launcher(
+    tmp_path: Path,
+) -> None:
+    """A token on loopback turns the launcher on by default: options count."""
+    got = _check_launcher(enabled=False, agent_cwd=str(tmp_path), agent_max=2)
+    assert got == tmp_path.resolve()
+    assert _check_launcher(enabled=False, agent_cwd=None, agent_max=2) is None
+
+
+def test_check_launcher_validates_the_default_launcher_cwd() -> None:
+    """The default launcher's directory goes through the same path rule."""
+    with pytest.raises(setup_service.SetupError):
+        _check_launcher(enabled=False, agent_cwd="relative/dir")
+
+
+@pytest.mark.parametrize("stray", [{"agent_cwd": "/tmp"}, {"agent_max": 2}])
+def test_check_launcher_refuses_options_with_the_opt_out(
+    stray: dict[str, object],
+) -> None:
+    """A cwd or ceiling next to --no-agent-launcher means nothing."""
+    overrides: dict[str, object] = {
+        "enabled": False,
+        "disabled": True,
+        "agent_cwd": None,
+        **stray,
+    }
+    with pytest.raises(setup_service.SetupError, match="--no-agent-launcher"):
+        _check_launcher(**overrides)
+
+
+def test_check_launcher_opt_out_returns_none() -> None:
+    """With the opt-out there is nothing to validate."""
+    assert _check_launcher(enabled=False, disabled=True, agent_cwd=None) is None
 
 
 def test_check_launcher_requires_an_operator_token() -> None:

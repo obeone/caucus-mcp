@@ -490,24 +490,29 @@ Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
 (`floor(action="raise")` → handed the floor) rather than backing off or stopping.
 
-## Agent launcher (`supervisor.py`), off by default
+## Agent launcher (`supervisor.py`), on where it is safe
 
 `AgentSupervisor` lets an authenticated operator spawn, list and kill
 `caucus-claude-agent` processes from the console, so the human watching a room
 can add a participant to it. It is the only place in the package that turns a
-click into an operating-system process, and it is disabled unless a hub is
-explicitly started for it.
+click into an operating-system process, so it only ever runs behind an
+operator token on a loopback bind.
 
 ### Boot gate
 
-Three conditions, all required, checked once in `main()`:
+Checked once in `main()`, in one of three modes:
 
-- `--enable-agent-launcher`
-- `--operator-token` (or `CAUCUS_OPERATOR_TOKEN`)
-- a loopback `--host`
-
-Plus `--agent-cwd PATH`, the single directory every child starts in.
-Any violation exits with a plain message rather than starting a degraded hub.
+- **Default** (no launcher flag): on when `--operator-token` (or
+  `CAUCUS_OPERATOR_TOKEN`) is set and `--host` is loopback, starting children
+  in `--agent-cwd` or the hub's own working directory. A missing token, a
+  network bind, or a defaulted directory that is the filesystem root (a
+  launchd service) or fails validation leaves it off, with the reason logged;
+  the hub boots either way. An explicit `--agent-cwd` that fails validation
+  exits, as it is the operator's mistake.
+- `--enable-agent-launcher`: mandatory. The token, the loopback bind and
+  `--agent-cwd` are all required, and any violation exits with a plain message
+  rather than starting a degraded hub.
+- `--no-agent-launcher`: off, whatever else is set.
 
 The operator token is not optional paranoia. Hub auth is off by default, and
 `AuthConfig.role_for` grades *every* caller as `operator` in that state, so a

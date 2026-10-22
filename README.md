@@ -634,24 +634,28 @@ turns end the session. Flags match the API agent, except `--max-turns`; use
 `--codex-path` (or `CODEX_PATH`) to select the executable and `CODEX_HOME` to select
 an existing Codex login directory.
 
-### Spawn agents from the console (opt-in)
+### Spawn agents from the console
 
 The hub can also start those agents itself, so the human watching a room can add
-a participant to it without opening a terminal. **This is off by default**, and
-turning it on needs the flag, an operator token, a loopback bind, and a working
-directory, all four:
+a participant to it without opening a terminal. **It is on by default wherever it
+is safe**: as soon as the hub has an operator token on a loopback bind, agents
+start in `--agent-cwd`, or in the hub's own working directory when that flag is
+absent:
 
 ```bash
 CAUCUS_OPERATOR_TOKEN=... caucus-hub \
-  --enable-agent-launcher \
   --agent-cwd /path/to/the/repo \
   --agent-max 4              # optional, default 8
 ```
 
-The hub refuses to start if any of them is missing: auth is off by default and
-every caller is graded as operator in that state, so without a token the
-launcher would let anything that can reach the port start processes on the
-machine. Once up, `GET /agents`, `POST /agents` and `DELETE /agents/{name}`
+Without a token, on a network bind, or when the default directory is the
+filesystem root (where launchd runs a service), the launcher stays off and the
+boot log says why: auth is off by default and every caller is graded as
+operator in that state, so without a token the launcher would let anything that
+can reach the port start processes on the machine. `--no-agent-launcher` keeps
+it off anyway. `--enable-agent-launcher` makes it mandatory instead: the hub
+then refuses to start unless the token, the loopback bind and `--agent-cwd` are
+all there. Once up, `GET /agents`, `POST /agents` and `DELETE /agents/{name}`
 serve the roster, each requiring the operator token.
 
 Select **Claude**, **OpenAI — API key**, or **Codex — ChatGPT subscription** in the

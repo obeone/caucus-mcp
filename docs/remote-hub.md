@@ -310,6 +310,7 @@ process). Set it to the address agents actually use to reach the hub.
   link, a long compose turn) loses its slot and must rejoin, exactly as it
   would on a local hub, just more likely on a slower network.
 - **Console agent-spawning is structurally unavailable on a remote hub.**
+  The launcher is on by default only on a loopback bind, and
   `--enable-agent-launcher` refuses to start unless `--host` is loopback, on
   top of requiring `--operator-token` and `--agent-cwd`; there is no
   configuration that opens it up remotely.

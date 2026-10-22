@@ -3238,6 +3238,69 @@ def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
     return hosts
 
 
+def _default_launcher_config(
+    *,
+    operator_token: str | None,
+    host: str,
+    agent_cwd: str | None,
+    max_agents: int,
+) -> tuple[LauncherConfig, str | None]:
+    """Decide the launcher when neither launcher flag was passed.
+
+    The launcher is on by default, but only where it is safe without anyone
+    asking: an operator token must gate the console (without one every caller
+    is graded as operator) and the bind must be loopback (process creation must
+    not be reachable from the network). Anywhere else it stays off and the
+    reason is returned for the boot log, never raised: a hub started with no
+    launcher flag must keep booting exactly as it did before.
+
+    The working directory is ``agent_cwd`` when the operator gave one, else the
+    hub's own working directory. A defaulted directory that is the filesystem
+    root (what a launchd service runs in) or that fails validation leaves the
+    launcher off; an explicit ``--agent-cwd`` that fails validation is the
+    operator's mistake and raises, as it does with ``--enable-agent-launcher``.
+
+    Args:
+        operator_token: The configured operator token, if any.
+        host: The address the hub binds to.
+        agent_cwd: The operator-supplied ``--agent-cwd``, if any.
+        max_agents: The concurrent-agent ceiling.
+
+    Returns:
+        The launcher policy and, when it stays off, a one-line reason.
+
+    Raises:
+        LauncherRefused: When an explicit ``agent_cwd`` or ``max_agents`` is
+            invalid.
+    """
+    if not operator_token:
+        return LauncherConfig(), "no --operator-token is set"
+    if not is_loopback_host(host):
+        return LauncherConfig(), f"--host {host} is not a loopback bind"
+    if agent_cwd:
+        return (
+            LauncherConfig(
+                enabled=True, cwd=validate_agent_cwd(agent_cwd), max_agents=max_agents
+            ),
+            None,
+        )
+    try:
+        cwd = Path.cwd()
+    except OSError as exc:
+        return LauncherConfig(), f"the working directory is unusable ({exc})"
+    if cwd.parent == cwd:
+        return LauncherConfig(), f"the working directory is {cwd}; set --agent-cwd"
+    try:
+        return (
+            LauncherConfig(
+                enabled=True, cwd=validate_agent_cwd(str(cwd)), max_agents=max_agents
+            ),
+            None,
+        )
+    except LauncherRefused as exc:
+        return LauncherConfig(), f"{exc}; set --agent-cwd"
+
+
 def _doors_block(*, operator: bool, agent: bool, requirement: str) -> str:
     """Render the two-doors inventory shared by both credential refusals.
 
@@ -3595,17 +3658,26 @@ def main() -> None:
             "--operator-token). Env: CAUCUS_MCP_HTTP overrides the default."
         ),
     )
-    parser.add_argument(
+    launcher_switch = parser.add_mutually_exclusive_group()
+    launcher_switch.add_argument(
         "--enable-agent-launcher",
         action="store_true",
         help=(
-            "let an authenticated operator spawn, list and kill "
-            "caucus-claude-agent processes from the console. OFF by default. "
-            "Requires --operator-token, --agent-cwd, and a loopback bind; the "
-            "hub refuses to start if any of the three is missing. A spawned "
-            "'worker' uses bounded workspace tools and operator-approved shell "
-            "actions as the hub's own user; the cwd is not a shell sandbox"
+            "require the agent launcher, which lets an authenticated operator "
+            "spawn, list and kill agent processes from the console. Requires "
+            "--operator-token, --agent-cwd, and a loopback bind; the hub "
+            "refuses to start if any of the three is missing. Without this "
+            "flag the launcher is still ON by default whenever an operator "
+            "token is set on a loopback bind, starting agents in --agent-cwd "
+            "or the hub's working directory. A spawned 'worker' uses bounded "
+            "workspace tools and operator-approved shell actions as the hub's "
+            "own user; the cwd is not a shell sandbox"
         ),
+    )
+    launcher_switch.add_argument(
+        "--no-agent-launcher",
+        action="store_true",
+        help="keep the agent launcher off even where it would be on by default",
     )
     parser.add_argument(
         "--agent-cwd",
@@ -3613,9 +3685,9 @@ def main() -> None:
         metavar="PATH",
         help=(
             "absolute directory every spawned agent starts in (required with "
-            "--enable-agent-launcher). Not an allowlist and not per-spawn: it "
-            "is a starting point, not a containment boundary. "
-            "Env: CAUCUS_AGENT_CWD"
+            "--enable-agent-launcher; defaults to the hub's working directory "
+            "otherwise). Not an allowlist and not per-spawn: it is a starting "
+            "point, not a containment boundary. Env: CAUCUS_AGENT_CWD"
         ),
     )
     parser.add_argument(
@@ -3713,9 +3785,24 @@ def main() -> None:
     # Fail closed at boot, not per request. AuthConfig.role_for grades every
     # caller as "operator" when no operator token is set, so "operator token
     # required" gates nothing in the hub's default configuration: the launcher
-    # would be wide open to anything that can reach the port. Demand all three
-    # preconditions here, once, and refuse to start otherwise.
-    if args.enable_agent_launcher:
+    # would be wide open to anything that can reach the port. An explicit
+    # --enable-agent-launcher demands all three preconditions and refuses to
+    # start otherwise; the default turns the launcher on only where they hold
+    # and leaves it off, with a logged reason, everywhere else.
+    launcher_off_reason: str | None = None
+    if args.no_agent_launcher:
+        launcher_off_reason = "--no-agent-launcher was passed"
+    elif not args.enable_agent_launcher:
+        try:
+            launcher_config, launcher_off_reason = _default_launcher_config(
+                operator_token=args.operator_token or None,
+                host=args.host,
+                agent_cwd=args.agent_cwd,
+                max_agents=args.agent_max,
+            )
+        except LauncherRefused as exc:
+            parser.error(str(exc))
+    else:
         if not args.operator_token:
             parser.error(
                 "--enable-agent-launcher requires --operator-token: without it "
@@ -3810,6 +3897,8 @@ def main() -> None:
             launcher_config.cwd,
             launcher_config.max_agents,
         )
+    elif launcher_off_reason is not None:
+        logger.info("agent launcher off: %s", launcher_off_reason)
     if not args.no_browser:
         _open_browser(_browser_url(args.host, args.port))
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
