@@ -94,6 +94,55 @@ a slow *recipient*), :meth:`route` drops the oldest queued message to make room,
 so the queue behaves like a ring buffer once full.
 """
 
+MAX_UI_QUEUE_SIZE = 256
+"""Maximum events buffered for one dashboard WebSocket.
+
+Dashboard state is recoverable from the snapshot sent on every connection, so
+a listener that falls this far behind is disconnected and must reconnect rather
+than retaining an unlimited event backlog in the hub process.
+"""
+
+
+class UIEventQueue(asyncio.Queue[dict[str, object]]):
+    """Bounded dashboard event queue with a latched overflow state."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=MAX_UI_QUEUE_SIZE)
+        self.overflowed = False
+
+
+def offer_ui_event(
+    queue: asyncio.Queue[dict[str, object]], event: dict[str, object]
+) -> bool:
+    """Queue one dashboard event without blocking or growing memory unboundedly.
+
+    A full listener has already lost the ability to observe an ordered event
+    stream. Discard its stale backlog, leave one overflow sentinel for the
+    WebSocket pump, and reject all later offers. The pump closes the connection;
+    the dashboard then reconnects and receives a fresh state snapshot.
+
+    Args:
+        queue: The per-dashboard event queue.
+        event: The event to enqueue.
+
+    Returns:
+        ``True`` when ``event`` was queued, or ``False`` when the listener was
+        already overflowed or became overflowed during this call.
+    """
+    if isinstance(queue, UIEventQueue) and queue.overflowed:
+        return False
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        while not queue.empty():
+            queue.get_nowait()
+        if isinstance(queue, UIEventQueue):
+            queue.overflowed = True
+        queue.put_nowait({"type": "overflow"})
+        logger.warning("dashboard event queue overflowed; disconnecting listener")
+        return False
+    return True
+
 
 # Per-agent control commands the operator can aim at a single connected agent
 # (as opposed to the room-wide pause/resume/stop/reset of :class:`ControlMode`).
@@ -2345,14 +2394,23 @@ class HubState:
         mode, channels, floors, forms and recent log, matching the dashboard
         protocol's extended snapshot.
         """
-        q: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        q: asyncio.Queue[dict[str, object]] = UIEventQueue()
         self._ui.add(q)
-        q.put_nowait({"type": "snapshot", "mode": self._mode.value,
-                      "peers": self.peers_info(), "channels": self.channels(),
-                      "floors": self.floors_public(),
-                      "forms": self.list_forms(), "log": self.recent(),
-                      "health": self.health(), "rate": self.rate_limit(),
-                      "quiet_after": self._quiet_after})
+        offer_ui_event(
+            q,
+            {
+                "type": "snapshot",
+                "mode": self._mode.value,
+                "peers": self.peers_info(),
+                "channels": self.channels(),
+                "floors": self.floors_public(),
+                "forms": self.list_forms(),
+                "log": self.recent(),
+                "health": self.health(),
+                "rate": self.rate_limit(),
+                "quiet_after": self._quiet_after,
+            },
+        )
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:
@@ -2361,8 +2419,9 @@ class HubState:
 
     def _push_ui(self, event: dict[str, object]) -> None:
         """Fan an event out to every connected UI listener."""
-        for q in self._ui:
-            q.put_nowait(event)
+        for q in tuple(self._ui):
+            if not offer_ui_event(q, event):
+                self._ui.discard(q)
 
     def _announce_system(self, text: str) -> None:
         """Log and broadcast a system notice to the UI feed only."""

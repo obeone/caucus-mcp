@@ -244,6 +244,12 @@ and rename that heading to the version when you cut the release.
   and `/decisions` peer routes now require `Authorization: Bearer` and reject
   query-only credentials. Current Caucus clients already use the header; raw
   HTTP integrations that still construct `?token=` URLs must be updated.
+- **Peer floor actions can no longer exhaust slow dashboard consumers.** The
+  talking-stick endpoint now spends the caller's normal write-rate budget, and
+  every dashboard event queue has a fixed capacity shared by state and launcher
+  fan-out. A console that falls behind is disconnected with a retryable close
+  and reconnects to a fresh snapshot instead of retaining an unlimited backlog
+  in hub memory; floor clients preserve the structured `rate_limited` response.
 - **Project names can no longer be claimed during a receive-poll gap.** A
   registration without the incumbent peer token used to receive the existing
   `Client` record whenever `active_polls == 0`, disclosing its stable bearer

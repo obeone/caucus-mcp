@@ -97,13 +97,33 @@ def _channel_outcome(status_code: int) -> ChannelOutcome | None:
     return _CHANNEL_REFUSALS.get(status_code)
 
 
+def _floor_result(response: httpx.Response) -> dict[str, object]:
+    """Decode a floor response while preserving its structured rate limit.
+
+    Args:
+        response: The hub response to one ``POST /floor`` request.
+
+    Returns:
+        The response body, including ``error=rate_limited`` and its
+        ``retry_after`` hint for HTTP 429.
+
+    Raises:
+        httpx.HTTPError: On any unexpected error status.
+    """
+    if response.status_code == 429:
+        body = response.json()
+        return {"error": "rate_limited", "retry_after": body.get("retry_after")}
+    response.raise_for_status()
+    return dict(response.json())
+
+
 class NameInUseError(RuntimeError):
-    """Raised when ``/register`` is refused because a live peer already holds the name.
+    """Raised when ``/register`` is refused because an identity owns the name.
 
     The hub returns HTTP 409 with ``error: "name_in_use"`` when the project name
-    is currently held by an active listener and no matching token is presented.
-    The caller should either wait for the existing peer to leave, or re-launch
-    under a different ``CAUCUS_PROJECT``.
+    belongs to a live or revivable identity and no matching token is presented.
+    The caller must present that identity's token, wait for terminal removal, or
+    re-launch under a different ``CAUCUS_PROJECT``.
     """
 
 
@@ -908,7 +928,8 @@ class HubConnector:
         Returns:
             The hub's response dict, typically ``{"ok": True}`` on success or
             ``{"ok": False, "error": "floor_held", ...}`` when another peer
-            already holds the stick and the caller is queued.
+            already holds the stick and the caller is queued. A spent floor
+            budget returns ``{"error": "rate_limited", "retry_after": ...}``.
 
         Raises:
             httpx.HTTPError: On transport failures or unexpected status codes.
@@ -918,8 +939,7 @@ class HubConnector:
             "/floor",
             json={"token": token, "action": "take", "scope": scope, "reason": reason},
         )
-        resp.raise_for_status()
-        return dict(resp.json())
+        return _floor_result(resp)
 
     async def pass_floor(self, token: str, scope: str) -> dict[str, object]:
         """Pass the talking stick to the next queued peer (or release it if empty).
@@ -943,8 +963,7 @@ class HubConnector:
             "/floor",
             json={"token": token, "action": "pass", "scope": scope},
         )
-        resp.raise_for_status()
-        return dict(resp.json())
+        return _floor_result(resp)
 
     async def drop_floor(self, token: str, scope: str) -> dict[str, object]:
         """Unconditionally release the talking stick for a scope.
@@ -967,8 +986,7 @@ class HubConnector:
             "/floor",
             json={"token": token, "action": "drop", "scope": scope},
         )
-        resp.raise_for_status()
-        return dict(resp.json())
+        return _floor_result(resp)
 
     async def raise_hand(self, token: str, scope: str) -> dict[str, object]:
         """Signal intent to speak next by joining the talking-stick queue.
@@ -993,8 +1011,7 @@ class HubConnector:
             "/floor",
             json={"token": token, "action": "raise", "scope": scope},
         )
-        resp.raise_for_status()
-        return dict(resp.json())
+        return _floor_result(resp)
 
     async def lower_hand(self, token: str, scope: str) -> dict[str, object]:
         """Withdraw from the talking-stick queue without taking the floor.
@@ -1018,8 +1035,7 @@ class HubConnector:
             "/floor",
             json={"token": token, "action": "lower", "scope": scope},
         )
-        resp.raise_for_status()
-        return dict(resp.json())
+        return _floor_result(resp)
 
     async def floors(self) -> dict[str, dict[str, object]]:
         """Fetch the current talking-stick state for all active scopes.

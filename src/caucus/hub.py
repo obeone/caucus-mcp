@@ -76,6 +76,7 @@ from .state import (
     Client,
     HubState,
     RegisterOutcome,
+    offer_ui_event,
 )
 from .supervisor import (
     AGENT_NAME_RE,
@@ -848,7 +849,8 @@ def _broadcast_agents() -> None:
     """Push the current agent roster to every connected operator console."""
     event: dict[str, object] = {"type": "agents", "agents": _agent_roster()}
     for queue in list(_ui_queues):
-        queue.put_nowait(event)
+        if not offer_ui_event(queue, event):
+            _ui_queues.discard(queue)
 
 
 @contextlib.asynccontextmanager
@@ -2458,7 +2460,8 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     state and routes the relevant SYSTEM notices; the JSON body returned carries
     ``ok`` plus an ``error`` describing any refusal (``floor_held``,
     ``not_holder``, ``no_floor``, ``bad_scope``, ``not_a_member``). An unknown
-    token is rejected with 401 and an unknown action with 400.
+    token is rejected with 401, an unknown action with 400, and a caller that
+    exhausts its normal chatter bucket with 429.
     """
     handlers = {
         "take": lambda: state.take_floor(req.token, req.scope, req.reason),
@@ -2470,6 +2473,12 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     handler = handlers.get(req.action)
     if handler is None:
         raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
+    client = state.client_for(req.token)
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
     try:
         result = handler()
     except CapExceeded as exc:
@@ -3008,6 +3017,9 @@ async def ui_socket(ws: WebSocket) -> None:
     async def pump() -> None:
         while True:
             event = await queue.get()
+            if event.get("type") == "overflow":
+                await ws.close(code=1013, reason="dashboard fell behind; reconnect")
+                return
             if event.get("type") == "snapshot":
                 # Prime the console with the agent roster too. Added here rather
                 # than in HubState.add_ui because the roster is a process fact,
