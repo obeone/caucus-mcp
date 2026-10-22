@@ -181,6 +181,21 @@ def test_console_csp_contains_required_directives() -> None:
     assert "frame-ancestors 'none'" in CONSOLE_CSP
 
 
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/docs/oauth2-redirect"])
+def test_interactive_api_documentation_is_disabled(
+    client: TestClient, path: str
+) -> None:
+    """CDN-backed documentation pages must not run in the console origin."""
+    assert client.get(path).status_code == 404
+
+
+def test_openapi_schema_remains_available(client: TestClient) -> None:
+    """Disabling active documentation must preserve inert schema discovery."""
+    resp = client.get("/openapi.json")
+    assert resp.status_code == 200
+    assert resp.json()["info"]["title"] == "Caucus Hub"
+
+
 # ===========================================================================
 # 4. BRIDGE token file (_write_token_file)
 # ===========================================================================
