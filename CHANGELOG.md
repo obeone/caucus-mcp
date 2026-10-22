@@ -195,6 +195,13 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **Privileged GitHub Actions now execute only reviewed immutable revisions.**
+  Release automation pins every third-party action and denies permissions by
+  default, granting repository read, PyPI OIDC, and release write authority
+  only to their owning jobs. Claude workflows pin checkout and action code,
+  replace OIDC with an explicitly scoped GitHub token for OAuth-backed jobs,
+  and load the review plugin from a separately checked-out, commit-pinned
+  marketplace. Release tools and transferred artifacts are checksum-verified.
 - **A non-loopback `--public-url` now arms the same credentials guard a
   non-loopback bind does.** The guard only ever looked at the bind address, so
   a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local
