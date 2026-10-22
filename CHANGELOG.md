@@ -121,6 +121,18 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **The agent launcher is on by default wherever it is safe.** A hub started
+  with an operator token on a loopback bind now lets the operator spawn agents
+  with no extra flag, starting them in `--agent-cwd` or the hub's working
+  directory. Without a token, on a network bind, or when the default directory
+  is the filesystem root (a launchd service), it stays off and the boot log
+  says why. The new `--no-agent-launcher` keeps it off, also in
+  `caucus-setup-service`, which now accepts `--agent-cwd` and `--agent-max`
+  for the default launcher. `--enable-agent-launcher` keeps its strict
+  behaviour. Upgrading a systemd user service that has an operator token turns
+  the launcher on in your home directory; add `--no-agent-launcher` to opt
+  out.
+
 - Extract the native conversation loop and nine room handlers into an
   SDK-independent module. Preserve Claude defaults, and propagate failed
   driver/poller tasks instead of leaving silently failed sessions.
