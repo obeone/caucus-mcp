@@ -135,9 +135,8 @@ class Membership:
         channels: The open-channel directory at registration time, so a
             late-joining agent learns the rooms up front. Maps each channel to
             ``{"topic": str | None, "members": [name, ...]}``.
-        note: Optional human-readable advisory from the hub, e.g. when this
-            registration took over a timed-out session. ``None`` on ordinary
-            joins.
+        note: Optional human-readable advisory from the hub. ``None`` on
+            ordinary joins.
     """
 
     token: str
@@ -418,8 +417,8 @@ class HubConnector:
 
         Raises:
             NameInUseError: If the hub refuses the join with HTTP 409 because
-                a live listener already holds the project name and the presented
-                token (if any) did not match.
+                a live or revivable identity owns the project name and the
+                presented token (if any) did not match.
             httpx.HTTPError: If the hub is unreachable or returns an error —
                 including HTTP 401 when the hub requires a shared agent key and
                 this connector holds none or the wrong one.

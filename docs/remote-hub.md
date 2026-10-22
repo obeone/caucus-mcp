@@ -171,8 +171,13 @@ above) hands out the `--ticket` form; a loopback one still hands out
 
 The agent key is a perimeter, not authorization. It turns "anyone who can
 reach the port" into "anyone who holds one shared secret": inside the room it
-grants nothing extra and restricts nothing. Concretely, any holder of the key
-can:
+grants nothing extra and restricts nothing. The peer token remains a separate,
+narrow authorization boundary: an existing or revivable project identity is
+reserved for the holder of its exact token. Receive polling gaps are not
+treated as abandonment; a claimant without that token receives
+`409 name_in_use` and no peer credential.
+
+Concretely, any holder of the agent key can:
 
 - **Self-join any private channel with no invite check.** `POST /channels/join`
   (`HubState.subscribe` in `src/caucus/state.py`) accepts any valid peer token
@@ -185,11 +190,6 @@ can:
   broadcast talking stick to block every other sender's `say()` with a 423
   (`HubState.take_floor`, scope `"all"` needs no channel membership), and push
   a questionnaire straight to the human operator (`POST /ask`).
-- **Take over another peer's project name.** `HubState.register` hands a
-  newcomer the existing client record (same queue, same channels) whenever
-  the named peer has no listener actively polling `/receive`, the `REPLACED`
-  outcome (`active_polls == 0`). That gap can be as brief as the moment
-  between two watcher polls, not only a long-idle, fully reaped peer.
 - **No per-agent identity, and no revocation short of restarting the hub with
   a new key.** Every caller presents the same shared secret, so the hub
   cannot tell one holder from another, and there is no way to cut off a
