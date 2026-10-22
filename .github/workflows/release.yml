@@ -7,25 +7,26 @@ on:
   push:
     tags: ["v*"]
 
-# Least privilege. `id-token: write` is required for PyPI Trusted Publishing
-# (OIDC, no long-lived API token to store). `contents: write` lets the job
-# attach the built artifacts to the GitHub Release for the tag.
-permissions:
-  contents: write
-  id-token: write
+# Deny by default. Publication authority is granted only to the job that uses it.
+permissions: {}
 
 jobs:
   build:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # hatch-vcs derives the version from the tag history — a shallow
           # clone would hide the tags and yield a bogus 0.0.0 version.
           fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.4"
+          checksum: "2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f"
       - name: Build sdist and wheel
         run: uv build
       - name: Sanity-check the built version matches the tag
@@ -37,8 +38,10 @@ jobs:
           built="$(ls dist/*.whl | sed -E 's/.*caucus_mcp-([^-]+)-.*/\1/')"
           echo "tag=$tag built=$built"
           test "$tag" = "$built"
+      - name: Record artifact digests
+        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
@@ -57,12 +60,19 @@ jobs:
       id-token: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
+      - name: Verify artifact digests
+        run: sha256sum --check dist/SHA256SUMS
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.4"
+          checksum: "2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f"
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        run: uv publish --trusted-publishing always dist/*.whl dist/*.tar.gz
 
   github-release:
     name: Attach artifacts to the GitHub Release
@@ -72,14 +82,16 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
+      - name: Verify artifact digests
+        run: sha256sum --check dist/SHA256SUMS
       - name: Create or update the GitHub Release
         # Idempotent: works whether the tag was pushed first or a Release was
         # drafted in the UI. Auto-generates notes from merged PRs.
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true
