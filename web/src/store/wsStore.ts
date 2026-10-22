@@ -3,7 +3,7 @@
  *
  * Responsibilities:
  * - Opens a WebSocket to /ui (same-origin), sends auth frame if a token is
- *   present (from ?token= URL param or localStorage "caucus_token").
+ *   already stored, or prompts after the hub confirms auth is required.
  * - Handles all inbound hub events defined in the protocol contract.
  * - Exposes send helpers for every operator command.
  * - Reconnects with exponential backoff (1s → 2s → 4s … max 30s).
@@ -59,38 +59,13 @@ function rawToMessage(raw: RawMessage): Message {
 /**
  * Read the persisted auth token from localStorage.
  *
- * Exposed (unlike {@link getToken}) so other modules that need to authenticate
- * a plain `fetch` against the hub -- e.g. the transcript export download in
+ * Exposed so other modules that need to authenticate a plain `fetch` against
+ * the hub -- e.g. the transcript export download in
  * FlowPanel -- can attach the same bearer token the WebSocket connection uses,
  * without duplicating the `caucus_token` key name.
  */
 export function getStoredToken(): string | null {
   return localStorage.getItem("caucus_token");
-}
-
-/**
- * Read the auth token from ?token= URL param or localStorage.
- *
- * Security: when the token is supplied in the URL we immediately strip it from
- * the address bar (via replaceState) before returning so it does not linger in
- * browser history, Referer headers, or server access logs.  localStorage is the
- * durable store; the ?token= param is only the one-time bootstrap path.
- */
-function getToken(): string | null {
-  const params = new URLSearchParams(window.location.search);
-  const fromUrl = params.get("token");
-  if (fromUrl) {
-    localStorage.setItem("caucus_token", fromUrl);
-    // Strip the token from the URL immediately to prevent leakage via browser
-    // history, server access logs, and Referer headers.
-    window.history.replaceState(
-      {},
-      "",
-      window.location.pathname + window.location.hash,
-    );
-    return fromUrl;
-  }
-  return getStoredToken();
 }
 
 /** Build the WebSocket URL for the /ui endpoint (same-origin). */
@@ -248,21 +223,43 @@ export const useDashStore = create<InternalState>()((set, get) => ({
 
   _handleEvent: (evt: HubEvent) => {
     switch (evt.type) {
-      case "auth_ok":
+      case "auth_required": {
+        const token = window.prompt("Enter the Caucus operator or observer token:");
+        if (token) {
+          set({ _pendingToken: token });
+          get()._send({ auth: token });
+        } else {
+          get()._ws?.close();
+        }
+        break;
+      }
+
+      case "auth_ok": {
         // Promote the token staged at handshake time: it is now confirmed
         // valid, so /agents HTTP mutations can reuse it as the bearer
         // credential instead of re-prompting the operator for one.
+        const pendingToken = get()._pendingToken;
+        if (evt.auth && pendingToken) {
+          localStorage.setItem("caucus_token", pendingToken);
+        }
         set({
           role: evt.role,
           connectionState: "connected",
           _backoff: BACKOFF_INITIAL,
-          _authToken: get()._pendingToken,
+          _authToken: pendingToken,
         });
         break;
+      }
 
       case "auth_error":
-        // Hub will close the socket; we just mark disconnected.
-        set({ connectionState: "disconnected" });
+        // Never retry an invalid persisted secret forever. The hub closes this
+        // socket; the reconnect probes again and presents a fresh prompt.
+        localStorage.removeItem("caucus_token");
+        set({
+          connectionState: "disconnected",
+          _pendingToken: null,
+          _authToken: null,
+        });
         break;
 
       case "snapshot": {
@@ -385,18 +382,15 @@ export const useDashStore = create<InternalState>()((set, get) => ({
     (window as any).__CAUCUS_WS__ = ws;
 
     ws.onopen = () => {
-      // Send auth frame if a token is configured. Stage it so the auth_ok
-      // handler can promote it to _authToken once the hub confirms it.
-      const token = getToken();
+      // A stored token can authenticate immediately. A fresh browser sends a
+      // non-secret probe; an auth-enabled hub answers `auth_required`, while an
+      // auth-disabled hub answers `auth_ok` without consuming the probe.
+      const token = getStoredToken();
       set({ _pendingToken: token });
       if (token) {
         ws.send(JSON.stringify({ auth: token }));
-      }
-      // If no token is configured the hub sends auth_ok immediately and we
-      // transition to "connected" in the auth_ok handler.
-      // When there IS a token we stay "connecting" until auth_ok arrives.
-      if (!token) {
-        set({ connectionState: "connected", _backoff: BACKOFF_INITIAL });
+      } else {
+        ws.send(JSON.stringify({ auth_probe: true }));
       }
     };
 

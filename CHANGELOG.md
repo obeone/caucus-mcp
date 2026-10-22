@@ -211,6 +211,12 @@ and rename that heading to the version when you cut the release.
   temporary descriptor into service without reopening the configured path.
   Platforms without POSIX descriptor-relative no-follow operations fail closed
   instead of falling back to a link-following open.
+- **Unauthenticated dashboard WebSockets now have time and capacity bounds.**
+  When console authentication is enabled, the complete `/ui` authentication
+  exchange must finish within 30 seconds and no more than 32 sockets may wait
+  for credentials concurrently. Silent, stalled, malformed, and disconnected
+  clients release their pre-authentication slot without allocating a dashboard
+  event queue; overload is rejected with retryable WebSocket close code 1013.
 - **Interactive API documentation is disabled on the operational hub.** The
   default Swagger UI and ReDoc routes loaded third-party JavaScript in the same
   origin where the dashboard stores console credentials. `/docs`, `/redoc`,
@@ -230,6 +236,14 @@ and rename that heading to the version when you cut the release.
   the rest of the plist structure remain available for review. Normal installs
   still write the real launchd plist directly with mode 0600; systemd previews
   continue to expose only the protected environment-file reference.
+- **Reusable console and peer credentials no longer authenticate from request
+  URLs.** The dashboard now uses a non-secret WebSocket probe, prompts for a
+  token only when the hub reports that authentication is required, and stores
+  the token only after `auth_ok`; rejected stored tokens are cleared. Console
+  responses also send `Referrer-Policy: no-referrer`. The `/receive`, `/peek`,
+  and `/decisions` peer routes now require `Authorization: Bearer` and reject
+  query-only credentials. Current Caucus clients already use the header; raw
+  HTTP integrations that still construct `?token=` URLs must be updated.
 - **A non-loopback `--public-url` now arms the same credentials guard a
   non-loopback bind does.** The guard only ever looked at the bind address, so
   a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local

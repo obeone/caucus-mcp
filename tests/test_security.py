@@ -44,6 +44,11 @@ def _register(client: TestClient, project: str) -> str:
     return str(resp.json()["token"])
 
 
+def _auth(token: str) -> dict[str, str]:
+    """Return the header-only peer credential transport used by clients."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _drain_until(ws: object, event_type: str) -> dict[str, object]:
     """Read /ui events until one of ``event_type`` arrives (bounded)."""
     for _ in range(50):
@@ -348,7 +353,9 @@ def test_peer_send_message_has_agent_origin(client: TestClient) -> None:
     token_a = _register(client, "alpha")
     token_b = _register(client, "beta")
     client.post("/send", json={"token": token_a, "to": "beta", "content": "hello"})
-    received = client.get("/receive", params={"token": token_b, "timeout": 2}).json()
+    received = client.get(
+        "/receive", params={"timeout": 2}, headers=_auth(token_b)
+    ).json()
     msgs = received["messages"]
     assert any(m.get("origin") == "agent" for m in msgs), f"no agent origin in {msgs}"
 
@@ -373,7 +380,9 @@ def test_operator_say_via_ui_has_operator_origin(
             pytest.fail("no message event from /ui say")
 
     # Verify the recipient also sees origin='operator'
-    received = client.get("/receive", params={"token": token, "timeout": 2}).json()
+    received = client.get(
+        "/receive", params={"timeout": 2}, headers=_auth(token)
+    ).json()
     msgs = received["messages"]
     op_msgs = [m for m in msgs if m.get("sender") == "human"]
     assert op_msgs, "alpha did not receive the operator's message"

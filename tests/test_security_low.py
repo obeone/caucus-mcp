@@ -166,6 +166,7 @@ def test_console_csp_present_on_index(client: TestClient) -> None:
     assert resp.status_code == 200
     csp = resp.headers.get("content-security-policy", "")
     assert csp == CONSOLE_CSP, f"unexpected CSP: {csp!r}"
+    assert resp.headers.get("referrer-policy") == "no-referrer"
 
 
 def test_console_csp_contains_required_directives() -> None:

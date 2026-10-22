@@ -118,6 +118,20 @@ REAP_INTERVAL_SECONDS = 15.0
 # rich peer roster) out to every connected UI listener.
 HEALTH_INTERVAL_SECONDS = 1.5
 
+# Maximum wall-clock time for the complete authenticated ``/ui`` handshake,
+# including the optional ``auth_probe`` round trip. A bounded but usable window
+# lets an operator answer the token prompt while preventing silent raw clients
+# from retaining accepted sockets forever.
+UI_AUTH_TIMEOUT_SECONDS = 30.0
+
+# Process-local ceiling for accepted ``/ui`` sockets that have not completed
+# authentication. The shipped CLI runs one Uvicorn worker, so this is the global
+# application limit for a normal deployment. It is intentionally not per-source:
+# proxies and NAT make ``ws.client.host`` unsuitable for fair source accounting.
+MAX_PENDING_UI_AUTH_CONNECTIONS = 32
+_pending_ui_auth: set[WebSocket] = set()
+_pending_ui_auth_lock = threading.Lock()
+
 # Hard ceiling on an inbound HTTP request body, in bytes. FastAPI/Starlette
 # buffers and parses the whole body before our handlers (and their Pydantic
 # validation) run, so an oversized POST — e.g. to the unauthenticated
@@ -1310,7 +1324,13 @@ async def index() -> FileResponse:
     """
     if not _UI_INDEX.is_file():
         raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
+    return FileResponse(
+        _UI_INDEX,
+        headers={
+            "Content-Security-Policy": CONSOLE_CSP,
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 def _require_agent_read(authorization: str | None) -> None:
@@ -1508,9 +1528,11 @@ async def export(
     # token the live feed does — otherwise auth on /ui is trivially bypassed by
     # downloading the same data here.
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) not in ("operator", "observer"):
-            raise HTTPException(status_code=401, detail="operator/observer token required")
+            raise HTTPException(
+                status_code=401, detail="operator/observer token required"
+            )
     body, media_type, filename = export_mod.render(state.recent(), format)
     return Response(
         content=body,
@@ -1897,27 +1919,6 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     )
 
 
-def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:
-    """Resolve the ``/receive`` access token: ``Authorization`` header, then query.
-
-    The header form is preferred because ``/receive`` is a long-poll ``GET``:
-    its token would otherwise ride in the URL query string, where httpx and the
-    server's own access logs record it in clear, leaking the secret. The query
-    parameter is kept as a **deprecated** fallback so a peer running an
-    older watcher keeps working through a hub upgrade; new callers must use the
-    header.
-
-    Args:
-        authorization: Raw ``Authorization`` header value, if any.
-        token: The deprecated ``?token=`` query parameter, if any.
-
-    Returns:
-        The bearer token from the header when present and well-formed, else the
-        query token, else ``None``.
-    """
-    return _bearer_from_header(authorization) or token
-
-
 @app.post("/ask", response_model=None)
 async def ask(req: AskRequest) -> AskResponse | JSONResponse:
     """Open an operator form on behalf of an agent.
@@ -1995,7 +1996,6 @@ async def forms(
 async def decisions(
     limit: int = Query(default=20, ge=1, le=500),
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, list[dict[str, object]]]:
     """List recently settled operator-form decisions, oldest first.
 
@@ -2004,8 +2004,8 @@ async def decisions(
     replaying the whole transcript. Unlike ``/forms`` (which only ever lists
     still-*pending* questions), a settled decision can carry a channel's
     private answer text, so this endpoint requires a token — no more
-    "works before join". The token is resolved exactly like ``/receive`` (see
-    :func:`_resolve_receive_token`) and tried two ways:
+    "works before join". The bearer token is read only from the
+    ``Authorization`` header and tried two ways:
 
     * A known **peer token** (:meth:`~caucus.state.HubState.client_for`) scopes
       the result to broadcast decisions plus those addressed to a channel the
@@ -2022,16 +2022,21 @@ async def decisions(
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
+        authorization: ``Authorization: Bearer <token>`` for a peer or console
+            role.
 
     Returns:
         ``{"decisions": [{"ts", "asker", "title", "status", "answer_summary"},
         ...]}`` — see :meth:`~caucus.state.HubState.decisions`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is not None:
         return {"decisions": state.decisions(limit, channels=client.channels)}
-    if auth_config.enabled and auth_config.role_for(resolved) in ("operator", "observer"):
+    if auth_config.enabled and auth_config.role_for(resolved) in (
+        "operator",
+        "observer",
+    ):
         return {"decisions": state.decisions(limit, channels=None)}
     raise HTTPException(status_code=401, detail="unknown token")
 
@@ -2159,17 +2164,15 @@ def _chatter_open(client: Client) -> bool:
 async def receive(
     request: Request,
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
     ack_seq: int | None = Query(default=None),
     lease: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
-    The access token is read from the ``Authorization: Bearer <token>`` header
-    (preferred) or, as a deprecated fallback, the ``?token=`` query parameter
-    -- see :func:`_resolve_receive_token`. Prefer the header: a query token
-    leaks into httpx and access logs because this is a ``GET``.
+    The access token is read only from the ``Authorization: Bearer <token>``
+    header. Reusable credentials are never accepted from the URL query string,
+    where HTTP clients, proxies, and server access logs can retain them.
 
     Blocks up to ``timeout`` seconds. Honors the pause gate (holds messages
     while paused) and surfaces a control ``stop`` signal immediately. Returns
@@ -2199,6 +2202,7 @@ async def receive(
     returned goes back to the head of its queue (see :func:`_release_getter`).
 
     Args:
+        authorization: ``Authorization: Bearer <peer token>``.
         ack_seq: Optional piggyback ACK — the highest ``seq`` the caller has
             successfully processed. Equivalent to ``POST /ack`` but saves a
             round-trip by folding the ACK into the next poll.
@@ -2217,7 +2221,7 @@ async def receive(
             ``lease``, ``409 already_listening`` when another consumer holds
             (or has taken) the slot.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2382,15 +2386,13 @@ async def receive(
 @app.get("/peek")
 async def peek(
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Report the caller's pending queue depth without draining it.
 
     The non-blocking counterpart to ``GET /receive``: a cheap "is a turn worth
     it?" check an agent can run before paying for a full receive. Authenticated
-    exactly like ``/receive`` — the token is read from the ``Authorization:
-    Bearer <token>`` header (preferred) or the deprecated ``?token=`` query
-    fallback, see :func:`_resolve_receive_token` — and resolved through
+    exactly like ``/receive`` — the token is read only from the
+    ``Authorization: Bearer <token>`` header — and resolved through
     :meth:`~caucus.state.HubState.client_for`, so it touches ``last_seen`` (and
     can revive a reaped identity) exactly the way every other authenticated
     endpoint does; no special-cased liveness bookkeeping.
@@ -2400,7 +2402,7 @@ async def peek(
         "preview_truncated", "content_chars"} | None}``; see
         :meth:`~caucus.state.HubState.peek`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2508,7 +2510,7 @@ async def control(
     otherwise an unauthenticated party (or a cross-site CSRF POST from a page in
     the operator's browser) could silently disarm the stop/pause that the human
     relies on. The bearer token is parsed the same way as ``/receive`` (see
-    :func:`_resolve_receive_token`) and must resolve to the ``operator`` role;
+    :func:`_bearer_from_header`) and must resolve to the ``operator`` role;
     when auth is disabled the endpoint stays open (the documented localhost
     default). As defense-in-depth, a present-but-disallowed browser ``Origin`` is
     also refused (blocks a simple cross-site form/fetch POST).
@@ -2546,7 +2548,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
 
     The same three checks in the same order: a present-but-disallowed browser
     ``Origin`` first (CSRF defense-in-depth, refused before anything happens),
-    then the bearer token parsed exactly as ``/receive`` parses it, then the
+    then the bearer token parsed from ``Authorization``, then the
     ``operator`` role. Factored out so ``/control`` and the ``/agents``
     endpoints cannot drift apart.
 
@@ -2563,7 +2565,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
     ):
         raise HTTPException(status_code=403, detail="origin not allowed")
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) != "operator":
             raise HTTPException(status_code=401, detail="operator token required")
 
@@ -2778,16 +2780,71 @@ _MUTATING_COMMANDS = frozenset(
 )
 
 
+def _reserve_ui_auth_slot(ws: WebSocket) -> bool:
+    """Reserve fail-fast capacity for one pending authenticated UI socket.
+
+    Args:
+        ws: The accepted WebSocket entering authentication.
+
+    Returns:
+        ``True`` when the socket was admitted, or ``False`` when the process-wide
+        pending-authentication cap is already full.
+    """
+    with _pending_ui_auth_lock:
+        if len(_pending_ui_auth) >= MAX_PENDING_UI_AUTH_CONNECTIONS:
+            return False
+        _pending_ui_auth.add(ws)
+        return True
+
+
+def _release_ui_auth_slot(ws: WebSocket) -> None:
+    """Release a pending-authentication reservation idempotently.
+
+    Args:
+        ws: The WebSocket leaving authentication for any reason.
+    """
+    with _pending_ui_auth_lock:
+        _pending_ui_auth.discard(ws)
+
+
+async def _ui_authenticate_enabled(ws: WebSocket) -> str | None:
+    """Run the configured-token handshake inside the caller's deadline.
+
+    Args:
+        ws: The accepted WebSocket.
+
+    Returns:
+        The granted role, or ``None`` after rejecting an invalid credential.
+    """
+    first = await ws.receive_json()
+    if isinstance(first, dict) and first.get("auth_probe") is True:
+        await ws.send_json({"type": "auth_required"})
+        first = await ws.receive_json()
+    token = first.get("auth") if isinstance(first, dict) else None
+    role = auth_config.role_for(str(token) if token is not None else None)
+    if role is None:
+        await ws.send_json({"type": "auth_error"})
+        await ws.close(code=1008)
+        return None
+    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
+    return role
+
+
 async def _ui_authenticate(ws: WebSocket) -> str | None:
     """Run the first-frame ``/ui`` auth handshake; return the granted role.
 
     When auth is disabled, replies ``auth_ok`` with ``role="operator"`` and
     ``auth=false`` immediately and returns ``"operator"`` without reading a
     frame. When an operator token is configured, reads the first frame, expects
-    ``{"auth": "<token>"}``, and grades it: a matching operator/observer token
-    gets ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
+    ``{"auth": "<token>"}``, and grades it. A dashboard with no persisted token
+    may instead send the non-secret ``{"auth_probe": true}`` frame; the hub
+    replies ``{"type":"auth_required"}`` and waits for the auth frame on the
+    same socket. A matching operator/observer token gets
+    ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
     anything else gets ``{"type":"auth_error"}``, the socket is closed (1008),
-    and ``None`` is returned.
+    and ``None`` is returned. The complete configured-token exchange has a
+    :data:`UI_AUTH_TIMEOUT_SECONDS` deadline; silence before either credential
+    receive closes the socket with code 1008.
 
     Args:
         ws: The accepted WebSocket.
@@ -2800,19 +2857,13 @@ async def _ui_authenticate(ws: WebSocket) -> str | None:
         await ws.send_json({"type": "auth_ok", "role": "operator", "auth": False})
         return "operator"
     try:
-        first = await ws.receive_json()
-    except (WebSocketDisconnect, ValueError):
+        return await asyncio.wait_for(
+            _ui_authenticate_enabled(ws), timeout=UI_AUTH_TIMEOUT_SECONDS
+        )
+    except (WebSocketDisconnect, ValueError, asyncio.TimeoutError):
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return None
-    token = first.get("auth") if isinstance(first, dict) else None
-    role = auth_config.role_for(str(token) if token is not None else None)
-    if role is None:
-        await ws.send_json({"type": "auth_error"})
-        await ws.close(code=1008)
-        return None
-    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
-    return role
 
 
 def _apply_ui_command(data: dict[str, object]) -> None:
@@ -2899,12 +2950,14 @@ async def ui_socket(ws: WebSocket) -> None:
     """Bidirectional channel for the operator UI.
 
     The first frame is an auth handshake (see :func:`_ui_authenticate`): when an
-    operator token is configured the client must send ``{"auth": "<token>"}``;
-    otherwise auth is disabled and every connection is an operator. The granted
-    role is enforced per-command — an ``observer`` may read the live feed but any
-    mutating command is refused with ``{"type":"error","reason":"forbidden",
-    "command":...}`` and left unapplied. There is no single-writer lock: multiple
-    operators may all act, last write wins.
+    operator token is configured the client may send ``{"auth": "<token>"}``
+    directly or send a non-secret ``{"auth_probe": true}`` and wait for
+    ``auth_required`` before sending the credential. Otherwise auth is disabled
+    and every connection is an operator. The granted role is enforced
+    per-command — an ``observer`` may read the live feed but any mutating command
+    is refused with ``{"type":"error","reason":"forbidden","command":...}``
+    and left unapplied. There is no single-writer lock: multiple operators may
+    all act, last write wins.
 
     Outbound: live feed events (messages, mode changes, rich peer lists, health
     ticks, heartbeat replies).
@@ -2943,7 +2996,21 @@ async def ui_socket(ws: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return  # cross-site origin; no role granted, no feed streamed
-    role = await _ui_authenticate(ws)
+    auth_slot_reserved = False
+    if auth_config.enabled:
+        if not _reserve_ui_auth_slot(ws):
+            with contextlib.suppress(Exception):
+                await ws.close(
+                    code=1013,
+                    reason="too many dashboard connections awaiting authentication",
+                )
+            return
+        auth_slot_reserved = True
+    try:
+        role = await _ui_authenticate(ws)
+    finally:
+        if auth_slot_reserved:
+            _release_ui_auth_slot(ws)
     if role is None:
         return  # handshake failed; socket already closed
     queue = state.add_ui()

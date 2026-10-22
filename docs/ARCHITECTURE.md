@@ -406,9 +406,8 @@ the process holding it.
 
 `/receive` reads its access token from the `Authorization: Bearer <token>`
 header, never the URL query string — a `GET` query token leaks into httpx and
-server access logs. The `?token=` query parameter is still accepted as a
-**deprecated** fallback (so an older watcher survives a hub upgrade); all
-first-party callers send the header. Keep new callers on the header.
+server access logs. Query credentials are not accepted by `/receive`, `/peek`,
+or `/decisions`; all callers must send the header.
 
 ## Operator forms (`/ask`, `/forms`, the wizard)
 
@@ -617,9 +616,15 @@ Auth is opt-in, controlled by `--operator-token` / `CAUCUS_OPERATOR_TOKEN` and
 `{"type":"auth_ok","role":"operator","auth":false}` on connect without reading a
 frame, preserving the original localhost-open behaviour.
 
-When an operator token is set, the first frame the client sends must be
-`{"auth":"<token>"}`. The hub compares it with `secrets.compare_digest` (constant-time)
-and replies:
+When an operator token is set, a client with a stored token may send
+`{"auth":"<token>"}` as its first frame. A fresh dashboard sends the non-secret
+`{"auth_probe":true}` first, waits for `{"type":"auth_required"}`, and then
+sends the auth frame. The complete exchange is limited to 30 seconds, and the
+hub admits at most 32 sockets awaiting authentication at once; timeout closes
+1008 and overload closes 1013 before any UI queue is allocated. The pending
+slot is released on success, rejection, parse failure, disconnect, timeout, or
+cancellation. The hub compares the token with `secrets.compare_digest`
+(constant-time) and replies:
 
 - `{"type":"auth_ok","role":"operator","auth":true}` — full read-write access.
 - `{"type":"auth_ok","role":"observer","auth":true}` — read-only access.

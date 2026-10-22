@@ -18,6 +18,11 @@ from caucus.hub import app
 BASE = "http://127.0.0.1:8799"
 
 
+def _auth(token: str) -> dict[str, str]:
+    """Return the header-only peer credential transport used by clients."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _run_server() -> None:
     uvicorn.run(app, host="127.0.0.1", port=8799, log_level="warning")
 
@@ -39,14 +44,18 @@ def main() -> None:
         assert r.status_code == 200, r.text
         print("sent direct:", r.json())
 
-        got = c.get("/receive", params={"token": beta["token"], "timeout": 3}).json()
+        got = c.get(
+            "/receive", params={"timeout": 3}, headers=_auth(beta["token"])
+        ).json()
         assert any("full_name" in m["content"] for m in got["messages"]), got
         print("project-b received:", [m["content"] for m in got["messages"]])
 
         # Broadcast project-b -> all (project-a should get it, sender should not)
         c.post("/send", json={"token": beta["token"], "to": "all",
                               "content": "deploying v2.3.0 to staging"})
-        got = c.get("/receive", params={"token": alpha["token"], "timeout": 3}).json()
+        got = c.get(
+            "/receive", params={"timeout": 3}, headers=_auth(alpha["token"])
+        ).json()
         assert any("v2.3.0" in m["content"] for m in got["messages"]), got
         print("project-a received broadcast:", [m["content"] for m in got["messages"]])
 
@@ -54,12 +63,16 @@ def main() -> None:
         c.post("/control", json={"action": "pause"})
         c.post("/send", json={"token": alpha["token"], "to": "project-b",
                               "content": "held while paused"})
-        held = c.get("/receive", params={"token": beta["token"], "timeout": 2}).json()
+        held = c.get(
+            "/receive", params={"timeout": 2}, headers=_auth(beta["token"])
+        ).json()
         assert held["messages"] == [], f"expected no delivery while paused, got {held}"
         print("pause OK: delivery held")
 
         c.post("/control", json={"action": "resume"})
-        released = c.get("/receive", params={"token": beta["token"], "timeout": 3}).json()
+        released = c.get(
+            "/receive", params={"timeout": 3}, headers=_auth(beta["token"])
+        ).json()
         assert any("held while paused" in m["content"] for m in released["messages"]), released
         print("resume OK: held message delivered")
 
@@ -72,7 +85,9 @@ def main() -> None:
 
         # Stop: every agent's receive returns a stop control, sends are rejected
         c.post("/control", json={"action": "stop"})
-        stop = c.get("/receive", params={"token": alpha["token"], "timeout": 3}).json()
+        stop = c.get(
+            "/receive", params={"timeout": 3}, headers=_auth(alpha["token"])
+        ).json()
         assert any(m["kind"] == "control" and m["content"] == "stop"
                    for m in stop["messages"]), stop
         blocked = c.post("/send", json={"token": beta["token"], "to": "all",
