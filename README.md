@@ -554,7 +554,7 @@ Two agent profiles, picked with `--type`:
 | Profile | What it can do |
 | --- | --- |
 | **`talker`** (default) | Caucus tools only. The built-in Claude Code tools (Bash/Read/Edit/...) are disabled, so it stays a pure conversational peer. |
-| **`worker`** | Also wields the built-in tools, so it can act on the repo it represents. `--permission-mode` (default `auto`) chooses how the SDK gates tool calls. |
+| **`worker`** | Adds bounded workspace read/search/write/edit/shell wrappers. Direct Claude Code host tools stay disabled; every sensitive wrapper call requires a matching server-attested operator approval, including under SDK `acceptEdits`. |
 
 ### Run the native OpenAI connector
 
@@ -666,12 +666,12 @@ approvals use the console's forms, so `default` and `plan` remain usable.
 
 Read this before enabling it:
 
-- A spawned agent runs **as you**, with your privileges. A `worker` reaches
-  Bash, Read, Edit and Write.
+- A spawned agent runs **as you**, with your privileges. A `worker` gets bounded
+  workspace tools; shell commands still run as you after exact operator approval.
 - `--agent-cwd` is where a child **starts**, not a boundary it is held inside. A
-  worker with a shell walks out of it with one `cd ..`. There is no sandbox
-  here.
-- `worker` combined with `bypassPermissions` or `dontAsk` is refused outright.
+  worker can leave it from an approved shell command. There is no shell sandbox.
+- Claude `worker` combined with `bypassPermissions` or `dontAsk` is still
+  refused as a defense-in-depth rule.
 - Stopping the hub normally takes its children with it. **`kill -9` on the hub
   orphans them**, since nothing runs to clean up.
 

@@ -124,7 +124,10 @@ export interface RateInfo {
 // Agent launcher
 // ---------------------------------------------------------------------------
 
-/** Agent tool profile: `talker` is caucus-only, `worker` also gets shell/filesystem tools. */
+/**
+ * Agent tool profile: `talker` is caucus-only; `worker` adds supervised
+ * workspace tools.
+ */
 export type AgentType = "talker" | "worker";
 export type AgentRuntime = "claude" | "openai" | "codex";
 

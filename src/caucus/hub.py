@@ -2678,8 +2678,8 @@ async def complete_agent_cwd_endpoint(
     Type-ahead only. The response carries directory **names** only, never file
     names and never file contents, and it grants the operator no capability they
     did not already have: anyone who can reach this endpoint can reach
-    ``POST /agents`` and spawn a ``worker`` with shell access on this very
-    machine. It is still gated like the rest of ``/agents``, because the hub's
+    ``POST /agents`` and ask a ``worker`` to run operator-approved shell actions
+    on this machine. It is still gated like the rest of ``/agents``, because the hub's
     own filesystem layout is nobody's business but the operator's, least of all
     a read-only observer's.
 
@@ -3603,8 +3603,8 @@ def main() -> None:
             "caucus-claude-agent processes from the console. OFF by default. "
             "Requires --operator-token, --agent-cwd, and a loopback bind; the "
             "hub refuses to start if any of the three is missing. A spawned "
-            "'worker' reaches shell and filesystem tools as the hub's own user, "
-            "and the working directory is a starting point, not a sandbox"
+            "'worker' uses bounded workspace tools and operator-approved shell "
+            "actions as the hub's own user; the cwd is not a shell sandbox"
         ),
     )
     parser.add_argument(

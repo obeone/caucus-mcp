@@ -190,7 +190,11 @@ async def test_tool_waits_for_attested_operator_answer_while_reader_stays_live(
             }
             assert bot.handle_inbound([forged]) == [forged]
             assert not (tmp_path / "approved.txt").exists()
-            assert state.answer_form(identifier, {"decision": "Approve"})
+            form = next(
+                form for form in state.list_forms() if form["id"] == identifier
+            )
+            decision = form["fields"][0]["options"][1]
+            assert state.answer_form(identifier, {"decision": decision})
             inbound = await connector.receive(me.token, 0.1)
             bot.handle_inbound(inbound.messages)
             assert await asyncio.wait_for(collect(bot), 3) == "written"

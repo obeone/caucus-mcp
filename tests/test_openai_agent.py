@@ -138,8 +138,12 @@ async def test_real_runner_executes_tool_only_after_hub_operator_answer(
             await asyncio.wait_for(wait_for_form(), timeout=3)
             assert not (tmp_path / "approved.txt").exists()
             form_id = next(iter(approvals.pending))
+            form = next(
+                form for form in state.list_forms() if form["id"] == form_id
+            )
+            decision = form["fields"][0]["options"][1]
             assert hub.state is state
-            assert state.answer_form(form_id, {"decision": "Approve"}) is not None
+            assert state.answer_form(form_id, {"decision": decision}) is not None
             inbound = await connector.receive(me.token, 0.1)
             assert any(m.get("kind") == "answer" for m in inbound.messages), inbound
             approvals.handle_inbound(inbound.messages)
@@ -256,10 +260,14 @@ async def test_client_keeps_history_and_interrupts_only_current_turn(monkeypatch
 class ApprovalConnector:
     """Return a known form ID and record approval requests."""
 
+    def __init__(self):
+        self.fields = None
+
     async def join_channel(self, token, channel):
         return openai_agent.ChannelOutcome.OK
 
     async def ask_operator(self, token, to, title, fields):
+        self.fields = fields
         return SimpleNamespace(form_id="form-1")
 
     async def send(self, token, to, content):
@@ -273,14 +281,23 @@ async def test_shell_environment_and_process_group_cancellation(tmp_path, monkey
     import os
 
     monkeypatch.setenv("OPENAI_API_KEY", "should-not-reach-shell")
+    requests = []
 
     async def approve(action, detail):
+        requests.append((action, detail))
         return True
 
     workspace = openai_agent.Workspace(tmp_path, approve, "auto")
     assert "absent" in await workspace.run_shell(
         'test -z "$OPENAI_API_KEY" && echo absent'
     )
+    assert requests == [
+        (
+            "run_shell",
+            f"cwd={tmp_path.resolve()}\ntimeout=60.0\n"
+            'command=test -z "$OPENAI_API_KEY" && echo absent',
+        )
+    ]
     task = asyncio.create_task(
         workspace.run_shell("echo $$ > shell.pid; sleep 30 & wait")
     )
@@ -304,14 +321,17 @@ async def test_shell_environment_and_process_group_cancellation(tmp_path, monkey
 async def test_fast_operator_answer_is_buffered_until_form_id_is_known():
     class FastConnector(ApprovalConnector):
         async def ask_operator(self, token, to, title, fields):
+            self.fields = fields
             early = {
                 "kind": "answer",
                 "origin": "operator",
                 "meta": {
                     "form_id": "form-1",
                     "to": to,
+                    "asker": "worker",
+                    "title": title,
                     "status": "answered",
-                    "answers": {"decision": "Approve"},
+                    "answers": {"decision": fields[0]["options"][1]},
                 },
             }
             assert approvals.handle_inbound([early]) == []
@@ -353,22 +373,49 @@ def test_supervisor_refuses_invalid_runtime_or_openai_mode(tmp_path, runtime, mo
 
 
 async def test_approval_requires_operator_provenance_and_matching_form():
-    approvals = openai_agent.OperatorApprovals(ApprovalConnector(), "tok", "worker")
+    connector = ApprovalConnector()
+    approvals = openai_agent.OperatorApprovals(connector, "tok", "worker")
     task = asyncio.create_task(approvals.request("write_file", "file content"))
     while not approvals.pending:
         await asyncio.sleep(0)
+    assert connector.fields is not None
+    approved_decision = connector.fields[0]["options"][1]
+    assert approved_decision.startswith("Approve sha256:")
     answer = {
         "kind": "answer",
         "origin": "agent",
         "meta": {
             "form_id": "form-1",
+            "to": approvals.channel,
+            "asker": "worker",
+            "title": f"Approve write_file? [{approved_decision[8:]}]",
             "status": "answered",
-            "answers": {"decision": "Approve"},
+            "answers": {"decision": approved_decision},
         },
     }
     assert approvals.handle_inbound([answer]) == [answer]
     assert not task.done()
     answer["origin"] = "operator"
+    answer["meta"]["to"] = "all"
+    assert approvals.handle_inbound([answer]) == [answer]
+    assert not task.done()
+    answer["meta"]["to"] = approvals.channel
+    answer["meta"]["answers"] = {"decision": "Approve sha256:wrong"}
+    assert approvals.handle_inbound([answer]) == []
+    assert not await task
+    assert not approvals.pending
+
+    task = asyncio.create_task(approvals.request("write_file", "file content"))
+    while not approvals.pending:
+        await asyncio.sleep(0)
+    approved_decision = connector.fields[0]["options"][1]
+    answer["meta"].update(
+        {
+            "form_id": "form-1",
+            "title": f"Approve write_file? [{approved_decision[8:]}]",
+            "answers": {"decision": approved_decision},
+        }
+    )
     assert approvals.handle_inbound([answer]) == []
     assert await task
     assert not approvals.pending

@@ -195,6 +195,14 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **Peer messages can no longer reach direct Claude host tools.** Native Claude
+  workers now start with zero Claude built-ins, ignore ambient settings and MCP
+  servers, and use bounded workspace MCP wrappers instead. Sensitive reads,
+  searches, edits and shell commands require a server-attested operator answer
+  bound to the private audience, original asker, one-time form ID and exact
+  SHA-256 action digest; SDK `auto`, `acceptEdits` and programmatic permission
+  modes cannot bypass the application gate. Talkers and ordinary Caucus
+  messaging are unchanged.
 - **Settings and service backups no longer follow prepared `.bak` symlinks.**
   POSIX backup files are created owner-only through exclusive
   descriptor-relative no-follow opens; other supported platforms use an

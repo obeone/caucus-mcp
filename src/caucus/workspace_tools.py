@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import math
 import os
 import secrets
@@ -31,8 +32,10 @@ class OperatorApprovals:
         """Bind the approval gate to this membership and a private channel."""
         self.connector = connector
         self.token = token
+        self.project = project
         self.channel = f"#approval-{secrets.token_hex(8)}"
         self.pending: dict[str, asyncio.Future[bool]] = {}
+        self._expected: dict[str, tuple[str, str]] = {}
         self._lock = asyncio.Lock()
         self._joined = False
         self._opening = False
@@ -45,42 +48,50 @@ class OperatorApprovals:
         edit approval covers only the exact content shown, never future calls.
         """
         async with self._lock:
+            digest = "sha256:" + hashlib.sha256(
+                f"{action}\0{detail}".encode()
+            ).hexdigest()
             if await self.connector.join_channel(self.token, self.channel) is not (
                 ChannelOutcome.OK
             ):
                 return False
             self._joined = True
             delivery = await self.connector.send(
-                self.token, self.channel, f"[workspace action]\n{action}\n{detail}"
+                self.token,
+                self.channel,
+                f"[workspace action]\n{digest}\n{action}\n{detail}",
             )
             if not delivery.message_id:
                 return False
             self._opening = True
             try:
-                return await self._open_form(action)
+                return await self._open_form(action, digest)
             finally:
                 self._opening = False
                 self._early_answers.clear()
 
-    async def _open_form(self, action: str) -> bool:
+    async def _open_form(self, action: str, digest: str) -> bool:
         """Bind a form ID before releasing buffered operator responses."""
+        title = f"Approve {action}? [{digest}]"
+        approved_decision = f"Approve {digest}"
         form = await self.connector.ask_operator(
             self.token,
             self.channel,
-            f"Approve {action}?",
+            title,
             [
                 {
                     "key": "decision",
                     "label": "Review the exact action in the "
                     "channel, then approve or reject it.",
                     "type": "radio",
-                    "options": ["Reject", "Approve"],
+                    "options": ["Reject", approved_decision],
                     "required": True,
                 }
             ],
         )
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         self.pending[form.form_id] = future
+        self._expected[form.form_id] = (title, approved_decision)
         self._opening = False
         self.handle_inbound(self._early_answers)
         self._early_answers.clear()
@@ -90,12 +101,14 @@ class OperatorApprovals:
             return False
         finally:
             self.pending.pop(form.form_id, None)
+            self._expected.pop(form.form_id, None)
 
     async def close(self) -> None:
         """Release the approval channel on reset so subscriptions cannot pile up."""
         for future in self.pending.values():
             future.cancel()
         self.pending.clear()
+        self._expected.clear()
         if self._joined:
             with contextlib.suppress(httpx.HTTPError):
                 await self.connector.leave_channel(self.token, self.channel)
@@ -117,17 +130,32 @@ class OperatorApprovals:
                 continue
             future = self.pending.get(str(meta.get("form_id")))
             if future is None:
-                if self._opening and meta.get("to") == self.channel:
+                if (
+                    self._opening
+                    and meta.get("to") == self.channel
+                    and meta.get("asker") == self.project
+                ):
                     self._early_answers.append(message)
                     self._early_answers[:] = self._early_answers[-8:]
                     continue
                 remaining.append(message)
                 continue
+            expected = self._expected.get(str(meta.get("form_id")))
+            if (
+                expected is None
+                or meta.get("to") != self.channel
+                or meta.get("asker") != self.project
+                or meta.get("title") != expected[0]
+                or meta.get("status") not in {"answered", "cancelled"}
+            ):
+                remaining.append(message)
+                continue
             answers = meta.get("answers")
+            decision = answers.get("decision") if isinstance(answers, dict) else None
             approved = (
                 meta.get("status") == "answered"
-                and isinstance(answers, dict)
-                and answers.get("decision") == "Approve"
+                and isinstance(decision, str)
+                and secrets.compare_digest(decision, expected[1])
             )
             if not future.done():
                 future.set_result(approved)
@@ -236,9 +264,11 @@ class Workspace:
 
     async def run_shell(self, command: str, timeout: float = 60) -> str:
         """Run an approved Bash command and terminate its group on cancel/timeout."""
+        timeout = float(timeout)
         if not math.isfinite(timeout) or not 0 < timeout <= 120:
             raise ValueError("timeout must be greater than 0 and at most 120 seconds")
-        if not await self._allowed("run_shell", command):
+        detail = f"cwd={self.root}\ntimeout={timeout!r}\ncommand={command}"
+        if not await self._allowed("run_shell", detail):
             return "denied: operator did not approve the shell command"
         env = {
             key: value
