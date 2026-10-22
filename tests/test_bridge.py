@@ -480,21 +480,42 @@ def test_join_after_a_session_expiry_restores_the_peer(
     assert "message_id" in bridge.say("back on the air", to="all")
 
 
-def test_join_surfaces_automode_under_claude_code(
+def test_join_surfaces_retired_automode_audit_under_claude_code(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Claude-Code auto-mode detection moved from the old setup() gesture into
-    join() (see mcp_bridge.py's automode.is_claude_code() gate); under a
-    Claude Code host, join's result must still carry the ``automode`` block.
-    """
+    """Claude Code receives the legacy-rule audit, never an install proposal."""
     monkeypatch.setattr(bridge, "PROJECT", "automode-joiner")
     monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
     monkeypatch.setattr(
-        bridge.automode, "detect", lambda: {"operator_rule": "missing"}
+        bridge.automode,
+        "detect",
+        lambda: {"operator_rule": "retired", "legacy_rule": "absent"},
     )
     result = bridge.join()
     assert result["joined"] is True
-    assert result["automode"] == {"operator_rule": "missing"}
+    assert result["automode"] == {
+        "operator_rule": "retired",
+        "legacy_rule": "absent",
+    }
+
+
+def test_join_refuses_unsafe_legacy_automode_rule(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A known-unsafe rule blocks peer traffic until the operator removes it."""
+    monkeypatch.setattr(bridge, "PROJECT", "unsafe-automode-joiner")
+    monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
+    monkeypatch.setattr(
+        bridge.automode,
+        "detect",
+        lambda: {"operator_rule": "retired", "legacy_rule": "present"},
+    )
+
+    result = bridge.join()
+
+    assert result["error"] == "unsafe_automode_rule"
+    assert result["automode"]["legacy_rule"] == "present"
+    assert bridge._token is None
 
 
 def test_join_omits_automode_outside_claude_code(
@@ -508,10 +529,10 @@ def test_join_omits_automode_outside_claude_code(
     assert "automode" not in result
 
 
-def test_join_survives_automode_detect_failure(
+def test_join_fails_closed_on_automode_detect_failure(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A broken auto-mode probe must never fail the join itself (non-fatal)."""
+    """Claude Code cannot join when the legacy-rule audit itself fails."""
     monkeypatch.setattr(bridge, "PROJECT", "automode-boom-joiner")
     monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
 
@@ -520,8 +541,12 @@ def test_join_survives_automode_detect_failure(
 
     monkeypatch.setattr(bridge.automode, "detect", _boom)
     result = bridge.join()
-    assert result["joined"] is True
-    assert result["automode"] == {"operator_rule": "unknown"}
+    assert result["error"] == "automode_audit_failed"
+    assert result["automode"] == {
+        "operator_rule": "retired",
+        "legacy_rule": "unknown",
+    }
+    assert bridge._token is None
 
 
 # --- identity ------------------------------------------------------------
