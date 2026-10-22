@@ -195,6 +195,13 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **Settings and service backups no longer follow prepared `.bak` symlinks.**
+  POSIX backup files are created owner-only through exclusive
+  descriptor-relative no-follow opens; other supported platforms use an
+  unpredictable private temporary file and verified atomic replacement.
+  Unsafe symlinks, non-regular files, and hard-link aliases are refused; POSIX
+  also rejects foreign-owned backups. Existing safe regular backups continue
+  to refresh with mode 0600.
 - **Transcript logging no longer follows attacker-prepared filesystem links.**
   DiskLog now walks only root- or service-owned directories that are private
   or have sticky owner protection,
