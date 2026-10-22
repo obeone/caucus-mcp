@@ -171,6 +171,11 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- **Agents started from the dashboard launcher run again.** The supervisor
+  ended every child command line with a bare `--`, which argparse rejects when
+  the parser has no positional argument, so Claude, OpenAI and Codex agents
+  all exited with "unrecognized arguments: --" before joining the room.
+
 - **The dashboard build works again with Tailwind CSS 4.** The web app now
   uses the `@tailwindcss/vite` plugin and loads the existing theme through
   `@config`, so every custom utility keeps its value.
