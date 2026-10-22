@@ -211,6 +211,12 @@ and rename that heading to the version when you cut the release.
   temporary descriptor into service without reopening the configured path.
   Platforms without POSIX descriptor-relative no-follow operations fail closed
   instead of falling back to a link-following open.
+- **Interactive API documentation is disabled on the operational hub.** The
+  default Swagger UI and ReDoc routes loaded third-party JavaScript in the same
+  origin where the dashboard stores console credentials. `/docs`, `/redoc`,
+  and Swagger's OAuth redirect are no longer registered as documentation pages
+  and return 404 with the default route configuration; the inert
+  `/openapi.json` schema remains available for compatible tooling.
 - **Privileged GitHub Actions now execute only reviewed immutable revisions.**
   Release automation pins every third-party action and denies permissions by
   default, granting repository read, PyPI OIDC, and release write authority

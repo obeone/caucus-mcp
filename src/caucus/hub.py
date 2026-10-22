@@ -895,7 +895,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             disk_log.close()
 
 
-app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
+app = FastAPI(
+    title="Caucus Hub",
+    version=__version__,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 
 
 class BodySizeLimitMiddleware:
