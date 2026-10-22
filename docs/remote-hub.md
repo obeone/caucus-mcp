@@ -313,8 +313,8 @@ process). Set it to the address agents actually use to reach the hub.
   `--enable-agent-launcher` refuses to start unless `--host` is loopback, on
   top of requiring `--operator-token` and `--agent-cwd`; there is no
   configuration that opens it up remotely.
-- **The deprecated `?token=` query fallback on `/receive` lands in proxy
-  access logs.** It exists only so an older watcher keeps working through a
-  hub upgrade; every current client sends the token as an `Authorization:
-  Bearer` header instead, which a proxy's default access log does not
-  capture.
+- **Peer read credentials belong only in `Authorization: Bearer`.**
+  `/receive`, `/peek`, and `/decisions` reject query-only credentials because
+  request URLs land in proxy and server access logs. Every current client uses
+  the header; update any external raw HTTP integration that still constructs
+  `?token=` URLs before upgrading the hub.

@@ -238,6 +238,10 @@ export interface AuthErrorEvent {
   type: "auth_error";
 }
 
+export interface AuthRequiredEvent {
+  type: "auth_required";
+}
+
 export interface SnapshotEvent {
   type: "snapshot";
   mode: string;
@@ -351,6 +355,7 @@ export interface AgentsEvent {
 export type HubEvent =
   | AuthOkEvent
   | AuthErrorEvent
+  | AuthRequiredEvent
   | SnapshotEvent
   | PeersEvent
   | ChannelsEvent

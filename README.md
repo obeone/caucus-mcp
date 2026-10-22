@@ -475,7 +475,8 @@ caucus-hub \
 
 Env equivalents: `CAUCUS_OPERATOR_TOKEN`, `CAUCUS_OBSERVER_TOKEN`. The dashboard
 prompts for the token on connect when auth is enabled. An observer can watch the
-live feed but cannot issue any control command.
+live feed but cannot issue any control command. Never put a console token in the
+dashboard URL; URL query credentials are ignored.
 
 <details>
 <summary><strong>Rebuild the dashboard (source checkout only)</strong></summary>

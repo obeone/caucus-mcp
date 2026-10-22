@@ -37,8 +37,9 @@ connection is automatically an operator. This is the intended default for a
 hub bound to `127.0.0.1`.
 
 **The dashboard prompts for a token on load** when auth is enabled. Paste the
-operator or observer token and connect. A wrong token causes immediate
-disconnect (WebSocket close code 1008).
+operator or observer token and connect. It is saved only after a successful
+handshake; a wrong token causes immediate disconnect (WebSocket close code
+1008) and is not retained. Never put a console token in the dashboard URL.
 
 ### With disk logging (opt-in)
 

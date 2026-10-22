@@ -28,6 +28,11 @@ def _register(client: TestClient, project: str) -> str:
     return str(resp.json()["token"])
 
 
+def _auth(token: str) -> dict[str, str]:
+    """Return the header-only peer credential transport used by clients."""
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _drain_ui_until(ws: object, event_type: str) -> dict[str, object]:
     """Read ``/ui`` events until one of ``event_type`` arrives (bounded).
 
@@ -328,7 +333,7 @@ def test_send_after_reap_revives_instead_of_401(
 
 def test_direct_message_is_delivered(client: TestClient) -> None:
     alpha = _register(client, "alpha")
-    _register(client, "beta")
+    beta = _register(client, "beta")
 
     sent = client.post(
         "/send", json={"token": alpha, "to": "beta", "content": "full_name"}
@@ -336,7 +341,7 @@ def test_direct_message_is_delivered(client: TestClient) -> None:
     assert sent.status_code == 200
     assert sent.json()["delivered_to"] == ["beta"]
 
-    got = client.get("/receive", params={"token": _token(client, "beta"), "timeout": 3})
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(beta))
     contents = [m["content"] for m in got.json()["messages"]]
     assert "full_name" in contents
 
@@ -347,7 +352,7 @@ def test_broadcast_excludes_sender(client: TestClient) -> None:
 
     client.post("/send", json={"token": beta, "to": "all", "content": "v2.3.0"})
 
-    got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(alpha)).json()
     assert any("v2.3.0" in m["content"] for m in got["messages"])
 
 
@@ -370,7 +375,7 @@ def test_messages_sent_while_peer_has_no_poll_in_flight_are_queued(
     client.post("/send", json={"token": alpha, "to": "beta", "content": "second"})
     client.post("/send", json={"token": alpha, "to": "beta", "content": "third"})
 
-    got = client.get("/receive", params={"token": beta, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(beta)).json()
     contents = [m["content"] for m in got["messages"]]
     assert contents == ["first", "second", "third"]
 
@@ -478,13 +483,13 @@ def test_delivered_send_reports_no_warning_or_hint(client: TestClient) -> None:
 
 def test_receive_times_out_empty(client: TestClient) -> None:
     token = _register(client, "alpha")
-    got = client.get("/receive", params={"token": token, "timeout": 0}).json()
+    got = client.get("/receive", params={"timeout": 0}, headers=_auth(token)).json()
     assert got["messages"] == []
     assert got["mode"] == "running"
 
 
 def test_receive_unknown_token_is_401(client: TestClient) -> None:
-    assert client.get("/receive", params={"token": "nope"}).status_code == 401
+    assert client.get("/receive", headers=_auth("nope")).status_code == 401
 
 
 # --- /receive token via Authorization header (anti-leak) -----------------
@@ -521,18 +526,17 @@ def test_receive_bearer_header_wins_over_query_token(client: TestClient) -> None
     assert got.json()["mode"] == "running"
 
 
-def test_receive_non_bearer_header_falls_back_to_query_token(client: TestClient) -> None:
-    """A non-Bearer ``Authorization`` header is ignored; the query token is used.
-
-    Keeps the deprecated query path working for older watchers mid-upgrade.
-    """
+def test_receive_non_bearer_header_does_not_enable_query_auth(
+    client: TestClient,
+) -> None:
+    """A non-Bearer header cannot downgrade authentication to a query token."""
     token = _register(client, "alpha")
     got = client.get(
         "/receive",
         params={"token": token, "timeout": 0},
         headers={"Authorization": "Basic Zm9vOmJhcg=="},
     )
-    assert got.status_code == 200
+    assert got.status_code == 401
 
 
 def test_receive_no_token_anywhere_is_401(client: TestClient) -> None:
@@ -540,21 +544,44 @@ def test_receive_no_token_anywhere_is_401(client: TestClient) -> None:
 
 
 @pytest.mark.parametrize(
-    ("authorization", "token", "expected"),
+    ("path", "extra_params"),
     [
-        ("Bearer abc", None, "abc"),  # header preferred
-        ("bearer abc", None, "abc"),  # scheme is case-insensitive
-        ("Bearer abc", "xyz", "abc"),  # header wins over query
-        ("Basic Zm9v", "xyz", "xyz"),  # non-bearer header ignored -> query
-        (None, "xyz", "xyz"),  # query fallback
-        ("Bearer   ", "xyz", "xyz"),  # empty bearer payload -> query
-        (None, None, None),  # nothing supplied
+        ("/receive", {"timeout": 0}),
+        ("/peek", {}),
+        ("/decisions", {}),
     ],
 )
-def test_resolve_receive_token_precedence(
-    authorization: str | None, token: str | None, expected: str | None
+def test_peer_read_routes_reject_query_only_credentials(
+    client: TestClient, path: str, extra_params: dict[str, object]
 ) -> None:
-    assert hub_module._resolve_receive_token(authorization, token) == expected
+    """Reusable peer credentials in request targets never authenticate."""
+    token = _register(client, "query-only")
+    response = client.get(path, params={"token": token, **extra_params})
+    assert response.status_code == 401
+
+
+def test_peer_read_route_rejects_percent_encoded_query_credential(
+    client: TestClient,
+) -> None:
+    """An encoded spelling of the removed query field cannot authenticate."""
+    token = _register(client, "encoded-query")
+    assert client.get(f"/peek?%74oken={token}").status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("authorization", "expected"),
+    [
+        ("Bearer abc", "abc"),
+        ("bearer abc", "abc"),  # scheme is case-insensitive
+        ("Basic Zm9v", None),
+        ("Bearer   ", None),
+        (None, None),
+    ],
+)
+def test_bearer_from_header(
+    authorization: str | None, expected: str | None
+) -> None:
+    assert hub_module._bearer_from_header(authorization) == expected
 
 
 def test_rate_limit_eventually_returns_429(client: TestClient) -> None:
@@ -592,10 +619,12 @@ def test_channel_message_reaches_only_members(client: TestClient) -> None:
     assert sent.status_code == 200
     assert sent.json()["delivered_to"] == ["beta"]
 
-    got_beta = client.get("/receive", params={"token": beta, "timeout": 3}).json()
+    got_beta = client.get("/receive", params={"timeout": 3}, headers=_auth(beta)).json()
     assert any("members only" in m["content"] for m in got_beta["messages"])
     # gamma never joined the channel, so it sees nothing.
-    got_gamma = client.get("/receive", params={"token": gamma, "timeout": 0}).json()
+    got_gamma = client.get(
+        "/receive", params={"timeout": 0}, headers=_auth(gamma)
+    ).json()
     assert got_gamma["messages"] == []
 
 
@@ -726,7 +755,7 @@ def test_operator_can_speak_into_a_channel(client: TestClient) -> None:
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"say": "operator here", "to": "#ops"})
 
-    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(token)).json()
     assert any("operator here" in m["content"] for m in got["messages"])
 
 
@@ -747,7 +776,7 @@ def test_leave_invalidates_the_token(client: TestClient) -> None:
     token = _register(client, "alpha")
     client.post("/leave", json={"token": token})
     # The dropped token can no longer send or receive.
-    assert client.get("/receive", params={"token": token}).status_code == 401
+    assert client.get("/receive", headers=_auth(token)).status_code == 401
 
 
 def test_leave_unknown_token_is_401(client: TestClient) -> None:
@@ -764,12 +793,12 @@ def test_pause_holds_then_resume_releases(client: TestClient) -> None:
     client.post("/control", json={"action": "pause"})
     client.post("/send", json={"token": alpha, "to": "beta", "content": "held"})
 
-    held = client.get("/receive", params={"token": beta, "timeout": 1}).json()
+    held = client.get("/receive", params={"timeout": 1}, headers=_auth(beta)).json()
     assert held["messages"] == []
     assert held["mode"] == "paused"
 
     client.post("/control", json={"action": "resume"})
-    released = client.get("/receive", params={"token": beta, "timeout": 3}).json()
+    released = client.get("/receive", params={"timeout": 3}, headers=_auth(beta)).json()
     assert any("held" in m["content"] for m in released["messages"])
 
 
@@ -779,7 +808,7 @@ def test_stop_delivers_control_and_blocks_sends(client: TestClient) -> None:
 
     client.post("/control", json={"action": "stop"})
 
-    stop = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    stop = client.get("/receive", params={"timeout": 3}, headers=_auth(alpha)).json()
     assert any(
         m["kind"] == "control" and m["content"] == "stop" for m in stop["messages"]
     )
@@ -797,7 +826,9 @@ def test_control_unknown_action_is_400(client: TestClient) -> None:
 def test_reset_returns_to_running(client: TestClient, state: HubState) -> None:
     client.post("/control", json={"action": "stop"})
     client.post("/control", json={"action": "reset"})
-    assert client.get("/receive", params={"token": _register(client, "x"), "timeout": 0}).json()["mode"] == "running"
+    token = _register(client, "x")
+    response = client.get("/receive", params={"timeout": 0}, headers=_auth(token))
+    assert response.json()["mode"] == "running"
     assert state.mode.value == "running"
 
 
@@ -843,7 +874,7 @@ def test_ui_operator_say_pierces_pause(client: TestClient) -> None:
         ws.send_json({"say": "course-correct", "to": "alpha"})
         ws.receive_json()  # the routed message echoed onto the UI feed
 
-    got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(alpha)).json()
     assert got["mode"] == "paused"
     assert any("course-correct" in m["content"] for m in got["messages"])
 
@@ -858,7 +889,7 @@ def test_ui_operator_command_pierces_pause(client: TestClient) -> None:
         ws.send_json({"command": "interrupt", "to": "alpha"})
         ws.receive_json()  # the routed control message echoed onto the UI feed
 
-    got = client.get("/receive", params={"token": alpha, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(alpha)).json()
     assert got["mode"] == "paused"
     assert any(
         m["kind"] == "control" and m["content"] == "interrupt"
@@ -1036,7 +1067,7 @@ def test_ui_answer_round_trip_reaches_asker(client: TestClient) -> None:
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"answer": {"id": form_id, "answers": {"ok": "yes"}}})
 
-    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(token)).json()
     answers = [m for m in got["messages"] if m["kind"] == "answer"]
     assert answers
     assert answers[0]["meta"]["form_id"] == form_id
@@ -1057,7 +1088,7 @@ def test_ui_cancel_form_notifies_asker(client: TestClient) -> None:
         assert ws.receive_json()["type"] == "snapshot"
         ws.send_json({"cancel_form": form_id})
 
-    got = client.get("/receive", params={"token": token, "timeout": 3}).json()
+    got = client.get("/receive", params={"timeout": 3}, headers=_auth(token)).json()
     answers = [m for m in got["messages"] if m["kind"] == "answer"]
     assert answers
     assert answers[0]["meta"]["status"] == "cancelled"
@@ -1081,7 +1112,7 @@ def test_receive_active_polls_balanced_on_timeout(
     assert underlying is not None
     assert underlying.active_polls == 0
 
-    resp = client.get("/receive", params={"token": token, "timeout": 0.2})
+    resp = client.get("/receive", params={"timeout": 0.2}, headers=_auth(token))
     assert resp.status_code == 200
     assert resp.json()["messages"] == []
 
@@ -1202,7 +1233,7 @@ def test_receive_active_polls_balanced_on_disconnect(
     underlying = state.client_for(token)
     assert underlying is not None
 
-    resp = client.get("/receive", params={"token": token, "timeout": 0.2})
+    resp = client.get("/receive", params={"timeout": 0.2}, headers=_auth(token))
     assert resp.status_code == 200
     assert resp.json()["messages"] == []
 

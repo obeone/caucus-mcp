@@ -3,7 +3,7 @@
  *
  * 1. Extends expect with @testing-library/jest-dom matchers.
  * 2. Stubs browser globals that jsdom doesn't provide so modules that reference
- *    localStorage / matchMedia / WebSocket / history at import time don't throw.
+ *    localStorage / matchMedia / WebSocket at import time don't throw.
  *
  * These stubs must live here (not inside test files) because ES module imports
  * are hoisted — by the time test-file body code runs, the store has already
@@ -58,11 +58,6 @@ class _FakeWS {
   close = vi.fn();
 }
 vi.stubGlobal("WebSocket", _FakeWS);
-
-// ---------------------------------------------------------------------------
-// history.replaceState — used by getToken() to strip ?token= from the URL.
-// ---------------------------------------------------------------------------
-vi.stubGlobal("history", { replaceState: vi.fn() });
 
 // ---------------------------------------------------------------------------
 // window.location — provide a minimal stub.

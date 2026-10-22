@@ -426,7 +426,7 @@ def main() -> None:
         parser.error(str(exc))
 
     # stderr keeps stdout clean (the agent's signal channel); configure_logging
-    # also silences httpx so the token in the /receive URL never hits stderr.
+    # also silences httpx's one-line-per-poll request noise.
     configure_logging(sys.stderr)
 
     try:
