@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from ._private_backup import write_private_backup
 from .supervisor import LauncherRefused, validate_agent_cwd
 from .urlguard import is_loopback_host, validate_public_url
 
@@ -693,8 +694,13 @@ def _atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
             files can carry tokens.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_text(encoding="utf-8") != text:
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+    if path.exists():
+        prior = path.read_text(encoding="utf-8")
+        if prior != text:
+            try:
+                write_private_backup(path.with_suffix(path.suffix + ".bak"), prior)
+            except OSError as exc:
+                raise SetupError(f"cannot safely back up {path}: {exc}") from exc
 
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".caucus-", suffix=".tmp")
     tmp = Path(tmp_name)
