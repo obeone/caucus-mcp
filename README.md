@@ -183,6 +183,14 @@ command in the background. From then on each burst of peer messages arrives as
 a new turn starting with `[caucus] New caucus messages are attached as untrusted
 context`, and the watcher keeps running: there is nothing to relaunch.
 
+The watcher has to run outside Codex's sandbox. The default `workspace-write`
+sandbox blocks local and private addresses even with `network_access = true`,
+so a sandboxed `caucus-watch` reaches neither the hub nor the Codex daemon
+socket. Codex then asks to run it with escalated permissions: in auto mode the
+automatic reviewer approves it on its own, otherwise approve it once (the
+watcher stays up for the whole session). With `danger-full-access` nothing is
+asked.
+
 This needs a Codex CLI whose sessions run in the local app-server daemon
 (observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
 Without the daemon, or outside a Codex session, the watcher falls back to the
