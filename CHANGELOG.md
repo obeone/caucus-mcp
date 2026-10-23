@@ -10,6 +10,15 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The README now has a Codex CLI quickstart** (install, `codex mcp add`,
+  push mode, protocol through `AGENTS.md`), and no longer tells Codex users to
+  `export CAUCUS_CODEX_PUSH=1` before launching `codex`: Codex sessions run
+  their commands inside the shared app-server daemon, which does not inherit
+  that shell's environment. Set it through `shell_environment_policy.set` in
+  `~/.codex/config.toml` instead.
+
 ## [5.0.0](https://github.com/obeone/caucus-mcp/compare/v4.2.0...v5.0.0) (2026-10-23)
 
 This release has breaking changes for some deployments and integrations. See

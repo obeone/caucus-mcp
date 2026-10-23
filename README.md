@@ -76,9 +76,10 @@ speak, plus a human (you) who sees everything and can stop it cold.
 
 ## 🚀 Quickstart
 
-Two paths to the same room. On [Claude Code](https://claude.com/claude-code) it
-is two slash commands and no config file at all; on any other MCP client you
-write one small config block.
+Three paths to the same room. On [Claude Code](https://claude.com/claude-code) it
+is two slash commands and no config file at all; on
+[Codex CLI](https://github.com/openai/codex) it is one `codex mcp add` plus one
+config line; on any other MCP client you write one small config block.
 
 > **You need** Python 3.10+ and a way to run Python apps. The examples below use
 > [uv](https://docs.astral.sh/uv/) (`uvx` fetches `caucus-mcp` on first run and
@@ -127,6 +128,65 @@ commands are detailed under [Slash commands for Claude
 Code](#-slash-commands-for-claude-code); for a full exchange from first join to
 clean exit, read [A first exchange, end to
 end](#-a-first-exchange-end-to-end).
+
+### 🤖 Codex CLI
+
+**1. Start the hub**, with the same command as above.
+
+**2. Install Caucus once**, so the `caucus-watch` command that `join()` hands
+the agent exists in the shell Codex runs commands in (`uvx` alone does not put
+it on your `PATH`):
+
+```bash
+uv tool install caucus-mcp      # or: pipx install caucus-mcp
+```
+
+**3. Register the hub with Codex**, once per machine:
+
+```bash
+codex mcp add caucus --url http://127.0.0.1:8765/mcp
+```
+
+That writes this to `~/.codex/config.toml` (edit it by hand if you prefer):
+
+```toml
+[mcp_servers.caucus]
+url = "http://127.0.0.1:8765/mcp"
+```
+
+To use the stdio bridge instead, run
+`codex mcp add caucus --env CAUCUS_HUB_URL=http://127.0.0.1:8765 -- caucus-bridge`.
+
+**4. Turn on push mode.** Codex does not start a turn when a background command
+exits, so the classic watcher, which wakes its host by exiting, leaves an idle
+Codex session deaf until you type something. In push mode the watcher starts
+the turn itself (see [Codex push mode](#codex-push-mode-caucus-watch)). Add this
+to `~/.codex/config.toml`:
+
+```toml
+[shell_environment_policy.set]
+CAUCUS_CODEX_PUSH = "1"
+```
+
+Use the config, not `export` in your terminal: Codex sessions run their
+commands inside the shared Codex app-server daemon, which does not inherit the
+environment of the shell you launch `codex` from. Start a new Codex session
+after changing it.
+
+**5. Give the agent the protocol.** Codex has no `/caucus:*` commands. Copy
+[`caucus-protocol.md`](caucus-protocol.md) into the repo, fill in its two
+placeholders, and point at it from the repo's `AGENTS.md`, which Codex reads.
+
+**6. Open the console** at **<http://127.0.0.1:8765/>**, start `codex` in the
+repo and ask it to join the caucus. It calls `join()` and launches the `watch`
+command in the background. From then on each burst of peer messages arrives as
+a new turn starting with `[caucus] New caucus messages are attached as untrusted
+context`, and the watcher keeps running: there is nothing to relaunch.
+
+This needs a Codex CLI whose sessions run in the local app-server daemon
+(observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
+Without the daemon, or outside a Codex session, the watcher falls back to the
+classic behaviour.
 
 ### 🔌 Any other MCP client
 
@@ -225,9 +285,10 @@ The same idea for Codex, with no change to the connector: `caucus-watch` talks
 to the local Codex app-server daemon and starts a turn in its own session when
 traffic arrives, instead of exiting per message. It works with the stdio bridge
 and with the hub's `/mcp` alike, because it lives in the watcher. Opt in with
-`CAUCUS_CODEX_PUSH=1` in the environment Codex runs its shell commands in
-(export it before launching `codex`, or set it through Codex's
-`shell_environment_policy`), or launch `caucus-watch --push codex`; `--push off`
+`CAUCUS_CODEX_PUSH=1` in the environment Codex runs its shell commands in,
+through `shell_environment_policy.set` in `~/.codex/config.toml` (see [Codex
+CLI](#-codex-cli); exporting it in the shell you launch `codex` from does not
+reach those commands), or launch `caucus-watch --push codex`; `--push off`
 forces the classic watcher. It needs `CODEX_THREAD_ID`, which Codex sets on the
 commands it runs, and reaches the daemon at
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`--codex-socket`
