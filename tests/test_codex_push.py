@@ -329,6 +329,44 @@ async def test_an_interrupt_command_is_steered_as_trusted_text(sock_dir: Path) -
     assert "additionalContext" not in steer
 
 
+async def test_a_room_stop_is_steered_into_a_running_turn(sock_dir: Path) -> None:
+    hub = _ScriptedHub()
+    hub.batch(_STOP)
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+        assert await _run(hub, path, lines) == 0
+    steer = fake.methods("turn/steer")[0]
+    assert "stopped the room" in steer["input"][0]["text"]
+    assert fake.methods("turn/start") == []
+    assert lines[-1].startswith("[caucus] STOP")
+
+
+async def test_the_hub_keeps_being_polled_while_a_burst_is_held(sock_dir: Path) -> None:
+    hub = _ScriptedHub()
+    hub.batch(_msg(1, "held for a while"))
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+
+        async def finish_turn() -> None:
+            await anyio.sleep(1.0)
+            fake.status = {"type": "idle"}
+            hub.batch(_STOP, delay=0.3)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(finish_turn)
+            await _run(hub, path, [])
+    # The hold keeps polling on the short timeout, so the reaper sees a live
+    # listener, and re-checks the thread after each poll.
+    hold_polls = [
+        r
+        for r in hub.receives
+        if float(r.url.params["timeout"]) == codex_push._HOLD_POLL_SECONDS
+    ]
+    assert len(hold_polls) >= 2
+    assert len(fake.methods("thread/read")) >= 2
+
+
 async def test_a_pending_approval_holds_even_the_operator(sock_dir: Path) -> None:
     hub = _ScriptedHub()
     hub.batch(_msg(4, "operator says hi", origin="operator"))
@@ -381,6 +419,32 @@ async def test_a_thread_that_stops_taking_input_falls_back_to_classic(sock_dir: 
     assert any("do not lose me" in line for line in lines)
     assert lines[-1].startswith("[caucus] PUSH UNAVAILABLE")
     assert hub.acks == [{"token": "tok-1", "seq": 8}]
+
+
+async def test_a_held_burst_falls_back_whole_when_the_thread_goes_away(
+    sock_dir: Path,
+) -> None:
+    hub = _ScriptedHub()
+    hub.batch(_msg(1, "held first"))
+    hub.batch(_msg(2, "held second"), delay=0.3)
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+
+        async def close_session() -> None:
+            await anyio.sleep(0.8)
+            fake.status = {"type": "notLoaded"}
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(close_session)
+            assert await _run(hub, path, lines) == 0
+    assert fake.methods("turn/start") == []
+    # Everything held is printed, then ACKed in one go: nothing is lost.
+    assert any("held first" in line for line in lines)
+    assert any("held second" in line for line in lines)
+    assert lines[-1].startswith("[caucus] PUSH UNAVAILABLE")
+    assert hub.acks == [{"token": "tok-1", "seq": 2}]
+    assert not any(r.url.params.get("ack_seq") for r in hub.receives)
 
 
 async def test_a_vanished_daemon_falls_back_to_classic(sock_dir: Path) -> None:
