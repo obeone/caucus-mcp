@@ -19,7 +19,7 @@ and rename that heading to the version when you cut the release.
   `confirm_delivery`), inbound messages are pushed straight into the session as
   channel events, with no `caucus-watch` process. If the probe never arrives,
   the normal watcher flow is untouched. Bursts are coalesced into one event
-  (quiet for 1.5 s, or at most `CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds, default
+  (quiet for 1.5 s, or at most `CAUCUS_PUSH_SETTLE` seconds, default
   5, `0` disables); operator messages and a room stop are pushed at once.
   Delivery is at most once into Claude Code's stdin. Permission relay is not
   implemented. The protocol text is unchanged.

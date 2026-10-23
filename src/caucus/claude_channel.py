@@ -28,7 +28,7 @@ session, so a later ``join`` goes straight to ``live``.
 
 Bursts are coalesced into one event, so three quick peer replies wake the agent
 once instead of twice: the pump pushes when the hub has been quiet for 1.5 s, or
-at the latest when the settle window (``CAUCUS_CLAUDE_CHANNEL_SETTLE`` seconds,
+at the latest when the settle window (``CAUCUS_PUSH_SETTLE`` seconds,
 default 5, ``0`` disables) has passed since the burst's first message. Operator
 messages, operator commands and a room stop are pushed at once.
 
@@ -42,11 +42,8 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-import math
-import os
 import secrets
 import threading
-import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Literal
@@ -58,7 +55,16 @@ from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from .hub_connector import HubConnector, Inbound
-from .native_agent import _defang_fence, format_inbound
+from .push import (
+    COMMAND_NOTICES,
+    DEFAULT_SETTLE_SECONDS,
+    POLL_TIMEOUT,
+    QUIET_GAP_SECONDS,
+    env_flag,
+    gather_burst,
+    max_seq,
+    render,
+)
 
 logger = logging.getLogger("caucus.bridge.channel")
 
@@ -68,18 +74,6 @@ CHANNEL_ENV = "CAUCUS_CLAUDE_CHANNEL"
 #: The capability Claude Code looks for before it registers a channel listener.
 CHANNEL_CAPABILITY: dict[str, dict[str, object]] = {"claude/channel": {}}
 
-#: Environment variable holding the settle window, in seconds (``0`` disables).
-SETTLE_ENV = "CAUCUS_CLAUDE_CHANNEL_SETTLE"
-
-#: Default settle window: the longest the pump keeps collecting after the first
-#: message of a burst before pushing the burst as one event.
-DEFAULT_SETTLE_SECONDS = 5.0
-
-#: Silence that ends a burst before the window does. Long enough to span the
-#: gap between two ``say`` calls a peer makes in one turn (a tool round-trip),
-#: short enough that a lone message is not held for the whole window.
-QUIET_GAP_SECONDS = 1.5
-
 #: JSON-RPC method of a pushed channel event.
 CHANNEL_METHOD = "notifications/claude/channel"
 
@@ -88,35 +82,10 @@ CHANNEL_METHOD = "notifications/claude/channel"
 #: upgrade that starts offering it is loud on stderr instead of silently fatal.
 MODERN_PROTOCOL_REVISION = "2026-07-28"
 
-# Values that count as "on" for CHANNEL_ENV, matched case-insensitively.
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-
-# Long-poll ceiling requested from the hub. Must stay at or under the hub's own
-# LONG_POLL_SECONDS (25) and below the connector's HTTP timeout (35): the
-# long-poll ordering invariant in CLAUDE.md.
-_POLL_TIMEOUT = 25.0
-
 # Retry pacing after a transport failure: doubles from the floor to the ceiling,
 # and drops back to the floor after a clean poll. Mirrors the native connectors.
 _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 15.0
-
-# Longest label (sender, recipient, form title) copied into an event. Project
-# names are capped at 64 by the hub; titles at 200.
-_LABEL_MAX = 200
-
-# Control commands a peer-facing operator may aim at one agent. Claude Code
-# cannot be interrupted through a channel, so these become plain notices.
-_COMMAND_NOTICES = {
-    "interrupt": (
-        "the operator asked you to interrupt: stop the task in progress and wait"
-        " for instructions"
-    ),
-    "reset": (
-        "the operator asked for a reset: drop the current caucus task and start"
-        " from a clean slate"
-    ),
-}
 
 PumpState = Literal["idle", "armed", "live"]
 
@@ -131,161 +100,7 @@ def channel_enabled(environ: Mapping[str, str] | None = None) -> bool:
         ``True`` when :data:`CHANNEL_ENV` holds one of ``1``, ``true``, ``yes`` or
         ``on`` (any case, surrounding whitespace ignored), else ``False``.
     """
-    env = os.environ if environ is None else environ
-    return env.get(CHANNEL_ENV, "").strip().lower() in _TRUTHY
-
-
-def settle_seconds(environ: Mapping[str, str] | None = None) -> float:
-    """Read the settle window from the environment.
-
-    Args:
-        environ: The environment to read. ``None`` reads :data:`os.environ`.
-
-    Returns:
-        :data:`SETTLE_ENV` as a float clamped to ``[0, 25]`` (the hub's
-        long-poll ceiling), or :data:`DEFAULT_SETTLE_SECONDS` when the variable
-        is unset, blank or not a finite number (a typo must not disable
-        coalescing or crash the bridge; it is logged instead).
-    """
-    env = os.environ if environ is None else environ
-    raw = env.get(SETTLE_ENV, "").strip()
-    if not raw:
-        return DEFAULT_SETTLE_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        value = math.nan
-    if not math.isfinite(value):
-        logger.warning(
-            "%s=%r is not a number; using %.0fs", SETTLE_ENV, raw, DEFAULT_SETTLE_SECONDS
-        )
-        return DEFAULT_SETTLE_SECONDS
-    return min(max(value, 0.0), _POLL_TIMEOUT)
-
-
-def _clean_label(value: object) -> str:
-    """Flatten a peer-chosen label so it cannot forge the event's framing.
-
-    Sender, recipient and form-title strings are chosen by peers, and the hub
-    restricts only their length. They end up *outside* the untrusted-data fence
-    (the attribution line) and in the ``<channel>`` tag attributes, so a newline
-    or an embedded fence delimiter there could fake trusted framing. Every
-    control or format character becomes a space, whitespace runs collapse, fence
-    delimiters are defanged, and the result is capped.
-
-    Args:
-        value: The raw label (any type; ``None`` becomes ``"?"``).
-
-    Returns:
-        A single-line, non-empty label of at most :data:`_LABEL_MAX` characters.
-    """
-    text = "?" if value is None else str(value)
-    flat = "".join(
-        " " if unicodedata.category(ch).startswith(("C", "Z")) else ch for ch in text
-    )
-    label = _defang_fence(" ".join(flat.split()))[:_LABEL_MAX]
-    return label or "?"
-
-
-def to_channel_event(message: Mapping[str, object]) -> tuple[str, dict[str, str]]:
-    """Render one hub message as channel event ``content`` and ``meta``.
-
-    The content reuses the native connectors' :func:`format_inbound` framing, so
-    the body is fenced as untrusted data under an attribution line exactly as a
-    native agent sees it. ``meta`` carries the routing facts as tag attributes;
-    every key is an identifier (Claude Code silently drops any other key) and
-    every value a string. ``source`` is never emitted: Claude Code sets it itself
-    from the server name.
-
-    Args:
-        message: One message in the hub's public shape (``sender``,
-            ``recipient``, ``content``, ``kind``, ``origin``, ``id``, ``seq``,
-            optional ``meta``).
-
-    Returns:
-        A ``(content, meta)`` pair ready for :func:`build_frame`.
-    """
-    sender = _clean_label(message.get("sender"))
-    recipient = _clean_label(message.get("recipient"))
-    content = format_inbound(
-        [{"sender": sender, "recipient": recipient, "content": message.get("content")}]
-    )
-    meta: dict[str, str] = {
-        "sender": sender,
-        "recipient": recipient,
-        "kind": _clean_label(message.get("kind") or "message"),
-        "origin": _clean_label(message.get("origin") or "agent"),
-    }
-    if message.get("id") is not None:
-        meta["msg_id"] = _clean_label(message["id"])
-    if message.get("seq") is not None:
-        meta["seq"] = _clean_label(message["seq"])
-    if recipient.startswith("#"):
-        meta["hub_channel"] = recipient
-    extra = message.get("meta")
-    if isinstance(extra, Mapping):
-        # Operator-form answers and cancellations: the recap is already in the
-        # content, these let the agent match it to the form it opened.
-        if extra.get("form_id") is not None:
-            meta["form_id"] = _clean_label(extra["form_id"])
-        if extra.get("title") is not None:
-            meta["form_title"] = _clean_label(extra["title"])
-        if extra.get("status") is not None:
-            meta["form_status"] = _clean_label(extra["status"])
-    return content, meta
-
-
-def to_batch_event(
-    messages: list[dict[str, object]],
-) -> tuple[str, dict[str, str]]:
-    """Render a settled burst of hub messages as one channel event.
-
-    The content is one :func:`format_inbound` block holding every message, each
-    fenced under its own (cleaned) attribution line. ``meta`` summarises the
-    burst, since a tag carries one value per attribute: ``kind="batch"``, the
-    message ``count``, and the distinct ``senders``, ``kinds`` and ``origins``
-    (comma-separated, in arrival order), plus the ``seq`` range and any operator
-    ``form_ids``.
-
-    Args:
-        messages: Two or more messages in the hub's public shape, in seq order.
-
-    Returns:
-        A ``(content, meta)`` pair ready for :func:`build_frame`.
-    """
-    senders = [_clean_label(m.get("sender")) for m in messages]
-    cleaned: list[dict[str, object]] = [
-        {
-            "sender": sender,
-            "recipient": _clean_label(m.get("recipient")),
-            "content": m.get("content"),
-        }
-        for sender, m in zip(senders, messages)
-    ]
-
-    def distinct(values: list[str]) -> str:
-        """Join the distinct values, keeping first-seen order."""
-        return ",".join(dict.fromkeys(values))
-
-    meta: dict[str, str] = {
-        "kind": "batch",
-        "count": str(len(messages)),
-        "senders": distinct(senders),
-        "kinds": distinct([_clean_label(m.get("kind") or "message") for m in messages]),
-        "origins": distinct([_clean_label(m.get("origin") or "agent") for m in messages]),
-    }
-    seqs = [_clean_label(m["seq"]) for m in messages if m.get("seq") is not None]
-    if seqs:
-        meta["seq_first"] = seqs[0]
-        meta["seq_last"] = seqs[-1]
-    forms: list[str] = []
-    for m in messages:
-        extra = m.get("meta")
-        if isinstance(extra, Mapping) and extra.get("form_id") is not None:
-            forms.append(_clean_label(extra["form_id"]))
-    if forms:
-        meta["form_ids"] = distinct(forms)
-    return format_inbound(cleaned), meta
+    return env_flag(CHANNEL_ENV, environ)
 
 
 def build_frame(content: str, meta: Mapping[str, str]) -> SessionMessage:
@@ -344,7 +159,7 @@ class ChannelPump:
         token_getter: Callable[[], str | None],
         *,
         agent_key: str | None = None,
-        poll_timeout: float = _POLL_TIMEOUT,
+        poll_timeout: float = POLL_TIMEOUT,
         settle: float = DEFAULT_SETTLE_SECONDS,
         quiet_gap: float = QUIET_GAP_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -579,23 +394,11 @@ class ChannelPump:
     ) -> None:
         """Run one long-poll, let a burst settle, and push it as one event.
 
-        Coalescing only pays off when the agent is idle: Claude Code already
-        groups the events that land while a turn is running. Waking an idle agent
-        on the first message of a burst would spend one turn on it and a second
-        on the rest, so the pump debounces instead:
-
-        * after the first message it keeps polling, and pushes as soon as the hub
-          stays quiet for ``quiet_gap`` seconds (the hub's long-poll is the
-          timer: a poll that comes back empty *is* the quiet gap);
-        * a burst that keeps trickling is pushed anyway once ``settle`` seconds
-          passed since its first message, so latency stays bounded;
-        * an urgent batch is pushed at once: anything the operator said, an
-          operator command, a room stop, or a displacement. Those are what an
-          agent is most likely waiting on, and debouncing them buys nothing.
-
-        A lone peer message therefore costs ``quiet_gap`` of latency, not the
-        whole window. Nothing is ACKed while a burst settles: the batch is ACKed
-        only after its event was handed to stdout.
+        The burst is collected by :func:`~caucus.push.gather_burst` (quiet gap,
+        settle cap, urgent traffic at once), so a lone peer message costs
+        ``quiet_gap`` of latency, not the whole window. Nothing is ACKed while a
+        burst settles: the batch is ACKed only after its event was handed to
+        stdout.
 
         Args:
             hub: The open connector.
@@ -608,52 +411,22 @@ class ChannelPump:
         inbound = await self._receive(hub, token, self._poll_timeout)
         if inbound is None:
             return
-        batch = list(inbound.messages)
-        commands = list(inbound.commands)
-        stop = inbound.stop
-        displaced = inbound.already_listening
-        urgent = stop or displaced or bool(commands) or _has_operator(batch)
-        if batch and self._settle > 0 and not urgent:
-            deadline = anyio.current_time() + self._settle
-            while self.state == "live":
-                remaining = deadline - anyio.current_time()
-                if remaining <= 0:
-                    break  # the burst kept trickling: push what settled
-                try:
-                    more = await self._receive(
-                        hub, token, min(self._quiet_gap, remaining)
-                    )
-                except Exception as exc:  # noqa: BLE001 - any failure, same fix
-                    # The batch already left the hub queue, and the hub only
-                    # replays unacked messages on a re-register: letting this
-                    # escape would drop it for good. Push what settled instead;
-                    # the next poll meets the error again and backs off.
-                    logger.warning("channel poll failed mid-burst (%s); pushing", exc)
-                    break
-                if more is None:
-                    break
-                if not (
-                    more.messages or more.commands or more.stop or more.already_listening
-                ):
-                    break  # quiet for a whole gap: the burst is over
-                batch.extend(more.messages)
-                commands.extend(more.commands)
-                stop = stop or more.stop
-                displaced = displaced or more.already_listening
-                if stop or displaced or more.commands or _has_operator(more.messages):
-                    break
+        burst = await gather_burst(
+            inbound,
+            lambda timeout: self._receive(hub, token, timeout),
+            settle=self._settle,
+            quiet_gap=self._quiet_gap,
+            keep_going=lambda: self.state == "live",
+        )
         # Push what the hub handed over even if a control call raced the poll:
         # those messages left the hub queue for this pump and have no other way
         # to reach the agent.
-        if batch:
-            content, meta = (
-                to_channel_event(batch[0]) if len(batch) == 1 else to_batch_event(batch)
-            )
+        if burst.messages:
+            content, meta = render(burst.messages)
             await write_stream.send(build_frame(content, meta))
-            seqs = [int(str(m["seq"])) for m in batch if m.get("seq")]
-            if seqs:
-                # ACK only now that the batch is on stdout's way.
-                self._ack_seq = max(seqs)
+            # ACK only now that the batch is on stdout's way.
+            self._ack_seq = max_seq(burst.messages)
+        commands, stop, displaced = burst.commands, burst.stop, burst.displaced
         if self.state != "live":
             return
         if displaced:
@@ -664,7 +437,7 @@ class ChannelPump:
             self._go_armed_with_displaced_notice()
             return
         for command in commands:
-            notice = _COMMAND_NOTICES.get(command)
+            notice = COMMAND_NOTICES.get(command)
             if notice is None:
                 logger.info("ignoring unknown operator command %r", command)
                 continue
@@ -716,18 +489,6 @@ class ChannelPump:
             )
         )
         self._kick()
-
-
-def _has_operator(messages: list[dict[str, object]]) -> bool:
-    """Tell whether any message came from the operator (server-set ``origin``).
-
-    Args:
-        messages: Messages in the hub's public shape.
-
-    Returns:
-        ``True`` when at least one carries ``origin == "operator"``.
-    """
-    return any(m.get("origin") == "operator" for m in messages)
 
 
 def _notice(text: str, *, kind: str, nonce: str | None = None) -> tuple[str, dict[str, str]]:

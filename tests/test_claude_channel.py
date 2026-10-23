@@ -30,17 +30,15 @@ import pytest
 from anyio.streams.memory import MemoryObjectReceiveStream
 from mcp.shared.message import SessionMessage
 
-from caucus import claude_channel
+from caucus import claude_channel, push
 from caucus import mcp_bridge as bridge_module
 from caucus.claude_channel import (
     CHANNEL_METHOD,
     ChannelPump,
     build_frame,
     channel_enabled,
-    settle_seconds,
-    to_batch_event,
-    to_channel_event,
 )
+from caucus.push import settle_seconds, to_batch_event, to_channel_event
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -88,11 +86,11 @@ def test_channel_mode_is_off_by_default() -> None:
 
 def test_settle_defaults_to_five_seconds_when_unset_or_blank() -> None:
     assert settle_seconds({}) == 5.0
-    assert settle_seconds({claude_channel.SETTLE_ENV: "  "}) == 5.0
+    assert settle_seconds({push.SETTLE_ENV: "  "}) == 5.0
 
 
 def test_settle_reads_and_clamps_the_env_value() -> None:
-    env = claude_channel.SETTLE_ENV
+    env = push.SETTLE_ENV
     assert settle_seconds({env: "2.5"}) == 2.5
     assert settle_seconds({env: "0"}) == 0.0
     assert settle_seconds({env: "-3"}) == 0.0
@@ -102,7 +100,7 @@ def test_settle_reads_and_clamps_the_env_value() -> None:
 
 @pytest.mark.parametrize("value", ["soon", "nan", "inf"])
 def test_settle_falls_back_to_the_default_on_garbage(value: str) -> None:
-    assert settle_seconds({claude_channel.SETTLE_ENV: value}) == 5.0
+    assert settle_seconds({push.SETTLE_ENV: value}) == 5.0
 
 
 # --- event rendering ---------------------------------------------------------
@@ -649,7 +647,7 @@ async def test_hub_outage_backs_off_and_recovers(monkeypatch: pytest.MonkeyPatch
 
 async def test_a_rendering_bug_does_not_kill_the_pump(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_channel, "_BACKOFF_MIN", 0.01)
-    real = claude_channel.to_channel_event
+    real = push.to_channel_event
     calls = {"n": 0}
 
     def flaky(message: Any) -> tuple[str, dict[str, str]]:
@@ -658,7 +656,7 @@ async def test_a_rendering_bug_does_not_kill_the_pump(monkeypatch: pytest.Monkey
             raise KeyError("boom")
         return real(message)
 
-    monkeypatch.setattr(claude_channel, "to_channel_event", flaky)
+    monkeypatch.setattr(push, "to_channel_event", flaky)
     hub = _ScriptedHub()
     hub.batch(_msg(1, "lost to the bug"))
     hub.batch(_msg(2, "survives"))

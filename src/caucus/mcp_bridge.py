@@ -31,7 +31,7 @@ Configuration via environment variables:
   once the agent confirms a probe event, pushes inbound messages straight into
   the session instead of relying on the watcher. Needs Claude Code started with
   ``--dangerously-load-development-channels server:<name>``.
-* ``CAUCUS_CLAUDE_CHANNEL_SETTLE`` -- longest a channel burst may settle before
+* ``CAUCUS_PUSH_SETTLE`` -- longest a channel burst may settle before
   it is pushed as one event (default 5 seconds, ``0`` disables). A burst is
   pushed earlier once the hub is quiet for 1.5 s, and operator traffic at once.
 """
@@ -67,10 +67,10 @@ from .claude_channel import (
     MODERN_PROTOCOL_REVISION,
     ChannelPump,
     channel_enabled,
-    settle_seconds,
 )
 from .logging_setup import configure_logging
 from .models import lean_public, request_carried_token, session_expired_error
+from .push import settle_seconds
 from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.bridge")

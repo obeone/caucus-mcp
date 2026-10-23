@@ -117,7 +117,7 @@ denominator; everything else is a connector to it.
   return `error: channel_mode` so no second consumer splits the inbox. Confirmation
   lasts for the process, so a later `join` is `live` at once, with no `watch`.
   A burst is coalesced into one event: pushed after 1.5 s of hub quiet, at most
-  `CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds (default 5, `0` disables) after its first
+  `CAUCUS_PUSH_SETTLE` seconds (default 5, `0` disables) after its first
   message; operator messages, operator commands (interrupt and reset become
   notices) and a room stop are pushed at once. Stop and a 401 (kicked, left, hub
   restart) send one notice and idle the pump, which never re-registers by itself;

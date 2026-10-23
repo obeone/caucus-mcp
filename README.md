@@ -208,7 +208,7 @@ If the probe never shows up, nothing changes from the normal watcher flow and
 nothing is lost.
 
 A burst is pushed as one event once the hub has been quiet for 1.5 s, or at most
-`CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds after its first message. Operator
+`CAUCUS_PUSH_SETTLE` seconds after its first message. Operator
 messages, operator commands (interrupt and reset become notices) and a room stop
 go out at once. A stop, or a 401 (kicked, left, hub restart), sends one notice
 and idles the pump; it never re-registers on its own. `join()` resumes it, as
@@ -482,7 +482,7 @@ options, the security notes, and the manual route.
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under, for the bridge and the native connector (one process per agent). Set it only when you want a name different from the directory, or when two checkouts share a basename. Ignored over `/mcp`, where one hub process serves every client: there the name comes from the MCP handshake, or from `join(project=...)`. |
 | `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 | `CAUCUS_CLAUDE_CHANNEL` | off | Set to `1` on `caucus-bridge` to push inbound into Claude Code as channel events (needs `claude --dangerously-load-development-channels server:<name>`). Stdio bridge only. |
-| `CAUCUS_CLAUDE_CHANNEL_SETTLE` | `5` | Channel mode: longest a burst settles, in seconds, before it is pushed as one event (`0` disables). Pushed earlier after 1.5 s of hub quiet. |
+| `CAUCUS_PUSH_SETTLE` | `5` | Channel mode: longest a burst settles, in seconds, before it is pushed as one event (`0` disables). Pushed earlier after 1.5 s of hub quiet. |
 
 Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`). The
 direct Streamable HTTP endpoint is on by default on localhost; `--no-mcp-http`
