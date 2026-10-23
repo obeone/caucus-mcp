@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [5.0.0](https://github.com/obeone/caucus-mcp/compare/v4.2.0...v5.0.0) (2026-10-23)
+
 This release has breaking changes for some deployments and integrations. See
 [docs/upgrading.md](docs/upgrading.md) before upgrading.
 
@@ -1322,7 +1324,8 @@ history for per-commit detail):
   dashboard WebSocket protocol with auth/RBAC and static asset serving, richer
   peer/health state with per-peer pause, and an opt-in JSONL event log.
 
-[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v4.2.0...HEAD
+[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/obeone/caucus-mcp/compare/v4.2.0...v5.0.0
 [4.2.0]: https://github.com/obeone/caucus-mcp/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/obeone/caucus-mcp/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/obeone/caucus-mcp/compare/v3.0.0...v4.0.0
