@@ -16,9 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -875,23 +878,58 @@ def test_sdk_does_not_offer_the_protocol_revision_claude_code_refuses() -> None:
 def _stdio_roundtrip(env_extra: dict[str, str], *requests: dict[str, object]) -> list[dict[str, Any]]:
     """Spawn ``caucus-bridge`` over stdio, send ``requests``, return the replies.
 
-    The subprocess exits on stdin EOF, so a hang here means the bridge (or its
-    channel pump) failed to shut down cleanly; the timeout turns that into a
-    failure.
+    Stdin stays open until every request that carries an ``id`` has been
+    answered: the MCP SDK cancels in-flight requests on stdin EOF, so closing
+    it right after writing races the replies (a slow CI runner lost the
+    ``tools/list`` answer that way). Only then is stdin closed, and the process
+    must exit on its own; a hang there means the bridge (or its channel pump)
+    failed to shut down cleanly, and the timeout turns that into a failure.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("CAUCUS_CLAUDE_")}
     env.update({"CAUCUS_PROJECT": "stdio-probe", **env_extra})
-    lines = "".join(json.dumps(r) + "\n" for r in requests)
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-c", "from caucus.mcp_bridge import main; main()"],
-        input=lines,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
         text=True,
-        timeout=30,
-        check=False,
         env=env,
     )
-    return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    assert proc.stdin is not None and proc.stdout is not None
+    replies: queue.Queue[str | None] = queue.Queue()
+
+    def pump_stdout() -> None:
+        """Forward stdout lines to the queue; ``None`` marks EOF."""
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            replies.put(line)
+        replies.put(None)
+
+    reader = threading.Thread(target=pump_stdout, daemon=True)
+    reader.start()
+    expected = {r["id"] for r in requests if "id" in r}
+    seen: list[dict[str, Any]] = []
+    try:
+        proc.stdin.write("".join(json.dumps(r) + "\n" for r in requests))
+        proc.stdin.flush()
+        deadline = time.monotonic() + 30
+        while expected - {r.get("id") for r in seen}:
+            line = replies.get(timeout=max(deadline - time.monotonic(), 0.01))
+            if line is None:
+                break
+            if line.strip():
+                seen.append(json.loads(line))
+        proc.stdin.close()
+        proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    reader.join(timeout=5)
+    while not replies.empty():
+        line = replies.get_nowait()
+        if line and line.strip():
+            seen.append(json.loads(line))
+    return seen
 
 
 _INIT = {
