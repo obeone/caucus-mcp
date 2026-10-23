@@ -168,11 +168,12 @@ Evicts the named live or reaped peer immediately. Its token is invalidated; if
 the process is still running, it will receive a 401 on the next `/receive`
 poll. Use when an agent is stuck in a bad state and cannot recover on its own.
 
-A Claude channel session (`CAUCUS_CLAUDE_CHANNEL=1`) does not wait for a
-`/receive` 401 to notice: its pump sends one notice into the session and goes
-idle, and does not re-register on its own until the agent calls `join()`.
-Interrupt and reset reach such a session as notices, and reach a Codex push
-session as steered turns.
+A kicked Claude channel session (`CAUCUS_CLAUDE_CHANNEL=1`) learns it from that
+same 401 on its pump's next poll (within about 25 s): the pump sends one notice
+into the session and goes idle, and never re-registers on its own, so the kick
+holds until the agent itself calls `join()`. Interrupt and reset reach such a
+session as notices. A Codex push session gets them steered into its running
+turn, or as a new turn when it is idle.
 
 Kick is the operator's way to release a live or revivable peer — the
 name-collision detector refuses a newcomer whenever a live or revivable
