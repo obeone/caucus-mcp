@@ -382,6 +382,22 @@ async def test_confirmed_pump_delivers_and_acks_after_the_push() -> None:
         assert first.headers["authorization"] == "Bearer tok-1"
 
 
+@pytest.mark.parametrize("failure", [500, 422])
+async def test_a_hub_error_while_settling_still_pushes_the_burst(failure: int) -> None:
+    # The first poll already took the message off the hub queue; the hub only
+    # replays unacked messages on a re-register, so dropping the batch here
+    # would lose it for good.
+    hub = _ScriptedHub()
+    hub.batch(_msg(1, "taken before the error"))
+    hub.status(failure)
+    pump = _pump(hub, _Token(), settle=2.0, quiet_gap=1.0)
+    async with _running(pump) as stream:
+        await _live(pump, stream)
+        event = await _next(stream)
+        assert "taken before the error" in event["content"]
+        assert pump.state == "live"
+
+
 async def test_settle_window_coalesces_a_burst_into_one_event() -> None:
     hub = _ScriptedHub()
     hub.batch(_msg(1, "first"))

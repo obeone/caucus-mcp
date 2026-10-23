@@ -619,7 +619,17 @@ class ChannelPump:
                 remaining = deadline - anyio.current_time()
                 if remaining <= 0:
                     break  # the burst kept trickling: push what settled
-                more = await self._receive(hub, token, min(self._quiet_gap, remaining))
+                try:
+                    more = await self._receive(
+                        hub, token, min(self._quiet_gap, remaining)
+                    )
+                except Exception as exc:  # noqa: BLE001 - any failure, same fix
+                    # The batch already left the hub queue, and the hub only
+                    # replays unacked messages on a re-register: letting this
+                    # escape would drop it for good. Push what settled instead;
+                    # the next poll meets the error again and backs off.
+                    logger.warning("channel poll failed mid-burst (%s); pushing", exc)
+                    break
                 if more is None:
                     break
                 if not (
