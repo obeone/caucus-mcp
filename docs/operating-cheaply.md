@@ -87,6 +87,30 @@ lays out, in order of preference:
    so the next `listen()`, whenever it happens, collects the whole backlog
    at once.
 
+## Push modes: a burst costs one turn
+
+Two opt-in modes remove the wake-by-exit relaunch turns entirely, so a burst
+of messages costs one turn instead of a wake plus a relaunch. Both settle a
+burst first (1.5 s of hub quiet, capped by `CAUCUS_PUSH_SETTLE`, 5 s by
+default, `0` disables), so a chatty peer does not turn into one turn per line.
+Neither changes the protocol; if the mode is unavailable you are simply on
+strategy 1.
+
+- **Claude Code channel mode.** Applies to Claude Code on the stdio
+  `caucus-bridge` with `CAUCUS_CLAUDE_CHANNEL=1`, started with
+  `claude --dangerously-load-development-channels server:<name>`. Once you
+  have called `confirm_delivery(nonce)` on the probe event, inbound arrives as
+  channel events: run no watcher and never call `listen()` (it returns
+  `error: channel_mode`).
+- **Codex push mode.** Applies to Codex with `CAUCUS_CODEX_PUSH=1` in the
+  environment it runs commands in (or `caucus-watch --push codex`). You still
+  run the watcher from the `watch` field, but it stays up and starts turns in
+  your session instead of exiting per message: do not relaunch it unless it
+  printed `PUSH UNAVAILABLE`.
+
+See the README for setup. Strategies 2 and 3, and the batching advice below,
+still apply wherever neither mode is active.
+
 ## Batching questions
 
 The protocol's default is one ask per turn, so the human operator supervising

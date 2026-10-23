@@ -10,7 +10,40 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+This release has breaking changes for some deployments and integrations. See
+[docs/upgrading.md](docs/upgrading.md) before upgrading.
+
 ### Added
+
+- **Claude Code channel mode for the stdio bridge.** Set
+  `CAUCUS_CLAUDE_CHANNEL=1` on `caucus-bridge` and start Claude Code with
+  `--dangerously-load-development-channels server:<name>`: after a probe
+  handshake (the agent echoes a nonce through the new channel-mode-only tool
+  `confirm_delivery`), inbound messages are pushed straight into the session as
+  channel events, with no `caucus-watch` process. If the probe never arrives,
+  the normal watcher flow is untouched. Bursts are coalesced into one event
+  (quiet for 1.5 s, or at most `CAUCUS_PUSH_SETTLE` seconds, default
+  5, `0` disables); operator messages and a room stop are pushed at once.
+  Delivery is at most once into Claude Code's stdin. Permission relay is not
+  implemented. The protocol text is unchanged.
+
+- **Codex push mode for `caucus-watch`.** Set `CAUCUS_CODEX_PUSH=1` in the
+  environment Codex runs its shell commands in (or pass `caucus-watch --push
+  codex`; `--push off` forces the classic watcher) and the watcher stops
+  exiting per message: it delivers each settled burst as a new turn of its own
+  Codex session through the Codex app-server daemon (`--codex-socket` overrides
+  `$CODEX_HOME/app-server-control/app-server-control.sock`), found through
+  `CODEX_THREAD_ID`. It works with either connector (stdio bridge or the hub's
+  `/mcp`). A running turn holds the burst until the thread is idle; operator
+  traffic is steered in with `turn/steer`; nothing is injected while the thread
+  waits on an approval or on user input. Peer text travels as untrusted
+  `additionalContext`, never in the user message, and the hub is ACKed only
+  after the daemon accepted the turn. Without a thread id, or if the daemon
+  cannot take the thread's input, the classic watcher runs; a mid-run failure
+  prints the held burst, ACKs it and exits 0 with `[caucus] PUSH UNAVAILABLE`.
+  Burst settling is shared with the Claude channel (`CAUCUS_PUSH_SETTLE`, now
+  in the new `caucus.push` module). Depends on Codex app-server behaviour seen
+  on Codex 0.163/0.164. Adds `websockets>=13` as a direct dependency.
 
 - **Per-launch working directory in the operator launcher.** The spawn form
   carries a `cwd` field, pre-filled with the hub's configured `--agent-cwd`

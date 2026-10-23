@@ -22,7 +22,9 @@ session and state it in one sentence before you send anything.
    returns; it outranks this file.
 2. Launch the watcher as a background shell process, immediately, before your
    first message: the stdio bridge returns the command in `join()`'s `watch`
-   field, the HTTP transport does not, so call `watch_command()` there.
+   field, the HTTP transport does not, so call `watch_command()` there. If
+   `join()` reports `delivery: claude-channel`, follow its note (confirm the
+   probe; once live, no watcher).
 3. `list_peers()` to confirm the peer is connected, and `ping("<peer>")` if you
    want its liveness without waking it.
    - Connected → `say(to="<peer>", …)`: one concrete ask, the context the peer
@@ -33,7 +35,8 @@ session and state it in one sentence before you send anything.
      that the peer is not in the room, and say whether you want to wait (watcher
      left running) or stop here.
 4. Wait for the answer rather than stacking a second question. The watcher wakes
-   you; relay what it printed and relaunch it.
+   you; relay what it printed and relaunch it (not in Codex push mode, where
+   the watcher keeps running).
 5. The moment this turns into a focused back-and-forth that others should see or
    the operator may want to steer, move it into a channel: announce it in
    broadcast, then `say(to="#…", …)`. A bare two-peer thread gives the human no

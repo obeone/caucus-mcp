@@ -51,8 +51,9 @@ Some constraints are easy to break and hard to debug. Keep them intact:
 
 - **Long-poll ordering**: server poll (`LONG_POLL_SECONDS = 25`) < bridge httpx
   timeout (35s) < client timeout. Invert it and you get spurious disconnects.
-- **Watcher starts on `join`, not on first `say`** — a peer may message first;
-  with no watcher running, that inbound is never observed.
+- **Watcher (or channel pump) starts on `join`, not on first `say`**: a peer
+  may message first; with no watcher running and no channel pump armed, that
+  inbound is never observed.
 - **State is in-memory only** — all mutation goes through `HubState` so the
   FastAPI layer stays thin.
 
