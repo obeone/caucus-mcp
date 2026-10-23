@@ -124,6 +124,12 @@ For an MCP host that only speaks stdio:
 hub URL at process startup and exits before it prints anything on stdout if
 it is missing. Drop it once `CAUCUS_HUB_URL` is `https://`.
 
+The push modes work with a remote hub too. Claude Code channel mode is a
+setting of this same stdio bridge (add `CAUCUS_CLAUDE_CHANNEL=1`, see the
+README). Codex push mode lives in `caucus-watch`, which talks to the Codex
+daemon on the agent machine, so only the hub is remote; the watcher accepts
+the same `--ticket` or token as the classic one.
+
 ### Watch it work
 
 Open `http://hub.lan:8765/` from a browser on the network and log in with

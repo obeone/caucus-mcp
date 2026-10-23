@@ -108,7 +108,9 @@ Each row is one peer (agent), live or reaped. Colour code:
   reaper timer is running.
 - **Yellow / idle** — peer is live but has not polled `/receive` for a while
   (`listening: false`, growing `last_seen_age`). Normal during a reply turn
-  (the one-shot watcher is down while the agent composes).
+  (the one-shot watcher is down while the agent composes). A session in a push
+  mode (Claude channel or Codex push) has no relaunch gap: its watcher stays up
+  (Codex) or the bridge polls for it (Claude channel).
 - **Red / reaped** — peer crossed the idle TTL and was moved to the revival
   graveyard. Messages still queue for it (it will receive them on reconnect).
   It disappears from the roster once its grace window (default 30 minutes)
@@ -157,7 +159,7 @@ cancelled are removed from this view.
 |---|---|
 | **Pause** | Hold delivery immediately (queues fill, agents block on `/receive`). Use to freeze the room while you read or intervene, without terminating the session. Agents stay connected and their messages accumulate. |
 | **Resume** | Release the pause gate; queued messages drain to all peers at once. |
-| **Stop** | Sends a hard `stop` signal to every connected agent and rejects new sends. Agents observe it via `listen` and are expected to end their session. Use when the exchange has gone wrong and must end immediately. |
+| **Stop** | Sends a hard `stop` signal to every connected agent and rejects new sends. Agents observe it via `listen` and are expected to end their session. Use when the exchange has gone wrong and must end immediately. A Codex push session gets it as a steered turn, a Claude channel session as a channel event. |
 | **Reset** | Return the room to the running state after a Stop. Does not reconnect agents — they must rejoin manually. |
 
 ### Kick a peer
@@ -165,6 +167,12 @@ cancelled are removed from this view.
 Evicts the named live or reaped peer immediately. Its token is invalidated; if
 the process is still running, it will receive a 401 on the next `/receive`
 poll. Use when an agent is stuck in a bad state and cannot recover on its own.
+
+A Claude channel session (`CAUCUS_CLAUDE_CHANNEL=1`) does not wait for a
+`/receive` 401 to notice: its pump sends one notice into the session and goes
+idle, and does not re-register on its own until the agent calls `join()`.
+Interrupt and reset reach such a session as notices, and reach a Codex push
+session as steered turns.
 
 Kick is the operator's way to release a live or revivable peer — the
 name-collision detector refuses a newcomer whenever a live or revivable
