@@ -26,6 +26,14 @@ Configuration via environment variables:
   the loopback default. Presented as ``Authorization: Bearer <key>`` on
   ``/register`` and on the pre-join read surface (``/peers``, ``/channels``,
   ``/forms``); every call made after join spends the per-peer token instead.
+* ``CAUCUS_CLAUDE_CHANNEL`` -- set to ``1`` to run as a Claude Code *channel*
+  (see :mod:`caucus.claude_channel`): the bridge declares ``claude/channel`` and,
+  once the agent confirms a probe event, pushes inbound messages straight into
+  the session instead of relying on the watcher. Needs Claude Code started with
+  ``--dangerously-load-development-channels server:<name>``.
+* ``CAUCUS_CLAUDE_CHANNEL_SETTLE`` -- longest a channel burst may settle before
+  it is pushed as one event (default 5 seconds, ``0`` disables). A burst is
+  pushed earlier once the hub is quiet for 1.5 s, and operator traffic at once.
 """
 
 from __future__ import annotations
@@ -45,10 +53,22 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import anyio
 import httpx
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
+from mcp.shared.message import SessionMessage
+from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 
 from . import __version__, automode, autostart
+from .claude_channel import (
+    CHANNEL_CAPABILITY,
+    MODERN_PROTOCOL_REVISION,
+    ChannelPump,
+    channel_enabled,
+    settle_seconds,
+)
 from .logging_setup import configure_logging
 from .models import lean_public, request_carried_token, session_expired_error
 from .urlguard import validate_hub_url
@@ -96,14 +116,85 @@ def _agent_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {AGENT_KEY}"}
 
 
-mcp = FastMCP(
+# Claude Code channel mode, read once at import: it decides the server's
+# capabilities, its instructions and whether confirm_delivery is registered.
+CHANNEL_MODE: bool = channel_enabled()
+
+_INSTRUCTIONS = (
+    "Tools arm automatically on first use (no setup step). Read-only tools "
+    "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
+    "work before joining; call join() to enter the room, then say(), "
+    "watch_command() and listen()."
+)
+
+_CHANNEL_INSTRUCTIONS = (
+    _INSTRUCTIONS + " Channel mode: after join(), a caucus probe channel event asks "
+    "you to call confirm_delivery(nonce). Once confirmed, caucus messages arrive as "
+    "channel events: do not relaunch caucus-watch and do not call listen()."
+)
+
+# The pump that pushes inbound as channel events; ``None`` unless channel mode
+# is on and the stdio runner started it (tool-level tests install their own).
+_pump: ChannelPump | None = None
+
+
+class _BridgeMCP(FastMCP):
+    """FastMCP whose stdio runner can also serve as a Claude Code channel.
+
+    With channel mode off it is plain FastMCP. With it on, the server declares
+    the ``claude/channel`` experimental capability and runs a
+    :class:`~caucus.claude_channel.ChannelPump` beside the MCP session, writing
+    to the same stdout. FastMCP 1.x offers no public hook for either, hence the
+    override (it resolves ``run_stdio_async`` on the instance, so ``mcp.run()``
+    still lands here).
+    """
+
+    async def run_stdio_async(self) -> None:
+        """Serve over stdio; with channel mode on, run the pump alongside."""
+        if not CHANNEL_MODE:
+            await super().run_stdio_async()
+            return
+        async with stdio_server() as (read_stream, write_stream):
+            await self._serve_channel(read_stream, write_stream)
+
+    async def _serve_channel(
+        self,
+        read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
+        write_stream: MemoryObjectSendStream[SessionMessage],
+    ) -> None:
+        """Run the MCP server and the channel pump on one pair of streams.
+
+        Split out of :meth:`run_stdio_async` so tests can drive it over memory
+        streams. The pump gets its own clone of the write stream and closes it
+        when cancelled, which lets the stdio writer finish on shutdown.
+
+        Args:
+            read_stream: Incoming JSON-RPC messages.
+            write_stream: Outgoing JSON-RPC messages (stdout).
+        """
+        global _pump
+        pump = ChannelPump(
+            HUB_URL,
+            lambda: _token,
+            agent_key=AGENT_KEY,
+            settle=settle_seconds(),
+        )
+        _pump = pump
+        options = self._mcp_server.create_initialization_options(
+            experimental_capabilities=dict(CHANNEL_CAPABILITY)
+        )
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(pump.run, write_stream.clone())
+                await self._mcp_server.run(read_stream, write_stream, options)
+                tg.cancel_scope.cancel()
+        finally:
+            _pump = None
+
+
+mcp = _BridgeMCP(
     "caucus",
-    instructions=(
-        "Tools arm automatically on first use (no setup step). Read-only tools "
-        "(list_peers, ping, list_channels, floor(action='status'), list_forms) "
-        "work before joining; call join() to enter the room, then say(), "
-        "watch_command() and listen()."
-    ),
+    instructions=_CHANNEL_INSTRUCTIONS if CHANNEL_MODE else _INSTRUCTIONS,
 )
 
 # Active membership, populated by :func:`join`. ``None`` means "not in the room".
@@ -441,7 +532,22 @@ def _resilient_hub_call(func: _ToolFn) -> _ToolFn:
                         "detail": str(retry_exc),
                         "hub": HUB_URL,
                     }
-                if fresh_token != stale_token and isinstance(result, dict):
+                if (
+                    fresh_token != stale_token
+                    and isinstance(result, dict)
+                    and _pump is not None
+                    and _pump.confirmed
+                ):
+                    # A confirmed channel session needs no watcher: the pump
+                    # reads the token on every poll, so re-arming is enough.
+                    _pump.arm()
+                    result = dict(result)
+                    result["note"] = (
+                        "session recovered automatically after session_expired"
+                        " (new identity); channel delivery follows it, no"
+                        " watcher needed"
+                    )
+                elif fresh_token != stale_token and isinstance(result, dict):
                     # Past the reap grace window the hub mints a brand-new
                     # identity rather than reviving the old one: the watcher
                     # (still holding the stale token in its --token-file) is
@@ -748,15 +854,30 @@ def join(
     if body.get("note"):
         # Surface any advisory the hub sent (e.g. taking over a timed-out slot).
         notes.append(str(body["note"]))
+    delivery = _pump.arm() if _pump is not None else None
+    if delivery is not None:
+        result["delivery"] = "claude-channel"
+        result["delivery_state"] = delivery
+        notes.append(
+            "channel mode, live: caucus messages arrive as channel events; do not"
+            " run caucus-watch or listen()"
+            if delivery == "live"
+            else "channel mode: launch the watcher in 'watch' as usual for now; a"
+            " caucus probe channel event will ask you to call"
+            " confirm_delivery(nonce), after which messages arrive as channel"
+            " events and the watcher exits DISPLACED (do not relaunch it)"
+        )
     if notes:
         result["note"] = "; ".join(notes)
     # Starting the watcher is the documented next step after join, so hand its
     # command over here instead of charging the agent a second tool round-trip
     # for watch_command(). A token-file failure must never sink a good join.
-    try:
-        result["watch"] = _watch_command_for(token)
-    except OSError as exc:  # pragma: no cover - needs an unwritable temp dir
-        logger.warning("watch command unavailable: %s", exc)
+    # A live channel session has no watcher: the pump already delivers.
+    if delivery != "live":
+        try:
+            result["watch"] = _watch_command_for(token)
+        except OSError as exc:  # pragma: no cover - needs an unwritable temp dir
+            logger.warning("watch command unavailable: %s", exc)
     # Safe Claude Code joins carry the already-completed audit so the model
     # knows operator answers remain informational. Other MCP hosts omit it.
     if automode_audit is not None:
@@ -771,6 +892,9 @@ def leave() -> dict[str, object]:
     if gate is not None:
         return gate
     global _token, _joined_as, _listen_lease
+    if _pump is not None:
+        # Before the hub forgets the token, so the pump stops polling with it.
+        _pump.disarm()
     token, name, _joined_as, _token = _token, _joined_as, None, None
     # The identity is gone, so the lease minted under it is meaningless; a later
     # re-join listens under a fresh one.
@@ -1092,6 +1216,8 @@ def listen(timeout: float = 30.0) -> dict[str, object]:
         return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
+    if _pump is not None and _pump.state == "live":
+        return _channel_mode_refusal()
     global _last_acked_seq, _listen_lease
     if _listen_lease is None:
         _listen_lease = secrets.token_urlsafe(8)
@@ -1149,10 +1275,52 @@ def watch_command() -> dict[str, object]:
         return gate
     if _token is None:
         return {"error": "not_joined", "hint": "call join() first"}
+    if _pump is not None and _pump.state == "live":
+        return _channel_mode_refusal()
     # No usage note here: the protocol already carries the run/relaunch/stop
     # rules verbatim, and repeating them on every call bought the agent nothing
     # it had not already read.
     return {"command": _watch_command_for(_token), "background": True}
+
+
+def _channel_mode_refusal() -> dict[str, object]:
+    """Build the refusal ``listen``/``watch_command`` return while the pump is live.
+
+    A second consumer on the token would take the hub's single ``/receive``
+    slot from the pump and split the conversation between the two, so both
+    tools refuse instead of competing.
+
+    Returns:
+        ``{"error": "channel_mode", "hint": ...}``.
+    """
+    return {
+        "error": "channel_mode",
+        "hint": (
+            "caucus messages already arrive as channel events in this session;"
+            " no watcher or listen() is needed. Just end your turn."
+        ),
+    }
+
+
+def confirm_delivery(nonce: str) -> dict[str, object]:
+    """Channel mode: echo the `nonce` from the caucus probe channel event to switch inbound to channel events. Afterwards do not relaunch caucus-watch or call listen(). Errors: not_joined, bad_nonce, not_armed."""
+    if _pump is None:
+        return {"error": "not_channel_mode", "hint": "channel mode is off"}
+    if _token is None:
+        return {"error": "not_joined", "hint": "call join() first"}
+    result = _pump.confirm(nonce)
+    if result.get("confirmed"):
+        # A watcher still running is displaced by the pump's lease and exits on
+        # its own. Removing its token file makes a relaunch of the command from
+        # join() fail at startup instead of taking the inbox back from the pump.
+        _cleanup_token_file()
+    return result
+
+
+if CHANNEL_MODE:
+    # Registered only in channel mode, so the default tool surface (and its
+    # parity with the hub's /mcp endpoint) is unchanged.
+    mcp.tool()(confirm_delivery)
 
 
 def main() -> None:
@@ -1191,6 +1359,17 @@ def main() -> None:
         logger.error("refusing to start: %s", exc)
         sys.exit(2)
     logger.info("caucus bridge ready (default project=%s); call join() to enter", PROJECT)
+    if CHANNEL_MODE:
+        logger.info("Claude Code channel mode on")
+        if MODERN_PROTOCOL_REVISION in SUPPORTED_PROTOCOL_VERSIONS:
+            # Claude Code refuses to register a channel server that negotiates
+            # this revision; events would then be dropped without a word.
+            logger.warning(
+                "the installed mcp SDK offers protocol %s, which Claude Code does"
+                " not register as a channel; start Claude Code with"
+                " MCP_PROTOCOL_NEGOTIATION=legacy",
+                MODERN_PROTOCOL_REVISION,
+            )
     mcp.run()
 
 
