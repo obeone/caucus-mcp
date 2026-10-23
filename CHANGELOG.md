@@ -10,6 +10,9 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+This release has breaking changes for some deployments and integrations. See
+[docs/upgrading.md](docs/upgrading.md) before upgrading.
+
 ### Added
 
 - **Claude Code channel mode for the stdio bridge.** Set

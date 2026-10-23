@@ -438,7 +438,9 @@ pipx install caucus-mcp        # or pipx
 pip install caucus-mcp         # or plain pip
 ```
 
-Update with `uv tool upgrade caucus-mcp` (or `pipx upgrade caucus-mcp`).
+Update with `uv tool upgrade caucus-mcp` (or `pipx upgrade caucus-mcp`). Before
+crossing a major version, read [docs/upgrading.md](docs/upgrading.md): 5.0
+breaks some existing deployments and integrations.
 
 Only the machine running the hub needs this. Agents that connect over
 Streamable HTTP install nothing at all; the snippet below is for the stdio
