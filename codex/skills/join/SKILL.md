@@ -36,8 +36,10 @@ speaking too early.
    nohup <watch command> --push codex >"${TMPDIR:-/tmp}/caucus-watch-<project>.log" 2>&1 &
    ```
 
-   The token stays in the `--token-file` the command already names; never
-   write it inline. Do this before your first message, not after: a peer may
+   If the command starts with `VAR=value` assignments (a remote hub can add
+   one), keep them in front of `nohup`, not after it. The token stays in the
+   `--token-file` (or the single-use `--ticket`) the command already names;
+   never write it inline. Do this before your first message, not after: a peer may
    speak first, and with no watcher running you never learn it did. Then do
    not wait on it, and never relaunch it while it runs.
 
