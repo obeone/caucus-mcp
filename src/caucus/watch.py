@@ -66,23 +66,39 @@ Configuration (flags win over environment):
     ``POST /watch-ticket/redeem`` (presenting ``CAUCUS_AGENT_KEY`` when the
     hub is keyed) and then polls exactly as it would with a direct token.
 * ``--timeout`` -- per-poll long-poll ceiling in seconds (default ``25``).
+* ``--push`` / ``CAUCUS_CODEX_PUSH`` -- Codex push mode (see below). ``--push
+  codex`` or ``CAUCUS_CODEX_PUSH=1`` turns it on, ``--push off`` forces the
+  classic contract. ``CAUCUS_PUSH_SETTLE`` caps how long a burst settles.
+
+Codex push mode (:mod:`caucus.codex_push`):
+
+When the watcher runs inside a Codex session (``CODEX_THREAD_ID`` set by Codex
+on the commands it runs) with push mode on, it does **not** exit per message.
+It delivers each settled burst as a new turn of that session through the Codex
+app-server daemon, holds bursts while a turn is running, ACKs only what the
+daemon accepted, and keeps running, so the agent never relaunches it. Without a
+thread id, or when the daemon cannot take the session's input, it falls back
+to the classic contract above, so nothing is lost.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import secrets
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
 
-from . import __version__
+from . import __version__, codex_push
 from .hub_connector import AGENT_KEY_ENV
 from .logging_setup import configure_logging
+from .push import POLL_TIMEOUT, settle_seconds
 from .urlguard import validate_hub_url
 
 logger = logging.getLogger("caucus.watch")
@@ -371,6 +387,61 @@ def redeem_ticket(hub: str, ticket: str) -> str | None:
     return str(token) if token else None
 
 
+def push_mode(flag: str | None, environ: Mapping[str, str] | None = None) -> bool:
+    """Decide whether to try Codex push mode.
+
+    Args:
+        flag: The ``--push`` value: ``"codex"``, ``"off"`` or ``None`` (unset).
+        environ: The environment to read. ``None`` reads :data:`os.environ`.
+
+    Returns:
+        ``True`` for ``--push codex``, ``False`` for ``--push off``, and the
+        ``CAUCUS_CODEX_PUSH`` flag when ``--push`` was not given.
+    """
+    if flag is not None:
+        return flag == "codex"
+    return codex_push.push_requested(environ)
+
+
+def _run_codex_push(args: argparse.Namespace, token: str) -> int | None:
+    """Run the Codex push loop when it can work here.
+
+    Args:
+        args: Parsed command line.
+        token: The peer token.
+
+    Returns:
+        The push loop's exit code, or ``None`` when push mode cannot start (no
+        Codex thread, or a daemon that cannot take the thread's input) and the
+        caller must run the classic watcher instead.
+    """
+    thread_id = codex_push.thread_id_from_env()
+    if thread_id is None:
+        logger.warning(
+            "Codex push requested but %s is unset; staying classic",
+            codex_push.THREAD_ENV,
+        )
+        return None
+    socket_path = (
+        Path(args.codex_socket) if args.codex_socket else codex_push.default_socket()
+    )
+    if not asyncio.run(codex_push.probe(thread_id, socket_path)):
+        logger.warning("Codex daemon cannot take this thread's input; staying classic")
+        return None
+    return asyncio.run(
+        codex_push.run(
+            args.hub,
+            token,
+            thread_id,
+            emit=_emit,
+            classic_line=_render_message,
+            socket_path=socket_path,
+            settle=settle_seconds(),
+            poll_timeout=min(args.timeout, POLL_TIMEOUT),
+        )
+    )
+
+
 def main() -> None:
     """CLI entry point: parse config and run the watch loop until it exits.
 
@@ -418,6 +489,20 @@ def main() -> None:
         default=25.0,
         help="Per-poll long-poll ceiling in seconds (default: %(default)s).",
     )
+    parser.add_argument(
+        "--push",
+        choices=("codex", "off"),
+        default=None,
+        help=(
+            "Deliver inbound as turns of the Codex session this runs in instead of"
+            " exiting per message (default: on when CAUCUS_CODEX_PUSH is set)."
+        ),
+    )
+    parser.add_argument(
+        "--codex-socket",
+        default=None,
+        help="Codex app-server control socket (default: under $CODEX_HOME).",
+    )
     args = parser.parse_args()
 
     try:
@@ -455,6 +540,10 @@ def main() -> None:
         )
 
     try:
+        if push_mode(args.push):
+            code = _run_codex_push(args, token)
+            if code is not None:
+                sys.exit(code)
         sys.exit(watch(args.hub, token, args.timeout))
     except KeyboardInterrupt:
         logger.info("watcher interrupted; exiting")
