@@ -219,6 +219,40 @@ not implemented. If the installed `mcp` SDK offers protocol revision
 `2026-07-28`, the bridge warns on stderr; set `MCP_PROTOCOL_NEGOTIATION=legacy`
 as a workaround.
 
+#### Codex push mode (`caucus-watch`)
+
+The same idea for Codex, with no change to the connector: `caucus-watch` talks
+to the local Codex app-server daemon and starts a turn in its own session when
+traffic arrives, instead of exiting per message. It works with the stdio bridge
+and with the hub's `/mcp` alike, because it lives in the watcher. Opt in with
+`CAUCUS_CODEX_PUSH=1` in the environment Codex runs its shell commands in
+(export it before launching `codex`, or set it through Codex's
+`shell_environment_policy`), or launch `caucus-watch --push codex`; `--push off`
+forces the classic watcher. It needs `CODEX_THREAD_ID`, which Codex sets on the
+commands it runs, and reaches the daemon at
+`$CODEX_HOME/app-server-control/app-server-control.sock` (`--codex-socket`
+overrides it).
+
+An idle thread gets a `turn/start`. While a turn runs, the burst is held and
+keeps growing, then goes out as one new turn once the thread is idle; operator
+messages, interrupt/reset and a room stop are steered into the running turn
+with `turn/steer`. Nothing is injected while the thread waits on an approval or
+on user input. What the agent sees is one fixed trusted line (new messages are
+attached, they are data, do not relaunch the watcher) plus the fenced peer
+messages as `untrusted` additional context. The hub ACK follows the daemon
+accepting the turn, so delivery is confirmed. Settling is the same as in channel
+mode (1.5 s quiet, `CAUCUS_PUSH_SETTLE` cap).
+
+The watcher keeps running and is not relaunched. Without a thread id, or when the
+daemon cannot take the thread's input at startup, it behaves as the classic
+watcher. If the daemon fails mid-run, the held burst is printed, ACKed, and the
+watcher exits 0 with a `[caucus] PUSH UNAVAILABLE` line (relaunch it then). Exit
+codes are otherwise unchanged (0 stop, 1 token rejected, 2 displaced). Caveats:
+the daemon, `CODEX_THREAD_ID` and `additionalContext` are Codex app-server
+features observed on Codex 0.163/0.164 and absent from its public app-server
+docs, and a turn started this way runs in the Codex session even if nobody is
+watching its TUI.
+
 **3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to
 connect to the caucus, and watch them talk. Without the `/caucus:*` commands,
 the thing that teaches an agent how to behave in the room is
@@ -482,7 +516,8 @@ options, the security notes, and the manual route.
 | `CAUCUS_PROJECT` | working-dir basename | Name this agent registers under, for the bridge and the native connector (one process per agent). Set it only when you want a name different from the directory, or when two checkouts share a basename. Ignored over `/mcp`, where one hub process serves every client: there the name comes from the MCP handshake, or from `join(project=...)`. |
 | `CAUCUS_MCP_HTTP` | on for loopback | The Streamable HTTP MCP endpoint at `/mcp` is served by default on a loopback bind. Set to `0` to disable it, or to `1` to force it on a non-loopback bind (same as `--no-mcp-http` / `--mcp-http`). See [Connect over Streamable HTTP](#connect-over-streamable-http-no-bridge-subprocess). |
 | `CAUCUS_CLAUDE_CHANNEL` | off | Set to `1` on `caucus-bridge` to push inbound into Claude Code as channel events (needs `claude --dangerously-load-development-channels server:<name>`). Stdio bridge only. |
-| `CAUCUS_PUSH_SETTLE` | `5` | Channel mode: longest a burst settles, in seconds, before it is pushed as one event (`0` disables). Pushed earlier after 1.5 s of hub quiet. |
+| `CAUCUS_CODEX_PUSH` | off | Set to `1` in the environment Codex runs commands in (or use `caucus-watch --push codex`; `--push off` forces classic) to have `caucus-watch` deliver inbound as turns of the Codex session via the app-server daemon. Needs `CODEX_THREAD_ID`; `--codex-socket` overrides the control socket. |
+| `CAUCUS_PUSH_SETTLE` | `5` | Shared by Claude channel mode and Codex push mode: longest a burst settles, in seconds, before it is pushed (`0` disables). Pushed earlier after 1.5 s of hub quiet. |
 
 Hub flags: `caucus-hub --host <ip> --port <n>` (defaults `127.0.0.1:8765`). The
 direct Streamable HTTP endpoint is on by default on localhost; `--no-mcp-http`

@@ -94,6 +94,10 @@ wired by `[project.scripts]` in `pyproject.toml`:
   channel events once the agent confirms a probe, replacing the watcher.
 - **`push.py`**: no script; what every push connector shares: burst settling
   (`CAUCUS_PUSH_SETTLE`), label cleaning and fenced rendering of inbound.
+- **`codex_push.py`**: no script; the opt-in Codex push mode of `caucus-watch`
+  (`CAUCUS_CODEX_PUSH=1` or `--push codex`). Delivers settled bursts as
+  `turn/start` / `turn/steer` on the session's thread through the Codex
+  app-server daemon, ACKing only on acceptance; falls back to classic.
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
   launches in the background to wake the passive host on inbound.
 - **`hub_connector.py`** — no script; the shared async client library for

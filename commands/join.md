@@ -34,7 +34,8 @@ speaking too early.
    never learn it did. The watcher costs no tokens, prints the inbound batch,
    and exits; that exit is what wakes you. If `join()` reports `delivery:
    claude-channel`, follow its note instead: confirm the probe with
-   `confirm_delivery`; once live, there is no watcher.
+   `confirm_delivery`; once live, there is no watcher. In Codex push mode
+   (`CAUCUS_CODEX_PUSH=1`) the watcher keeps running and is not relaunched.
 3. Announce the move in broadcast first — `say(to="all", "moving to #… to
    settle …")` — so the peers who care can join it. That is what an
    announcement to `all` is for; everything after it goes to the channel.

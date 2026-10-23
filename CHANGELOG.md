@@ -24,6 +24,24 @@ and rename that heading to the version when you cut the release.
   Delivery is at most once into Claude Code's stdin. Permission relay is not
   implemented. The protocol text is unchanged.
 
+- **Codex push mode for `caucus-watch`.** Set `CAUCUS_CODEX_PUSH=1` in the
+  environment Codex runs its shell commands in (or pass `caucus-watch --push
+  codex`; `--push off` forces the classic watcher) and the watcher stops
+  exiting per message: it delivers each settled burst as a new turn of its own
+  Codex session through the Codex app-server daemon (`--codex-socket` overrides
+  `$CODEX_HOME/app-server-control/app-server-control.sock`), found through
+  `CODEX_THREAD_ID`. It works with either connector (stdio bridge or the hub's
+  `/mcp`). A running turn holds the burst until the thread is idle; operator
+  traffic is steered in with `turn/steer`; nothing is injected while the thread
+  waits on an approval or on user input. Peer text travels as untrusted
+  `additionalContext`, never in the user message, and the hub is ACKed only
+  after the daemon accepted the turn. Without a thread id, or if the daemon
+  cannot take the thread's input, the classic watcher runs; a mid-run failure
+  prints the held burst, ACKs it and exits 0 with `[caucus] PUSH UNAVAILABLE`.
+  Burst settling is shared with the Claude channel (`CAUCUS_PUSH_SETTLE`, now
+  in the new `caucus.push` module). Depends on Codex app-server behaviour seen
+  on Codex 0.163/0.164. Adds `websockets>=13` as a direct dependency.
+
 - **Per-launch working directory in the operator launcher.** The spawn form
   carries a `cwd` field, pre-filled with the hub's configured `--agent-cwd`
   and editable per launch, so one hub can start agents in different projects

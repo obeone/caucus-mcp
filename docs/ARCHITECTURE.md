@@ -125,6 +125,28 @@ denominator; everything else is a connector to it.
   identity) resumes it. The guarantee is at most once into Claude Code's stdin: a
   batch is ACKed only after its event frame was written, and Claude Code never
   acknowledges a channel event. Permission relay is not implemented.
+- **`codex_push.py`**: the Codex push path of `caucus-watch`, opt-in with
+  `CAUCUS_CODEX_PUSH=1` or `--push codex` (`--push off` forces classic). It needs
+  `CODEX_THREAD_ID` (set by Codex on the commands it runs) and speaks JSON-RPC
+  over the WebSocket-on-Unix control socket of the Codex app-server daemon,
+  `$CODEX_HOME/app-server-control/app-server-control.sock` (`--codex-socket`).
+  It lives in the watcher, so it works whichever connector the session uses.
+  Each burst is settled by `push.py` (1.5 s quiet, `CAUCUS_PUSH_SETTLE` cap).
+  Idle thread: `turn/start`. Running turn: the burst is held and grows, and goes
+  out as one `turn/start` once idle; only operator traffic (messages,
+  interrupt/reset, stop) is steered in with `turn/steer`. Nothing is injected
+  while the thread waits on an approval or on user input. The turn's user input
+  is the fixed `TRIGGER` line; peer text rides `additionalContext` with `kind:
+  "untrusted"`, fenced like the native connectors. The hub is ACKed only after
+  the daemon accepted the turn (confirmed delivery). No thread id, or a daemon
+  that cannot take the thread's input at startup: the classic watcher runs. A
+  mid-run failure prints the held burst the classic way, ACKs it and exits 0
+  with `[caucus] PUSH UNAVAILABLE`; exit codes are otherwise unchanged (0
+  stop/fallback, 1 token rejected, 2 displaced). The daemon, `CODEX_THREAD_ID`
+  and `additionalContext` were observed on Codex 0.163/0.164 and are not in the
+  public app-server docs.
+- **`push.py`**: no script; what the Claude channel and Codex push share: burst
+  settling (`CAUCUS_PUSH_SETTLE`), label cleaning and fenced rendering.
 - **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop
   (no LLM) that the agent launches in the background via `watch_command()`. It
   polls `/receive` with an access token handed over directly (loopback), or,
@@ -142,6 +164,8 @@ denominator; everything else is a connector to it.
   relaunch after a stop). `listen` stays as a one-shot fallback for
   direct/manual polls. **`watch.py` and the one-shot dance only exist to serve
   the passive-host bridge** — a native connector needs none of it.
+  In Codex push mode (see `codex_push.py`) the watcher does not exit per message
+  and is not relaunched.
 - **`hub_connector.py`** — no script; the shared **async** client library for
   native connectors. A thin `httpx.AsyncClient` wrapper over the same hub
   endpoints the bridge uses (`/protocol`, `/register`, `/leave`, `/send`,
@@ -275,6 +299,9 @@ agent (MCP client) --stdio--> mcp_bridge --HTTP-->  hub (FastAPI) --WS--> operat
 # passive host, Claude Code channel mode (CAUCUS_CLAUDE_CHANNEL=1): in-process push
 claude code <--stdio (channel events)-- mcp_bridge (pump) --HTTP (own lease)--> hub
 
+# passive host, Codex push mode (CAUCUS_CODEX_PUSH=1): the watcher pushes
+codex session <--turn/start, turn/steer-- codex app-server daemon <--unix socket-- caucus-watch --HTTP--> hub
+
 # native connector (owns its loop): listens + speaks in one process
 claude_agent (ClaudeSDKClient) --HTTP (HubConnector)--> hub (FastAPI) --WS--> operator UI
 
@@ -287,8 +314,11 @@ translate HTTP status the same way: 429 → rate-limited (`retry_after`), 409 �
 stopped. Each strips control messages out of the chatter list and folds a `stop`
 control into a top-level `stop` flag — the bridge surfaces it to the agent as a
 result, the native connector ends its loop. The hub is identical on both paths;
-only the wake mechanism differs (watcher-exit, in-loop injection, or the bridge's
-channel push into Claude Code).
+only the wake mechanism differs (watcher-exit, in-loop injection, the bridge's
+channel push into Claude Code, or the watcher's push into a Codex session).
+In that last path a burst is held while the thread is busy, delivered as one
+turn, and ACKed only once the daemon accepted it; on failure it falls back to
+the classic print-ACK-exit.
 
 ## State (`state.py`) — the design center
 
