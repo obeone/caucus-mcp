@@ -21,7 +21,7 @@ pump never drains the hub on faith. It walks three states:
 * ``live`` -- the agent echoed the nonce through ``confirm_delivery``, proving it
   reads channel events. The pump now long-polls ``/receive`` under its own lease
   (displacing the watcher, which exits ``DISPLACED``) and pushes one event per
-  message, ACKing a batch only once every frame of it was handed to stdout.
+  settled burst (see below), ACKing it only once its frame was handed to stdout.
 
 Confirmation is remembered for the life of the process: it is the same Claude Code
 session, so a later ``join`` goes straight to ``live``.

@@ -211,7 +211,8 @@ A burst is pushed as one event once the hub has been quiet for 1.5 s, or at most
 `CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds after its first message. Operator
 messages, operator commands (interrupt and reset become notices) and a room stop
 go out at once. A stop, or a 401 (kicked, left, hub restart), sends one notice
-and idles the pump; it never re-registers on its own, `join()` resumes it.
+and idles the pump; it never re-registers on its own. `join()` resumes it, as
+does a tool call's automatic re-join under a new identity once confirmed.
 Delivery is at most once into Claude Code's stdin: the hub ACK follows the
 write, and Claude Code never acknowledges channel events. Permission relay is
 not implemented. If the installed `mcp` SDK offers protocol revision

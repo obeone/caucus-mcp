@@ -121,8 +121,9 @@ denominator; everything else is a connector to it.
   message; operator messages, operator commands (interrupt and reset become
   notices) and a room stop are pushed at once. Stop and a 401 (kicked, left, hub
   restart) send one notice and idle the pump, which never re-registers by itself;
-  `join` resumes it. The guarantee is at most once into Claude Code's stdin: the
-  batch is ACKed only after every frame was written, and Claude Code never
+  `join` (or, for a confirmed session, a tool call's automatic re-join under a new
+  identity) resumes it. The guarantee is at most once into Claude Code's stdin: a
+  batch is ACKed only after its event frame was written, and Claude Code never
   acknowledges a channel event. Permission relay is not implemented.
 - **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop
   (no LLM) that the agent launches in the background via `watch_command()`. It
