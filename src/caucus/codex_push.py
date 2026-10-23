@@ -90,7 +90,13 @@ _RPC_TIMEOUT = 15.0
 _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 15.0
 
-Outcome = Literal["delivered", "busy", "unavailable"]
+# Consecutive failed delivery attempts (daemon errors, refused turn/start or
+# turn/steer) tolerated before push mode gives up and falls back. A single
+# refusal is usually a race (a turn started or ended under our feet); three in a
+# row, one hold-poll apart, is a daemon that will not take the turn.
+_MAX_DELIVERY_ERRORS = 3
+
+Outcome = Literal["delivered", "busy", "retry", "unavailable"]
 
 
 class DaemonError(Exception):
@@ -199,14 +205,22 @@ class CodexDaemon:
         """
         self._next_id += 1
         request_id = self._next_id
+        loop = asyncio.get_running_loop()
+        # One deadline for the whole call: a stream of notifications must not
+        # keep resetting the wait.
+        deadline = loop.time() + _RPC_TIMEOUT
         try:
             await self._ws.send(
                 json.dumps({"id": request_id, "method": method, "params": dict(params)})
             )
             while True:
-                raw = await asyncio.wait_for(self._ws.recv(), _RPC_TIMEOUT)
-                message = json.loads(raw)
-                if message.get("id") == request_id:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"no answer within {_RPC_TIMEOUT:.0f}s")
+                message = json.loads(await asyncio.wait_for(self._ws.recv(), remaining))
+                # A daemon-to-client request carries a method and may reuse an
+                # id; only a response (no method) answers this call.
+                if "method" not in message and message.get("id") == request_id:
                     break
         except DaemonError:
             raise
@@ -410,44 +424,68 @@ async def run(
                 logger.warning("poll failed: %s", exc)
             return None
 
+        errors = 0
         while True:
-            timeout = _HOLD_POLL_SECONDS if _deliverable(held) else poll_timeout
-            try:
-                inbound = await poll(timeout, ack_seq)
-            except httpx.HTTPStatusError:
-                emit(
-                    "[caucus] SESSION EXPIRED -- the hub no longer knows this token:"
-                    " the peer was idle past the reaper timeout, left, or was kicked"
-                    " by the operator. Call join() to get a fresh token, then relaunch"
-                    " this watcher with watch_command(). Watcher exiting."
-                )
-                return 1
-            if inbound is None:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, _BACKOFF_MAX)
+            if held.displaced:
+                # Our lease is refused for good, and a refused poll answers at
+                # once: polling again would spin. Wait calmly for the thread to
+                # take what is held, then exit.
+                await asyncio.sleep(_HOLD_POLL_SECONDS)
+            else:
+                timeout = _HOLD_POLL_SECONDS if _deliverable(held) else poll_timeout
+                try:
+                    inbound = await poll(timeout, ack_seq)
+                except httpx.HTTPStatusError:
+                    # Kicked, left or reaped: the token is dead, so nothing can
+                    # be ACKed, but what is held must still reach the agent.
+                    for line in _classic_lines(held, classic_line):
+                        emit(line)
+                    emit(
+                        "[caucus] SESSION EXPIRED -- the hub no longer knows this"
+                        " token: the peer was idle past the reaper timeout, left, or"
+                        " was kicked by the operator. Call join() to get a fresh"
+                        " token, then relaunch this watcher with watch_command()."
+                        " Watcher exiting."
+                    )
+                    return 1
+                if inbound is None:
+                    # Hub unreachable. Back off, but still try to deliver what
+                    # is already held: the daemon does not need the hub.
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _BACKOFF_MAX)
+                else:
+                    backoff = _BACKOFF_MIN
+                    ack_seq = None  # spent by this poll
+                    burst = await gather_burst(
+                        inbound,
+                        lambda t: _settle_poll(poll, t),
+                        settle=settle,
+                        quiet_gap=quiet_gap,
+                    )
+                    _merge(held, burst)
+            if not _deliverable(held):
+                if held.displaced:
+                    return _final(held, emit)
                 continue
-            backoff = _BACKOFF_MIN
-            ack_seq = None  # spent by this poll
-            burst = await gather_burst(
-                inbound, lambda t: _settle_poll(poll, t), settle=settle, quiet_gap=quiet_gap
-            )
-            _merge(held, burst)
-            if _deliverable(held):
-                outcome = await _attempt(socket_path, thread_id, held)
-                if outcome == "unavailable":
-                    return await _fall_back(hub, token, held, emit, classic_line)
-                if outcome == "delivered":
-                    # ACK only now that the daemon accepted the turn.
-                    ack_seq = max_seq(held.messages)
-                    if held.stop or held.displaced:
-                        if ack_seq is not None:
-                            await hub.ack(token, ack_seq)
-                        return _final(held, emit)
-                    held = Burst()
-                    continue
-                # Busy: keep holding; the shorter poll re-checks soon.
-            if held.displaced and not _deliverable(held):
-                return _final(held, emit)
+            outcome = await _attempt(socket_path, thread_id, held)
+            if outcome == "retry":
+                errors += 1
+                if errors < _MAX_DELIVERY_ERRORS:
+                    continue  # likely a race; the next hold-poll retries
+                outcome = "unavailable"
+            else:
+                errors = 0
+            if outcome == "unavailable":
+                return await _fall_back(hub, token, held, emit, classic_line)
+            if outcome == "delivered":
+                # ACK only now that the daemon accepted the turn.
+                ack_seq = max_seq(held.messages)
+                if held.stop or held.displaced:
+                    if ack_seq is not None:
+                        await hub.ack(token, ack_seq)
+                    return _final(held, emit)
+                held = Burst()
+            # Busy: keep holding; the shorter poll re-checks soon.
 
 
 async def _settle_poll(
@@ -472,7 +510,9 @@ async def _attempt(socket_path: Path, thread_id: str, held: Burst) -> Outcome:
         held: The burst waiting for delivery.
 
     Returns:
-        The delivery outcome; a daemon failure counts as ``unavailable``.
+        The delivery outcome. A daemon failure (unreachable, or a refused
+        ``turn/start`` / ``turn/steer``) is ``retry``: the caller counts those
+        and only gives up after :data:`_MAX_DELIVERY_ERRORS` in a row.
     """
     text, untrusted = compose(held)
     try:
@@ -482,7 +522,27 @@ async def _attempt(socket_path: Path, thread_id: str, held: Burst) -> Outcome:
             )
     except DaemonError as exc:
         logger.warning("Codex delivery failed: %s", exc)
-        return "unavailable"
+        return "retry"
+
+
+def _classic_lines(
+    held: Burst, classic_line: Callable[[dict[str, object]], str]
+) -> list[str]:
+    """Render a held burst the classic watcher's way, commands included.
+
+    Args:
+        held: The burst to print.
+        classic_line: Renders one message the classic way.
+
+    Returns:
+        One stdout line per message, then one per known operator command.
+    """
+    lines = [classic_line(message) for message in held.messages]
+    for command in held.commands:
+        notice = COMMAND_NOTICES.get(command)
+        if notice is not None:
+            lines.append(f"[caucus] OPERATOR {command} -- {notice}.")
+    return lines
 
 
 async def _fall_back(
@@ -505,8 +565,8 @@ async def _fall_back(
         ``0`` (or ``2`` when the burst also carried a displacement).
     """
     logger.warning("Codex push unavailable; falling back to the classic watcher")
-    for message in held.messages:
-        emit(classic_line(message))
+    for line in _classic_lines(held, classic_line):
+        emit(line)
     seq = max_seq(held.messages)
     if seq is not None:
         await hub.ack(token, seq)
@@ -536,7 +596,7 @@ def _final(held: Burst, emit: Callable[[str], None], *, fallback: bool = False) 
     if fallback and not held.stop:
         emit(
             "[caucus] PUSH UNAVAILABLE -- the Codex session could not take a new"
-            " turn, so these messages were printed instead. Relaunch the watcher"
-            " to keep listening."
+            " turn, so what was waiting for it is printed above instead. Relaunch"
+            " the watcher to keep listening."
         )
     return 0

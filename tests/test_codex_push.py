@@ -58,6 +58,8 @@ class _FakeDaemon:
         self.turn_status = "inProgress"
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.refuse: set[str] = set()
+        #: Methods refused only for their next N calls (a transient race).
+        self.refuse_once: dict[str, int] = {}
 
     def methods(self, name: str) -> list[dict[str, Any]]:
         """Params of every call to ``name``, in order."""
@@ -72,7 +74,10 @@ class _FakeDaemon:
                 continue
             method, params = message["method"], message.get("params") or {}
             self.calls.append((method, params))
-            if method in self.refuse:
+            if self.refuse_once.get(method, 0) > 0:
+                self.refuse_once[method] -= 1
+                reply: dict[str, Any] = {"error": {"code": -32600, "message": "race"}}
+            elif method in self.refuse:
                 reply: dict[str, Any] = {"error": {"code": -32600, "message": "refused"}}
             else:
                 reply = {"result": self._result(method)}
@@ -120,6 +125,11 @@ class _ScriptedHub:
     def __init__(self) -> None:
         self.script: list[tuple[int, dict[str, object], float]] = []
         self.requests: list[httpx.Request] = []
+        #: Status answered at once for every ``/receive`` once the script is
+        #: empty (e.g. 409 forever after a displacement); ``None`` is quiet.
+        self.exhausted: int | None = None
+        #: When set, every ``/receive`` fails in transit (hub down).
+        self.down = False
 
     def batch(self, *messages: dict[str, object], delay: float = 0.0) -> None:
         """Queue a ``/receive`` answer carrying ``messages``."""
@@ -144,11 +154,15 @@ class _ScriptedHub:
         self.requests.append(request)
         if request.url.path == "/ack":
             return httpx.Response(200, json={"acked": True})
+        if self.down:
+            raise httpx.ConnectError("hub down", request=request)
         if self.script:
             code, body, delay = self.script.pop(0)
             if delay:
                 await asyncio.sleep(delay)
             return httpx.Response(code, json=body)
+        if self.exhausted is not None:
+            return httpx.Response(self.exhausted, json={"detail": "scripted"})
         await asyncio.sleep(min(float(request.url.params.get("timeout", "1")), 0.3))
         return httpx.Response(200, json={"messages": [], "mode": "running"})
 
@@ -454,6 +468,93 @@ async def test_a_vanished_daemon_falls_back_to_classic(sock_dir: Path) -> None:
     assert await _run(hub, sock_dir / "gone.sock", lines) == 0
     assert any("daemon is gone" in line for line in lines)
     assert hub.acks == [{"token": "tok-1", "seq": 9}]
+
+
+async def test_displaced_while_holding_does_not_spin(sock_dir: Path) -> None:
+    # Regression: a displaced lease is refused at once on every poll, so a
+    # watcher holding a burst for a busy thread used to loop ~1200 times a
+    # second against both the hub and the daemon until the turn ended.
+    hub = _ScriptedHub()
+    hub.batch(_msg(1, "held across a displacement"))
+    hub.status(409)
+    hub.exhausted = 409
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+
+        async def finish_turn() -> None:
+            await anyio.sleep(1.0)
+            fake.status = {"type": "idle"}
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(finish_turn)
+            assert await _run(hub, path, lines) == 2
+    assert len(hub.receives) <= 3
+    assert len(fake.methods("thread/read")) <= 10
+    assert "held across a displacement" in (
+        fake.methods("turn/start")[0]["additionalContext"]["caucus"]["value"]
+    )
+    assert lines[-1].startswith("[caucus] DISPLACED")
+
+
+async def test_a_racing_turn_start_is_retried_not_abandoned(sock_dir: Path) -> None:
+    hub = _ScriptedHub()
+    hub.batch(_msg(12, "retry me"))
+    hub.batch(_STOP, delay=0.6)
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.refuse_once["turn/start"] = 1  # a turn started under our feet
+        assert await _run(hub, path, lines) == 0
+    assert len(fake.methods("turn/start")) >= 2
+    assert not any("retry me" in line for line in lines)  # pushed, not printed
+
+
+async def test_the_fallback_prints_held_operator_commands(sock_dir: Path) -> None:
+    hub = _ScriptedHub()
+    hub.batch({"kind": "control", "content": "interrupt", "seq": 0})
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        assert await _run(hub, path, lines) == 0
+    assert any("interrupt" in line for line in lines)
+    assert lines[-1].startswith("[caucus] PUSH UNAVAILABLE")
+
+
+async def test_a_kick_while_holding_prints_the_held_burst(sock_dir: Path) -> None:
+    hub = _ScriptedHub()
+    hub.batch(_msg(13, "said before the kick"))
+    hub.status(401)
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+        assert await _run(hub, path, lines) == 1
+    assert any("said before the kick" in line for line in lines)
+    assert lines[-1].startswith("[caucus] SESSION EXPIRED")
+
+
+async def test_a_hub_outage_while_holding_still_delivers(sock_dir: Path, monkeypatch) -> None:
+    monkeypatch.setattr(codex_push, "_BACKOFF_MAX", 0.2)
+    hub = _ScriptedHub()
+    hub.batch(_msg(14, "deliver me during the outage"))
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "active", "activeFlags": []}
+
+        async def outage_then_idle() -> None:
+            await anyio.sleep(0.3)
+            hub.down = True
+            await anyio.sleep(0.5)
+            fake.status = {"type": "idle"}
+            with anyio.fail_after(5):
+                while not fake.methods("turn/start"):
+                    await anyio.sleep(0.05)
+            tg.cancel_scope.cancel()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(outage_then_idle)
+            await _run(hub, path, [])
+    assert "deliver me during the outage" in (
+        fake.methods("turn/start")[0]["additionalContext"]["caucus"]["value"]
+    )
 
 
 async def test_a_refused_turn_falls_back_to_classic(sock_dir: Path) -> None:
