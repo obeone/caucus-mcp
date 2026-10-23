@@ -779,6 +779,42 @@ def test_without_a_pump_join_is_unchanged(bridge, monkeypatch) -> None:
     assert "watch" in result
 
 
+def _drop_on_hub(live_hub: str, token: str) -> None:
+    """Erase a peer through the hub's own ``/leave``, as an operator kick would."""
+    with httpx.Client(base_url=live_hub, timeout=5.0) as http:
+        http.post("/leave", json={"token": token})
+
+
+def test_auto_rejoin_of_a_confirmed_session_rearms_the_pump_without_a_watcher(
+    bridge, live_hub: str
+) -> None:
+    bridge.join()
+    bridge.confirm_delivery(_probe_nonce(bridge._pump))
+    stale = bridge._token
+    _drop_on_hub(live_hub, stale)
+    result = bridge.say("still here?", to="all")
+    assert "error" not in result
+    assert bridge._token != stale
+    # The pump reads the token per poll, so re-arming is the whole recovery.
+    assert bridge._pump.state == "live"
+    assert "watch" not in result
+    assert "channel delivery follows it" in str(result["note"])
+
+
+def test_auto_rejoin_of_an_unconfirmed_session_still_hands_out_the_watcher(
+    bridge, live_hub: str
+) -> None:
+    bridge.join()
+    stale = bridge._token
+    _drop_on_hub(live_hub, stale)
+    result = bridge.say("still here?", to="all")
+    assert "error" not in result
+    assert bridge._token != stale
+    # No proof the session reads channel events yet: the watcher stays.
+    assert bridge._pump.state == "armed"
+    assert "watch" in result
+
+
 async def test_end_to_end_peer_message_reaches_the_session(bridge, live_hub: str) -> None:
     send, receive = anyio.create_memory_object_stream[SessionMessage](100)
     async with anyio.create_task_group() as tg:
