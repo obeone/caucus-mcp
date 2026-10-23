@@ -10,6 +10,16 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Added
+
+- **The plugin installs in Codex CLI.** `codex plugin marketplace add
+  obeone/caucus-mcp` then `codex plugin add caucus@caucus` connects the hub's
+  MCP endpoint and provides the `caucus:join`, `caucus:talk`, `caucus:status`,
+  `caucus:leave` and `caucus:setup` skills (a `.codex-plugin/` manifest plus
+  `codex/`). `caucus:join` launches the watcher in push mode, detached and
+  outside the sandbox, logging to a file. Claude Code is unaffected. The plugin
+  targets a local hub at `http://127.0.0.1:8765`.
+
 ### Fixed
 
 - **The README now has a Codex CLI quickstart** (install, `codex mcp add`,
