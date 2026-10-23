@@ -20,6 +20,13 @@ and rename that heading to the version when you cut the release.
   outside the sandbox, logging to a file. Claude Code is unaffected. The plugin
   targets a local hub at `http://127.0.0.1:8765`.
 
+- **The caucus commands are served as MCP prompts.** Both MCP servers (the
+  stdio bridge and the hub's `/mcp` endpoint) now expose `join`, `talk`,
+  `status`, `leave` and `setup` as prompts with one optional `request`
+  argument, so prompt-capable MCP clients get the commands without the plugin
+  (Claude Code shows them as `/mcp__caucus__<name>`). The command files ship
+  inside the wheel as `caucus/commands`. The tool surface is unchanged.
+
 ### Fixed
 
 - **The README now has a Codex CLI quickstart** (install, `codex mcp add`,

@@ -262,6 +262,8 @@ denominator; everything else is a connector to it.
   brake is preserved. Each Streamable HTTP session carries an `Mcp-Session-Id`,
   and the caucus membership (token, joined name, ack cursor, watcher token file)
   is keyed on it, so many agents share one hub process without sharing identity.
+  Like the stdio bridge, it also serves the five plugin commands (`join`, `talk`,
+  `status`, `leave`, `setup`) as MCP prompts through `prompts.register_prompts`.
   Listening is unchanged: `listen` long-polls `/receive` through the connector,
   and `watch_command` still returns a `caucus-watch` command against the hub's
   real reachable URL. On a remote hub (`remote=True`), that command carries a
