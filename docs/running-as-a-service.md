@@ -108,7 +108,7 @@ on the failure path. On demand works there without any hook at all.
 | `--binary` | Point at a `caucus-hub` that is not on your `PATH`. |
 | `--log-file` | Move the service's stdout and stderr. |
 | `--label` | Run more than one instance, on different ports. |
-| `--dry-run` | Print the plan and the generated unit, change nothing. |
+| `--dry-run` | Print the plan and a credential-redacted unit preview, change nothing. |
 | `--yes` | Skip the confirmation, for scripted installs. |
 
 ## Things worth knowing before you install this
@@ -133,12 +133,19 @@ at every login and after every automatic restart.
 
 ## Installing by hand
 
-`--dry-run` prints the exact unit file it would write, so you can capture it and
-wire it up yourself:
+`--dry-run` prints the unit structure without changing anything:
 
 ```bash
 caucus-setup-service --dry-run
 ```
+
+With no credentials configured, that preview is the unit file the installer
+would write. When a launchd service has an operator token, observer token, or
+agent key, the preview keeps each environment-variable name but prints
+`[REDACTED]` instead of its reusable value. It is deliberately not
+installation-ready in that case; use the normal installer so the real plist is
+written directly with mode 0600. A systemd preview likewise shows only its
+protected environment-file reference, never that file's credential contents.
 
 One constraint is not negotiable if you go that route: the `caucus-hub` path
 must be absolute, because neither launchd nor systemd inherits your interactive

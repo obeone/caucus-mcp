@@ -24,8 +24,8 @@ Design (the load-bearing decisions):
   ``429`` a burst of honest joins. That flood guard is the wrong brake for a
   trusted in-process caller, so ``join`` calls :meth:`HubState.register`
   directly and replicates the *full* ``/register`` response shaping (CONTESTED
-  ``name_in_use``, ``CapExceeded``, REPLACED note, protocol-stale, channel
-  directory), intentionally skipping only the host bucket. The duplicate-name
+  ``name_in_use``, ``CapExceeded``, protocol-stale, channel directory),
+  intentionally skipping only the host bucket. The duplicate-name
   brake (``name_in_use``) is preserved. Because that shortcut also skips the
   ``RegisterRequest`` pydantic model, ``join`` re-applies its two name guards
   itself: the 1-64 character bound, and the reserved-name rejection that stops a
@@ -39,10 +39,8 @@ Design (the load-bearing decisions):
   the tools fail closed to ``no_session`` when it is absent. The *default* name
   is per-session too (the handshake's ``clientInfo.name``, see
   :func:`_default_project`), because a process-wide default put every client on
-  one name, where the hub's REPLACED path then merged them onto one Client record.
-  Two live sessions contending for a name are refused in :func:`join`: the hub
-  measures liveness by the in-flight long-poll and so cannot tell that the
-  incumbent is alive, but this process can.
+  one name. Two sessions contending for a name are refused by the shared state
+  boundary, which requires proof of the incumbent token.
 
 * **Listening is unchanged.** ``listen`` long-polls ``/receive`` through the
   connector exactly as the bridge does, and ``watch_command`` still returns a
@@ -110,10 +108,9 @@ _POOL_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 #
 # Deliberately NOT read from ``CAUCUS_PROJECT``: that env var names the *hub*
 # process, while this server is shared by every HTTP client. Honouring it handed
-# all of them one and the same name, and because a session's liveness at the hub
-# is its in-flight long-poll, the second joiner met REPLACED (not CONTESTED) and
-# inherited the first one's Client record: same token, same inbox. Two agents,
-# one identity. The per-session default now comes from :func:`_default_project`.
+# all of them one and the same name. The per-session default now comes from
+# :func:`_default_project`, and the state boundary also refuses any claimant that
+# cannot present the incumbent identity's token.
 _FALLBACK_PROJECT = "mcp-client"
 
 # Mirrors ``RegisterRequest.project``'s ``max_length``. The ``/mcp`` join path
@@ -310,7 +307,7 @@ def _default_project(ctx: _Ctx) -> str:
     The MCP ``initialize`` handshake carries a per-session ``clientInfo.name``,
     which is the closest thing to a client identity the transport offers. Using
     it keeps two HTTP clients apart by default, where the old hub-wide constant
-    collapsed them onto one name (and, via REPLACED, onto one hub identity).
+    collapsed them onto one name.
 
     It is only a *default*: clients that care should pass ``project`` explicitly.
     Two instances of the same MCP host still announce the same ``clientInfo``,
@@ -759,7 +756,7 @@ def build_mcp_server(
         # membership record: the parent would start speaking as the newcomer
         # and its own peer would be orphaned on the hub. Refuse before the hub
         # is touched, so no stray peer is minted. Re-joining under the SAME
-        # name stays allowed (the reaffirm / revive / replace path).
+        # name stays allowed (the reaffirm/revive path).
         if member.token is not None and member.joined_as != name:
             logger.warning(
                 "join refused: session already holds identity %s (requested %s)",
@@ -779,28 +776,6 @@ def build_mcp_server(
                     " the parent's peer from the roster."
                 ),
             }
-        # Another *live* session in this process already holding the name is a
-        # collision the hub cannot see: its liveness signal is the in-flight
-        # /receive long-poll, so between two polls HubState.register reports
-        # REPLACED rather than CONTESTED and hands the newcomer the existing
-        # Client record: same token, same inbox, two agents merged into one
-        # identity. This process does know both sessions are alive, so it refuses
-        # here, matching the name_in_use contract the REST path gives.
-        sid = _session_id(ctx)
-        if any(
-            other_sid != sid and other.token is not None and other.joined_as == name
-            for other_sid, other in sessions.items()
-        ):
-            logger.warning("duplicate join refused (live session) project=%s", name)
-            return {
-                "error": "name_in_use",
-                "project": name,
-                "note": (
-                    "another live MCP session on this hub already holds this"
-                    " name; re-join with an explicit, distinct project."
-                ),
-                "hub": self_url,
-            }
         # A3-direct (A1): call HubState.register straight, skipping the per-host
         # /register flood bucket that ASGITransport would collide all sessions
         # into. Resolve the module global at call time so a test-swapped state
@@ -815,7 +790,7 @@ def build_mcp_server(
             logger.warning("join refused (cap) project=%s: %s", name, exc)
             return {"error": "cap_exceeded", "detail": str(exc), "hub": self_url}
         if reg.outcome is RegisterOutcome.CONTESTED:
-            # Name held by a live listener and no matching token — refuse. Do
+            # Name owned by another identity and no matching token — refuse. Do
             # NOT dereference reg.client here: it is None on CONTESTED.
             logger.warning("duplicate join refused project=%s", name)
             # register() rejected the token this session presented, so it holds
@@ -827,12 +802,12 @@ def build_mcp_server(
                 "error": "name_in_use",
                 "project": name,
                 "note": (
-                    "an active listener already holds this name; you look like"
-                    " a duplicate process — re-join under a different name."
+                    "an existing identity already owns this name; present its"
+                    " token or re-join under a different name."
                 ),
                 "hub": self_url,
             }
-        client = reg.client  # not None for FRESH / REAFFIRMED / REPLACED
+        client = reg.client  # not None for FRESH / REAFFIRMED
         assert client is not None
         member.token = client.token
         member.joined_as = name
@@ -866,13 +841,6 @@ def build_mcp_server(
             notes.append(
                 "protocol unchanged; already delivered this session"
                 " (pass force_protocol=true to re-read it)"
-            )
-        if reg.outcome is RegisterOutcome.REPLACED:
-            # Took over a timed-out slot — advise the caller it may be joining
-            # mid-conversation, exactly as the /register handler does.
-            notes.append(
-                "you may be replacing a timed-out session and could be joining"
-                " mid-conversation."
             )
         if notes:
             result["note"] = "; ".join(notes)
@@ -1106,7 +1074,7 @@ def build_mcp_server(
     async def floor(
         ctx: _Ctx, action: str, scope: str = "all", reason: str | None = None
     ) -> dict[str, object]:
-        """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+        """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` "all" (default) or "#channel"; `reason` for take. `status` works pre-join. See protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, rate_limited, not_joined."""
         member, gate = await _ensure_armed(ctx)
         if gate is not None:
             return gate

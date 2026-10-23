@@ -25,8 +25,14 @@ Behaviour:
 - **No operator token configured** → auth disabled, every `/ui` connection is
   `operator` (preserves today's localhost behaviour). The hub sends
   `{"type":"auth_ok","role":"operator","auth":false}` immediately on connect.
-- **Operator token configured** → the client MUST send the first frame
-  `{"auth":"<token>"}` within a short window. The hub replies:
+- **Operator token configured** → a client with a stored token sends the first
+  frame `{"auth":"<token>"}`. A fresh dashboard instead sends the non-secret
+  `{"auth_probe":true}` first; the hub replies `{"type":"auth_required"}` and
+  waits for `{"auth":"<token>"}` on the same socket. The complete exchange must
+  finish within 30 seconds of connection; a silent or stalled client is closed
+  with code 1008. At most 32 sockets may await authentication at once; excess
+  connections are closed with the retryable overload code 1013. The hub then
+  replies:
   - `{"type":"auth_ok","role":"operator","auth":true}` if it matches the
     operator token,
   - `{"type":"auth_ok","role":"observer","auth":true}` if it matches the
@@ -34,6 +40,10 @@ Behaviour:
   - otherwise the hub sends `{"type":"auth_error"}` and closes the socket
     (code 1008).
 - After `auth_ok`, the hub sends the usual `snapshot` event.
+
+Reusable credentials never belong in the dashboard URL. The dashboard ignores
+`?token=` and persists a prompted token only after `auth_ok`; `auth_error`
+clears a stale stored token before reconnecting.
 
 **RBAC.** `observer` connections may only read. Any mutating command from an
 observer is refused with `{"type":"error","reason":"forbidden","command":"<name>"}`

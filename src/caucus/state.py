@@ -60,7 +60,7 @@ MAX_CLIENTS = 512
 Counts both the active roster and the revival graveyard, since both pin a
 :class:`Client` (with its queue and unacked buffer) in memory. A fresh
 registration past this ceiling is refused; reusing an existing identity
-(reaffirm/replace/revive) is always allowed so honest reconnects never trip it.
+(reaffirm/revive) is always allowed so honest reconnects never trip it.
 """
 
 MAX_CHANNELS_PER_CLIENT = 64
@@ -93,6 +93,55 @@ not yet drained; rather than reject sends (which would penalise the *sender* for
 a slow *recipient*), :meth:`route` drops the oldest queued message to make room,
 so the queue behaves like a ring buffer once full.
 """
+
+MAX_UI_QUEUE_SIZE = 256
+"""Maximum events buffered for one dashboard WebSocket.
+
+Dashboard state is recoverable from the snapshot sent on every connection, so
+a listener that falls this far behind is disconnected and must reconnect rather
+than retaining an unlimited event backlog in the hub process.
+"""
+
+
+class UIEventQueue(asyncio.Queue[dict[str, object]]):
+    """Bounded dashboard event queue with a latched overflow state."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=MAX_UI_QUEUE_SIZE)
+        self.overflowed = False
+
+
+def offer_ui_event(
+    queue: asyncio.Queue[dict[str, object]], event: dict[str, object]
+) -> bool:
+    """Queue one dashboard event without blocking or growing memory unboundedly.
+
+    A full listener has already lost the ability to observe an ordered event
+    stream. Discard its stale backlog, leave one overflow sentinel for the
+    WebSocket pump, and reject all later offers. The pump closes the connection;
+    the dashboard then reconnects and receives a fresh state snapshot.
+
+    Args:
+        queue: The per-dashboard event queue.
+        event: The event to enqueue.
+
+    Returns:
+        ``True`` when ``event`` was queued, or ``False`` when the listener was
+        already overflowed or became overflowed during this call.
+    """
+    if isinstance(queue, UIEventQueue) and queue.overflowed:
+        return False
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        while not queue.empty():
+            queue.get_nowait()
+        if isinstance(queue, UIEventQueue):
+            queue.overflowed = True
+        queue.put_nowait({"type": "overflow"})
+        logger.warning("dashboard event queue overflowed; disconnecting listener")
+        return False
+    return True
 
 
 # Per-agent control commands the operator can aim at a single connected agent
@@ -134,7 +183,7 @@ STATUS_BUCKET_CAPACITY = 30.0
 STATUS_BUCKET_REFILL = 1.0
 """Sustained ``set_status`` rate, in updates per second, per client."""
 
-# A CONTESTED join (a newcomer claiming a name a live listener still holds)
+# A CONTESTED join (a newcomer claiming an existing identity without its token)
 # raises an operator notice. That path is not rate-limited by the sender's
 # bucket (the caller has no token yet), and the hub-level per-host brake on
 # ``/register`` still lets a steady trickle through, so a client retrying in a
@@ -224,14 +273,10 @@ class Client:
             message reaches a client only if its name is in this set, so
             membership is per-client and explicit (self-join).
         active_polls: Number of in-flight ``/receive`` long-polls currently
-            held for this client — i.e. live listeners. Used to tell a genuine
-            reconnect from a colliding duplicate at register time. Distinct
-            from :attr:`poll_lease`, which the lease machinery uses: this
-            counter answers "is anybody polling *right now*", the lease answers
-            "who is allowed to poll at all". Register deliberately keeps
-            reading the counter, since a lease survives between two polls and
-            past the holder's death, so deciding CONTESTED on it would wedge a
-            name behind a lease no live process still holds.
+            held for this client — i.e. live listeners. This is observability,
+            not proof of identity ownership: a legitimate watcher routinely
+            leaves gaps between polls. Distinct from :attr:`poll_lease`, which
+            answers who is allowed to poll at all.
         poll_lease: The single-consumer grant currently held on ``/receive``,
             or ``None`` before anyone has polled. Managed by
             :meth:`HubState.acquire_poll_lease`.
@@ -333,9 +378,9 @@ class RegisterOutcome(str, Enum):
     REAFFIRMED = "reaffirmed"
     """Same agent re-joined; a valid token was presented and matched."""
     REPLACED = "replaced"
-    """Took over a record whose listener was gone (``active_polls == 0``)."""
+    """Legacy outcome retained for compatibility; no longer returned."""
     CONTESTED = "contested"
-    """Name held by a live listener — caller refused, no token issued."""
+    """Name belongs to another identity — caller refused, no token issued."""
 
 
 @dataclass(slots=True)
@@ -592,14 +637,10 @@ class HubState:
           window): the client is revived in place with the same token (an
           operator-only "reconnected" notice is emitted in that case — see
           :meth:`_revive`).
-        * **REPLACED** — name exists but ``active_polls == 0`` (the prior
-          listener is gone) and no valid token is presented. The existing
-          client record is reused (same queue and channel memberships);
-          ``last_seen`` is refreshed. No new announce.
-        * **CONTESTED** — name exists, no valid token presented, AND the
-          existing client has ``active_polls > 0`` (a live listener is
-          present). The caller is refused; state is not mutated. An operator
-          warning is broadcast via :meth:`_announce_system`, at most once per
+        * **CONTESTED** — a live or revivable identity owns the name and no
+          matching token was presented. The caller is refused and the identity
+          record is not mutated. An operator warning is broadcast via
+          :meth:`_announce_system`, at most once per
           :data:`CONTESTED_NOTICE_WINDOW` for a given name so a retry loop
           cannot flood the feed.
 
@@ -607,67 +648,48 @@ class HubState:
             project: The human-readable project name to register.
             token: The token previously issued for this project, if the caller
                 still holds it. Supplying the correct token causes a
-                REAFFIRMED outcome regardless of ``active_polls``.
+                REAFFIRMED outcome; polling activity is not an ownership check.
 
         Returns:
             A :class:`Registration` describing the outcome and (when the
             caller is accepted) the associated :class:`Client`.
         """
-        existing = self._clients.get(project)
-        if existing is not None:
-            if token is not None and secrets.compare_digest(token, existing.token):
-                # Same agent re-joining: refresh and return without fanfare.
-                existing.last_seen = time.time()
-                return Registration(RegisterOutcome.REAFFIRMED, existing)
-            if existing.active_polls > 0:
-                # A live listener holds the name — refuse the newcomer. The
-                # notice is throttled per name: a client retrying in a tight
-                # loop would otherwise push one notice per attempt into the
-                # bounded log and wipe the recent history the operator relies
-                # on. The refusal itself is never throttled, only its echo.
-                now = time.time()
-                last = self._contested_notice_at.get(project)
-                if last is None or now - last >= CONTESTED_NOTICE_WINDOW:
-                    self._contested_notice_at[project] = now
-                    self._announce_system(
-                        f"⚠️ {project} re-registered while a live listener held"
-                        " the name — duplicate refused"
-                    )
-                return Registration(RegisterOutcome.CONTESTED, None)
-            # Dead/timed-out record: hand the slot to the newcomer.
-            existing.last_seen = time.time()
-            return Registration(RegisterOutcome.REPLACED, existing)
-        # No live record under this name. The caller may be the same agent
-        # reviving a reaped identity: if it still holds the reaped token (and
-        # the name has not been handed to someone else), restore it in place
-        # with the same token rather than minting a fresh one.
-        if token is not None:
-            reaped = self._reaped.get(token)
-            if (
-                reaped is not None
-                and reaped.project == project
-                and secrets.compare_digest(token, reaped.token)
-            ):
-                revived = self._revive(reaped)
+        live = self._clients.get(project)
+        incumbent = live or self._reaped_by_project.get(project)
+        if incumbent is not None:
+            token_matches = token is not None and secrets.compare_digest(
+                token.encode("utf-8", errors="surrogatepass"),
+                incumbent.token.encode("ascii"),
+            )
+            if token_matches:
+                if live is not None:
+                    # Same live identity re-joining: refresh without fanfare.
+                    live.last_seen = time.time()
+                    return Registration(RegisterOutcome.REAFFIRMED, live)
+                revived = self._revive(incumbent)
                 if revived is not None:
                     return Registration(RegisterOutcome.REAFFIRMED, revived)
-        # The name is now being handed to a fresh identity. A reaped ghost may
-        # still hold this exact project name under a *different* token (it was
-        # idle-dropped, and the caller presented no token or one that did not
-        # match it). Evict that stale ghost from the revival graveyard: its name
-        # has been reassigned, so — exactly as :meth:`_revive` would decide — it
-        # can never come back. Leaving it parked would put the project in both
-        # ``_clients`` and ``_reaped_by_project``, breaking the "exactly one map"
-        # invariant and listing the peer twice in the dashboard roster.
-        ghost = self._reaped_by_project.pop(project, None)
-        if ghost is not None:
-            self._reaped.pop(ghost.token, None)
+
+            # A live or revivable identity owns the name. Poll activity cannot
+            # prove abandonment because ordinary watcher gaps make it transiently
+            # zero. Refuse without exposing or replacing the incumbent token.
+            now = time.time()
+            last = self._contested_notice_at.get(project)
+            if last is None or now - last >= CONTESTED_NOTICE_WINDOW:
+                self._contested_notice_at[project] = now
+                self._announce_system(
+                    f"⚠️ {project} re-registered without its identity token"
+                    " — duplicate refused"
+                )
+            return Registration(RegisterOutcome.CONTESTED, None)
+
+        # No live or revivable record owns this name, so a fresh identity may
+        # claim it. Reaped identities reach this point only after grace expiry,
+        # when the reaper has removed them from both revival indexes.
         # Cap the total number of client records (live + reaped) before minting
-        # a brand-new identity. Reaffirm/replace/revive reuse an existing record
+        # a brand-new identity. Reaffirm/revive reuse an existing record
         # and are checked out above, so this only gates genuinely new peers — a
-        # runaway registrant cannot grow in-memory state without bound. We
-        # checked above for a ghost under this exact name and evicted it, so it
-        # is not double-counted here.
+        # runaway registrant cannot grow in-memory state without bound.
         if len(self._clients) + len(self._reaped) >= MAX_CLIENTS:
             raise CapExceeded("client limit reached")
         client = Client(
@@ -684,11 +706,11 @@ class HubState:
     def kick(self, project: str) -> bool:
         """Evict the named peer from the roster (operator action).
 
-        Looks up the client by project name; if found, drops it via
-        :meth:`_drop` (which announces a system notice and pushes a refreshed
-        peer list to the UI) and returns ``True``. Returns ``False`` when no
-        client with that name is connected, so the caller can distinguish a
-        genuine eviction from a no-op.
+        Looks up the live or revivable client by project name; if found, drops
+        it via :meth:`_drop` (which announces a system notice and pushes a
+        refreshed peer list to the UI) and returns ``True``. Returns ``False``
+        when no client with that name is connected, so the caller can
+        distinguish a genuine eviction from a no-op.
 
         Args:
             project: The project name of the peer to evict.
@@ -696,7 +718,7 @@ class HubState:
         Returns:
             ``True`` if a client was found and dropped, ``False`` otherwise.
         """
-        client = self._clients.get(project)
+        client = self._clients.get(project) or self._reaped_by_project.get(project)
         if client is None:
             return False
         self._drop(client, "kicked by operator")
@@ -893,15 +915,16 @@ class HubState:
         had_channels = bool(client.channels)
         self._clients.pop(client.project, None)
         self._by_token.pop(client.token, None)
-        # The name is free again: forget its contested-notice throttle so the
-        # map cannot grow with every name that was ever fought over.
+        self._reaped.pop(client.token, None)
+        self._reaped_by_project.pop(client.project, None)
+        # Reset the contested-notice throttle whenever this lifecycle changes.
+        # A revivable drop can acquire a fresh throttle entry if challenged;
+        # a terminal drop releases the name and must not retain one.
         self._contested_notice_at.pop(client.project, None)
         if revivable:
             client.reaped_at = time.time()
             self._reaped[client.token] = client
             self._reaped_by_project[client.project] = client
-        else:
-            self._reaped_by_project.pop(client.project, None)
         self._announce_system(f"{client.project} {reason}")
         self._push_ui({"type": "peers", "peers": self.peers_info()})
         if had_channels:
@@ -1011,7 +1034,7 @@ class HubState:
         Returns:
             The deregistered project name, or ``None`` if the token is unknown.
         """
-        client = self._by_token.get(token)
+        client = self._by_token.get(token) or self._reaped.get(token)
         if client is None:
             return None
         self._drop(client, "left")
@@ -1053,6 +1076,7 @@ class HubState:
             expired = self._reaped.pop(token, None)
             if expired is not None:
                 self._reaped_by_project.pop(expired.project, None)
+                self._contested_notice_at.pop(expired.project, None)
         # Piggyback the watch-ticket expiry on the sweep the hub already runs:
         # a ticket nobody ever redeems would otherwise sit in memory until the
         # next mint happened to prune it.
@@ -2370,14 +2394,23 @@ class HubState:
         mode, channels, floors, forms and recent log, matching the dashboard
         protocol's extended snapshot.
         """
-        q: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        q: asyncio.Queue[dict[str, object]] = UIEventQueue()
         self._ui.add(q)
-        q.put_nowait({"type": "snapshot", "mode": self._mode.value,
-                      "peers": self.peers_info(), "channels": self.channels(),
-                      "floors": self.floors_public(),
-                      "forms": self.list_forms(), "log": self.recent(),
-                      "health": self.health(), "rate": self.rate_limit(),
-                      "quiet_after": self._quiet_after})
+        offer_ui_event(
+            q,
+            {
+                "type": "snapshot",
+                "mode": self._mode.value,
+                "peers": self.peers_info(),
+                "channels": self.channels(),
+                "floors": self.floors_public(),
+                "forms": self.list_forms(),
+                "log": self.recent(),
+                "health": self.health(),
+                "rate": self.rate_limit(),
+                "quiet_after": self._quiet_after,
+            },
+        )
         return q
 
     def remove_ui(self, q: asyncio.Queue[dict[str, object]]) -> None:
@@ -2386,8 +2419,9 @@ class HubState:
 
     def _push_ui(self, event: dict[str, object]) -> None:
         """Fan an event out to every connected UI listener."""
-        for q in self._ui:
-            q.put_nowait(event)
+        for q in tuple(self._ui):
+            if not offer_ui_event(q, event):
+                self._ui.discard(q)
 
     def _announce_system(self, text: str) -> None:
         """Log and broadcast a system notice to the UI feed only."""

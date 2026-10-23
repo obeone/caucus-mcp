@@ -76,6 +76,7 @@ from .state import (
     Client,
     HubState,
     RegisterOutcome,
+    offer_ui_event,
 )
 from .supervisor import (
     AGENT_NAME_RE,
@@ -117,6 +118,20 @@ REAP_INTERVAL_SECONDS = 15.0
 # How often the dashboard health tick fans a fresh ``health`` event (with the
 # rich peer roster) out to every connected UI listener.
 HEALTH_INTERVAL_SECONDS = 1.5
+
+# Maximum wall-clock time for the complete authenticated ``/ui`` handshake,
+# including the optional ``auth_probe`` round trip. A bounded but usable window
+# lets an operator answer the token prompt while preventing silent raw clients
+# from retaining accepted sockets forever.
+UI_AUTH_TIMEOUT_SECONDS = 30.0
+
+# Process-local ceiling for accepted ``/ui`` sockets that have not completed
+# authentication. The shipped CLI runs one Uvicorn worker, so this is the global
+# application limit for a normal deployment. It is intentionally not per-source:
+# proxies and NAT make ``ws.client.host`` unsuitable for fair source accounting.
+MAX_PENDING_UI_AUTH_CONNECTIONS = 32
+_pending_ui_auth: set[WebSocket] = set()
+_pending_ui_auth_lock = threading.Lock()
 
 # Hard ceiling on an inbound HTTP request body, in bytes. FastAPI/Starlette
 # buffers and parses the whole body before our handlers (and their Pydantic
@@ -834,7 +849,8 @@ def _broadcast_agents() -> None:
     """Push the current agent roster to every connected operator console."""
     event: dict[str, object] = {"type": "agents", "agents": _agent_roster()}
     for queue in list(_ui_queues):
-        queue.put_nowait(event)
+        if not offer_ui_event(queue, event):
+            _ui_queues.discard(queue)
 
 
 @contextlib.asynccontextmanager
@@ -880,6 +896,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 await stack.enter_async_context(_mcp_server.session_manager.run())
             yield
     finally:
+        if disk_log is not None:
+            state.set_log_sink(None)
         if supervisor is not None:
             with contextlib.suppress(Exception):
                 await supervisor.shutdown()
@@ -889,9 +907,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if disk_log is not None:
+            disk_log.close()
 
 
-app = FastAPI(title="Caucus Hub", version=__version__, lifespan=lifespan)
+app = FastAPI(
+    title="Caucus Hub",
+    version=__version__,
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
+)
 
 
 class BodySizeLimitMiddleware:
@@ -1300,7 +1326,13 @@ async def index() -> FileResponse:
     """
     if not _UI_INDEX.is_file():
         raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(_UI_INDEX, headers={"Content-Security-Policy": CONSOLE_CSP})
+    return FileResponse(
+        _UI_INDEX,
+        headers={
+            "Content-Security-Policy": CONSOLE_CSP,
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 def _require_agent_read(authorization: str | None) -> None:
@@ -1498,9 +1530,11 @@ async def export(
     # token the live feed does — otherwise auth on /ui is trivially bypassed by
     # downloading the same data here.
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) not in ("operator", "observer"):
-            raise HTTPException(status_code=401, detail="operator/observer token required")
+            raise HTTPException(
+                status_code=401, detail="operator/observer token required"
+            )
     body, media_type, filename = export_mod.render(state.recent(), format)
     return Response(
         content=body,
@@ -1681,14 +1715,12 @@ async def register(
     The current channel directory (names, topics, members) ships in the response
     so a late-joining peer learns the open rooms without a follow-up call.
 
-    When the project name is already held by a live listener **and** no valid
-    token is presented, the hub refuses the request with HTTP 409 so the caller
-    knows it looks like a duplicate process.
+    When a live or revivable identity already owns the project name and no
+    matching token is presented, the hub refuses the request with HTTP 409.
 
     When a valid ``token`` is presented and matches the existing record, the
-    registration is silently re-affirmed (REAFFIRMED outcome). When the prior
-    listener is gone (dead process / timed-out watcher), the slot is taken over
-    (REPLACED outcome) and a human-readable ``note`` advises the caller.
+    registration is silently re-affirmed (REAFFIRMED outcome), including across
+    polling gaps and while reviving an idle-reaped record inside its grace window.
 
     A peer holds no per-peer token yet, so this is the door the shared agent key
     guards: when one is configured, the caller must present it as
@@ -1733,19 +1765,13 @@ async def register(
                 "error": "name_in_use",
                 "project": req.project,
                 "note": (
-                    "an active listener already holds this name; you look like"
-                    " a duplicate process — re-join under a different name."
+                    "an existing identity already owns this name; present its"
+                    " token or re-join under a different name."
                 ),
             },
         )
-    client = reg.client  # not None for FRESH / REAFFIRMED / REPLACED
+    client = reg.client  # not None for FRESH / REAFFIRMED
     assert client is not None
-    note = (
-        "you may be replacing a timed-out session and could be joining"
-        " mid-conversation."
-        if reg.outcome is RegisterOutcome.REPLACED
-        else None
-    )
     stale = req.protocol_version is None or req.protocol_version < PROTOCOL_VERSION
     logger.info(
         "registered project=%s outcome=%s (protocol_version=%s, stale=%s)",
@@ -1761,7 +1787,6 @@ async def register(
         protocol_stale=stale,
         protocol_text=PROTOCOL_TEXT if stale else None,
         channels=state.channels(),
-        note=note,
     )
 
 
@@ -1887,27 +1912,6 @@ async def send(req: SendRequest) -> SendResponse | JSONResponse:
     )
 
 
-def _resolve_receive_token(authorization: str | None, token: str | None) -> str | None:
-    """Resolve the ``/receive`` access token: ``Authorization`` header, then query.
-
-    The header form is preferred because ``/receive`` is a long-poll ``GET``:
-    its token would otherwise ride in the URL query string, where httpx and the
-    server's own access logs record it in clear, leaking the secret. The query
-    parameter is kept as a **deprecated** fallback so a peer running an
-    older watcher keeps working through a hub upgrade; new callers must use the
-    header.
-
-    Args:
-        authorization: Raw ``Authorization`` header value, if any.
-        token: The deprecated ``?token=`` query parameter, if any.
-
-    Returns:
-        The bearer token from the header when present and well-formed, else the
-        query token, else ``None``.
-    """
-    return _bearer_from_header(authorization) or token
-
-
 @app.post("/ask", response_model=None)
 async def ask(req: AskRequest) -> AskResponse | JSONResponse:
     """Open an operator form on behalf of an agent.
@@ -1985,7 +1989,6 @@ async def forms(
 async def decisions(
     limit: int = Query(default=20, ge=1, le=500),
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, list[dict[str, object]]]:
     """List recently settled operator-form decisions, oldest first.
 
@@ -1994,8 +1997,8 @@ async def decisions(
     replaying the whole transcript. Unlike ``/forms`` (which only ever lists
     still-*pending* questions), a settled decision can carry a channel's
     private answer text, so this endpoint requires a token — no more
-    "works before join". The token is resolved exactly like ``/receive`` (see
-    :func:`_resolve_receive_token`) and tried two ways:
+    "works before join". The bearer token is read only from the
+    ``Authorization`` header and tried two ways:
 
     * A known **peer token** (:meth:`~caucus.state.HubState.client_for`) scopes
       the result to broadcast decisions plus those addressed to a channel the
@@ -2012,16 +2015,21 @@ async def decisions(
 
     Args:
         limit: Maximum number of decisions to return (the most recent ones).
+        authorization: ``Authorization: Bearer <token>`` for a peer or console
+            role.
 
     Returns:
         ``{"decisions": [{"ts", "asker", "title", "status", "answer_summary"},
         ...]}`` — see :meth:`~caucus.state.HubState.decisions`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is not None:
         return {"decisions": state.decisions(limit, channels=client.channels)}
-    if auth_config.enabled and auth_config.role_for(resolved) in ("operator", "observer"):
+    if auth_config.enabled and auth_config.role_for(resolved) in (
+        "operator",
+        "observer",
+    ):
         return {"decisions": state.decisions(limit, channels=None)}
     raise HTTPException(status_code=401, detail="unknown token")
 
@@ -2149,17 +2157,15 @@ def _chatter_open(client: Client) -> bool:
 async def receive(
     request: Request,
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
     timeout: float = LONG_POLL_SECONDS,
     ack_seq: int | None = Query(default=None),
     lease: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Long-poll for messages addressed to the caller.
 
-    The access token is read from the ``Authorization: Bearer <token>`` header
-    (preferred) or, as a deprecated fallback, the ``?token=`` query parameter
-    -- see :func:`_resolve_receive_token`. Prefer the header: a query token
-    leaks into httpx and access logs because this is a ``GET``.
+    The access token is read only from the ``Authorization: Bearer <token>``
+    header. Reusable credentials are never accepted from the URL query string,
+    where HTTP clients, proxies, and server access logs can retain them.
 
     Blocks up to ``timeout`` seconds. Honors the pause gate (holds messages
     while paused) and surfaces a control ``stop`` signal immediately. Returns
@@ -2173,11 +2179,10 @@ async def receive(
     one it displaced gets ``409 already_listening`` (immediately if its poll is
     still in flight, otherwise on its next poll) and must stop polling.
 
-    While this call is in flight, ``client.active_polls`` is incremented, which
-    lets :meth:`~caucus.state.HubState.register` distinguish a genuine
-    reconnect from a colliding duplicate process. That counter tracks polls, the
-    lease tracks consumers; both are needed, see
-    :attr:`~caucus.state.Client.active_polls`.
+    While this call is in flight, ``client.active_polls`` is incremented for
+    listener observability in the operator UI. Identity ownership is proved by
+    the peer token, never inferred from this transient counter. The lease tracks
+    which consumer may poll; see :attr:`~caucus.state.Client.active_polls`.
 
     Messages returned to the caller are appended to :attr:`~caucus.state.Client.unacked`
     so they can be replayed if the client disconnects before acknowledging them.
@@ -2189,6 +2194,7 @@ async def receive(
     returned goes back to the head of its queue (see :func:`_release_getter`).
 
     Args:
+        authorization: ``Authorization: Bearer <peer token>``.
         ack_seq: Optional piggyback ACK — the highest ``seq`` the caller has
             successfully processed. Equivalent to ``POST /ack`` but saves a
             round-trip by folding the ACK into the next poll.
@@ -2207,7 +2213,7 @@ async def receive(
             ``lease``, ``409 already_listening`` when another consumer holds
             (or has taken) the slot.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2360,11 +2366,8 @@ async def receive(
             _release_getter(pri_get, client.priority_queue)
             _release_getter(chat_get, client.queue)
         finally:
-            # This decrement must never be skipped. A leaked count leaves the
-            # peer looking like it holds a live listener forever, and
-            # HubState.register then refuses every re-join under that name as a
-            # colliding duplicate (CONTESTED) — the project is wedged out of its
-            # own identity for the lifetime of the hub. Cleanup failures still
+            # This decrement must never be skipped: a leaked count makes the
+            # operator UI report a live listener forever. Cleanup failures still
             # propagate; they just do not take the counter down with them.
             client.active_polls -= 1
 
@@ -2372,15 +2375,13 @@ async def receive(
 @app.get("/peek")
 async def peek(
     authorization: str | None = Header(default=None),
-    token: str | None = Query(default=None),
 ) -> dict[str, object]:
     """Report the caller's pending queue depth without draining it.
 
     The non-blocking counterpart to ``GET /receive``: a cheap "is a turn worth
     it?" check an agent can run before paying for a full receive. Authenticated
-    exactly like ``/receive`` — the token is read from the ``Authorization:
-    Bearer <token>`` header (preferred) or the deprecated ``?token=`` query
-    fallback, see :func:`_resolve_receive_token` — and resolved through
+    exactly like ``/receive`` — the token is read only from the
+    ``Authorization: Bearer <token>`` header — and resolved through
     :meth:`~caucus.state.HubState.client_for`, so it touches ``last_seen`` (and
     can revive a reaped identity) exactly the way every other authenticated
     endpoint does; no special-cased liveness bookkeeping.
@@ -2390,7 +2391,7 @@ async def peek(
         "preview_truncated", "content_chars"} | None}``; see
         :meth:`~caucus.state.HubState.peek`.
     """
-    resolved = _resolve_receive_token(authorization, token)
+    resolved = _bearer_from_header(authorization)
     client = state.client_for(resolved) if resolved is not None else None
     if client is None:
         raise HTTPException(status_code=401, detail="unknown token")
@@ -2459,7 +2460,8 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     state and routes the relevant SYSTEM notices; the JSON body returned carries
     ``ok`` plus an ``error`` describing any refusal (``floor_held``,
     ``not_holder``, ``no_floor``, ``bad_scope``, ``not_a_member``). An unknown
-    token is rejected with 401 and an unknown action with 400.
+    token is rejected with 401, an unknown action with 400, and a caller that
+    exhausts its normal chatter bucket with 429.
     """
     handlers = {
         "take": lambda: state.take_floor(req.token, req.scope, req.reason),
@@ -2471,6 +2473,12 @@ async def floor_action(req: FloorRequest) -> dict[str, object] | JSONResponse:
     handler = handlers.get(req.action)
     if handler is None:
         raise HTTPException(status_code=400, detail=f"unknown action {req.action!r}")
+    client = state.client_for(req.token)
+    if client is None:
+        raise HTTPException(status_code=401, detail="unknown token")
+    limited = _check_rate_limit(client)
+    if limited is not None:
+        return limited
     try:
         result = handler()
     except CapExceeded as exc:
@@ -2498,7 +2506,7 @@ async def control(
     otherwise an unauthenticated party (or a cross-site CSRF POST from a page in
     the operator's browser) could silently disarm the stop/pause that the human
     relies on. The bearer token is parsed the same way as ``/receive`` (see
-    :func:`_resolve_receive_token`) and must resolve to the ``operator`` role;
+    :func:`_bearer_from_header`) and must resolve to the ``operator`` role;
     when auth is disabled the endpoint stays open (the documented localhost
     default). As defense-in-depth, a present-but-disallowed browser ``Origin`` is
     also refused (blocks a simple cross-site form/fetch POST).
@@ -2536,7 +2544,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
 
     The same three checks in the same order: a present-but-disallowed browser
     ``Origin`` first (CSRF defense-in-depth, refused before anything happens),
-    then the bearer token parsed exactly as ``/receive`` parses it, then the
+    then the bearer token parsed from ``Authorization``, then the
     ``operator`` role. Factored out so ``/control`` and the ``/agents``
     endpoints cannot drift apart.
 
@@ -2553,7 +2561,7 @@ def _gate_operator_request(authorization: str | None, origin: str | None) -> Non
     ):
         raise HTTPException(status_code=403, detail="origin not allowed")
     if auth_config.enabled:
-        token = _resolve_receive_token(authorization, None)
+        token = _bearer_from_header(authorization)
         if auth_config.role_for(token) != "operator":
             raise HTTPException(status_code=401, detail="operator token required")
 
@@ -2670,8 +2678,8 @@ async def complete_agent_cwd_endpoint(
     Type-ahead only. The response carries directory **names** only, never file
     names and never file contents, and it grants the operator no capability they
     did not already have: anyone who can reach this endpoint can reach
-    ``POST /agents`` and spawn a ``worker`` with shell access on this very
-    machine. It is still gated like the rest of ``/agents``, because the hub's
+    ``POST /agents`` and ask a ``worker`` to run operator-approved shell actions
+    on this machine. It is still gated like the rest of ``/agents``, because the hub's
     own filesystem layout is nobody's business but the operator's, least of all
     a read-only observer's.
 
@@ -2768,16 +2776,71 @@ _MUTATING_COMMANDS = frozenset(
 )
 
 
+def _reserve_ui_auth_slot(ws: WebSocket) -> bool:
+    """Reserve fail-fast capacity for one pending authenticated UI socket.
+
+    Args:
+        ws: The accepted WebSocket entering authentication.
+
+    Returns:
+        ``True`` when the socket was admitted, or ``False`` when the process-wide
+        pending-authentication cap is already full.
+    """
+    with _pending_ui_auth_lock:
+        if len(_pending_ui_auth) >= MAX_PENDING_UI_AUTH_CONNECTIONS:
+            return False
+        _pending_ui_auth.add(ws)
+        return True
+
+
+def _release_ui_auth_slot(ws: WebSocket) -> None:
+    """Release a pending-authentication reservation idempotently.
+
+    Args:
+        ws: The WebSocket leaving authentication for any reason.
+    """
+    with _pending_ui_auth_lock:
+        _pending_ui_auth.discard(ws)
+
+
+async def _ui_authenticate_enabled(ws: WebSocket) -> str | None:
+    """Run the configured-token handshake inside the caller's deadline.
+
+    Args:
+        ws: The accepted WebSocket.
+
+    Returns:
+        The granted role, or ``None`` after rejecting an invalid credential.
+    """
+    first = await ws.receive_json()
+    if isinstance(first, dict) and first.get("auth_probe") is True:
+        await ws.send_json({"type": "auth_required"})
+        first = await ws.receive_json()
+    token = first.get("auth") if isinstance(first, dict) else None
+    role = auth_config.role_for(str(token) if token is not None else None)
+    if role is None:
+        await ws.send_json({"type": "auth_error"})
+        await ws.close(code=1008)
+        return None
+    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
+    return role
+
+
 async def _ui_authenticate(ws: WebSocket) -> str | None:
     """Run the first-frame ``/ui`` auth handshake; return the granted role.
 
     When auth is disabled, replies ``auth_ok`` with ``role="operator"`` and
     ``auth=false`` immediately and returns ``"operator"`` without reading a
     frame. When an operator token is configured, reads the first frame, expects
-    ``{"auth": "<token>"}``, and grades it: a matching operator/observer token
-    gets ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
+    ``{"auth": "<token>"}``, and grades it. A dashboard with no persisted token
+    may instead send the non-secret ``{"auth_probe": true}`` frame; the hub
+    replies ``{"type":"auth_required"}`` and waits for the auth frame on the
+    same socket. A matching operator/observer token gets
+    ``{"type":"auth_ok","role":...,"auth":true}`` and the role is returned;
     anything else gets ``{"type":"auth_error"}``, the socket is closed (1008),
-    and ``None`` is returned.
+    and ``None`` is returned. The complete configured-token exchange has a
+    :data:`UI_AUTH_TIMEOUT_SECONDS` deadline; silence before either credential
+    receive closes the socket with code 1008.
 
     Args:
         ws: The accepted WebSocket.
@@ -2790,19 +2853,13 @@ async def _ui_authenticate(ws: WebSocket) -> str | None:
         await ws.send_json({"type": "auth_ok", "role": "operator", "auth": False})
         return "operator"
     try:
-        first = await ws.receive_json()
-    except (WebSocketDisconnect, ValueError):
+        return await asyncio.wait_for(
+            _ui_authenticate_enabled(ws), timeout=UI_AUTH_TIMEOUT_SECONDS
+        )
+    except (WebSocketDisconnect, ValueError, asyncio.TimeoutError):
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return None
-    token = first.get("auth") if isinstance(first, dict) else None
-    role = auth_config.role_for(str(token) if token is not None else None)
-    if role is None:
-        await ws.send_json({"type": "auth_error"})
-        await ws.close(code=1008)
-        return None
-    await ws.send_json({"type": "auth_ok", "role": role, "auth": True})
-    return role
 
 
 def _apply_ui_command(data: dict[str, object]) -> None:
@@ -2889,12 +2946,14 @@ async def ui_socket(ws: WebSocket) -> None:
     """Bidirectional channel for the operator UI.
 
     The first frame is an auth handshake (see :func:`_ui_authenticate`): when an
-    operator token is configured the client must send ``{"auth": "<token>"}``;
-    otherwise auth is disabled and every connection is an operator. The granted
-    role is enforced per-command — an ``observer`` may read the live feed but any
-    mutating command is refused with ``{"type":"error","reason":"forbidden",
-    "command":...}`` and left unapplied. There is no single-writer lock: multiple
-    operators may all act, last write wins.
+    operator token is configured the client may send ``{"auth": "<token>"}``
+    directly or send a non-secret ``{"auth_probe": true}`` and wait for
+    ``auth_required`` before sending the credential. Otherwise auth is disabled
+    and every connection is an operator. The granted role is enforced
+    per-command — an ``observer`` may read the live feed but any mutating command
+    is refused with ``{"type":"error","reason":"forbidden","command":...}``
+    and left unapplied. There is no single-writer lock: multiple operators may
+    all act, last write wins.
 
     Outbound: live feed events (messages, mode changes, rich peer lists, health
     ticks, heartbeat replies).
@@ -2933,7 +2992,21 @@ async def ui_socket(ws: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await ws.close(code=1008)
         return  # cross-site origin; no role granted, no feed streamed
-    role = await _ui_authenticate(ws)
+    auth_slot_reserved = False
+    if auth_config.enabled:
+        if not _reserve_ui_auth_slot(ws):
+            with contextlib.suppress(Exception):
+                await ws.close(
+                    code=1013,
+                    reason="too many dashboard connections awaiting authentication",
+                )
+            return
+        auth_slot_reserved = True
+    try:
+        role = await _ui_authenticate(ws)
+    finally:
+        if auth_slot_reserved:
+            _release_ui_auth_slot(ws)
     if role is None:
         return  # handshake failed; socket already closed
     queue = state.add_ui()
@@ -2944,6 +3017,9 @@ async def ui_socket(ws: WebSocket) -> None:
     async def pump() -> None:
         while True:
             event = await queue.get()
+            if event.get("type") == "overflow":
+                await ws.close(code=1013, reason="dashboard fell behind; reconnect")
+                return
             if event.get("type") == "snapshot":
                 # Prime the console with the agent roster too. Added here rather
                 # than in HubState.add_ui because the roster is a process fact,
@@ -3160,6 +3236,69 @@ def _collect_allowed_hosts(cli: list[str] | None, port: int) -> list[str]:
         if value not in hosts:
             hosts.append(value)
     return hosts
+
+
+def _default_launcher_config(
+    *,
+    operator_token: str | None,
+    host: str,
+    agent_cwd: str | None,
+    max_agents: int,
+) -> tuple[LauncherConfig, str | None]:
+    """Decide the launcher when neither launcher flag was passed.
+
+    The launcher is on by default, but only where it is safe without anyone
+    asking: an operator token must gate the console (without one every caller
+    is graded as operator) and the bind must be loopback (process creation must
+    not be reachable from the network). Anywhere else it stays off and the
+    reason is returned for the boot log, never raised: a hub started with no
+    launcher flag must keep booting exactly as it did before.
+
+    The working directory is ``agent_cwd`` when the operator gave one, else the
+    hub's own working directory. A defaulted directory that is the filesystem
+    root (what a launchd service runs in) or that fails validation leaves the
+    launcher off; an explicit ``--agent-cwd`` that fails validation is the
+    operator's mistake and raises, as it does with ``--enable-agent-launcher``.
+
+    Args:
+        operator_token: The configured operator token, if any.
+        host: The address the hub binds to.
+        agent_cwd: The operator-supplied ``--agent-cwd``, if any.
+        max_agents: The concurrent-agent ceiling.
+
+    Returns:
+        The launcher policy and, when it stays off, a one-line reason.
+
+    Raises:
+        LauncherRefused: When an explicit ``agent_cwd`` or ``max_agents`` is
+            invalid.
+    """
+    if not operator_token:
+        return LauncherConfig(), "no --operator-token is set"
+    if not is_loopback_host(host):
+        return LauncherConfig(), f"--host {host} is not a loopback bind"
+    if agent_cwd:
+        return (
+            LauncherConfig(
+                enabled=True, cwd=validate_agent_cwd(agent_cwd), max_agents=max_agents
+            ),
+            None,
+        )
+    try:
+        cwd = Path.cwd()
+    except OSError as exc:
+        return LauncherConfig(), f"the working directory is unusable ({exc})"
+    if cwd.parent == cwd:
+        return LauncherConfig(), f"the working directory is {cwd}; set --agent-cwd"
+    try:
+        return (
+            LauncherConfig(
+                enabled=True, cwd=validate_agent_cwd(str(cwd)), max_agents=max_agents
+            ),
+            None,
+        )
+    except LauncherRefused as exc:
+        return LauncherConfig(), f"{exc}; set --agent-cwd"
 
 
 def _doors_block(*, operator: bool, agent: bool, requirement: str) -> str:
@@ -3519,17 +3658,26 @@ def main() -> None:
             "--operator-token). Env: CAUCUS_MCP_HTTP overrides the default."
         ),
     )
-    parser.add_argument(
+    launcher_switch = parser.add_mutually_exclusive_group()
+    launcher_switch.add_argument(
         "--enable-agent-launcher",
         action="store_true",
         help=(
-            "let an authenticated operator spawn, list and kill "
-            "caucus-claude-agent processes from the console. OFF by default. "
-            "Requires --operator-token, --agent-cwd, and a loopback bind; the "
-            "hub refuses to start if any of the three is missing. A spawned "
-            "'worker' reaches shell and filesystem tools as the hub's own user, "
-            "and the working directory is a starting point, not a sandbox"
+            "require the agent launcher, which lets an authenticated operator "
+            "spawn, list and kill agent processes from the console. Requires "
+            "--operator-token, --agent-cwd, and a loopback bind; the hub "
+            "refuses to start if any of the three is missing. Without this "
+            "flag the launcher is still ON by default whenever an operator "
+            "token is set on a loopback bind, starting agents in --agent-cwd "
+            "or the hub's working directory. A spawned 'worker' uses bounded "
+            "workspace tools and operator-approved shell actions as the hub's "
+            "own user; the cwd is not a shell sandbox"
         ),
+    )
+    launcher_switch.add_argument(
+        "--no-agent-launcher",
+        action="store_true",
+        help="keep the agent launcher off even where it would be on by default",
     )
     parser.add_argument(
         "--agent-cwd",
@@ -3537,9 +3685,9 @@ def main() -> None:
         metavar="PATH",
         help=(
             "absolute directory every spawned agent starts in (required with "
-            "--enable-agent-launcher). Not an allowlist and not per-spawn: it "
-            "is a starting point, not a containment boundary. "
-            "Env: CAUCUS_AGENT_CWD"
+            "--enable-agent-launcher; defaults to the hub's working directory "
+            "otherwise). Not an allowlist and not per-spawn: it is a starting "
+            "point, not a containment boundary. Env: CAUCUS_AGENT_CWD"
         ),
     )
     parser.add_argument(
@@ -3637,9 +3785,24 @@ def main() -> None:
     # Fail closed at boot, not per request. AuthConfig.role_for grades every
     # caller as "operator" when no operator token is set, so "operator token
     # required" gates nothing in the hub's default configuration: the launcher
-    # would be wide open to anything that can reach the port. Demand all three
-    # preconditions here, once, and refuse to start otherwise.
-    if args.enable_agent_launcher:
+    # would be wide open to anything that can reach the port. An explicit
+    # --enable-agent-launcher demands all three preconditions and refuses to
+    # start otherwise; the default turns the launcher on only where they hold
+    # and leaves it off, with a logged reason, everywhere else.
+    launcher_off_reason: str | None = None
+    if args.no_agent_launcher:
+        launcher_off_reason = "--no-agent-launcher was passed"
+    elif not args.enable_agent_launcher:
+        try:
+            launcher_config, launcher_off_reason = _default_launcher_config(
+                operator_token=args.operator_token or None,
+                host=args.host,
+                agent_cwd=args.agent_cwd,
+                max_agents=args.agent_max,
+            )
+        except LauncherRefused as exc:
+            parser.error(str(exc))
+    else:
         if not args.operator_token:
             parser.error(
                 "--enable-agent-launcher requires --operator-token: without it "
@@ -3734,6 +3897,8 @@ def main() -> None:
             launcher_config.cwd,
             launcher_config.max_agents,
         )
+    elif launcher_off_reason is not None:
+        logger.info("agent launcher off: %s", launcher_off_reason)
     if not args.no_browser:
         _open_browser(_browser_url(args.host, args.port))
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())

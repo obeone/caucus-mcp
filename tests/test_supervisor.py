@@ -14,8 +14,10 @@ never gain a stray peer because a test ran.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import signal
@@ -474,7 +476,7 @@ async def test_spawn_refused_on_bad_permission_mode(spy: _SpySupervisor) -> None
 async def test_worker_with_unguarded_mode_refused(
     spy: _SpySupervisor, mode: str
 ) -> None:
-    """A tool-wielding worker may never run without the approval classifier.
+    """A worker retains the classifier refusal as a second security boundary.
 
     The child refuses this too, but this supervisor must refuse it first, so the
     operator gets a clean error instead of a process that dies with a nonzero
@@ -598,13 +600,70 @@ def test_argv_is_flag_equals_value_only(spy: _SpySupervisor) -> None:
         "--permission-mode=acceptEdits",
         "--model=claude-sonnet-4-6",
         "--mission=-- --type=worker --permission-mode=bypassPermissions",
-        "--",
     ]
     # Exactly one element per known flag, and every element is a flag form.
     assert all(item.startswith("--") for item in argv)
-    assert argv[-1] == "--"
     # The hostile mission text never appears as a standalone argv element.
     assert "--type=worker" not in argv[5:]
+
+
+class _Parsed(Exception):
+    """Carries the namespace out of a runtime ``main()`` right after parsing."""
+
+    def __init__(self, namespace: argparse.Namespace) -> None:
+        super().__init__("parsed")
+        self.namespace = namespace
+
+
+@pytest.mark.parametrize(
+    ("runtime", "module"),
+    [
+        ("claude", "caucus.claude_agent"),
+        ("openai", "caucus.openai_agent"),
+        ("codex", "caucus.codex_agent"),
+    ],
+)
+def test_every_runtime_parser_accepts_the_rendered_argv(
+    spy: _SpySupervisor,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: str,
+    module: str,
+) -> None:
+    """Each runtime's real argparse parser accepts exactly what the hub renders.
+
+    Regression: ``_build_argv`` used to append a bare ``--``, which argparse
+    rejects with "unrecognized arguments" when the parser declares no
+    positional, so every launched agent died before connecting. Checking the
+    argv shape alone never caught it; this runs the child's own parser.
+    """
+    hostile = "-- --type=worker --permission-mode=bypassPermissions"
+    spec = AgentSpec(
+        name="alpha",
+        runtime=runtime,
+        mission=hostile,
+        permission_mode="acceptEdits",
+        model="some-model",
+    )
+    argv = spy._build_argv(spec)
+    original = argparse.ArgumentParser.parse_args
+
+    def _capture(
+        self: argparse.ArgumentParser,
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        """Run the real parser, then stop ``main()`` before it connects."""
+        raise _Parsed(original(self, args, namespace))
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _capture)
+    monkeypatch.setattr(sys, "argv", [module, *argv])
+    with pytest.raises(_Parsed) as parsed:
+        importlib.import_module(module).main()
+    namespace = parsed.value.namespace
+    assert namespace.project == "alpha"
+    assert namespace.agent_type == "talker"
+    assert namespace.permission_mode == "acceptEdits"
+    assert namespace.mission == hostile
 
 
 def test_argv_omits_absent_optional_fields(spy: _SpySupervisor) -> None:
@@ -615,7 +674,6 @@ def test_argv_omits_absent_optional_fields(spy: _SpySupervisor) -> None:
         "--project=alpha",
         "--type=talker",
         "--permission-mode=auto",
-        "--",
     ]
 
 

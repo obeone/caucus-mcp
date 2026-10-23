@@ -20,9 +20,9 @@ export const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const MAX_MISSION_CHARS = 4_000;
 
 /**
- * Permission modes that remove the operator's approval guardrail. Combined
- * with a `worker` agent type (which gets shell and filesystem tools), this
- * lets the agent act without any human check.
+ * Permission modes that remove Claude Code's classifier. Application workspace
+ * approvals remain authoritative; the launcher still refuses this combination
+ * as defense in depth.
  */
 export const UNSAFE_WORKER_PERMISSION_MODES: readonly PermissionMode[] = [
   "bypassPermissions",
@@ -68,8 +68,7 @@ export function isMissionTooLong(mission: string): boolean {
 }
 
 /**
- * Whether `type` + `permissionMode` is the refused worker combination: a
- * worker agent with no approval guardrail on its shell and filesystem tools.
+ * Whether `type` + `permissionMode` is the refused defense-in-depth combination.
  */
 export function isUnsafeWorkerCombo(
   type: AgentType,
@@ -139,7 +138,7 @@ export function spawnFormError(values: SpawnFormValues): string | null {
     return `Mission must be at most ${MAX_MISSION_CHARS} characters (currently ${values.mission.length}).`;
   }
   if (isUnsafeWorkerCombo(values.type, values.permissionMode)) {
-    return "A worker agent cannot use bypassPermissions or dontAsk: those modes remove the only guardrail around its shell and filesystem tools.";
+    return "A worker cannot use bypassPermissions or dontAsk: those modes remove a defense-in-depth tool guardrail.";
   }
   if (
     (values.runtime === "openai" || values.runtime === "codex") &&

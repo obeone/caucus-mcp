@@ -171,8 +171,13 @@ above) hands out the `--ticket` form; a loopback one still hands out
 
 The agent key is a perimeter, not authorization. It turns "anyone who can
 reach the port" into "anyone who holds one shared secret": inside the room it
-grants nothing extra and restricts nothing. Concretely, any holder of the key
-can:
+grants nothing extra and restricts nothing. The peer token remains a separate,
+narrow authorization boundary: an existing or revivable project identity is
+reserved for the holder of its exact token. Receive polling gaps are not
+treated as abandonment; a claimant without that token receives
+`409 name_in_use` and no peer credential.
+
+Concretely, any holder of the agent key can:
 
 - **Self-join any private channel with no invite check.** `POST /channels/join`
   (`HubState.subscribe` in `src/caucus/state.py`) accepts any valid peer token
@@ -185,11 +190,6 @@ can:
   broadcast talking stick to block every other sender's `say()` with a 423
   (`HubState.take_floor`, scope `"all"` needs no channel membership), and push
   a questionnaire straight to the human operator (`POST /ask`).
-- **Take over another peer's project name.** `HubState.register` hands a
-  newcomer the existing client record (same queue, same channels) whenever
-  the named peer has no listener actively polling `/receive`, the `REPLACED`
-  outcome (`active_polls == 0`). That gap can be as brief as the moment
-  between two watcher polls, not only a long-idle, fully reaped peer.
 - **No per-agent identity, and no revocation short of restarting the hub with
   a new key.** Every caller presents the same shared secret, so the hub
   cannot tell one holder from another, and there is no way to cut off a
@@ -310,11 +310,12 @@ process). Set it to the address agents actually use to reach the hub.
   link, a long compose turn) loses its slot and must rejoin, exactly as it
   would on a local hub, just more likely on a slower network.
 - **Console agent-spawning is structurally unavailable on a remote hub.**
+  The launcher is on by default only on a loopback bind, and
   `--enable-agent-launcher` refuses to start unless `--host` is loopback, on
   top of requiring `--operator-token` and `--agent-cwd`; there is no
   configuration that opens it up remotely.
-- **The deprecated `?token=` query fallback on `/receive` lands in proxy
-  access logs.** It exists only so an older watcher keeps working through a
-  hub upgrade; every current client sends the token as an `Authorization:
-  Bearer` header instead, which a proxy's default access log does not
-  capture.
+- **Peer read credentials belong only in `Authorization: Bearer`.**
+  `/receive`, `/peek`, and `/decisions` reject query-only credentials because
+  request URLs land in proxy and server access logs. Every current client uses
+  the header; update any external raw HTTP integration that still constructs
+  `?token=` URLs before upgrading the hub.

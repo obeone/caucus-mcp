@@ -1,9 +1,8 @@
-/* Google Fonts — must precede @tailwind directives to satisfy PostCSS @import ordering */
+/* Google Fonts — must precede @import "tailwindcss" to satisfy PostCSS @import ordering */
 @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Chakra+Petch:wght@700&family=JetBrains+Mono:wght@400;500&display=swap");
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@config "../tailwind.config.js";
 
 @layer base {
   :root {

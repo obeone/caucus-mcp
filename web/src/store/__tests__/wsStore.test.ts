@@ -1,7 +1,7 @@
 /**
  * Unit tests for store/wsStore.ts — event reducer and reconnect backoff.
  *
- * Browser globals (localStorage, WebSocket, matchMedia, history, location)
+ * Browser globals (localStorage, WebSocket, matchMedia, location)
  * are stubbed in src/test/setup.ts before any module is imported.
  *
  * We exercise _handleEvent directly (the private method is accessible via
@@ -18,6 +18,7 @@ import type { SnapshotEvent, PeerInfo } from "../types";
 
 /** Reset store to a known baseline before each test. */
 function resetStore() {
+  localStorage.removeItem("caucus_token");
   useDashStore.setState({
     connectionState: "connecting",
     role: "operator",
@@ -29,6 +30,8 @@ function resetStore() {
     health: null,
     messages: [],
     selectedPeer: null,
+    _pendingToken: null,
+    _authToken: null,
   });
 }
 
@@ -52,9 +55,33 @@ describe("wsStore — auth events", () => {
     expect(s.connectionState).toBe("connected");
   });
 
-  it("auth_error sets connectionState to disconnected", () => {
+  it("prompts on auth_required and sends the token without persisting it yet", () => {
+    const send = vi.fn();
+    const promptSpy = vi
+      .spyOn(window, "prompt")
+      .mockReturnValue("prompted-secret");
+    useDashStore.setState({ _send: send } as never);
+
+    handle({ type: "auth_required" });
+
+    expect(send).toHaveBeenCalledWith({ auth: "prompted-secret" });
+    expect(localStorage.getItem("caucus_token")).toBeNull();
+    promptSpy.mockRestore();
+  });
+
+  it("persists a prompted token only after auth_ok", () => {
+    useDashStore.setState({ _pendingToken: "validated-secret" } as never);
+
+    handle({ type: "auth_ok", role: "operator", auth: true });
+
+    expect(localStorage.getItem("caucus_token")).toBe("validated-secret");
+  });
+
+  it("auth_error clears a stale persisted token before reconnect", () => {
+    localStorage.setItem("caucus_token", "stale-secret");
     handle({ type: "auth_error" });
     expect(useDashStore.getState().connectionState).toBe("disconnected");
+    expect(localStorage.getItem("caucus_token")).toBeNull();
   });
 });
 
@@ -354,9 +381,10 @@ describe("wsStore — sendChat wire format", () => {
   });
 });
 
-describe("wsStore — getToken() strips token from URL", () => {
-  it("history.replaceState is called to remove ?token= from address bar", () => {
-    // Simulate ?token=secret in location.search
+describe("wsStore — URL credentials", () => {
+  beforeEach(resetStore);
+
+  it("ignores ?token= and asks the hub whether authentication is required", () => {
     vi.stubGlobal("location", {
       protocol: "http:",
       host: "localhost",
@@ -364,27 +392,37 @@ describe("wsStore — getToken() strips token from URL", () => {
       pathname: "/",
       hash: "",
     });
-    const replaceSpy = vi.spyOn(globalThis.history, "replaceState");
+    localStorage.removeItem("caucus_token");
 
-    // Inline the same logic as getToken() to verify the strip behaviour.
-    const params = new URLSearchParams(globalThis.location.search);
-    const fromUrl = params.get("token");
-    if (fromUrl) {
-      globalThis.localStorage.setItem("caucus_token", fromUrl);
-      globalThis.history.replaceState(
-        {},
-        "",
-        globalThis.location.pathname + globalThis.location.hash,
-      );
-    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (useDashStore.getState() as any)._initWs();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ws = (window as any).__CAUCUS_WS__;
+    ws.onopen();
 
-    expect(replaceSpy).toHaveBeenCalledWith({}, "", "/");
-    expect(globalThis.localStorage.getItem("caucus_token")).toBe("secret123");
+    expect(globalThis.localStorage.getItem("caucus_token")).toBeNull();
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ auth_probe: true }));
 
-    // Restore
     vi.stubGlobal("location", {
       protocol: "http:", host: "localhost", search: "", pathname: "/", hash: "",
     });
+  });
+
+  it("still sends a previously validated stored token in the auth frame", () => {
+    localStorage.setItem("caucus_token", "stored-secret");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (useDashStore.getState() as any)._initWs();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ws = (window as any).__CAUCUS_WS__;
+    ws.onopen();
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({ auth: "stored-secret" }),
+    );
+    expect(ws.send).not.toHaveBeenCalledWith(
+      JSON.stringify({ auth_probe: true }),
+    );
   });
 });
 

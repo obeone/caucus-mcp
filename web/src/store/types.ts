@@ -124,7 +124,10 @@ export interface RateInfo {
 // Agent launcher
 // ---------------------------------------------------------------------------
 
-/** Agent tool profile: `talker` is caucus-only, `worker` also gets shell/filesystem tools. */
+/**
+ * Agent tool profile: `talker` is caucus-only; `worker` adds supervised
+ * workspace tools.
+ */
 export type AgentType = "talker" | "worker";
 export type AgentRuntime = "claude" | "openai" | "codex";
 
@@ -236,6 +239,10 @@ export interface AuthOkEvent {
 
 export interface AuthErrorEvent {
   type: "auth_error";
+}
+
+export interface AuthRequiredEvent {
+  type: "auth_required";
 }
 
 export interface SnapshotEvent {
@@ -351,6 +358,7 @@ export interface AgentsEvent {
 export type HubEvent =
   | AuthOkEvent
   | AuthErrorEvent
+  | AuthRequiredEvent
   | SnapshotEvent
   | PeersEvent
   | ChannelsEvent

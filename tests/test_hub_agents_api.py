@@ -926,9 +926,100 @@ def test_launcher_boots_with_the_full_set(
     assert hub_module.launcher_config.max_agents == 3
 
 
-def test_launcher_stays_off_by_default(
+def test_launcher_stays_off_by_default_without_an_operator_token(
     monkeypatch: pytest.MonkeyPatch, boot_env: Path
 ) -> None:
-    """A hub started without the flag has no launcher at all."""
+    """With no operator token every caller is an operator: no launcher."""
+    monkeypatch.chdir(boot_env)
     _run_main(monkeypatch, "--no-mcp-http")
+    assert hub_module.launcher_config.enabled is False
+
+
+def test_launcher_is_on_by_default_with_a_token_on_loopback(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """Token plus loopback and no flag: on, starting in the hub's own cwd."""
+    monkeypatch.chdir(boot_env)
+    _run_main(monkeypatch, "--operator-token=op", "--no-mcp-http")
+    assert hub_module.launcher_config.enabled is True
+    assert hub_module.launcher_config.cwd == boot_env
+
+
+def test_default_launcher_uses_an_explicit_agent_cwd(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path, tmp_path: Path
+) -> None:
+    """``--agent-cwd`` wins over the hub's working directory."""
+    monkeypatch.chdir(tmp_path)
+    _run_main(
+        monkeypatch,
+        "--operator-token=op",
+        f"--agent-cwd={boot_env}",
+        "--agent-max=2",
+        "--no-mcp-http",
+    )
+    assert hub_module.launcher_config.enabled is True
+    assert hub_module.launcher_config.cwd == boot_env
+    assert hub_module.launcher_config.max_agents == 2
+
+
+def test_no_agent_launcher_keeps_it_off(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """The opt-out wins even where the default would turn it on."""
+    monkeypatch.chdir(boot_env)
+    _run_main(
+        monkeypatch, "--operator-token=op", "--no-agent-launcher", "--no-mcp-http"
+    )
+    assert hub_module.launcher_config.enabled is False
+
+
+def test_launcher_flags_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """Asking for the launcher and refusing it at once is a usage error."""
+    with pytest.raises(SystemExit):
+        _run_main(
+            monkeypatch,
+            "--operator-token=op",
+            f"--agent-cwd={boot_env}",
+            "--enable-agent-launcher",
+            "--no-agent-launcher",
+        )
+    assert hub_module.launcher_config.enabled is False
+
+
+def test_default_launcher_stays_off_on_a_non_loopback_bind(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """A network-reachable hub boots, but never with the launcher by default."""
+    monkeypatch.chdir(boot_env)
+    _run_main(
+        monkeypatch,
+        "--operator-token=op",
+        "--agent-key=key",
+        "--host=0.0.0.0",
+        # Past the separate bind guard, so only the launcher decision is tested.
+        "--allow-insecure-bind",
+        "--no-mcp-http",
+    )
+    assert hub_module.launcher_config.enabled is False
+
+
+def test_default_launcher_stays_off_in_the_filesystem_root(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """A launchd service runs in ``/``: agents must not default to it."""
+    monkeypatch.chdir("/")
+    _run_main(monkeypatch, "--operator-token=op", "--no-mcp-http")
+    assert hub_module.launcher_config.enabled is False
+
+
+def test_default_launcher_refuses_an_invalid_explicit_agent_cwd(
+    monkeypatch: pytest.MonkeyPatch, boot_env: Path
+) -> None:
+    """A bad ``--agent-cwd`` is the operator's mistake: fail at boot."""
+    with pytest.raises(SystemExit):
+        _run_main(
+            monkeypatch, "--operator-token=op", "--agent-cwd=relative/dir"
+        )
     assert hub_module.launcher_config.enabled is False

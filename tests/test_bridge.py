@@ -9,6 +9,7 @@ so stop-mode tests don't leak into their neighbours.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import httpx
@@ -42,6 +43,11 @@ def _register_peer(base: str, project: str) -> str:
     """Register a peer straight against the hub and return its token."""
     with httpx.Client(base_url=base, timeout=5.0) as http:
         return str(http.post("/register", json={"project": project}).json()["token"])
+
+
+def _auth(token: str) -> dict[str, str]:
+    """Return the header-only peer credential transport used by clients."""
+    return {"Authorization": f"Bearer {token}"}
 
 
 # --- lazy arming & gate --------------------------------------------------
@@ -474,21 +480,42 @@ def test_join_after_a_session_expiry_restores_the_peer(
     assert "message_id" in bridge.say("back on the air", to="all")
 
 
-def test_join_surfaces_automode_under_claude_code(
+def test_join_surfaces_retired_automode_audit_under_claude_code(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Claude-Code auto-mode detection moved from the old setup() gesture into
-    join() (see mcp_bridge.py's automode.is_claude_code() gate); under a
-    Claude Code host, join's result must still carry the ``automode`` block.
-    """
+    """Claude Code receives the legacy-rule audit, never an install proposal."""
     monkeypatch.setattr(bridge, "PROJECT", "automode-joiner")
     monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
     monkeypatch.setattr(
-        bridge.automode, "detect", lambda: {"operator_rule": "missing"}
+        bridge.automode,
+        "detect",
+        lambda: {"operator_rule": "retired", "legacy_rule": "absent"},
     )
     result = bridge.join()
     assert result["joined"] is True
-    assert result["automode"] == {"operator_rule": "missing"}
+    assert result["automode"] == {
+        "operator_rule": "retired",
+        "legacy_rule": "absent",
+    }
+
+
+def test_join_refuses_unsafe_legacy_automode_rule(
+    bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A known-unsafe rule blocks peer traffic until the operator removes it."""
+    monkeypatch.setattr(bridge, "PROJECT", "unsafe-automode-joiner")
+    monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
+    monkeypatch.setattr(
+        bridge.automode,
+        "detect",
+        lambda: {"operator_rule": "retired", "legacy_rule": "present"},
+    )
+
+    result = bridge.join()
+
+    assert result["error"] == "unsafe_automode_rule"
+    assert result["automode"]["legacy_rule"] == "present"
+    assert bridge._token is None
 
 
 def test_join_omits_automode_outside_claude_code(
@@ -502,10 +529,10 @@ def test_join_omits_automode_outside_claude_code(
     assert "automode" not in result
 
 
-def test_join_survives_automode_detect_failure(
+def test_join_fails_closed_on_automode_detect_failure(
     bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A broken auto-mode probe must never fail the join itself (non-fatal)."""
+    """Claude Code cannot join when the legacy-rule audit itself fails."""
     monkeypatch.setattr(bridge, "PROJECT", "automode-boom-joiner")
     monkeypatch.setattr(bridge.automode, "is_claude_code", lambda: True)
 
@@ -514,8 +541,12 @@ def test_join_survives_automode_detect_failure(
 
     monkeypatch.setattr(bridge.automode, "detect", _boom)
     result = bridge.join()
-    assert result["joined"] is True
-    assert result["automode"] == {"operator_rule": "unknown"}
+    assert result["error"] == "automode_audit_failed"
+    assert result["automode"] == {
+        "operator_rule": "retired",
+        "legacy_rule": "unknown",
+    }
+    assert bridge._token is None
 
 
 # --- identity ------------------------------------------------------------
@@ -804,9 +835,7 @@ def test_say_direct_is_delivered(
     assert result["delivered_to"] == ["watcher-1"]
 
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
-        got = http.get(
-            "/receive", params={"token": watcher, "timeout": 3}
-        ).json()
+        got = http.get("/receive", params={"timeout": 3}, headers=_auth(watcher)).json()
     assert any("hello watcher" in m["content"] for m in got["messages"])
 
 
@@ -949,6 +978,25 @@ def test_take_floor_then_status_reports_it(
     assert status["floors"]["all"]["holder"] == "stick-holder"
     # Release so the module-scoped hub does not carry the stick into the next test.
     assert bridge.floor(action="drop")["released"] is True
+
+
+def test_floor_surfaces_rate_limit(client, state, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bridge reports the floor brake instead of hub_unreachable."""
+    token = str(client.post("/register", json={"project": "floor-rate-limited"}).json()["token"])
+    state.set_rate_limit(refill_rate=0.001, capacity=2.0)
+    monkeypatch.setattr(bridge_module, "_armed", True)
+    monkeypatch.setattr(bridge_module, "_token", token)
+    monkeypatch.setattr(bridge_module, "_joined_as", "floor-rate-limited")
+    monkeypatch.setattr(
+        bridge_module, "_client", lambda: contextlib.nullcontext(client)
+    )
+
+    assert bridge_module.floor(action="take", reason="x")["ok"] is True
+    assert bridge_module.floor(action="drop")["released"] is True
+    blocked = bridge_module.floor(action="take", reason="x")
+
+    assert blocked["error"] == "rate_limited"
+    assert "retry_after" in blocked
 
 
 def test_say_is_blocked_while_another_holds_the_floor(
@@ -1143,7 +1191,7 @@ def test_say_to_channel_reaches_member(
     assert "br-ch-rx" in result["delivered_to"]
 
     with httpx.Client(base_url=live_hub, timeout=5.0) as http:
-        got = http.get("/receive", params={"token": peer, "timeout": 3}).json()
+        got = http.get("/receive", params={"timeout": 3}, headers=_auth(peer)).json()
     assert any("hi channel" in m["content"] for m in got["messages"])
 
 
@@ -1227,7 +1275,9 @@ def _radio_field() -> dict[str, object]:
 
 
 def test_ask_operator_opens_form(bridge, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bridge, "PROJECT", "form-asker")
+    # Distinct from "form-asker": the hub outlives a single test and refuses a
+    # tokenless re-join of a name another test already registered.
+    monkeypatch.setattr(bridge, "PROJECT", "form-opener")
     bridge.join()
     result = bridge.ask_operator("Deploy?", [_radio_field()])
     assert result["form_id"]
@@ -1530,7 +1580,7 @@ def test_join_returns_name_in_use_when_live_listener_holds_name(
     def _hold_poll() -> None:
         with httpx.Client(base_url=live_hub, timeout=10.0) as http:
             try:
-                http.get("/receive", params={"token": token, "timeout": 5})
+                http.get("/receive", params={"timeout": 5}, headers=_auth(token))
             except Exception:
                 pass
         stop_event.set()

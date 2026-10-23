@@ -47,10 +47,11 @@ def _radio(key: str = "ok", label: str = "Proceed?") -> Field:
     return Field(key=key, label=label, type=FieldType.RADIO, options=["yes", "no"])
 
 
-async def test_register_is_idempotent_per_project() -> None:
+async def test_register_is_idempotent_with_project_token() -> None:
     state = HubState()
     first = state.register("alpha").client
-    second = state.register("alpha").client
+    assert first is not None
+    second = state.register("alpha", token=first.token).client
     assert first is second  # same record, token preserved
     assert state.peers() == ["alpha"]
 
@@ -403,6 +404,31 @@ async def test_ui_receives_message_and_mode_events() -> None:
     assert "mode" in types
 
 
+def test_slow_ui_queue_is_bounded_and_reconnect_gets_latest_snapshot() -> None:
+    """A blocked dashboard is cut off instead of retaining endless events."""
+    state = HubState()
+    client = state.register("floor-flooder").client
+    assert client is not None
+    queue = state.add_ui()
+    queue.get_nowait()  # drop the priming snapshot
+
+    assert queue.maxsize > 0
+    for _ in range(queue.maxsize + 1):
+        assert state.take_floor(client.token, "all", "x")["ok"] is True
+        assert state.drop_floor(client.token, "all")["ok"] is True
+
+    assert queue.qsize() <= queue.maxsize
+    assert queue.get_nowait() == {"type": "overflow"}
+
+    # Once overflowed, this stale listener ignores later events. A reconnect is
+    # primed from authoritative state and therefore sees the latest floor.
+    assert state.take_floor(client.token, "all", "latest")["ok"] is True
+    assert queue.empty()
+    snapshot = state.add_ui().get_nowait()
+    assert snapshot["floors"]["all"]["holder"] == "floor-flooder"
+    assert snapshot["floors"]["all"]["reason"] == "latest"
+
+
 async def test_remove_ui_stops_fanout() -> None:
     state = HubState()
     queue = state.add_ui()
@@ -545,51 +571,46 @@ async def test_revival_restores_channel_membership() -> None:
     assert "alpha" in state.channels()["#room"]["members"]
 
 
-async def test_revival_refused_when_name_reclaimed() -> None:
-    """If a fresh peer grabbed the freed name, the reaped token stays dead."""
+@pytest.mark.parametrize(
+    "presented", [None, "wrong-token", "jeton-étranger", "\ud800"]
+)
+async def test_reaped_identity_requires_matching_token(
+    presented: str | None,
+) -> None:
+    """A revivable name stays reserved for the holder of its exact token."""
     state = HubState()
     old = state.register("alpha").client
     assert old is not None
     old_token = old.token
     state.reap_stale(ttl=30.0, now=old.last_seen + 1000.0)
 
-    # A different process claims the freed name and gets its own token.
-    new = state.register("alpha").client
-    assert new is not None
-    assert new.token != old_token
+    contested = state.register("alpha", token=presented)
 
-    # The stale token cannot revive — the slot is occupied; the live holder
-    # is left untouched.
-    assert state.client_for(old_token) is None
-    assert state.client_for(new.token) is new
+    assert contested.outcome is RegisterOutcome.CONTESTED
+    assert contested.client is None
+    assert state.peers() == []
+    revived = state.register("alpha", token=old_token)
+    assert revived.outcome is RegisterOutcome.REAFFIRMED
+    assert revived.client is old
 
 
-async def test_fresh_reregister_evicts_same_name_reaped_ghost() -> None:
-    """Re-registering a reaped name fresh must not list the peer twice.
-
-    Regression: a peer that was idle-reaped sits in the revival graveyard
-    keyed by its name. When the same name re-registers *without* the reaped
-    token (a brand-new identity), the old ghost used to linger in
-    ``_reaped_by_project`` while the new client sat in ``_clients`` — so the
-    project appeared twice in :meth:`peers_info`, doubling it in the dashboard
-    roster. The fresh registration must evict the now-unreachable ghost.
-    """
-    state = HubState()
+async def test_reaped_name_registers_fresh_after_grace_expires() -> None:
+    """A forgotten identity no longer reserves its old project name."""
+    state = HubState(reaped_grace=100.0)
     old = state.register("alpha").client
     assert old is not None
     old_token = old.token
-    state.reap_stale(ttl=30.0, now=old.last_seen + 1000.0)
+    base = old.last_seen + 31.0
+    state.reap_stale(ttl=30.0, now=base)
+    assert state.register("alpha").outcome is RegisterOutcome.CONTESTED
+    assert "alpha" in state._contested_notice_at
+    state.reap_stale(ttl=30.0, now=base + 200.0)
 
-    # Brand-new identity grabs the freed name (no token presented).
+    assert "alpha" not in state._contested_notice_at
     new = state.register("alpha").client
     assert new is not None
     assert new.token != old_token
-
-    # The roster lists "alpha" exactly once — no reaped ghost lingering.
-    names = [p["name"] for p in state.peers_info()]
-    assert names.count("alpha") == 1
     assert state.peers() == ["alpha"]
-    # The ghost is gone from both revival indices.
     assert state.client_for(old_token) is None
 
 
@@ -614,6 +635,38 @@ async def test_explicit_leave_token_is_not_revivable() -> None:
     state.unregister(token)
     assert state.client_for(token) is None
     assert state.peers() == []
+
+
+async def test_reaped_identity_can_leave_and_release_its_name() -> None:
+    """An authenticated leave is terminal even after idle reaping."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+
+    assert state.unregister(token) == "alpha"
+    assert state.client_for(token) is None
+    fresh = state.register("alpha")
+    assert fresh.outcome is RegisterOutcome.FRESH
+    assert fresh.client is not None
+    assert fresh.client.token != token
+
+
+async def test_operator_can_kick_reaped_identity_and_release_its_name() -> None:
+    """Operator kick can explicitly discard a reserved, revivable identity."""
+    state = HubState()
+    client = state.register("alpha").client
+    assert client is not None
+    token = client.token
+    state.reap_stale(ttl=30.0, now=client.last_seen + 1000.0)
+
+    assert state.kick("alpha") is True
+    assert state.client_for(token) is None
+    fresh = state.register("alpha")
+    assert fresh.outcome is RegisterOutcome.FRESH
+    assert fresh.client is not None
+    assert fresh.client.token != token
 
 
 async def test_receive_style_drain_after_route() -> None:
@@ -730,16 +783,25 @@ async def test_contested_notice_throttle_is_cleared_on_drop() -> None:
     assert len(_contested_notices(state)) == 2
 
 
-async def test_register_replaced_when_no_live_listener() -> None:
+@pytest.mark.parametrize(
+    "presented", [None, "wrong-token", "jeton-étranger", "\ud800"]
+)
+async def test_register_requires_matching_token_when_no_poll_is_active(
+    presented: str | None,
+) -> None:
     state = HubState()
     reg = state.register("alpha")
     assert reg.client is not None
     assert reg.client.active_polls == 0  # default
+    token = reg.client.token
+    last_seen = reg.client.last_seen
 
-    replaced = state.register("alpha")  # no token, no live listener
+    contested = state.register("alpha", token=presented)
 
-    assert replaced.outcome is RegisterOutcome.REPLACED
-    assert replaced.client is reg.client
+    assert contested.outcome is RegisterOutcome.CONTESTED
+    assert contested.client is None
+    assert reg.client.last_seen == last_seen
+    assert state.client_for(token) is reg.client
 
 
 async def test_register_contested_bypassed_by_valid_token_even_with_live_listener() -> None:

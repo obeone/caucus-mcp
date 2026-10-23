@@ -10,16 +10,15 @@ guard here is load-bearing and the module is deliberately paranoid:
   supplies *values*, never program names and never raw argv.
 * **No caller-controlled flags.** Each operator-supplied value is rendered by
   this module into a single ``--flag=value`` argv element, so an operator string
-  can never land in a position argparse would read as an option. A trailing
-  ``--`` terminates option parsing for good measure.
+  can never land in a position argparse would read as an option.
 * **No inherited environment.** The child's environment is rebuilt from the
   explicit :data:`CHILD_ENV_ALLOWLIST`, never from a copy of ``os.environ``. The
   hub process typically holds ``ANTHROPIC_API_KEY`` and one or more ``CAUCUS_*``
   peer tokens; handing those to a spawned agent would silently widen its reach
   well past what the operator asked for.
-* **No unguarded worker.** A ``worker`` agent wields Bash/Read/Edit/Write on the
-  host, so this module refuses to combine it with a permission mode that removes
-  the approval classifier, *before* spawning anything.
+* **No unguarded worker.** Claude's direct host built-ins are disabled and its
+  workspace wrappers enforce exact operator approvals. This module still
+  refuses classifier-free worker modes as a second boundary, before spawning.
 * **No mute agent.** The opposite failure is just as bad for the operator: in
   ``plan`` and ``default`` the caucus tools are not permitted and, with
   ``stdin`` closed, no approval can ever arrive, so the child would join the
@@ -29,11 +28,11 @@ guard here is load-bearing and the module is deliberately paranoid:
   own ``claude`` CLI child, and signalling only the direct child would leave that
   grandchild running and still talking to Anthropic.
 
-What this module deliberately does **not** provide is containment. The working
-directory is a *starting point*, not a sandbox: a ``worker`` reaches shell and
-filesystem tools and can walk anywhere the hub's own user can. The safety story
-is "the operator authenticated, chose the profile, and can see and kill the
-child", not "the child is jailed".
+What this module deliberately does **not** provide is a shell sandbox. File
+wrappers enforce a workspace root, but an approved shell command runs with the
+hub user's privileges and can walk elsewhere. The safety story is "the operator
+approved this exact host action and can see and kill the child", not "the child
+is jailed".
 
 Notes
 -----
@@ -132,8 +131,8 @@ DEFAULT_AGENT_TYPE = "talker"
 DEFAULT_PERMISSION_MODE = "auto"
 
 #: Permission modes that remove Claude Code's approval classifier entirely.
-#: Combined with a tool-wielding ``worker`` they leave nothing between an
-#: inbound peer message and real host tool execution.
+#: Application wrappers remain authoritative, but supervised Claude workers
+#: retain this refusal as a conservative second boundary.
 UNGUARDED_PERMISSION_MODES = frozenset({"bypassPermissions", "dontAsk"})
 
 #: Permission modes in which a *supervised* child can never say a word.
@@ -712,9 +711,13 @@ class AgentSupervisor:
         Every operator-supplied value is embedded in a single ``--flag=value``
         element rather than following its flag as a separate one. That way a
         value beginning with a dash can never be mistaken for an option, and no
-        operator string ever occupies an argv slot of its own. The trailing
-        ``--`` terminates option parsing, so even if the child's parser grows a
-        positional later, nothing here can drift into it.
+        operator string ever occupies an argv slot of its own.
+
+        No trailing ``--`` is appended: argparse rejects a bare ``--`` as an
+        unrecognized argument when the parser declares no positional, which is
+        the case for every runtime, so it made every launch exit before
+        connecting. The single-element form already keeps values out of option
+        position without it.
 
         Parameters
         ----------
@@ -736,7 +739,6 @@ class AgentSupervisor:
             argv.append(f"--model={spec.model}")
         if spec.mission:
             argv.append(f"--mission={spec.mission}")
-        argv.append("--")
         return argv
 
     def _command(self, spec: AgentSpec) -> ArgvList:
@@ -861,7 +863,7 @@ class AgentSupervisor:
         ):
             raise LauncherRefused(
                 "worker agents may not run with bypassPermissions/dontAsk: these "
-                "remove the only guardrail against peer-injected tool use"
+                "remove a defense-in-depth guardrail around tool use"
             )
         # The other end of the same problem: a mode so tight the agent cannot
         # reach the room at all. Nothing downstream refuses this, and the

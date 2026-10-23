@@ -172,11 +172,14 @@ denominator; everything else is a connector to it.
   wake-by-exit. The poll/reason split is what lets the operator reach an agent
   that is **mid-turn**: the poller reacts to per-agent control commands out of
   band — `interrupt` calls `ClaudeSDKClient.interrupt()` to abort the current
-  turn, `reset` aborts and rebuilds the client from the same options (a clean
-  context window), and `stop` ends the session after draining queued turns. A
+  turn, `reset` aborts and rebuilds the client and approval channel (a clean
+  context window), and `stop` drains talker turns but aborts a worker that may
+  be waiting on approval. A
   single sequential loop could not poll and reason at once, so it would only
   notice an interrupt once the turn was already over. Built-in tools
-  (Bash/Read/Edit/…) are disallowed so it stays a pure conversational peer.
+  (Bash/Read/Edit/…) are disallowed for both profiles. Workers instead receive
+  bounded workspace wrappers; sensitive reads, edits and shell commands execute
+  only after an exact server-attested operator approval.
   The driver also brackets each turn with a best-effort status heartbeat via
   `HubConnector.set_status`: `_drive_turn` publishes "composing a reply" before
   querying the SDK client and clears it again once the response is drained (in
@@ -270,18 +273,17 @@ maps, a per-client `asyncio.Queue` of pending `Message`s, a bounded `deque` log
 - **Peer identity and registration** (`register`): peer identity is keyed on the
   `project` name (the name passed to `join`). `HubState.register(project, token=None)`
   returns a `Registration(outcome, client)` where `outcome` is a `RegisterOutcome`
-  enum with four cases: `FRESH` (brand-new peer), `REAFFIRMED` (caller presented
-  a token matching the existing record, genuine re-join by the same agent, same
-  client returned — also covers reviving a reaped identity still in its grace
-  window), `REPLACED` (name existed but had no live listener → newcomer
-  takes over the record and queue, advisory note returned), or `CONTESTED` (name
-  held by a live listener with no valid token → 409 HTTP conflict, no token issued,
-  operator console receives a system notice). Duplicate-join protection works by
-  counting active long-poll listeners per client: `Client.active_polls` increments
-  on `/receive` entry, decrements in a `finally`, and the endpoint now returns
-  early if `request.is_disconnected()` so a dead process stops counting promptly.
-  Clients re-send their cached token on re-join (bridge and native connector)
-  ensuring a legitimate reconnect is REAFFIRMED, never mistaken for a duplicate.
+  enum with three current cases: `FRESH` (brand-new peer), `REAFFIRMED`
+  (caller presented a token matching the existing record, genuine re-join by
+  the same agent, same client returned — also covers reviving a reaped identity
+  still in its grace window), or `CONTESTED` (a live or revivable identity owns
+  the name but the caller did not present its exact token → 409 HTTP conflict,
+  no token issued, operator console receives a throttled system notice). The
+  legacy `REPLACED` enum value remains importable for compatibility but is
+  never returned. Identity ownership is deliberately independent of transient
+  receive activity: `Client.active_polls` is observability only. Clients
+  re-send their cached token on re-join (bridge and native connector), ensuring
+  a legitimate reconnect is REAFFIRMED while a polling-gap claimant is refused.
 - **Operator kick** (`kick`): the `/ui` WebSocket accepts `{"kick": "<project>"}`,
   dropping that peer (reason "kicked by operator"). This is the manual counterpart
   to the collision detector — the only way a live incumbent is evicted (collisions
@@ -406,9 +408,8 @@ the process holding it.
 
 `/receive` reads its access token from the `Authorization: Bearer <token>`
 header, never the URL query string — a `GET` query token leaks into httpx and
-server access logs. The `?token=` query parameter is still accepted as a
-**deprecated** fallback (so an older watcher survives a hub upgrade); all
-first-party callers send the header. Keep new callers on the header.
+server access logs. Query credentials are not accepted by `/receive`, `/peek`,
+or `/decisions`; all callers must send the header.
 
 ## Operator forms (`/ask`, `/forms`, the wizard)
 
@@ -489,24 +490,29 @@ Unlike the two brakes it is selective (one lane) and self-served (any peer can
 take it), and it is the only send-refusal an agent clears by *waiting its turn*
 (`floor(action="raise")` → handed the floor) rather than backing off or stopping.
 
-## Agent launcher (`supervisor.py`), off by default
+## Agent launcher (`supervisor.py`), on where it is safe
 
 `AgentSupervisor` lets an authenticated operator spawn, list and kill
 `caucus-claude-agent` processes from the console, so the human watching a room
 can add a participant to it. It is the only place in the package that turns a
-click into an operating-system process, and it is disabled unless a hub is
-explicitly started for it.
+click into an operating-system process, so it only ever runs behind an
+operator token on a loopback bind.
 
 ### Boot gate
 
-Three conditions, all required, checked once in `main()`:
+Checked once in `main()`, in one of three modes:
 
-- `--enable-agent-launcher`
-- `--operator-token` (or `CAUCUS_OPERATOR_TOKEN`)
-- a loopback `--host`
-
-Plus `--agent-cwd PATH`, the single directory every child starts in.
-Any violation exits with a plain message rather than starting a degraded hub.
+- **Default** (no launcher flag): on when `--operator-token` (or
+  `CAUCUS_OPERATOR_TOKEN`) is set and `--host` is loopback, starting children
+  in `--agent-cwd` or the hub's own working directory. A missing token, a
+  network bind, or a defaulted directory that is the filesystem root (a
+  launchd service) or fails validation leaves it off, with the reason logged;
+  the hub boots either way. An explicit `--agent-cwd` that fails validation
+  exits, as it is the operator's mistake.
+- `--enable-agent-launcher`: mandatory. The token, the loopback bind and
+  `--agent-cwd` are all required, and any violation exits with a plain message
+  rather than starting a degraded hub.
+- `--no-agent-launcher`: off, whatever else is set.
 
 The operator token is not optional paranoia. Hub auth is off by default, and
 `AuthConfig.role_for` grades *every* caller as `operator` in that state, so a
@@ -520,15 +526,15 @@ enable the launcher without a token is what makes the request-time check real.
   `create_subprocess_exec`.
 - **No caller-controlled flags.** Each operator value is rendered into one
   `--flag=value` argv element, so a value starting with a dash can never be read
-  as an option, and a trailing `--` terminates option parsing.
+  as an option.
 - **No inherited environment.** The child environment is rebuilt from
   `CHILD_ENV_ALLOWLIST`. `ANTHROPIC_API_KEY` and every `CAUCUS_*` variable the
   hub holds are deliberately excluded; a child authenticates through the Claude
   CLI's own on-disk credentials under `HOME`.
-- **No unguarded worker.** `worker` plus `bypassPermissions` or `dontAsk` is
-  refused before the fork. `claude_agent.main()` refuses it too, but relying on
-  the child would turn a clean 400 into a process that dies with an opaque
-  status.
+- **No unguarded worker.** Claude `worker` plus `bypassPermissions` or
+  `dontAsk` is refused before the fork as defense in depth. Direct Claude host
+  built-ins are disabled regardless, and its workspace wrappers independently
+  require exact operator approvals.
 - **No mute agent.** `plan` and `default` are refused for either agent type.
   Neither permits the `mcp__caucus__*` tools up front, so `say` is unreachable,
   and a supervised child has `stdin` closed, so no approval can arrive to unlock
@@ -551,11 +557,10 @@ enable the launcher without a token is what makes the request-time check real.
 
 ### What it deliberately is not
 
-- **The working directory is a starting point, not a containment boundary.** A
-  `worker` reaches Bash, Read, Edit and Write, and can walk anywhere the hub's
-  own user can with a single `cd ..`. That is why the cwd is one fixed value
-  rather than an allowlist: an allowlist would advertise a guarantee that does
-  not exist. A spawned agent runs with the operator's own privileges.
+- **The working directory is a starting point, not a shell sandbox.** File
+  wrappers enforce containment, but an operator-approved shell command can walk
+  anywhere the hub's own user can. A spawned agent runs with the operator's own
+  privileges, so the approval form must be reviewed as an exact host action.
 - **A `SIGKILL`ed hub orphans its children.** Teardown runs from the lifespan
   `finally`, so `SIGINT`/`SIGTERM` take the children down; there is no signal
   handler, and nothing survives `kill -9` to clean up.
@@ -617,9 +622,15 @@ Auth is opt-in, controlled by `--operator-token` / `CAUCUS_OPERATOR_TOKEN` and
 `{"type":"auth_ok","role":"operator","auth":false}` on connect without reading a
 frame, preserving the original localhost-open behaviour.
 
-When an operator token is set, the first frame the client sends must be
-`{"auth":"<token>"}`. The hub compares it with `secrets.compare_digest` (constant-time)
-and replies:
+When an operator token is set, a client with a stored token may send
+`{"auth":"<token>"}` as its first frame. A fresh dashboard sends the non-secret
+`{"auth_probe":true}` first, waits for `{"type":"auth_required"}`, and then
+sends the auth frame. The complete exchange is limited to 30 seconds, and the
+hub admits at most 32 sockets awaiting authentication at once; timeout closes
+1008 and overload closes 1013 before any UI queue is allocated. The pending
+slot is released on success, rejection, parse failure, disconnect, timeout, or
+cancellation. The hub compares the token with `secrets.compare_digest`
+(constant-time) and replies:
 
 - `{"type":"auth_ok","role":"operator","auth":true}` — full read-write access.
 - `{"type":"auth_ok","role":"observer","auth":true}` — read-only access.

@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from ._private_backup import write_private_backup
 from .supervisor import LauncherRefused, validate_agent_cwd
 from .urlguard import is_loopback_host, validate_public_url
 
@@ -67,6 +68,11 @@ WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
 #: escaping for both, restrict them to characters neither treats specially;
 #: every sane generator (``openssl rand -hex``, ``uuidgen``, base64url) fits.
 TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+#: Visible placeholder used only in diagnostic output. Launchd credentials are
+#: replaced before XML rendering so no value-based text substitution can alter
+#: an unrelated field or leave an overlapping credential partially exposed.
+DRY_RUN_REDACTION = "[REDACTED]"
 
 #: Same idea for the values that are addresses rather than secrets: a public URL
 #: and the ``Host`` allowlist entries travel through the same plist and env-file
@@ -452,6 +458,7 @@ def check_launcher(
     operator_token: str | None,
     agent_cwd: str | None,
     agent_max: int | None,
+    disabled: bool = False,
 ) -> Path | None:
     """Refuse a launcher install the hub would itself refuse to boot.
 
@@ -462,30 +469,48 @@ def check_launcher(
     failure to install time. The path rule is :func:`caucus.supervisor.
     validate_agent_cwd` itself, not a second copy of it.
 
+    Without either launcher flag the hub turns the launcher on by itself when
+    it has an operator token on a loopback bind, so ``--agent-cwd`` and
+    ``--agent-max`` are valid there too; anywhere the launcher cannot run they
+    would be silently ignored, and are refused instead.
+
     Args:
         enabled: Whether ``--enable-agent-launcher`` was passed.
         host: Address the hub would bind to.
         operator_token: Token that would gate operator access, if any.
         agent_cwd: Operator-supplied default working directory, if any.
         agent_max: Operator-supplied concurrent-agent ceiling, if any.
+        disabled: Whether ``--no-agent-launcher`` was passed.
 
     Returns:
-        The validated, resolved working directory, or ``None`` when the
-        launcher is not being enabled.
+        The validated, resolved working directory, or ``None`` when none was
+        given or the launcher is off.
 
     Raises:
-        SetupError: When ``--agent-cwd`` or ``--agent-max`` is given without the
-            launcher, when the launcher lacks a token, a loopback bind or a
-            valid directory, or when the directory or ceiling cannot be carried
-            by the unit files.
+        SetupError: When ``--agent-cwd`` or ``--agent-max`` is given where the
+            launcher cannot run, when an explicit launcher lacks a token, a
+            loopback bind or a valid directory, or when the directory or
+            ceiling cannot be carried by the unit files.
     """
-    if not enabled:
-        for name, value in (("--agent-cwd", agent_cwd), ("--agent-max", agent_max)):
-            if value is not None:
-                raise SetupError(
-                    f"{name} only means something with --enable-agent-launcher"
-                )
+    given = [
+        name
+        for name, value in (("--agent-cwd", agent_cwd), ("--agent-max", agent_max))
+        if value is not None
+    ]
+    if disabled:
+        if given:
+            raise SetupError(f"{given[0]} means nothing with --no-agent-launcher")
         return None
+    if not enabled:
+        if not given:
+            return None
+        if not operator_token or not is_loopback_host(host):
+            raise SetupError(
+                f"{given[0]} only takes effect where the agent launcher runs:\n"
+                "with --operator-token on a loopback --host (where it is on by\n"
+                "default), or with --enable-agent-launcher."
+            )
+        return _launcher_cwd(agent_cwd, agent_max)
     if not operator_token:
         raise SetupError(
             "--enable-agent-launcher requires --operator-token: without it every\n"
@@ -503,6 +528,27 @@ def check_launcher(
             "--enable-agent-launcher requires --agent-cwd: it is the directory\n"
             "spawned agents start in unless the operator picks another one."
         )
+    return _launcher_cwd(agent_cwd, agent_max)
+
+
+def _launcher_cwd(agent_cwd: str | None, agent_max: int | None) -> Path | None:
+    """Validate the launcher directory and ceiling the unit files will carry.
+
+    Args:
+        agent_cwd: Operator-supplied default working directory, if any.
+        agent_max: Operator-supplied concurrent-agent ceiling, if any.
+
+    Returns:
+        The validated, resolved directory, or ``None`` when none was given.
+
+    Raises:
+        SetupError: When the directory fails the hub's own path rule, cannot be
+            written into a plist or env file, or the ceiling is below one.
+    """
+    if agent_max is not None and agent_max < 1:
+        raise SetupError(f"--agent-max must be at least 1, got {agent_max}")
+    if agent_cwd is None:
+        return None
     try:
         cwd = validate_agent_cwd(agent_cwd)
     except LauncherRefused as exc:
@@ -512,8 +558,6 @@ def check_launcher(
             f"--agent-cwd {str(cwd)!r} may only contain letters, digits and . _ ~ - /\n"
             "It is written into a plist and a shell-sourced env file."
         )
-    if agent_max is not None and agent_max < 1:
-        raise SetupError(f"--agent-max must be at least 1, got {agent_max}")
     return cwd
 
 
@@ -587,6 +631,7 @@ def render_unit(
     enable_agent_launcher: bool = False,
     agent_cwd: Path | None = None,
     agent_max: int | None = None,
+    disable_agent_launcher: bool = False,
 ) -> str:
     """Render the service definition for ``kind``.
 
@@ -614,10 +659,19 @@ def render_unit(
             treatment as ``operator_token`` (``CAUCUS_AGENT_CWD``).
         agent_max: Concurrent-agent ceiling; same treatment
             (``CAUCUS_AGENT_MAX``).
+        disable_agent_launcher: Add ``--no-agent-launcher`` instead, keeping
+            the launcher off where the hub would turn it on by default.
 
     Returns:
         The complete file contents, ready to write.
     """
+    launcher_flag = (
+        "--enable-agent-launcher"
+        if enable_agent_launcher
+        else "--no-agent-launcher"
+        if disable_agent_launcher
+        else None
+    )
     if kind == "systemd":
         return SYSTEMD_TEMPLATE.format(
             binary=binary,
@@ -625,7 +679,7 @@ def render_unit(
             port=port,
             logfile=logfile,
             envfile=env_file_path(),
-            launcher_args=" --enable-agent-launcher" if enable_agent_launcher else "",
+            launcher_args=f" {launcher_flag}" if launcher_flag else "",
         )
 
     environment = ""
@@ -650,9 +704,7 @@ def render_unit(
         environment=environment,
         run_at_load="true" if at_login else "false",
         launcher_args=(
-            "    <string>--enable-agent-launcher</string>\n"
-            if enable_agent_launcher
-            else ""
+            f"    <string>{launcher_flag}</string>\n" if launcher_flag else ""
         ),
     )
 
@@ -693,8 +745,13 @@ def _atomic_write(path: Path, text: str, *, mode: int = 0o600) -> None:
             files can carry tokens.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_text(encoding="utf-8") != text:
-        shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+    if path.exists():
+        prior = path.read_text(encoding="utf-8")
+        if prior != text:
+            try:
+                write_private_backup(path.with_suffix(path.suffix + ".bak"), prior)
+            except OSError as exc:
+                raise SetupError(f"cannot safely back up {path}: {exc}") from exc
 
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".caucus-", suffix=".tmp")
     tmp = Path(tmp_name)
@@ -999,6 +1056,7 @@ def describe_plan(
     agent_cwd: Path | None = None,
     agent_max: int | None = None,
     enable_agent_launcher: bool = False,
+    disable_agent_launcher: bool = False,
 ) -> str:
     """Build the human-readable summary shown before anything is written.
 
@@ -1024,6 +1082,8 @@ def describe_plan(
         agent_max: Concurrent-agent ceiling, when given.
         enable_agent_launcher: Whether operators can spawn agents from the
             console.
+        disable_agent_launcher: Whether ``--no-agent-launcher`` keeps the
+            launcher off where it would be on by default.
 
     Returns:
         A multi-line block, ending without a trailing newline.
@@ -1050,15 +1110,36 @@ def describe_plan(
         lines.append(f"  hosts    /mcp also accepts {', '.join(allowed_hosts)}")
     if mcp_http:
         lines.append("  mcp      in-process /mcp endpoint forced on")
+    # Where spawned agents start, or None when the launcher stays off. Without a
+    # launcher flag the hub decides by itself (token on a loopback bind), from
+    # --agent-cwd or its own working directory: "/" under launchd, which it
+    # refuses, and the home directory under a systemd user manager.
+    launcher_cwd: str | None = None
     if enable_agent_launcher:
+        launcher_cwd = str(agent_cwd)
+    elif disable_agent_launcher:
+        lines.append("  launcher off (--no-agent-launcher)")
+    elif operator_token and is_loopback_host(host):
+        if agent_cwd is not None:
+            launcher_cwd = str(agent_cwd)
+        elif kind == "systemd":
+            launcher_cwd = "your home directory"
+        else:
+            lines.append(
+                "  launcher off: launchd starts the hub in /, pass --agent-cwd to"
+            )
+            lines.append("           turn it on")
+    if launcher_cwd is not None:
         lines.append(
-            f"  launcher operators can spawn agents; default cwd {agent_cwd}"
+            f"  launcher operators can spawn agents; default cwd {launcher_cwd}"
             + (f", at most {agent_max}" if agent_max is not None else "")
         )
         lines.append(
             "           a spawned worker runs as you, with shell access: the cwd is"
         )
         lines.append("           a starting point, not a sandbox")
+        if not enable_agent_launcher:
+            lines.append("           on by default; --no-agent-launcher keeps it off")
     if hook_path is not None:
         verb = {"created": "create", "updated": "update", "unchanged": "leave"}
         lines.append(
@@ -1208,21 +1289,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "bind and off elsewhere, so this is the opt-in a remote hub needs"
         ),
     )
-    parser.add_argument(
+    launcher_switch = parser.add_mutually_exclusive_group()
+    launcher_switch.add_argument(
         "--enable-agent-launcher",
         action="store_true",
         help=(
-            "let an authenticated operator spawn agents from the console. "
-            "Requires --operator-token, --agent-cwd and a loopback --host; "
-            "refused here rather than at first boot when any is missing"
+            "require the agent launcher, which lets an authenticated operator "
+            "spawn agents from the console. Requires --operator-token, "
+            "--agent-cwd and a loopback --host; refused here rather than at "
+            "first boot when any is missing. Without it the hub still turns "
+            "the launcher on by default with an operator token on loopback"
         ),
+    )
+    launcher_switch.add_argument(
+        "--no-agent-launcher",
+        action="store_true",
+        help="keep the agent launcher off even where it would be on by default",
     )
     parser.add_argument(
         "--agent-cwd",
         metavar="PATH",
         help=(
             "absolute directory spawned agents start in by default (required "
-            "with --enable-agent-launcher). A starting point, not a sandbox"
+            "with --enable-agent-launcher; otherwise the hub's working "
+            "directory). A starting point, not a sandbox"
         ),
     )
     parser.add_argument(
@@ -1251,7 +1341,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the plan and the generated unit, change nothing",
+        help=(
+            "print the plan and a credential-redacted unit preview, change nothing"
+        ),
     )
     parser.add_argument(
         "--uninstall", action="store_true", help="stop the service and remove it"
@@ -1292,6 +1384,7 @@ def main(argv: list[str] | None = None) -> int:
         check_bind(args.host, args.operator_token, args.agent_key, args.public_url)
         agent_cwd = check_launcher(
             enabled=args.enable_agent_launcher,
+            disabled=args.no_agent_launcher,
             host=args.host,
             operator_token=args.operator_token,
             agent_cwd=args.agent_cwd,
@@ -1310,13 +1403,26 @@ def main(argv: list[str] | None = None) -> int:
             logfile=logfile,
             label=args.label,
             at_login=args.at_login,
-            operator_token=args.operator_token,
-            observer_token=args.observer_token,
-            agent_key=args.agent_key,
+            operator_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.operator_token is not None
+                else args.operator_token
+            ),
+            observer_token=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.observer_token is not None
+                else args.observer_token
+            ),
+            agent_key=(
+                DRY_RUN_REDACTION
+                if args.dry_run and args.agent_key is not None
+                else args.agent_key
+            ),
             public_url=args.public_url,
             allowed_hosts=args.allowed_host,
             mcp_http=args.mcp_http,
             enable_agent_launcher=args.enable_agent_launcher,
+            disable_agent_launcher=args.no_agent_launcher,
             agent_cwd=agent_cwd,
             agent_max=args.agent_max,
         )
@@ -1352,6 +1458,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_cwd=agent_cwd,
                 agent_max=args.agent_max,
                 enable_agent_launcher=args.enable_agent_launcher,
+                disable_agent_launcher=args.no_agent_launcher,
             )
         )
 

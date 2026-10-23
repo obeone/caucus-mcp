@@ -281,7 +281,7 @@ def _session_expired() -> dict[str, object]:
 # Minimum interval between automatic session_expired recoveries, in seconds,
 # regardless of outcome. Guards :func:`_attempt_auto_rejoin` against turning
 # into a retry loop when the hub keeps refusing this identity (genuinely down,
-# or the name was taken over by another live peer): one attempt per window,
+# or the name now belongs to another identity): one attempt per window,
 # never a tight loop of 401s each minting another /register call.
 _AUTO_REJOIN_COOLDOWN_SECONDS = 60.0
 
@@ -600,6 +600,36 @@ def join(
     gate = _ensure_armed()
     if gate is not None:
         return gate
+    automode_audit: dict[str, object] | None = None
+    if automode.is_claude_code():
+        try:
+            automode_audit = automode.detect()
+        # A failed audit cannot prove that the retired authority rule is absent.
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
+            logger.warning("auto-mode audit failed; refusing join: %s", exc)
+            return {
+                "error": "automode_audit_failed",
+                "automode": {
+                    "operator_rule": "retired",
+                    "legacy_rule": "unknown",
+                },
+                "hint": (
+                    "Caucus cannot safely deliver peer text until the legacy "
+                    "auto-mode rule audit succeeds."
+                ),
+            }
+        if (
+            automode_audit.get("legacy_rule") == "present"
+            or automode_audit.get("operator_rule") == "present"
+        ):
+            return {
+                "error": "unsafe_automode_rule",
+                "automode": automode_audit,
+                "hint": automode_audit.get(
+                    "hint",
+                    "Remove the legacy Caucus autoMode.allow rule before joining.",
+                ),
+            }
     global _token, _joined_as, _known_protocol_version, _protocol_text
     global _protocol_delivered
     name = project or PROJECT
@@ -609,8 +639,8 @@ def join(
     # later tool call in this process would speak as the newcomer, and the
     # parent's peer would be left on the hub with nobody holding its token.
     # Refuse locally, before the hub is contacted, so no stray peer is minted.
-    # Re-joining under the SAME name stays allowed: that is the reaffirm /
-    # revive / replace path the protocol tells agents to use.
+    # Re-joining under the SAME name stays allowed: that is the reaffirm/revive
+    # path the protocol tells agents to use.
     if _token is not None and _joined_as != name:
         logger.warning(
             "join refused: this process already holds identity %s (requested %s)",
@@ -643,10 +673,10 @@ def join(
             resp = http.post("/register", json=payload, headers=_agent_headers())
             if resp.status_code == 409:
                 body = resp.json()
-                note = body.get("note", "an active listener already holds this name")
+                note = body.get("note", "an existing identity owns this name")
                 logger.warning(
-                    "join refused for project=%s — name is already held by a live"
-                    " peer; re-launch under a different CAUCUS_PROJECT",
+                    "join refused for project=%s — name is already owned; present"
+                    " its token or re-launch under a different CAUCUS_PROJECT",
                     name,
                 )
                 # The hub rejected the token we presented, so this process holds
@@ -727,18 +757,10 @@ def join(
         result["watch"] = _watch_command_for(token)
     except OSError as exc:  # pragma: no cover - needs an unwritable temp dir
         logger.warning("watch command unavailable: %s", exc)
-    # Auto mode is Claude-Code-specific, so only surface it under Claude Code —
-    # other MCP hosts (Codex, Gemini, …) would just get irrelevant noise. Cheap,
-    # never-fatal probe: does auto mode already know a caucus operator answer is
-    # a user decision? If not, the agent can propose installing the rule (see
-    # automode.py / the `caucus-setup-automode` script).
-    if automode.is_claude_code():
-        try:
-            result["automode"] = automode.detect()
-        # Deliberately blind: probing auto mode must never break join().
-        except Exception as exc:  # noqa: BLE001  # pragma: no cover
-            logger.warning("auto-mode detection skipped: %s", exc)
-            result["automode"] = {"operator_rule": "unknown"}
+    # Safe Claude Code joins carry the already-completed audit so the model
+    # knows operator answers remain informational. Other MCP hosts omit it.
+    if automode_audit is not None:
+        result["automode"] = automode_audit
     return result
 
 
@@ -967,7 +989,7 @@ def set_channel_topic(channel: str, topic: str = "") -> dict[str, object]:
 def floor(
     action: str, scope: str = "all", reason: str | None = None
 ) -> dict[str, object]:
-    """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` (default "all") "all" or "#channel"; `reason` (for take). `status` works pre-join. Mechanics: protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, not_joined."""
+    """Talking-stick: `action` (required) take|pass|drop|raise|status; `scope` "all" (default) or "#channel"; `reason` for take. `status` works pre-join. See protocol_section('talking-stick'). Errors: floor_held, not_holder, invalid_action, rate_limited, not_joined."""
     gate = _ensure_armed()
     if gate is not None:
         return gate
@@ -994,6 +1016,9 @@ def floor(
                 "reason": reason or "",
             },
         )
+        if resp.status_code == 429:
+            body = resp.json()
+            return {"error": "rate_limited", "retry_after": body.get("retry_after")}
         resp.raise_for_status()
         return dict(resp.json())
 

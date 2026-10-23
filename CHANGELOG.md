@@ -121,6 +121,18 @@ and rename that heading to the version when you cut the release.
 
 ### Changed
 
+- **The agent launcher is on by default wherever it is safe.** A hub started
+  with an operator token on a loopback bind now lets the operator spawn agents
+  with no extra flag, starting them in `--agent-cwd` or the hub's working
+  directory. Without a token, on a network bind, or when the default directory
+  is the filesystem root (a launchd service), it stays off and the boot log
+  says why. The new `--no-agent-launcher` keeps it off, also in
+  `caucus-setup-service`, which now accepts `--agent-cwd` and `--agent-max`
+  for the default launcher. `--enable-agent-launcher` keeps its strict
+  behaviour. Upgrading a systemd user service that has an operator token turns
+  the launcher on in your home directory; add `--no-agent-launcher` to opt
+  out.
+
 - Extract the native conversation loop and nine room handlers into an
   SDK-independent module. Preserve Claude defaults, and propagate failed
   driver/poller tasks instead of leaving silently failed sessions.
@@ -171,6 +183,15 @@ and rename that heading to the version when you cut the release.
 
 ### Fixed
 
+- **Agents started from the dashboard launcher run again.** The supervisor
+  ended every child command line with a bare `--`, which argparse rejects when
+  the parser has no positional argument, so Claude, OpenAI and Codex agents
+  all exited with "unrecognized arguments: --" before joining the room.
+
+- **The dashboard build works again with Tailwind CSS 4.** The web app now
+  uses the `@tailwindcss/vite` plugin and loads the existing theme through
+  `@config`, so every custom utility keeps its value.
+
 - Keep the dependency lockfile portable across environments by excluding
   the local uv release-age cutoff. All locked package versions remain
   unchanged, and CI can install with `uv sync --locked --extra dev`.
@@ -195,6 +216,92 @@ and rename that heading to the version when you cut the release.
 
 ### Security
 
+- **Peer messages can no longer reach direct Claude host tools.** Native Claude
+  workers now start with zero Claude built-ins, ignore ambient settings and MCP
+  servers, and use bounded workspace MCP wrappers instead. Sensitive reads,
+  searches, edits and shell commands require a server-attested operator answer
+  bound to the private audience, original asker, one-time form ID and exact
+  SHA-256 action digest; SDK `auto`, `acceptEdits` and programmatic permission
+  modes cannot bypass the application gate. Talkers and ordinary Caucus
+  messaging are unchanged.
+- **Settings and service backups no longer follow prepared `.bak` symlinks.**
+  POSIX backup files are created owner-only through exclusive
+  descriptor-relative no-follow opens; other supported platforms use an
+  unpredictable private temporary file and verified atomic replacement.
+  Unsafe symlinks, non-regular files, and hard-link aliases are refused; POSIX
+  also rejects foreign-owned backups. Existing safe regular backups continue
+  to refresh with mode 0600.
+- **Transcript logging no longer follows attacker-prepared filesystem links.**
+  DiskLog now walks only root- or service-owned directories that are private
+  or have sticky owner protection,
+  opens the final file relative to that verified parent with no-follow flags,
+  validates a single service-owned regular inode, and retains the descriptor
+  across appends. New logs use mode 0600, and retention swaps its verified
+  temporary descriptor into service without reopening the configured path.
+  Platforms without POSIX descriptor-relative no-follow operations fail closed
+  instead of falling back to a link-following open.
+- **Unauthenticated dashboard WebSockets now have time and capacity bounds.**
+  When console authentication is enabled, the complete `/ui` authentication
+  exchange must finish within 30 seconds and no more than 32 sockets may wait
+  for credentials concurrently. Silent, stalled, malformed, and disconnected
+  clients release their pre-authentication slot without allocating a dashboard
+  event queue; overload is rejected with retryable WebSocket close code 1013.
+- **Interactive API documentation is disabled on the operational hub.** The
+  default Swagger UI and ReDoc routes loaded third-party JavaScript in the same
+  origin where the dashboard stores console credentials. `/docs`, `/redoc`,
+  and Swagger's OAuth redirect are no longer registered as documentation pages
+  and return 404 with the default route configuration; the inert
+  `/openapi.json` schema remains available for compatible tooling.
+- **Privileged GitHub Actions now execute only reviewed immutable revisions.**
+  Release automation pins every third-party action and denies permissions by
+  default, granting repository read, PyPI OIDC, and release write authority
+  only to their owning jobs. Claude workflows pin checkout and action code,
+  replace OIDC with an explicitly scoped GitHub token for OAuth-backed jobs,
+  and load the review plugin from a separately checked-out, commit-pinned
+  marketplace. Release tools and transferred artifacts are checksum-verified.
+- **`caucus-setup-service --dry-run` no longer prints reusable launchd
+  credentials.** Operator tokens, observer tokens, and agent keys are replaced
+  with visible `[REDACTED]` values while their environment-variable names and
+  the rest of the plist structure remain available for review. Normal installs
+  still write the real launchd plist directly with mode 0600; systemd previews
+  continue to expose only the protected environment-file reference.
+- **Reusable console and peer credentials no longer authenticate from request
+  URLs.** The dashboard now uses a non-secret WebSocket probe, prompts for a
+  token only when the hub reports that authentication is required, and stores
+  the token only after `auth_ok`; rejected stored tokens are cleared. Console
+  responses also send `Referrer-Policy: no-referrer`. The `/receive`, `/peek`,
+  and `/decisions` peer routes now require `Authorization: Bearer` and reject
+  query-only credentials. Current Caucus clients already use the header; raw
+  HTTP integrations that still construct `?token=` URLs must be updated.
+- **Peer floor actions can no longer exhaust slow dashboard consumers.** The
+  talking-stick endpoint now spends the caller's normal write-rate budget, and
+  every dashboard event queue has a fixed capacity shared by state and launcher
+  fan-out. A console that falls behind is disconnected with a retryable close
+  and reconnects to a fresh snapshot instead of retaining an unlimited backlog
+  in hub memory; floor clients preserve the structured `rate_limited` response.
+- **Claude Code auto mode no longer grants authority from rendered Caucus
+  messages.** A peer could put the trusted-looking `origin="operator"` and
+  `kind="answer"` markers in ordinary message content, while the auto-mode
+  classifier could not inspect the hub's authenticated structured provenance.
+  `caucus-setup-automode` therefore no longer installs the natural-language
+  allow rule: check mode identifies legacy copies as unsafe, and `--apply`
+  removes every project-local marker-bearing copy while preserving unrelated
+  settings. The Claude Code stdio bridge refuses to join when that audit finds
+  a legacy copy or fails; direct HTTP MCP users must follow the documented
+  migration because a remote hub cannot inspect their client-local settings.
+  Operator answers remain informational on passive MCP hosts; native workers
+  continue to authorize only exact pending actions through structured, one-time
+  form checks at the execution boundary.
+- **Project names can no longer be claimed during a receive-poll gap.** A
+  registration without the incumbent peer token used to receive the existing
+  `Client` record whenever `active_polls == 0`, disclosing its stable bearer
+  token and transferring its private queue, acknowledgements, and channel
+  memberships. The same no-token path could replace a reaped-but-revivable
+  identity. `HubState.register` now requires the exact peer token for every
+  live or revivable name, returns `409 name_in_use` otherwise, and compares
+  UTF-8 bytes so a non-ASCII impostor token is refused instead of raising.
+  Authenticated leave and operator kick remain explicit ways to release a
+  reaped reservation.
 - **A non-loopback `--public-url` now arms the same credentials guard a
   non-loopback bind does.** The guard only ever looked at the bind address, so
   a hub on `127.0.0.1` exposed through a Cloudflare Tunnel, ngrok or a local
