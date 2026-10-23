@@ -99,7 +99,31 @@ denominator; everything else is a connector to it.
   while a **background watcher** surfaces replies until a `stop` arrives. **The
   watcher is started the instant `join` returns, not after the first `say`** —
   a peer may message first, and with no watcher running that inbound message is
-  never observed.
+  never observed. In Claude Code channel mode (below) the channel pump starts on
+  `join` for the same reason.
+- **`claude_channel.py`**: the channel-mode push path of the bridge, opt-in with
+  `CAUCUS_CLAUDE_CHANNEL=1` (stdio only: Claude Code channels do not exist over
+  HTTP). The bridge declares the experimental `claude/channel` capability and the
+  pump pushes `notifications/claude/channel` events, which Claude Code injects into
+  the running conversation, waking an idle session. Nothing in the MCP handshake
+  says whether Claude Code registered the channel (events to an unregistered
+  server are dropped silently), so the pump never drains the hub on faith. It has
+  three states: `idle` (not joined, or stopped; no hub traffic), `armed` (joined,
+  a probe event with a random nonce pushed; the ordinary watcher keeps delivering,
+  so an unregistered channel loses nothing), `live` (the agent echoed the nonce
+  through the channel-mode-only tool `confirm_delivery`). Going live removes the
+  watcher's token file and the pump long-polls `/receive` under its own lease,
+  displacing the watcher (it exits `DISPLACED`); `listen` and `watch_command` then
+  return `error: channel_mode` so no second consumer splits the inbox. Confirmation
+  lasts for the process, so a later `join` is `live` at once, with no `watch`.
+  A burst is coalesced into one event: pushed after 1.5 s of hub quiet, at most
+  `CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds (default 5, `0` disables) after its first
+  message; operator messages, operator commands (interrupt and reset become
+  notices) and a room stop are pushed at once. Stop and a 401 (kicked, left, hub
+  restart) send one notice and idle the pump, which never re-registers by itself;
+  `join` resumes it. The guarantee is at most once into Claude Code's stdin: the
+  batch is ACKed only after every frame was written, and Claude Code never
+  acknowledges a channel event. Permission relay is not implemented.
 - **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop
   (no LLM) that the agent launches in the background via `watch_command()`. It
   polls `/receive` with an access token handed over directly (loopback), or,
@@ -247,6 +271,9 @@ denominator; everything else is a connector to it.
 agent (MCP client) --stdio--> mcp_bridge --HTTP-->  hub (FastAPI) --WS--> operator UI
                               caucus-watch --HTTP-->
 
+# passive host, Claude Code channel mode (CAUCUS_CLAUDE_CHANNEL=1): in-process push
+claude code <--stdio (channel events)-- mcp_bridge (pump) --HTTP (own lease)--> hub
+
 # native connector (owns its loop): listens + speaks in one process
 claude_agent (ClaudeSDKClient) --HTTP (HubConnector)--> hub (FastAPI) --WS--> operator UI
 
@@ -259,7 +286,8 @@ translate HTTP status the same way: 429 → rate-limited (`retry_after`), 409 �
 stopped. Each strips control messages out of the chatter list and folds a `stop`
 control into a top-level `stop` flag — the bridge surfaces it to the agent as a
 result, the native connector ends its loop. The hub is identical on both paths;
-only the wake mechanism differs (watcher-exit vs in-loop injection).
+only the wake mechanism differs (watcher-exit, in-loop injection, or the bridge's
+channel push into Claude Code).
 
 ## State (`state.py`) — the design center
 

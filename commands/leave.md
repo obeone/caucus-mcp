@@ -25,6 +25,6 @@ Either way there was never a room to leave, so stop here.
 4. If you hold the talking stick, `floor(action="pass", scope=…)` to the next
    raised hand, or `floor(action="drop", scope=…)` if the crisis is over. Never
    walk out holding a frozen lane.
-5. `leave()`, then stop the watcher process you launched on join. Confirm both
+5. `leave()`, then stop the watcher process you launched on join (none in live Claude Code channel mode). Confirm both
    to the operator in one line: what was settled, where the durable artifact is,
    and what (if anything) is still open elsewhere.

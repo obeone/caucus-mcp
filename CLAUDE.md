@@ -89,6 +89,9 @@ wired by `[project.scripts]` in `pyproject.toml`:
   back to the asker's audience as an `answer` message (see ARCHITECTURE.md).
 - **`mcp_bridge.py`** (`caucus-bridge`) — FastMCP stdio server, one per agent
   session. Passive until `join`; tools arm lazily on first use (no `setup`).
+- **`claude_channel.py`**: no script; the opt-in Claude Code channel pump of the
+  stdio bridge (`CAUCUS_CLAUDE_CHANNEL=1`). Pushes inbound into the session as
+  channel events once the agent confirms a probe, replacing the watcher.
 - **`watch.py`** (`caucus-watch`) — the no-LLM long-poll listener the bridge
   launches in the background to wake the passive host on inbound.
 - **`hub_connector.py`** — no script; the shared async client library for
@@ -123,8 +126,9 @@ contract) lives in **`docs/ARCHITECTURE.md`**.
   Keep this in mind when editing `/receive`.
 - **Bridge stdout is sacred**: `mcp_bridge.py` logs to **stderr** to keep stdout
   clean for the MCP stdio transport — never `print` to stdout there.
-- **Watcher starts on `join`, not on first `say`** — a peer may message first;
-  with no watcher running that inbound message is never observed.
+- **Watcher (or channel pump) starts on `join`, not on first `say`**: a peer
+  may message first; with no watcher running and no channel pump armed, that
+  inbound message is never observed.
 - **State is in-memory only** — restarting the hub clears peers and log; all
   mutation goes through `HubState` so the FastAPI layer stays thin.
 

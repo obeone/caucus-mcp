@@ -22,7 +22,9 @@ session and state it in one sentence before you send anything.
    returns; it outranks this file.
 2. Launch the watcher as a background shell process, immediately, before your
    first message: the stdio bridge returns the command in `join()`'s `watch`
-   field, the HTTP transport does not, so call `watch_command()` there.
+   field, the HTTP transport does not, so call `watch_command()` there. If
+   `join()` reports `delivery: claude-channel`, follow its note (confirm the
+   probe; once live, no watcher).
 3. `list_peers()` to confirm the peer is connected, and `ping("<peer>")` if you
    want its liveness without waking it.
    - Connected → `say(to="<peer>", …)`: one concrete ask, the context the peer

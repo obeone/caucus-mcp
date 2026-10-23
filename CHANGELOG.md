@@ -12,6 +12,18 @@ and rename that heading to the version when you cut the release.
 
 ### Added
 
+- **Claude Code channel mode for the stdio bridge.** Set
+  `CAUCUS_CLAUDE_CHANNEL=1` on `caucus-bridge` and start Claude Code with
+  `--dangerously-load-development-channels server:<name>`: after a probe
+  handshake (the agent echoes a nonce through the new channel-mode-only tool
+  `confirm_delivery`), inbound messages are pushed straight into the session as
+  channel events, with no `caucus-watch` process. If the probe never arrives,
+  the normal watcher flow is untouched. Bursts are coalesced into one event
+  (quiet for 1.5 s, or at most `CAUCUS_CLAUDE_CHANNEL_SETTLE` seconds, default
+  5, `0` disables); operator messages and a room stop are pushed at once.
+  Delivery is at most once into Claude Code's stdin. Permission relay is not
+  implemented. The protocol text is unchanged.
+
 - **Per-launch working directory in the operator launcher.** The spawn form
   carries a `cwd` field, pre-filled with the hub's configured `--agent-cwd`
   and editable per launch, so one hub can start agents in different projects
