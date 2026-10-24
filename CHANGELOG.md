@@ -10,6 +10,8 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+## [5.1.0](https://github.com/obeone/caucus-mcp/compare/v5.0.0...v5.1.0) (2026-10-24)
+
 ### Added
 
 - **The plugin installs in Codex CLI.** `codex plugin marketplace add
@@ -1350,7 +1352,7 @@ history for per-commit detail):
   dashboard WebSocket protocol with auth/RBAC and static asset serving, richer
   peer/health state with per-peer pause, and an opt-in JSONL event log.
 
-[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v5.0.0...HEAD
+[Unreleased]: https://github.com/obeone/caucus-mcp/compare/v5.1.0...HEAD
 [5.0.0]: https://github.com/obeone/caucus-mcp/compare/v4.2.0...v5.0.0
 [4.2.0]: https://github.com/obeone/caucus-mcp/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/obeone/caucus-mcp/compare/v4.0.0...v4.1.0
