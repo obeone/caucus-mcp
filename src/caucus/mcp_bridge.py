@@ -70,6 +70,7 @@ from .claude_channel import (
 )
 from .logging_setup import configure_logging
 from .models import lean_public, request_carried_token, session_expired_error
+from .prompts import register_prompts
 from .push import settle_seconds
 from .urlguard import validate_hub_url
 
@@ -196,6 +197,7 @@ mcp = _BridgeMCP(
     "caucus",
     instructions=_CHANNEL_INSTRUCTIONS if CHANNEL_MODE else _INSTRUCTIONS,
 )
+register_prompts(mcp)
 
 # Active membership, populated by :func:`join`. ``None`` means "not in the room".
 _token: str | None = None

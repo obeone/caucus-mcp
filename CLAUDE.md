@@ -114,6 +114,10 @@ wired by `[project.scripts]` in `pyproject.toml`:
   and the same supervised workspace policies as the API runtime.
 - **`workspace_tools.py`** — SDK-independent workspace operations and operator
   approval forms shared by OpenAI and Codex.
+- **`prompts.py`** (no script): serves the plugin's `commands/*.md` as MCP prompts
+  (`join`, `talk`, `status`, `leave`, `setup`, one optional `request` argument) on
+  both MCP servers; `register_prompts(server)` is called by the bridge and by
+  `build_mcp_server`. Reads the packaged `caucus/commands` copy, else the checkout.
 - **`mcp_http.py`** (no script): an in-process Streamable HTTP MCP server the hub
   mounts at `/mcp`, on by default for a loopback bind (`--no-mcp-http` disables
   it), so an MCP client can connect

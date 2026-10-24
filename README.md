@@ -260,6 +260,12 @@ Both expose the exact same tools (plus `confirm_delivery` on the bridge in
 Claude Code channel mode, see below). See [Which transport?](#which-transport)
 for the trade-off.
 
+Both endpoints also serve the five caucus commands as MCP prompts (`join`,
+`talk`, `status`, `leave`, `setup`), each with one optional `request` argument.
+Claude Code lists them as `/mcp__caucus__join` and so on, so plugin users see
+them next to `/caucus:*`. Codex does not support MCP prompts; it uses the
+plugin's skills instead.
+
 #### Claude Code channel mode (stdio bridge only)
 
 Claude Code cannot be woken by its MCP server, so the bridge normally hands the

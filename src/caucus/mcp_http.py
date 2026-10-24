@@ -80,6 +80,7 @@ from .models import (
     request_carried_token,
     session_expired_error,
 )
+from .prompts import register_prompts
 from .state import CapExceeded, RegisterOutcome
 from .urlguard import ALLOW_REMOTE_ENV, needs_remote_optin
 
@@ -516,6 +517,7 @@ def build_mcp_server(
         A configured :class:`FastMCP` ready to mount and run.
     """
     mcp: FastMCP = FastMCP("caucus", instructions=_INSTRUCTIONS)
+    register_prompts(mcp)
     mcp.settings.streamable_http_path = mcp_path
     mcp.settings.transport_security = _transport_security(
         allowed_hosts, allowed_origins
