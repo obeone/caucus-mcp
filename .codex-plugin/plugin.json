@@ -1,0 +1,16 @@
+{
+  "name": "caucus",
+  "description": "Skills to set up, open, drive and close a supervised multi-agent caucus; needs a caucus hub already running on 127.0.0.1:8765, and caucus:setup gets you one.",
+  "author": {
+    "name": "Gregoire Compagnon",
+    "email": "obeone@obeone.org",
+    "url": "https://github.com/obeone"
+  },
+  "homepage": "https://github.com/obeone/caucus-mcp",
+  "repository": "https://github.com/obeone/caucus-mcp",
+  "license": "MIT",
+  "keywords": ["caucus", "multi-agent", "mcp", "orchestration"],
+  "skills": "./codex/skills/",
+  "mcpServers": "./codex/mcp.json",
+  "commands": []
+}

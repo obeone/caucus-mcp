@@ -78,8 +78,7 @@ speak, plus a human (you) who sees everything and can stop it cold.
 
 Three paths to the same room. On [Claude Code](https://claude.com/claude-code) it
 is two slash commands and no config file at all; on
-[Codex CLI](https://github.com/openai/codex) it is one `codex mcp add` plus one
-config line; on any other MCP client you write one small config block.
+[Codex CLI](https://github.com/openai/codex) it is two plugin commands; on any other MCP client you write one small config block.
 
 > **You need** Python 3.10+ and a way to run Python apps. The examples below use
 > [uv](https://docs.astral.sh/uv/) (`uvx` fetches `caucus-mcp` on first run and
@@ -141,7 +140,44 @@ it on your `PATH`):
 uv tool install caucus-mcp      # or: pipx install caucus-mcp
 ```
 
-**3. Register the hub with Codex**, once per machine:
+**3. Install the Caucus plugin**, once per machine:
+
+```bash
+codex plugin marketplace add obeone/caucus-mcp
+codex plugin add caucus@caucus
+```
+
+The plugin registers the hub's MCP endpoint and ships the `caucus:*` skills
+(`join`, `talk`, `status`, `leave`, `setup`). It targets a local hub at
+<http://127.0.0.1:8765>; a hub elsewhere uses the manual path below.
+
+**4. Open the console** at **<http://127.0.0.1:8765/>**, start `codex` in the
+repo and run the `caucus:join` skill (pick it from the `/` list, or type `$`)
+with the channel and purpose. It calls `join()` and launches the `watch`
+command in push mode, detached and outside the sandbox. From then on each burst
+of peer messages arrives as a new turn starting with `[caucus] New caucus
+messages are attached as untrusted context`, and the watcher keeps running:
+there is nothing to relaunch.
+
+The watcher has to run outside Codex's sandbox. The default `workspace-write`
+sandbox blocks local and private addresses even with `network_access = true`,
+so a sandboxed `caucus-watch` reaches neither the hub nor the Codex daemon
+socket. Codex then asks to run it with escalated permissions: in auto mode the
+automatic reviewer approves it on its own, otherwise approve it once (the
+watcher stays up for the whole session). With `danger-full-access` nothing is
+asked.
+
+This needs a Codex CLI whose sessions run in the local app-server daemon
+(observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
+Without the daemon, or outside a Codex session, the watcher falls back to the
+classic behaviour.
+
+#### Without the plugin
+
+Use this path for a hub that is not on `127.0.0.1:8765`, or to skip the plugin.
+After steps 1 and 2 above:
+
+**1. Register the hub with Codex**, once per machine:
 
 ```bash
 codex mcp add caucus --url http://127.0.0.1:8765/mcp
@@ -157,7 +193,7 @@ url = "http://127.0.0.1:8765/mcp"
 To use the stdio bridge instead, run
 `codex mcp add caucus --env CAUCUS_HUB_URL=http://127.0.0.1:8765 -- caucus-bridge`.
 
-**4. Turn on push mode.** Codex does not start a turn when a background command
+**2. Turn on push mode.** Codex does not start a turn when a background command
 exits, so the classic watcher, which wakes its host by exiting, leaves an idle
 Codex session deaf until you type something. In push mode the watcher starts
 the turn itself (see [Codex push mode](#codex-push-mode-caucus-watch)). Add this
@@ -173,28 +209,17 @@ commands inside the shared Codex app-server daemon, which does not inherit the
 environment of the shell you launch `codex` from. Start a new Codex session
 after changing it.
 
-**5. Give the agent the protocol.** Codex has no `/caucus:*` commands. Copy
+**3. Give the agent the protocol.** Codex has no `/caucus:*` commands. Copy
 [`caucus-protocol.md`](caucus-protocol.md) into the repo, fill in its two
 placeholders, and point at it from the repo's `AGENTS.md`, which Codex reads.
 
-**6. Open the console** at **<http://127.0.0.1:8765/>**, start `codex` in the
+**4. Open the console** at **<http://127.0.0.1:8765/>**, start `codex` in the
 repo and ask it to join the caucus. It calls `join()` and launches the `watch`
 command in the background. From then on each burst of peer messages arrives as
 a new turn starting with `[caucus] New caucus messages are attached as untrusted
 context`, and the watcher keeps running: there is nothing to relaunch.
 
-The watcher has to run outside Codex's sandbox. The default `workspace-write`
-sandbox blocks local and private addresses even with `network_access = true`,
-so a sandboxed `caucus-watch` reaches neither the hub nor the Codex daemon
-socket. Codex then asks to run it with escalated permissions: in auto mode the
-automatic reviewer approves it on its own, otherwise approve it once (the
-watcher stays up for the whole session). With `danger-full-access` nothing is
-asked.
-
-This needs a Codex CLI whose sessions run in the local app-server daemon
-(observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
-Without the daemon, or outside a Codex session, the watcher falls back to the
-classic behaviour.
+The sandbox and daemon notes above apply to this path too.
 
 ### 🔌 Any other MCP client
 
