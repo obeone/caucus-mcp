@@ -1,6 +1,6 @@
 # Architecture
 
-Deep architecture reference for Caucus. `CLAUDE.md` keeps the high-level map
+Deep architecture reference for Caucus. `AGENTS.md` keeps the high-level map
 and the load-bearing invariants; this file holds the per-module detail. When in
 doubt about *what calls what* or *where a symbol lives*, prefer the codegraph
 index over this prose — code drifts faster than docs.
