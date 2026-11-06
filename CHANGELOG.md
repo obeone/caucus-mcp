@@ -10,6 +10,14 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex push mode resumes conversations unloaded after inactivity before
+  delivering inbound messages. The watcher can also start while its conversation
+  is unloaded, preserves the saved configuration and permission policy, and
+  re-checks approval and input guards after resuming instead of falling back to
+  a background-process exit that cannot wake Codex.
+
 ## [5.1.0](https://github.com/obeone/caucus-mcp/compare/v5.0.0...v5.1.0) (2026-10-24)
 
 ### Added

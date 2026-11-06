@@ -55,6 +55,7 @@ class _FakeDaemon:
     def __init__(self) -> None:
         self.status: dict[str, object] = {"type": "idle"}
         self.can_accept = True
+        self.resume_status: dict[str, object] = {"type": "idle"}
         self.turn_status = "inProgress"
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.refuse: set[str] = set()
@@ -85,6 +86,9 @@ class _FakeDaemon:
 
     def _result(self, method: str) -> dict[str, Any]:
         """The canned result for ``method``."""
+        if method == "thread/resume":
+            self.status = self.resume_status
+            return {"thread": {"id": THREAD, "status": self.status}}
         if method == "thread/read":
             return {
                 "thread": {
@@ -248,8 +252,62 @@ async def test_probe_refuses_a_thread_that_takes_no_input(sock_dir: Path) -> Non
         fake.can_accept = False
         assert await codex_push.probe(THREAD, path) is False
         fake.can_accept = True
-        fake.status = {"type": "notLoaded"}
+        fake.status = {"type": "systemError"}
         assert await codex_push.probe(THREAD, path) is False
+
+
+async def test_probe_accepts_an_unloaded_thread_without_resuming(sock_dir: Path) -> None:
+    """Starting a watcher must not require the desktop to keep its thread loaded."""
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        fake.can_accept = False
+        assert await codex_push.probe(THREAD, path) is True
+        assert fake.methods("thread/resume") == []
+
+
+async def test_unloaded_thread_resumes_before_starting_a_turn(sock_dir: Path) -> None:
+    """Resume a cold thread without changing its saved configuration or permissions."""
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        async with codex_push.CodexDaemon(path) as daemon:
+            assert await daemon.deliver(THREAD, "trigger", "peer data", urgent=False) == (
+                "delivered"
+            )
+        assert fake.methods("thread/resume") == [
+            {"threadId": THREAD, "excludeTurns": True}
+        ]
+        methods = [name for name, _ in fake.calls]
+        assert methods.index("thread/resume") < methods.index("turn/start")
+        assert fake.methods("turn/start")[0]["additionalContext"] == {
+            "caucus": {"kind": "untrusted", "value": "peer data"}
+        }
+
+
+async def test_resumed_thread_waiting_for_approval_holds_operator_input(
+    sock_dir: Path,
+) -> None:
+    """Re-check runtime brakes after resuming, even for urgent operator traffic."""
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        fake.resume_status = {"type": "active", "activeFlags": ["waitingOnApproval"]}
+        async with codex_push.CodexDaemon(path) as daemon:
+            assert await daemon.deliver(THREAD, "trigger", None, urgent=True) == "busy"
+        assert len(fake.methods("thread/resume")) == 1
+        assert fake.methods("turn/start") == []
+        assert fake.methods("turn/steer") == []
+
+
+async def test_resumed_thread_refusing_input_does_not_start_a_turn(sock_dir: Path) -> None:
+    """A successful resume must not bypass the thread's direct-input guard."""
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        fake.can_accept = False
+        async with codex_push.CodexDaemon(path) as daemon:
+            assert await daemon.deliver(THREAD, "trigger", None, urgent=False) == (
+                "unavailable"
+            )
+        assert len(fake.methods("thread/resume")) == 1
+        assert fake.methods("turn/start") == []
 
 
 async def test_probe_refuses_a_missing_daemon(sock_dir: Path) -> None:
@@ -435,7 +493,7 @@ async def test_a_thread_that_stops_taking_input_falls_back_to_classic(sock_dir: 
     assert hub.acks == [{"token": "tok-1", "seq": 8}]
 
 
-async def test_a_held_burst_falls_back_whole_when_the_thread_goes_away(
+async def test_a_held_burst_resumes_a_thread_unloaded_while_busy(
     sock_dir: Path,
 ) -> None:
     hub = _ScriptedHub()
@@ -448,17 +506,16 @@ async def test_a_held_burst_falls_back_whole_when_the_thread_goes_away(
         async def close_session() -> None:
             await anyio.sleep(0.8)
             fake.status = {"type": "notLoaded"}
+            hub.batch(_STOP, delay=0.3)
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(close_session)
             assert await _run(hub, path, lines) == 0
-    assert fake.methods("turn/start") == []
-    # Everything held is printed, then ACKed in one go: nothing is lost.
-    assert any("held first" in line for line in lines)
-    assert any("held second" in line for line in lines)
-    assert lines[-1].startswith("[caucus] PUSH UNAVAILABLE")
-    assert hub.acks == [{"token": "tok-1", "seq": 2}]
-    assert not any(r.url.params.get("ack_seq") for r in hub.receives)
+    assert len(fake.methods("thread/resume")) == 1
+    value = fake.methods("turn/start")[0]["additionalContext"]["caucus"]["value"]
+    assert "held first" in value and "held second" in value
+    assert not any("PUSH UNAVAILABLE" in line for line in lines)
+    assert any(r.url.params.get("ack_seq") == "2" for r in hub.receives)
 
 
 async def test_a_vanished_daemon_falls_back_to_classic(sock_dir: Path) -> None:
@@ -509,12 +566,35 @@ async def test_a_racing_turn_start_is_retried_not_abandoned(sock_dir: Path) -> N
     assert not any("retry me" in line for line in lines)  # pushed, not printed
 
 
+async def test_a_transient_resume_failure_retries_before_acknowledging(
+    sock_dir: Path,
+) -> None:
+    """A cold-thread resume race keeps the burst pending until a turn is accepted."""
+    hub = _ScriptedHub()
+    hub.batch(_msg(15, "retry the resume"))
+    hub.batch(_STOP, delay=0.6)
+    lines: list[str] = []
+    async with _daemon(sock_dir) as (fake, path):
+        fake.status = {"type": "notLoaded"}
+        fake.refuse_once["thread/resume"] = 1
+        assert await _run(hub, path, lines) == 0
+    assert len(fake.methods("thread/resume")) == 2
+    assert len(fake.methods("turn/start")) == 1
+    assert "retry the resume" in (
+        fake.methods("turn/start")[0]["additionalContext"]["caucus"]["value"]
+    )
+    assert not any("PUSH UNAVAILABLE" in line for line in lines)
+    assert "ack_seq" not in hub.receives[1].url.params
+    assert hub.acks == [{"token": "tok-1", "seq": 15}]
+
+
 async def test_the_fallback_prints_held_operator_commands(sock_dir: Path) -> None:
     hub = _ScriptedHub()
     hub.batch({"kind": "control", "content": "interrupt", "seq": 0})
     lines: list[str] = []
     async with _daemon(sock_dir) as (fake, path):
         fake.status = {"type": "notLoaded"}
+        fake.refuse.add("thread/resume")
         assert await _run(hub, path, lines) == 0
     assert any("interrupt" in line for line in lines)
     assert lines[-1].startswith("[caucus] PUSH UNAVAILABLE")

@@ -18,7 +18,9 @@ Delivery, per settled burst (see :func:`caucus.push.gather_burst`):
   turn would derail it; only operator traffic (messages, ``interrupt``,
   ``reset``, a room ``stop``) is steered in at once with ``turn/steer``;
 * thread waiting on an approval or on user input: held, even for the operator;
-* daemon unreachable, thread not loaded or not accepting input: the watcher falls
+* thread unloaded after inactivity: resume it with its saved configuration,
+  then re-check its status before delivering;
+* daemon unreachable, resume refused or thread not accepting input: the watcher falls
   back to the classic contract (print the burst, ACK it, exit so the exit wakes
   the agent).
 
@@ -250,6 +252,17 @@ class CodexDaemon:
             DaemonError: If the daemon fails mid-delivery.
         """
         thread = (await self.call("thread/read", {"threadId": thread_id})).get("thread", {})
+        if (thread.get("status") or {}).get("type") == "notLoaded":
+            # Reading a stored thread does not load it. The daemon can unload
+            # idle sessions after their last subscriber leaves, so resume on
+            # demand without overriding their saved model or permissions.
+            logger.info("Resuming unloaded Codex thread %s", thread_id)
+            await self.call(
+                "thread/resume", {"threadId": thread_id, "excludeTurns": True}
+            )
+            thread = (await self.call("thread/read", {"threadId": thread_id})).get(
+                "thread", {}
+            )
         status = thread.get("status") or {}
         kind = status.get("type")
         if kind not in ("idle", "active") or thread.get("canAcceptDirectInput") is False:
@@ -295,7 +308,10 @@ class CodexDaemon:
 
 
 async def probe(thread_id: str, socket_path: Path) -> bool:
-    """Tell whether ``thread_id`` is loaded in a reachable daemon and takes input.
+    """Tell whether a reachable daemon can deliver to ``thread_id``.
+
+    Unloaded threads remain eligible: delivery resumes them on demand. Probing
+    never resumes a thread or starts a turn by itself.
 
     Args:
         thread_id: The thread to check.
@@ -313,6 +329,8 @@ async def probe(thread_id: str, socket_path: Path) -> bool:
         logger.warning("Codex push unavailable: %s", exc)
         return False
     kind = (thread.get("status") or {}).get("type")
+    if kind == "notLoaded":
+        return True
     return kind in ("idle", "active") and thread.get("canAcceptDirectInput") is not False
 
 
