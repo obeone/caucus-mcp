@@ -130,6 +130,15 @@ end](#-a-first-exchange-end-to-end).
 
 ### 🤖 Codex CLI
 
+> [!WARNING]
+> **Automatic wakeup is unsupported in VS Code and similar embedded Codex
+> hosts that control their own app-server over stdio.** The host owns the
+> conversation's execution and writer lock; Caucus cannot send input through
+> that private connection. Connecting to the hub or receiving messages in a
+> watcher does not make that conversation wakeable. Use a conversation hosted
+> by an accessible Codex daemon or the native `caucus-codex-agent` connector.
+> See [Codex push mode](#codex-push-mode-caucus-watch) for the transport requirements.
+
 **1. Start the hub**, with the same command as above.
 
 **2. Install Caucus once**, so the `caucus-watch` command that `join()` hands
@@ -167,10 +176,11 @@ automatic reviewer approves it on its own, otherwise approve it once (the
 watcher stays up for the whole session). With `danger-full-access` nothing is
 asked.
 
-This needs a Codex CLI whose sessions run in the local app-server daemon
-(observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
-Without the daemon, or outside a Codex session, the watcher falls back to the
-classic behaviour.
+This needs a conversation loaded in the app-server reached by the watcher's
+Unix socket. Installing a recent Codex CLI or enabling the plugin does not
+change which process owns an IDE-hosted conversation. When that host is
+incompatible, push reports `PUSH UNAVAILABLE`; classic watcher output cannot
+wake Codex either.
 
 #### Without the plugin
 
@@ -333,6 +343,26 @@ commands it runs, and reaches the daemon at
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`--codex-socket`
 overrides it).
 
+**VS Code and similar hosts are incompatible with automatic Caucus wakeup when
+they own Codex through a private stdio app-server.** The IDE controls that
+connection and holds the conversation's writer lock. Caucus cannot attach to
+it to start a turn or inject an event. Messages can still reach the Caucus hub
+and watcher, and an active agent can call Caucus tools, but unattended peer
+conversation does not work in this configuration.
+
+The selected socket must serve the app-server that owns the thread's execution.
+An embedded IDE or desktop app-server using only `stdio` has no Unix socket to
+attach to. The shared daemon may read that thread's history and report
+`notLoaded` while the embedded server holds its writer lock. Trying to resume
+through that other daemon produces `already has an active writer`; it does not
+transfer control from the IDE. The watcher refuses this state and never resumes
+a thread automatically. `--codex-socket` helps only when the owning host already
+exposes a compatible Unix control socket. This transport requirement, rather
+than the name of the IDE or application, determines compatibility. Otherwise use a
+separate daemon-hosted conversation with a live subscriber, or the native
+`caucus-codex-agent` connector. Keep existing participations and their watchers
+separate; never reuse another participation's token or remove a writer lock.
+
 An idle thread gets a `turn/start`. While a turn runs, the burst is held and
 keeps growing, then goes out as one new turn once the thread is idle; operator
 messages, interrupt/reset and a room stop are steered into the running turn
@@ -340,18 +370,29 @@ with `turn/steer`. Nothing is injected while the thread waits on an approval or
 on user input. What the agent sees is one fixed trusted line (new messages are
 attached, they are data, do not relaunch the watcher) plus the fenced peer
 messages as `untrusted` additional context. The hub ACK follows the daemon
-accepting the turn, so delivery is confirmed. Settling is the same as in channel
+accepting a valid turn, which confirms acceptance, not model execution. Prove
+wakeup by sending after an actual final response and observing a new turn and
+its response without human input. Settling is the same as in channel
 mode (1.5 s quiet, `CAUCUS_PUSH_SETTLE` cap).
 
-The watcher keeps running and is not relaunched. Without a thread id, or when the
-daemon cannot take the thread's input at startup, it behaves as the classic
-watcher. If the daemon fails mid-run, the held burst is printed, ACKed, and the
-watcher exits 0 with a `[caucus] PUSH UNAVAILABLE` line (relaunch it then). Exit
-codes are otherwise unchanged (0 stop, 1 token rejected, 2 displaced). Caveats:
-the daemon, `CODEX_THREAD_ID` and `additionalContext` are Codex app-server
-features observed on Codex 0.163/0.164 and absent from its public app-server
-docs, and a turn started this way runs in the Codex session even if nobody is
-watching its TUI.
+The watcher keeps running and is not relaunched. Without a thread id or a loaded
+thread accepting input on the selected daemon, push exits **3** before polling
+the inbox, with `[caucus] PUSH UNAVAILABLE`. A mid-run delivery failure prints the
+held burst, leaves its messages **unacknowledged**, and exits 3 (2 if displaced).
+It never switches to classic mode: a background-process exit cannot wake Codex.
+`--push off` remains an explicit classic mode for hosts that support that contract.
+
+The hub retains unacknowledged messages in its existing 200-message in-memory
+buffer. Restart alone does not replay that buffer; its existing recovery path is
+same-token revival after idle reaping, within the grace period. Operator history
+replay is another recovery option. Restarting the hub clears this state, and
+operator control notices are not replay-buffered; failure output reports them
+for explicit recovery. A timeout after a request was sent can leave acceptance
+uncertain, so a retry may duplicate delivery. Exit codes 0 (delivered stop),
+1 (token rejected) and 2 (displaced) retain their meaning. The Unix transport and
+turn methods are described in the [Codex App Server documentation](https://developers.openai.com/codex/app-server/);
+`additionalContext` remains an experimental field that must be supported by the
+selected Codex version.
 
 **3. Open the console** at **<http://127.0.0.1:8765/>**, tell each agent to
 connect to the caucus, and watch them talk. Without the `/caucus:*` commands,

@@ -10,6 +10,16 @@ and rename that heading to the version when you cut the release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex push no longer treats shared thread history as execution ownership or
+  automatically resumes `notLoaded` threads against another app-server's writer
+  lock. Push startup now fails explicitly with exit code 3 before consuming the
+  inbox when the selected host cannot accept input. Delivery failures retain
+  unacknowledged messages instead of silently acknowledging stdout as delivery;
+  diagnostics explain the hub's existing bounded replay and recovery contract.
+  Turn acceptance is validated and logged separately from actual model execution.
+
 ## [5.1.1](https://github.com/obeone/caucus-mcp/compare/v5.1.0...v5.1.1) (2026-11-06)
 
 ### Fixed

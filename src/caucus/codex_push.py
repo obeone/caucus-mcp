@@ -3,7 +3,7 @@
 The classic watcher wakes a passive host by *exiting*: the host re-invokes the
 agent when a background process ends, the agent reads what the watcher printed,
 relays it and relaunches the watcher. Codex offers a better path. Its interactive
-sessions live in a shared local app-server daemon, reachable as a WebSocket on a
+sessions may live in a shared local app-server daemon, reachable as a WebSocket on a
 Unix control socket (``$CODEX_HOME/app-server-control/app-server-control.sock``),
 and every shell command Codex runs carries the session's thread id in
 ``CODEX_THREAD_ID``. A watcher launched by the agent can therefore start a turn in
@@ -18,21 +18,21 @@ Delivery, per settled burst (see :func:`caucus.push.gather_burst`):
   turn would derail it; only operator traffic (messages, ``interrupt``,
   ``reset``, a room ``stop``) is steered in at once with ``turn/steer``;
 * thread waiting on an approval or on user input: held, even for the operator;
-* thread unloaded after inactivity: resume it with its saved configuration,
-  then re-check its status before delivering;
-* daemon unreachable, resume refused or thread not accepting input: the watcher falls
-  back to the classic contract (print the burst, ACK it, exit so the exit wakes
-  the agent).
+* thread not loaded on this daemon: refuse delivery without resuming, since
+  another app-server may own the thread's writer lock;
+* daemon unreachable or thread not accepting input: print a diagnostic, leave
+  messages unacknowledged for recovery and exit with code 3. A background exit
+  does not wake Codex, so printing is never counted as delivery.
 
 Peer text never rides the user message. The turn's input is one fixed line
 written here; the fenced peer messages travel in ``additionalContext`` with
 ``kind: "untrusted"``, the protocol's own channel for content the model must
-treat as data. The hub is ACKed only once the daemon accepted the turn, so unlike
-the Claude Code channel, delivery is confirmed.
+treat as data. The hub is ACKed only once the daemon accepted the turn. This
+confirms acceptance, not actual model execution or a completed response.
 
 Opt in with ``CAUCUS_CODEX_PUSH=1`` in the environment Codex runs its commands in
-(or ``caucus-watch --push codex``); without ``CODEX_THREAD_ID`` the watcher stays
-classic.
+(or ``caucus-watch --push codex``); without ``CODEX_THREAD_ID`` push startup
+fails before consuming the inbox.
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ _BACKOFF_MIN = 1.0
 _BACKOFF_MAX = 15.0
 
 # Consecutive failed delivery attempts (daemon errors, refused turn/start or
-# turn/steer) tolerated before push mode gives up and falls back. A single
+# turn/steer) tolerated before push mode exits with unacknowledged messages. A single
 # refusal is usually a race (a turn started or ended under our feet); three in a
 # row, one hold-poll apart, is a daemon that will not take the turn.
 _MAX_DELIVERY_ERRORS = 3
@@ -246,27 +246,35 @@ class CodexDaemon:
 
         Returns:
             ``"delivered"``, ``"busy"`` (hold and retry) or ``"unavailable"``
-            (fall back to the classic watcher).
+            (exit without acknowledging the burst).
 
         Raises:
             DaemonError: If the daemon fails mid-delivery.
         """
-        thread = (await self.call("thread/read", {"threadId": thread_id})).get("thread", {})
-        if (thread.get("status") or {}).get("type") == "notLoaded":
-            # Reading a stored thread does not load it. The daemon can unload
-            # idle sessions after their last subscriber leaves, so resume on
-            # demand without overriding their saved model or permissions.
-            logger.info("Resuming unloaded Codex thread %s", thread_id)
+        thread = (
             await self.call(
-                "thread/resume", {"threadId": thread_id, "excludeTurns": True}
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
             )
-            thread = (await self.call("thread/read", {"threadId": thread_id})).get(
-                "thread", {}
+        ).get("thread", {})
+        if (thread.get("status") or {}).get("type") == "notLoaded":
+            logger.warning(
+                "Codex thread %s is not loaded on %s; stored history does not"
+                " establish execution ownership. Refusing automatic resume."
+                " Use the owning app-server's Unix socket, or a separate"
+                " daemon-hosted conversation/native connector",
+                thread_id,
+                self._socket_path,
             )
+            return "unavailable"
         status = thread.get("status") or {}
         kind = status.get("type")
-        if kind not in ("idle", "active") or thread.get("canAcceptDirectInput") is False:
-            logger.warning("Codex thread %s cannot take input (status %s)", thread_id, kind)
+        if (
+            kind not in ("idle", "active")
+            or thread.get("canAcceptDirectInput") is False
+        ):
+            logger.warning(
+                "Codex thread %s cannot take input (status %s)", thread_id, kind
+            )
             return "unavailable"
         params: dict[str, object] = {
             "threadId": thread_id,
@@ -277,7 +285,19 @@ class CodexDaemon:
                 _CONTEXT_SOURCE: {"kind": "untrusted", "value": untrusted}
             }
         if kind == "idle":
-            await self.call("turn/start", params)
+            result = await self.call("turn/start", params)
+            turn = result.get("turn") or {}
+            if not turn.get("id") or turn.get("status") not in (
+                "inProgress",
+                "completed",
+            ):
+                raise DaemonError("turn/start did not return an accepted turn")
+            logger.info(
+                "Codex accepted turn/start for thread %s (turn %s);"
+                " model execution must be observed separately",
+                thread_id,
+                turn["id"],
+            )
             return "delivered"
         if status.get("activeFlags") or not urgent:
             # Waiting on an approval or on the user, or plain peer chatter: do
@@ -286,7 +306,12 @@ class CodexDaemon:
         turn_id = await self._active_turn(thread_id)
         if turn_id is None:
             return "busy"  # the turn just ended; the next attempt starts one
-        await self.call("turn/steer", {**params, "expectedTurnId": turn_id})
+        result = await self.call("turn/steer", {**params, "expectedTurnId": turn_id})
+        if result.get("turnId") != turn_id:
+            raise DaemonError("turn/steer did not confirm the expected turn")
+        logger.info(
+            "Codex accepted turn/steer for thread %s (turn %s)", thread_id, turn_id
+        )
         return "delivered"
 
     async def _active_turn(self, thread_id: str) -> str | None:
@@ -299,10 +324,15 @@ class CodexDaemon:
             The newest turn's id when it is ``inProgress``, else ``None``.
         """
         page = await self.call(
-            "thread/turns/list", {"threadId": thread_id, "limit": 1, "sortDirection": "desc"}
+            "thread/turns/list",
+            {"threadId": thread_id, "limit": 1, "sortDirection": "desc"},
         )
         turns = page.get("data") or []
-        if turns and isinstance(turns[0], dict) and turns[0].get("status") == "inProgress":
+        if (
+            turns
+            and isinstance(turns[0], dict)
+            and turns[0].get("status") == "inProgress"
+        ):
             return str(turns[0].get("id"))
         return None
 
@@ -310,28 +340,42 @@ class CodexDaemon:
 async def probe(thread_id: str, socket_path: Path) -> bool:
     """Tell whether a reachable daemon can deliver to ``thread_id``.
 
-    Unloaded threads remain eligible: delivery resumes them on demand. Probing
-    never resumes a thread or starts a turn by itself.
+    Only a thread loaded on this daemon is eligible. Stored history is shared
+    between app-servers, so ``notLoaded`` cannot prove execution ownership.
+    Probing never resumes a thread or starts a turn by itself. Success is only
+    a readiness check, not proof that a future turn will execute.
 
     Args:
         thread_id: The thread to check.
         socket_path: The daemon's control socket.
 
     Returns:
-        ``True`` when push mode can work, ``False`` to stay classic.
+        ``True`` when the thread is loaded and accepts input, else ``False``.
     """
     try:
         async with CodexDaemon(socket_path) as daemon:
-            thread = (await daemon.call("thread/read", {"threadId": thread_id})).get(
-                "thread", {}
-            )
+            thread = (
+                await daemon.call(
+                    "thread/read", {"threadId": thread_id, "includeTurns": False}
+                )
+            ).get("thread", {})
     except DaemonError as exc:
         logger.warning("Codex push unavailable: %s", exc)
         return False
     kind = (thread.get("status") or {}).get("type")
     if kind == "notLoaded":
-        return True
-    return kind in ("idle", "active") and thread.get("canAcceptDirectInput") is not False
+        logger.warning(
+            "Codex thread %s is not loaded on %s; this socket may belong to a"
+            " different app-server. No automatic resume or classic fallback."
+            " --codex-socket requires an exposed Unix socket on the owning host;"
+            " an embedded stdio host cannot be attached this way",
+            thread_id,
+            socket_path,
+        )
+        return False
+    return (
+        kind in ("idle", "active") and thread.get("canAcceptDirectInput") is not False
+    )
 
 
 def compose(burst: Burst) -> tuple[str, str | None]:
@@ -404,16 +448,16 @@ async def run(
 ) -> int:
     """Long-poll the hub and push every settled burst into the Codex thread.
 
-    Exit codes match the classic watcher's: ``0`` after a stop or a fallback
-    delivery, ``1`` when the hub rejects the token, ``2`` when another listener
-    took the inbox.
+    Exit codes: ``0`` after a delivered stop, ``1`` when the hub rejects the
+    token, ``2`` when another listener took the inbox, ``3`` when Codex could
+    not accept delivery. Code 3 leaves the held messages unacknowledged.
 
     Args:
         hub_url: Hub base URL.
         token: The peer token to poll with.
         thread_id: The Codex thread to deliver into.
         emit: Writes one signal line to stdout (the classic contract).
-        classic_line: Renders one message the classic way, for the fallback.
+        classic_line: Renders one undelivered message for explicit recovery.
         socket_path: The daemon's control socket.
         settle: Settle window cap, seconds.
         quiet_gap: Silence that ends a burst early, seconds.
@@ -481,6 +525,13 @@ async def run(
                         quiet_gap=quiet_gap,
                     )
                     _merge(held, burst)
+                    if burst.messages:
+                        logger.info(
+                            "Caucus received %d messages (through seq %s);"
+                            " awaiting Codex acceptance",
+                            len(burst.messages),
+                            max_seq(burst.messages),
+                        )
             if not _deliverable(held):
                 if held.displaced:
                     return _final(held, emit)
@@ -494,7 +545,7 @@ async def run(
             else:
                 errors = 0
             if outcome == "unavailable":
-                return await _fall_back(hub, token, held, emit, classic_line)
+                return _undelivered(held, emit, classic_line)
             if outcome == "delivered":
                 # ACK only now that the daemon accepted the turn.
                 ack_seq = max_seq(held.messages)
@@ -563,41 +614,41 @@ def _classic_lines(
     return lines
 
 
-async def _fall_back(
-    hub: HubConnector,
-    token: str,
+def _undelivered(
     held: Burst,
     emit: Callable[[str], None],
     classic_line: Callable[[dict[str, object]], str],
 ) -> int:
-    """Hand the held burst over the classic way: print, ACK, exit.
+    """Report failed push delivery without treating stdout as an ACK.
 
     Args:
-        hub: The open hub connector.
-        token: The peer token.
         held: The burst that could not be pushed.
         emit: Writes one signal line to stdout.
         classic_line: Renders one message the classic way.
 
     Returns:
-        ``0`` (or ``2`` when the burst also carried a displacement).
+        ``3`` (or ``2`` when the burst also carried a displacement).
     """
-    logger.warning("Codex push unavailable; falling back to the classic watcher")
+    logger.warning("Codex push unavailable; held messages remain unacknowledged")
     for line in _classic_lines(held, classic_line):
         emit(line)
-    seq = max_seq(held.messages)
-    if seq is not None:
-        await hub.ack(token, seq)
-    return _final(held, emit, fallback=True)
+    emit(
+        "[caucus] PUSH UNAVAILABLE -- Codex did not accept delivery. Messages"
+        " printed above remain unacknowledged on the hub while this participation"
+        " survives; stdout does not wake Codex. Restart alone does not replay"
+        " the hub's unacked buffer: recovery needs same-token revival or"
+        " operator history replay, after fixing the owning-host transport."
+        " Operator control notices printed above require explicit recovery."
+    )
+    return 2 if _final(held, emit) == 2 else 3
 
 
-def _final(held: Burst, emit: Callable[[str], None], *, fallback: bool = False) -> int:
+def _final(held: Burst, emit: Callable[[str], None]) -> int:
     """Print the terminal notice a burst calls for and pick the exit code.
 
     Args:
         held: The last burst.
         emit: Writes one signal line to stdout.
-        fallback: Whether the burst was printed instead of pushed.
 
     Returns:
         ``2`` when displaced, else ``0``.
@@ -611,10 +662,4 @@ def _final(held: Burst, emit: Callable[[str], None], *, fallback: bool = False) 
             " is exiting; do NOT relaunch it unless nothing else is listening."
         )
         return 2
-    if fallback and not held.stop:
-        emit(
-            "[caucus] PUSH UNAVAILABLE -- the Codex session could not take a new"
-            " turn, so what was waiting for it is printed above instead. Relaunch"
-            " the watcher to keep listening."
-        )
     return 0

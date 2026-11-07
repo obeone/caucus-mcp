@@ -138,13 +138,28 @@ denominator; everything else is a connector to it.
   while the thread waits on an approval or on user input. The turn's user input
   is the fixed `TRIGGER` line; peer text rides `additionalContext` with `kind:
   "untrusted"`, fenced like the native connectors. The hub is ACKed only after
-  the daemon accepted the turn (confirmed delivery). No thread id, or a daemon
-  that cannot take the thread's input at startup: the classic watcher runs. A
-  mid-run failure prints the held burst the classic way, ACKs it and exits 0
-  with `[caucus] PUSH UNAVAILABLE`; exit codes are otherwise unchanged (0
-  stop/fallback, 1 token rejected, 2 displaced). The daemon, `CODEX_THREAD_ID`
-  and `additionalContext` were observed on Codex 0.163/0.164 and are not in the
-  public app-server docs.
+  daemon returns a valid accepted turn. This proves RPC acceptance; a completed
+  model response is separate evidence. Only threads loaded on the selected
+  daemon are eligible. `notLoaded` can mean a different embedded app-server owns
+  the writer lock, so the watcher never calls `thread/resume`. The owning host
+  must expose a Unix socket; `--codex-socket` cannot attach to a stdio-only host.
+  In particular, VS Code and similar IDE or desktop hosts can launch and control
+  their own private stdio app-server. That host owns the execution and writer
+  lock; Caucus has no supported connection through which to start a turn or
+  inject an event. Hub reception and agent-initiated tool calls can still work,
+  but automatic wakeup cannot. A second daemon's `thread/resume` is a competing
+  writer, not a route into the IDE's live conversation. Compatibility depends
+  on an input transport exposed by the owning host, not on the installed CLI
+  version or on a successful MCP connection.
+  Startup failure exits 3 before consuming the inbox. Mid-run failure prints the
+  held burst, leaves its messages unacknowledged and exits 3 (2 if displaced),
+  with `[caucus] PUSH UNAVAILABLE`. There is no automatic classic fallback.
+  The existing 200-message in-memory unacked buffer is replayed on same-token
+  revival after idle reaping, not on a watcher restart alone. Control notices
+  are printed for explicit recovery, because they are not replay-buffered.
+  A transport timeout after sending can leave acceptance uncertain and a retry
+  can duplicate delivery. Exit codes 0 (delivered stop), 1 (token rejected) and
+  2 (displaced) are unchanged. `additionalContext` is experimental.
 - **`push.py`**: no script; what the Claude channel and Codex push share: burst
   settling (`CAUCUS_PUSH_SETTLE`), label cleaning and fenced rendering.
 - **`watch.py`** — `caucus-watch`. The default listener: a plain long-poll loop

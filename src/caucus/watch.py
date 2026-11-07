@@ -76,9 +76,11 @@ When the watcher runs inside a Codex session (``CODEX_THREAD_ID`` set by Codex
 on the commands it runs) with push mode on, it does **not** exit per message.
 It delivers each settled burst as a new turn of that session through the Codex
 app-server daemon, holds bursts while a turn is running, ACKs only what the
-daemon accepted, and keeps running, so the agent never relaunches it. Without a
-thread id, or when the daemon cannot take the session's input, it falls back
-to the classic contract above, so nothing is lost.
+daemon accepted, and keeps running, so the agent never relaunches it. The socket
+must serve the thread's owning app-server; shared history is not ownership.
+Without a thread id or a compatible loaded thread, push exits 3 before polling.
+Mid-run failures leave messages unacknowledged and print a recovery diagnostic.
+There is no automatic classic fallback, because process exit cannot wake Codex.
 """
 
 from __future__ import annotations
@@ -283,7 +285,9 @@ def watch(hub: str, token: str, timeout: float) -> int:
                 # A proxy or misbehaving hub can return an HTML/empty 200; treat
                 # a decode failure like any other transient error so the loop
                 # retries rather than crashing the watcher with a traceback.
-                logger.warning("non-JSON response body (%s); retrying in %.0fs", exc, backoff)
+                logger.warning(
+                    "non-JSON response body (%s); retrying in %.0fs", exc, backoff
+                )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX)
                 continue
@@ -403,7 +407,7 @@ def push_mode(flag: str | None, environ: Mapping[str, str] | None = None) -> boo
     return codex_push.push_requested(environ)
 
 
-def _run_codex_push(args: argparse.Namespace, token: str) -> int | None:
+def _run_codex_push(args: argparse.Namespace, token: str) -> int:
     """Run the Codex push loop when it can work here.
 
     Args:
@@ -411,23 +415,27 @@ def _run_codex_push(args: argparse.Namespace, token: str) -> int | None:
         token: The peer token.
 
     Returns:
-        The push loop's exit code, or ``None`` when push mode cannot start (no
-        Codex thread, or a daemon that cannot take the thread's input) and the
-        caller must run the classic watcher instead.
+        The push loop's exit code, or ``3`` when push cannot start. Never fall
+        back to a consumer whose stdout cannot wake Codex.
     """
     thread_id = codex_push.thread_id_from_env()
     if thread_id is None:
         logger.warning(
-            "Codex push requested but %s is unset; staying classic",
+            "Codex push requested but %s is unset; exiting without consuming messages",
             codex_push.THREAD_ENV,
         )
-        return None
+        _emit("[caucus] PUSH UNAVAILABLE -- no Codex thread id; inbox untouched.")
+        return 3
     socket_path = (
         Path(args.codex_socket) if args.codex_socket else codex_push.default_socket()
     )
     if not asyncio.run(codex_push.probe(thread_id, socket_path)):
-        logger.warning("Codex daemon cannot take this thread's input; staying classic")
-        return None
+        _emit(
+            "[caucus] PUSH UNAVAILABLE -- selected Codex host cannot take this"
+            " thread's input; inbox untouched. Use the owning host's exposed"
+            " Unix socket or a separate daemon-hosted conversation/native connector."
+        )
+        return 3
     return asyncio.run(
         codex_push.run(
             args.hub,
@@ -541,9 +549,7 @@ def main() -> None:
 
     try:
         if push_mode(args.push):
-            code = _run_codex_push(args, token)
-            if code is not None:
-                sys.exit(code)
+            sys.exit(_run_codex_push(args, token))
         sys.exit(watch(args.hub, token, args.timeout))
     except KeyboardInterrupt:
         logger.info("watcher interrupted; exiting")
