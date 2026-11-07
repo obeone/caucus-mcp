@@ -143,6 +143,14 @@ denominator; everything else is a connector to it.
   daemon are eligible. `notLoaded` can mean a different embedded app-server owns
   the writer lock, so the watcher never calls `thread/resume`. The owning host
   must expose a Unix socket; `--codex-socket` cannot attach to a stdio-only host.
+  In particular, VS Code and similar IDE or desktop hosts can launch and control
+  their own private stdio app-server. That host owns the execution and writer
+  lock; Caucus has no supported connection through which to start a turn or
+  inject an event. Hub reception and agent-initiated tool calls can still work,
+  but automatic wakeup cannot. A second daemon's `thread/resume` is a competing
+  writer, not a route into the IDE's live conversation. Compatibility depends
+  on an input transport exposed by the owning host, not on the installed CLI
+  version or on a successful MCP connection.
   Startup failure exits 3 before consuming the inbox. Mid-run failure prints the
   held burst, leaves its messages unacknowledged and exits 3 (2 if displaced),
   with `[caucus] PUSH UNAVAILABLE`. There is no automatic classic fallback.

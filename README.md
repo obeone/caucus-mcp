@@ -130,6 +130,15 @@ end](#-a-first-exchange-end-to-end).
 
 ### 🤖 Codex CLI
 
+> [!WARNING]
+> **Automatic wakeup is unsupported in VS Code and similar embedded Codex
+> hosts that control their own app-server over stdio.** The host owns the
+> conversation's execution and writer lock; Caucus cannot send input through
+> that private connection. Connecting to the hub or receiving messages in a
+> watcher does not make that conversation wakeable. Use a conversation hosted
+> by an accessible Codex daemon or the native `caucus-codex-agent` connector.
+> See [Codex push mode](#codex-push-mode-caucus-watch) for the transport requirements.
+
 **1. Start the hub**, with the same command as above.
 
 **2. Install Caucus once**, so the `caucus-watch` command that `join()` hands
@@ -167,10 +176,11 @@ automatic reviewer approves it on its own, otherwise approve it once (the
 watcher stays up for the whole session). With `danger-full-access` nothing is
 asked.
 
-This needs a Codex CLI whose sessions run in the local app-server daemon
-(observed on 0.163 and 0.164; `codex app-server daemon version` shows it).
-Without the daemon, or outside a Codex session, the watcher falls back to the
-classic behaviour.
+This needs a conversation loaded in the app-server reached by the watcher's
+Unix socket. Installing a recent Codex CLI or enabling the plugin does not
+change which process owns an IDE-hosted conversation. When that host is
+incompatible, push reports `PUSH UNAVAILABLE`; classic watcher output cannot
+wake Codex either.
 
 #### Without the plugin
 
@@ -333,12 +343,22 @@ commands it runs, and reaches the daemon at
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`--codex-socket`
 overrides it).
 
+**VS Code and similar hosts are incompatible with automatic Caucus wakeup when
+they own Codex through a private stdio app-server.** The IDE controls that
+connection and holds the conversation's writer lock. Caucus cannot attach to
+it to start a turn or inject an event. Messages can still reach the Caucus hub
+and watcher, and an active agent can call Caucus tools, but unattended peer
+conversation does not work in this configuration.
+
 The selected socket must serve the app-server that owns the thread's execution.
 An embedded IDE or desktop app-server using only `stdio` has no Unix socket to
 attach to. The shared daemon may read that thread's history and report
-`notLoaded` while the embedded server holds its writer lock. The watcher refuses
-this state and never resumes a thread automatically. `--codex-socket` helps only
-when the owning server already exposes a Unix control socket. Otherwise use a
+`notLoaded` while the embedded server holds its writer lock. Trying to resume
+through that other daemon produces `already has an active writer`; it does not
+transfer control from the IDE. The watcher refuses this state and never resumes
+a thread automatically. `--codex-socket` helps only when the owning host already
+exposes a compatible Unix control socket. This transport requirement, rather
+than the name of the IDE or application, determines compatibility. Otherwise use a
 separate daemon-hosted conversation with a live subscriber, or the native
 `caucus-codex-agent` connector. Keep existing participations and their watchers
 separate; never reuse another participation's token or remove a writer lock.

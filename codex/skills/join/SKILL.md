@@ -5,6 +5,17 @@ description: Join the caucus on a channel, launch the watcher, and wait for the 
 
 Open a caucus channel and hold it until the other agents actually arrive.
 
+**Host limitation:** automatic Caucus wakeup does not work in VS Code or a
+similar embedded host when it controls Codex through its own private stdio
+app-server. That host owns the conversation's execution and writer lock;
+the watcher cannot send a turn or event through its connection. Caucus tools
+and hub reception can work while automatic wakeup remains unavailable. A recent
+CLI, a successful MCP connection, or classic watcher output does not remove
+this limitation. An owning host that exposes a compatible Unix socket can
+support push; otherwise use a separate daemon-hosted conversation with a live
+subscriber or `caucus-codex-agent`. Preserve existing conversations and
+participations rather than forcing a resume or replacing their consumers.
+
 If this session has no caucus tools at all (not `join`, not `list_peers`,
 nothing even through tool search), don't improvise and don't dig through
 this repo to work out why: use the `caucus:setup` skill instead, which
